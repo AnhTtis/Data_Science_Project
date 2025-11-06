@@ -1,46 +1,88 @@
-import feedparser
-import re
-import json
-import time
+   
+import arxiv
 
-def id_to_tuple(arxiv_id: str):
-    clean = re.sub(r'^arXiv:', '', arxiv_id)
-    match = re.match(r'(\d{4})\.(\d+)(v\d+)?$', clean)
-    if not match:
-        raise ValueError(f"Invalid arXiv id format: {arxiv_id}")
-    prefix, num, version = match.groups()
-    return prefix, int(num), version
+def get_ID(month, year, number):
+    return f"{year % 100:02d}{month:02d}.{number:05d}"
 
-def tuple_to_id(prefix, num):
-    return f"{prefix}.{num:05d}"
+def get_ID(month, year, number):
+    """Return arXiv ID in YYMM.NNNNN format."""
+    return f"{year % 100:02d}{month:02d}.{number:05d}"
 
-def get_arxiv_id_exists(arxiv_id):
-    url = f"http://export.arxiv.org/api/query?id_list={arxiv_id}"
-    feed = feedparser.parse(url)
-    return bool(feed.entries)
+def id_exists(paper_id):
+    """Check if a specific arXiv ID exists."""
+    search = arxiv.Search(id_list=[paper_id])
+    client = arxiv.Client(page_size=1, delay_seconds=0.2)
+    try:
+        next(client.results(search))
+        return True
+    except StopIteration:
+        return False
+    except Exception:
+        # Network or parsing error — assume not found for safety
+        return False
 
-def collect_ids_sequentially(start_id, end_id):
-    prefix, start_num, _ = id_to_tuple(start_id)
-    _, end_num, _ = id_to_tuple(end_id)
-    ids = []
-    for num in range(start_num, end_num + 1):
-        arxiv_id = tuple_to_id(prefix, num)
-        if get_arxiv_id_exists(arxiv_id):
-            ids.append(arxiv_id)
-            print(f"Found: {arxiv_id}")
+def find_first_id(year, month):
+    """Find the first valid arXiv ID of a given month using exponential + binary search."""
+    low, high = 1, 1
+    # Exponential search upward until we find a valid ID
+    while not id_exists(get_ID(month, year, high)):
+        high *= 2
+        if high > 99999:
+            return None  # No valid papers this month
+
+    # Now binary search between low and high to find the *first* valid ID
+    while low + 1 < high:
+        mid = (low + high) // 2
+        if id_exists(get_ID(month, year, mid)):
+            high = mid
         else:
-            print(f"Not found: {arxiv_id}")
-        time.sleep(0.5)  # Be polite to the API
+            low = mid
+    return high
+
+def find_last_id(year, month):
+    """Find the last valid arXiv ID of a given month."""
+    low, high = 1, 1
+    # Exponential search upward until we find a missing ID
+    while id_exists(get_ID(month, year, high)):
+        high *= 2
+        if high > 99999:
+            return 99999
+    low = high // 2
+    # Binary search for the last existing ID
+    while low + 1 < high:
+        mid = (low + high) // 2
+        if id_exists(get_ID(month, year, mid)):
+            low = mid
+        else:
+            high = mid
+    return low
+
+def get_IDs_month(month, year, start_number, end_number):
+    """Get all valid arXiv IDs in a given month."""
+    return [get_ID(month, year, i) for i in range(start_number, end_number + 1)]
+
+def get_IDs_All(start_month, start_year, start_ID, end_month, end_year, end_ID):
+    """Get all valid arXiv IDs in the given range."""
+    ids = []
+    y, m = start_year, start_month
+    n_start = start_ID
+    n_end = None
+    while True:
+        if y == end_year and m == end_month:
+            n_end = end_ID
+        else:
+            n_end = find_last_id(y, m)
+            if n_end is None:
+                n_end = 0  # No papers this month
+
+        if n_start <= n_end:
+            ids.extend(get_IDs_month(m, y, n_start, n_end))
+
+        if y == end_year and m == end_month:
+            break
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+        n_start = find_first_id(y, m)  # reset numbering
+
     return ids
-
-# --- Run ---
-start_id = "2303.07856"
-end_id   = "2304.04606"
-
-arxiv_ids = collect_ids_sequentially(start_id, end_id)
-
-output_file = f"arxiv_ids_{start_id}_{end_id}_sequential.json"
-with open(output_file, "w", encoding="utf-8") as f:
-    json.dump(arxiv_ids, f, ensure_ascii=False, indent=2)
-
-print(f"Saved {len(arxiv_ids)} arXiv IDs to {output_file}")
