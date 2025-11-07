@@ -2,9 +2,6 @@
 import arxiv
 
 def get_ID(month, year, number):
-    return f"{year % 100:02d}{month:02d}.{number:05d}"
-
-def get_ID(month, year, number):
     """Return arXiv ID in YYMM.NNNNN format."""
     return f"{year % 100:02d}{month:02d}.{number:05d}"
 
@@ -86,3 +83,4 @@ def get_IDs_All(start_month, start_year, start_ID, end_month, end_year, end_ID):
         n_start = find_first_id(y, m)  # reset numbering
 
     return ids
+

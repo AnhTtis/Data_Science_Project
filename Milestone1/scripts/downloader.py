@@ -1,10 +1,8 @@
 import os
 import re
-import json
 import arxiv
 from sickle import Sickle
 import tarfile
-import chardet
 
 def extract_and_clean_source(tar_path: str, extract_dir: str):
     """
@@ -23,21 +21,21 @@ def extract_and_clean_source(tar_path: str, extract_dir: str):
         - Verifies extracted file count for sanity check.
     """
     if not os.path.exists(tar_path):
-        print(f"⚠️ File not found: {tar_path}")
+        print(f"File not found: {tar_path}")
         return
 
-    # --- 1️⃣ Open and inspect archive ---
+    # --- Open and inspect archive ---
     try:
         with tarfile.open(tar_path, "r:gz") as tar:
             members = tar.getmembers()
             total_files = len(members)
             tar.extractall(path=extract_dir)
-        print(f"📦 Extracted {total_files} files from {os.path.basename(tar_path)}")
+        print(f"Extracted {total_files} files from {os.path.basename(tar_path)}")
     except Exception as e:
-        print(f"❌ Extraction failed for {tar_path}: {e}")
+        print(f"Extraction failed for {tar_path}: {e}")
         return
 
-    # --- 2️⃣ Remove figure/image files ---
+    # --- Remove figure/image files ---
     figure_exts = {
         # raster formats
         ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp",
@@ -59,35 +57,21 @@ def extract_and_clean_source(tar_path: str, extract_dir: str):
             else:
                 extracted_files += 1
 
-    print(f"🧹 Removed {removed_count} figure/image files")
-    print(f"📁 Remaining {extracted_files} non-image files after cleanup")
+    print(f"Removed {removed_count} figure/image files")
+    print(f"Remaining {extracted_files} non-image files after cleanup")
 
-    # --- 3️⃣ Detect encoding for remaining text files (optional check) ---
-    for root, _, files in os.walk(extract_dir):
-        for fname in files:
-            path = os.path.join(root, fname)
-            ext = os.path.splitext(fname)[1].lower()
-            if ext not in figure_exts:
-                try:
-                    with open(path, "rb") as f:
-                        raw = f.read(4096)
-                    enc = chardet.detect(raw)["encoding"]
-                    print(f"📄 {os.path.relpath(path, extract_dir)} → {enc}")
-                except Exception:
-                    pass
-
-    # --- 4️⃣ Delete the archive after successful extraction ---
+    # --- Delete the archive after successful extraction ---
     try:
         os.remove(tar_path)
-        print(f"🗑️ Deleted archive: {os.path.basename(tar_path)}")
+        print(f"Deleted archive: {os.path.basename(tar_path)}")
     except Exception as e:
-        print(f"⚠️ Could not delete archive: {e}")
+        print(f"Could not delete archive: {e}")
 
-    # --- 5️⃣ Verify extraction sanity ---
+    # --- Verify extraction sanity ---
     if extracted_files == 0:
-        print(f"⚠️ Warning: No non-image files found after extraction in {extract_dir}")
+        print(f"Warning: No non-image files found after extraction in {extract_dir}")
     else:
-        print(f"✅ Extraction and cleanup complete: {extract_dir}")
+        print(f"Extraction and cleanup complete: {extract_dir}")
 
 
 def get_oai_metadata(arxiv_id: str):
@@ -102,7 +86,7 @@ def get_oai_metadata(arxiv_id: str):
         record = sickle.GetRecord(identifier=oai_identifier, metadataPrefix="arXiv")
         return record.metadata
     except Exception as e:
-        print(f"⚠️ OAI fetch failed for {arxiv_id}: {e}")
+        print(f"OAI fetch failed for {arxiv_id}: {e}")
         return {"error": str(e)}
 
 
@@ -185,10 +169,10 @@ def download(arxiv_id: str):
     Create folders for all versions of a known arXiv ID (e.g. '2312.09876v3'),
     then download each version's PDF, source, and metadata as JSON.
     """
-    # --- 1️⃣ Base paths ---
+    # --- Base paths ---
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
 
-    # --- 2️⃣ Parse ID and latest version ---
+    # --- Parse ID and latest version ---
     match = re.match(r"^(\d{4}\.\d{5})v(\d+)$", arxiv_id)
     if not match:
         raise ValueError(f"Invalid arXiv ID format: {arxiv_id} (expected like '2312.09876v3')")
@@ -196,34 +180,33 @@ def download(arxiv_id: str):
     main_id, latest_v = match.groups()
     latest_v = int(latest_v)
 
-    print(f"📦 Preparing folders for {main_id} (up to v{latest_v})")
+    print(f"Preparing folders for {main_id} (up to v{latest_v})")
 
     paper_folder = os.path.join(base_dir, main_id)
     os.makedirs(paper_folder, exist_ok=True)
 
     client = arxiv.Client()
 
-    # --- 3️⃣ Loop through all versions 1..vN ---
+    # --- Loop through all versions 1..vN ---
     for v in range(1, latest_v + 1):
         vid = f"{main_id}v{v}"
         ver_folder = os.path.join(paper_folder, f"v{v}")
         os.makedirs(ver_folder, exist_ok=True)
 
-        print(f"📥 Downloading {vid} ...")
+        print(f"Downloading {vid} ...")
 
         try:
             search = arxiv.Search(id_list=[vid])
             result = next(client.results(search))
 
-            # --- 4️⃣ Download files ---
-            result.download_pdf(dirpath=ver_folder, filename="paper.pdf")
+            # --- Download files ---
             result.download_source(dirpath=ver_folder, filename="source.tar.gz")
             extract_and_clean_source(
                 tar_path=os.path.join(ver_folder, "source.tar.gz"),
                 extract_dir=ver_folder
             )
 
-            # # --- 5️⃣ Save metadata to JSON ---
+            # # --- Save metadata to JSON ---
             # oai_meta = get_oai_metadata(vid)
             # meta = merge_metadata(result, oai_meta)
         
@@ -231,11 +214,11 @@ def download(arxiv_id: str):
             # with open(json_path, "w", encoding="utf-8") as f:
             #     json.dump(meta, f, indent=4, ensure_ascii=False)
 
-            print(f"✅ Saved {vid} → {ver_folder}")
+            print(f"Saved {vid} → {ver_folder}")
 
         except StopIteration:
-            print(f"❌ Version {vid} not found (maybe withdrawn).")
+            print(f"Version {vid} not found (maybe withdrawn).")
         except Exception as e:
-            print(f"⚠️ Error downloading {vid}: {e}")
+            print(f"Error downloading {vid}: {e}")
 
-    print(f"\n🎯 Completed {main_id} (v1 → v{latest_v}).")
+    print(f"\nCompleted {main_id} (v1 → v{latest_v}).")
