@@ -1,5 +1,7 @@
-   
+import logging
+logging.getLogger("arxiv").setLevel(logging.ERROR)   
 import arxiv
+import re
 
 def get_ID(month, year, number):
     """Return arXiv ID in YYMM.NNNNN format."""
@@ -84,3 +86,17 @@ def get_IDs_All(start_month, start_year, start_ID, end_month, end_year, end_ID):
 
     return ids
 
+def format_arxiv_id_for_key(arxiv_id):
+    """
+    Convert arXiv ID from YYMM.NNNNN format to yyyymm-id format.
+    Examples:
+        2304.07856 -> 202304-07856
+        1912.00123 -> 201912-00123
+    """
+    match = re.match(r'^(\d{2})(\d{2})\.(\d{5})$', arxiv_id)
+    if match:
+        yy, mm, id_num = match.groups()
+        # Convert YY to YYYY (assuming 20YY for papers after 2000)
+        yyyy = f"20{yy}"
+        return f"{yyyy}{mm}-{id_num}"
+    return arxiv_id  # Return as-is if format doesn't match
