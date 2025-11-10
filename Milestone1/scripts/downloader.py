@@ -3,7 +3,7 @@ import re
 import arxiv
 import tarfile
 from arXiv_handler import format_arxiv_id_for_key
-from metadata_collector import MetadataCollector
+from metadata_collector import save_metadata
 
 def safe_extract_tar(tar_path: str, extract_to: str) -> None:
     """Safely extract a tar.gz file using filter='data'."""
@@ -59,7 +59,6 @@ def download(list_download: list[arxiv.Result], base_dir: str) -> None:
         except Exception as e:
             print(f"[Error] Downloading or extracting {result.get_short_id()}: {e}")
             
-    collector = MetadataCollector(base_dir=base_dir)
-    collector.save_metadata(result, folder_arxiv)
+    save_metadata(result, folder_arxiv)
     
     
