@@ -87,25 +87,22 @@ Data_Scince_Project/
 └── Milestone1/
     │
     ├── data/                                   # Main data repository
-    │   ├── 2310-12345/                         # Folder named after an arXiv ID (yyyymm-id)
-    │   │   ├── v1/                             # Subfolder for version 1 of the paper
-    │   │   │   ├── paper_2310-12345v1.tar.gz
-    │   │   │   ├── metadata.json
-    │   │   │   ├── references.json
+    │   ├── 232303-07857/                         # Folder named after an arXiv ID (yyyymm-id)
+    │   │   ├── 2303.07857v1/                             # Subfolder for version 1 of the paper
+    │   │   │   ├── paper_2310-12345v1.tex
     │   │   │   └── references.bib
     │   │   ├── v2/                             # Version 2, same structure
-    │   │   │   ├── paper_2310-12345v2.tar.gz
-    │   │   │   ├── metadata.json
+    │   │   │   ├── paper_2310-12345v2.tex
     │   │   │   ├── references.json
     │   │   │   └── references.bib
-    │   │
-    │   ├── 2310-12678/
+    │   │   ├── metadata.json
+    │   │   │── references.json
+    │   ├── 232303-07858/
     │   │   ├── v1/
-    │   │   │   ├── paper_2310-12678v1.tar.gz
-    │   │   │   ├── metadata.json
-    │   │   │   ├── references.json
+    │   │   │   ├── paper_2310-12678v1.tex
     │   │   │   └── references.bib
-    │   │   └── ...
+    │   │   │── metadata.json
+    │   │   │── references.json
     │   │
     │   └── ...                                 # Additional arXiv paper folders
     │
@@ -115,9 +112,6 @@ Data_Scince_Project/
     │   ├── downloader.py                       # Downloads .tar.gz sources and PDFs
     │   ├── metadata_collector.py               # Retrieves metadata for all versions
     │   ├── reference_extractor.py              # Collects references from Semantic Scholar
-    │   ├── utils.py                            # Utility functions, logging, and error handling
-    │   └── config.json                         # Configuration file (API keys, limits, etc.)
-    │
     │
     ├── Milestone1_Report.pdf                   # Single official report file (methodology & performance)
     │
@@ -144,15 +138,8 @@ pip install -r requirements.txt
 **Run Command Example:**
 
 ```bash
-python scripts/pipeline_manager.py --start 2310.12000 --end 2310.12500 --threads 4
+python scripts/main.py
 ```
-
-Parameters:
-
-* `--start`, `--end`: Range of arXiv IDs assigned
-* `--threads`: Number of worker threads (default = 4)
-* `--rate-limit`: Optional argument to comply with API restrictions
-
 ---
 
 ## 📊 Evaluation Metrics
