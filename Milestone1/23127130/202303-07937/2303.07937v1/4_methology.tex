@@ -1,0 +1,95 @@
+\subsection{Motivation and overview}
+
+The score distillation-based text-to-3D methods~\cite{poole2022dreamfusion,lin2022magic3d,wang2022score} assume that maximizing the likelihood of images rendered from arbitrary viewpoints of a NeRF can be translated as maximizing the likelihood of the overall NeRF. Although this is a reasonable assumption, 2D diffusion models lack 3D awareness, which leads to inconsistent and distorted geometry of generated NeRF. To overcome this challenge and ensure NeRF's 3D-consistency, we incorporate 3D awareness into the diffusion model.
+
+Previous works~\cite{poole2022dreamfusion, wang2022score} attempt this by using the text prompts that roughly describe the camera viewpoint (\textit{e.g.}, ``\textit{side view}''). However, this ad-hoc approach is severely limited: the ambiguity caused by the same text prompt representing a wide range of different pose values leaves NeRF generation vulnerable to geometric inconsistencies. A diffusion model directly conditioned on camera pose value $\pi$ would be an ideal solution; however, this is not feasible due to the ambiguity in defining a canonical space for each 3D scene, and the difficulty of acquiring camera pose data.
+
+To overcome these limitations, we present \ours, our novel framework for effectively incorporating 3D awareness into pretrained text-to-image diffusion models~\cite{ho2020denoising, rombach2022high}. Instead of having the diffusion model explicitly model camera pose $\pi$, our method constructs a coarse point cloud of an initially generated image $\hat{x}$ through an off-the-shelf model~\cite{nichol2022point, wu2023multiview} and gives its viewpoint-specific depth map as a condition for the diffusion model. As the sparse depth map contains rich 3D information describing the scene from a given viewpoint, this approach effectively enables the diffusion model to generate NeRF in a 3D aware manner. In addition, to ensure the semantic similarity of NeRF across viewpoints, we introduce semantic code sampling, which constrains the entire 3D scene to a single semantic identity. 
+
+In the following, we describe our proposed methodology in detail. Our overall architecture is described in Fig.~\ref{fig:network_overall}.
+
+\subsection{Semantic code sampling}
+\label{method:semcode}
+The task of text-to-3D generation comes with a problem of inherent ambiguity within the text prompt. For instance, the text prompt ``\textit{a cute cat}'' has color ambiguity, as it could refer to either a black or white cat. This ambiguity leads to the freedom to generate any image within this range, which harms the quality and coherence of the generated NeRF. Each score distillation step may guide NeRF toward widely different textures and semantics, which could result in a lack of coherence in the generated output. In Sec.~\ref{abl:semcode}, we provide a detailed demonstration of this phenomenon.
+
+We introduce a simple yet effective technique to counter this text prompt ambiguity, which we call semantic code sampling. To specify the semantic identity of the scene we optimize and thus reduce ambiguity, we first generate a 2D image $\hat{x}$ from the text prompt $c$. Then, we optimize the text prompt embedding $e$ to better fit the generated image, similarly to the textual inversion~\cite{gal2022image}:
+\begin{equation}
+{e}^* = \underset{e}{\mathrm{argmin}} \ || {\epsilon}_{\theta}(\hat{x}_t,{e}) - {\epsilon} ||^2_2,
+ \label{equation:embedding_optimize}
+\end{equation}
+where $\hat{x}_t$ is a noised image of the generated image $\hat{x}$ with the noise $\epsilon$ and the noise level $t$. 
+
+We refer to the pair of the generated image $\hat{x}$ and the optimized embedding ${e}^*$ as semantic code ${s}$, \textit{i.e.}, $s := (\hat{x}, {e}^*)$, which are the inputs for our consistency injection module. 
+
+\subsection{Incorporating a coarse 3D prior}
+\label{method:3dprior}
+
+Our approach aims to incorporate 3D awareness into pre-trained 2D diffusion models, and to achieve this we construct a coarse 3D representation of a given initial image and project it to a target viewpoint to make a sparse depth map. This sparse depth map is leveraged in our consistency injection module as a condition for 3D awareness.
+         
+Specifically, an off-the-shelf model ${D}(\cdot)$ receives an image as input and outputs a coarse 3D representation, which is a sparse 3D point cloud in our architecture.  We can choose ${D}(\cdot)$ from a wide variety of models: it could be a point cloud generative model such as Point-E~\cite{nichol2022point} or a single-image reconstruction model such as MCC~\cite{wu2023multiview}. Using them as 3D priors, we construct a sparse point cloud and project it to get a sparse depth map ${P}$ corresponding to the camera pose $\pi$:
+\begin{align}
+ {P} = \mathcal{P}({D}(\hat{x}),\pi),
+ \label{equation:projection}
+\end{align}
+where $\mathcal{P}(\cdot)$ is a depth-projection function. Subsequently, adopting the architecture of ControlNet~\cite{zhang2023adding}, our sparse depth injector $E_\phi$ receives the sparse depth map $P$, and its output features are added to the intermediate features within diffusion U-net of $\epsilon_\theta \bigl(\hat{x}_t,{e}^*\bigr)$, which can be further formulated such that $\epsilon_\theta \bigl(\hat{x}_t,{e}^*;E_\phi(P) \bigr)$.
+
+This approach brings significant advantages to score distillation-based NeRF generation. Unlike previous methods that directly optimize NeRF using only global text prompts, our \ours conditions the 3D optimization explicitly on the semantic code and its view-specific depth map. Not only does this enhance the 3D-consistency and fidelity of NeRF as intended, but it also encourages the 3D scene to be faithful to the semantic code, ensuring both geometric and semantic robustness of the generated 3D scene.  
+
+\subsection{Training the sparse depth injector}
+\label{method:sparsedepth}
+The point cloud obtained by the off-the-shelf 3D model inevitably contains errors and artifacts. It naturally causes its depth map to also have artifacts, as shown in Fig.~\ref{fig:depthcomp}(a). Therefore, our module must be able to handle both sparse geometry and the errors of the projected depth map.
+
+To this end, we employ two training strategies for our sparse depth injector ${E}_\phi(\cdot)$. First, we train our injector using sparse depth maps, acquired by projecting point clouds from a point cloud dataset~\cite{reizenstein2021common} to known viewpoints. By training our module with sparse depth map–image pairs, our model learns to interpolate and infer dense structural information from sparse depth. We impose strong augmentations on the point cloud data by randomly subsampling from it and adding randomly generated noisy points, which increases the robustness of our model against errors and noises present in the predicted sparse depth map. The texts for the corresponding images are obtained using the image caption model~\cite{dosovitskiy2020image,kumar2022imagecaptioning}.
+
+Second, the injector ${E}_\phi(\cdot)$ is also trained on predicted dense depth maps of text-to-image pairs, acquired using MiDaS~\cite{ranftl2020towards}. This strengthens of model’s generalization capability, enabling it to infer structural information from categories that were not included in the 3D point cloud dataset for sparse depth training.
+
+
+Combining the two, given the depth map $P$ along with the corresponding image $y$ and caption $c$, the training objective of the depth injector $E_\phi$ is as follows:
+\begin{equation}
+    \mathcal{L}_\mathrm{inject}(\phi)= \mathbb{E}_{y,c,P,t,\epsilon}\Bigl[ || \epsilon_\theta \bigl(y_t,c;E_\phi(P) \bigr)-\epsilon ||^2_2 \Bigr],
+\end{equation}
+which is similar to Eq.~\ref{equation:diffloss}, but only tunes the depth injector $E_\phi$ while the diffusion model remains frozen.
+These training strategies enable our model to receive sparse and noisy depth maps directly as input and successfully infer dense and robust structural information from them, without needing any auxiliary depth completion network. Fig.~\ref{fig:depthcomp} illustrates the effectiveness of our approach: our approach successfully generates realistic results without being restricted to the domain of the point cloud dataset. Note that the owl and eagle used in the illustration of Fig.~\ref{fig:depthcomp} are not included in the category of the point cloud dataset~\cite{reizenstein2021common} we use.
+
+\begin{figure}[t]
+    \centering
+    \small
+    \setlength\tabcolsep{0.8pt}
+    {
+    % \renewcommand{\arraystretch}{0.5}
+    % \resizebox{\columnwidth}{!}{%
+    \begin{tabular}{cccc}
+     \includegraphics[width=0.249\linewidth]{fig/depthcomp_a} &
+      \includegraphics[width=0.249\linewidth]{fig/depthcomp_b} &
+      \includegraphics[width=0.249\linewidth]{fig/depthcomp_c} &
+      \includegraphics[width=0.249\linewidth]{fig/depthcomp_d} \\
+      \includegraphics[width=0.249\linewidth]{fig/depthcomp_a2} &
+      \includegraphics[width=0.249\linewidth]{fig/depthcomp_b2} &
+      \includegraphics[width=0.249\linewidth]{fig/depthcomp_c2} &
+      \includegraphics[width=0.249\linewidth]{fig/depthcomp_d2} \\
+       (a) & (b) & (c) & (d)\\
+    \end{tabular} }
+    % }
+    \vspace{-10pt}
+    \caption{\textbf{Qualitative results conditioned on the sparse depth map.} Given sparse depth maps in (a), (b) are the results of depth-conditional Stable Diffusion, (c) are the results of ControlNet~\cite{zhang2023adding} trained on MiDaS~\cite{ranftl2020towards} depths only, and (d) are our \ours results. The given text prompts are ``\textit{a front view of an owl}'' and ``\textit{a majestic eagle}''.}
+    \label{fig:depthcomp} 
+    \vspace{-5pt}
+\end{figure}
+
+\begin{figure*}[t]
+\begin{center}
+\includegraphics[width=0.89\linewidth]{fig/Arxiv_qual_comparison.pdf}
+\end{center}
+\vspace{-10pt}
+\caption{\textbf{Qualitative comparisons for text-to-3D generation.} We compare our approach with Stable-DreamFusion~\cite{poole2022dreamfusion,stable-dreamfusion} and SJC~\cite{wang2022score}. Notice that all the results are rendered with a fixed random seed for a fair comparison. The geometric consistency of our approach can also be found at the \textbf{video results} provided in the project page.}
+\label{qual_textto3d}
+% \vspace{-5pt}
+\end{figure*}
+
+\subsection{Pivotal tuning for semantic consistency}
+\label{method:pivotal}
+To accomplish our objective, the diffusion model should produce a score that generates identical objects as much as possible from different camera poses, based on a semantic code. Although optimized embedding ${e}^*$ preserves the semantics, we further enhance this by adopting LoRA~\cite{hu2021lora} technique motivated by \cite{lora_diff}. LoRA layers $\psi$ consist of linear layers, inserted into the residual path of the attention layers in the diffusion U-net. Specifically, at test time, given an image $\hat{x}$ generated from text prompt $c$, we fix the optimized embedding ${e}^*$ and tune the LoRA layers $\psi$~\cite{roich2022pivotal}:
+\begin{equation}
+    \mathcal{L}_\mathrm{LoRA}(\psi) =\mathbb{E}_{\epsilon,t}\Bigl[ || \epsilon_\theta(\hat{x}_t,e^*;\psi) - \epsilon ||^2_2 \Bigr].
+\end{equation}
+Note that we only train the LoRA layers instead of the entire diffusion model to avoid overfitting to a specific viewpoint.

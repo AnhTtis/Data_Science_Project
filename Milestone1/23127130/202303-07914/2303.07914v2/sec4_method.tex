@@ -1,0 +1,135 @@
+\section{Method}
+
+To address the mismatch problem between offline training and online inference, we propose a novel methodology called Future-Aware Streaming Translation (FAST). 
+This approach adapts an offline ST model for streaming scenarios by using a Future-Aware Inference (FAI) strategy during inference and a Future-Aware Distillation (FAD) strategy during training. 
+An overview of our proposed method is depicted in Figure \ref{fig:method}.
+
+
+\begin{figure*}
+\centering
+\includegraphics[width=1.0\linewidth]{structure.eps}
+\caption{Illustration of offline ST model and proposed methods FAI and FAD.}
+\label{fig:method}
+\end{figure*}
+
+\subsection{Model Architecture}
+Unlike previous works \cite{ren-etal-2020-simulspeech,ma-etal-2020-simulmt,zeng-etal-2021-realtrans,liu2021cross} that require training multiple streaming models for different latency requirements, our goal is to train one single offline model to meet the requirements. 
+The overall architecture depicted in Figure \ref{fig:method}(a) consists of an acoustic encoder, an acoustic boundary detector, a semantic encoder, and a translation decoder. 
+\\
+\textbf{Acoustic encoder}: The pre-trained Wav2Vec2.0 is adopted as the acoustic encoder to learn a better speech representation \cite{ye21_interspeech,ye-etal-2022-cross}.
+\\
+\textbf{Acoustic boundary detector}: To enable the offline ST model to perform chunk-wise streaming inference, we use a Continuous Integrate-and-Fire (CIF) module \cite{dong2022cif} as the acoustic boundary detector to dynamically locate the acoustic boundaries of speech segments following \cite{yi2021efficiently,dong-etal-2022-learning}. 
+The CIF module generates an integration weight $\alpha_t$ for each acoustic representation $a_t$ by Wav2Vec2.0. 
+Then, CIF accumulates $\alpha_t$ in a step-by-step way.
+When the accumulation reaches a certain threshold (e.g. 1.0), the acoustic representations corresponding to these weights are integrated into a single hidden representation $h_j$ by weighted average, indicating a found token boundary. 
+The shrunk representations $\mathbf{h}$ will be fed into the semantic encoder. 
+To learn the correct acoustic boundaries, we use the source text length $J$ as the weakly supervised signal.
+%
+\begin{equation}
+\mathcal{L}_{\text{CIF}}=\left\|J-\sum\nolimits_{t=1}^{T}\alpha_t\right\|_2
+\label{eq:cif_loss}
+\end{equation}
+%
+There are two benefits of using CIF as a boundary detector.
+For offline ST model, it can address the length gap between speech and text.
+It can also provide the acoustic boundaries to perform read/write policies for streaming inference. 
+Similar to the word alignment in NMT \cite{li2022structural,li2023neural}, it can align the source audio and source text token.
+\\
+\textbf{Semantic encoder and Translation decoder}: The standard transformer \cite{vaswani2017attention} composed of $L_{e}$ encoder layers and $L_{d}$ decoder layers is used. 
+The translation loss is defined as:
+%
+\begin{equation}
+\mathcal{L}_{\text{ST}}(\mathbf{x},\mathbf{y})=-\sum\nolimits_{j=1}^{J}\log p\left(y_j \mid y_{<j}, \mathbf{x}\right)
+\label{eq:st_loss}
+\end{equation}
+%
+
+
+\subsection{Future-Aware Inference}
+
+The offline ST model is trained with the following objective function:
+%
+\begin{equation}
+\mathcal{L}_{\text{offline}}=\mathcal{L}_{\text{ST}} + \lambda \cdot \mathcal{L}_{\text{CIF}}
+\label{eq:offline_loss}
+\end{equation}
+%
+where $\lambda$ is a hyper-parameter to balance two losses. 
+
+Based on the analysis in Section \ref{sec:analysis}, we find that it is only necessary for the offline ST model to be aware of a short future during streaming encoding. 
+Thus, we first propose a Future-Aware Inference (FAI) strategy to enhance the representations of streaming speech in Figure \ref{fig:method} (b). 
+
+In this strategy, the streaming inference is directly performed on offline ST model without fine-tuning. 
+Particularly, we use the mask tokens of Wave2Vec2.0 as the pseudo future context and append them to the speech tokens generated from the already consumed speech frames. 
+Because the mask token embedding is trainable when pre-training Wave2Vec2.0, and the contrastive loss is to identify the quantized latent audio representation of masked regions based on unmasked context, this is intuition that mask tokens can possibly encode future context. 
+In addition, the masking strategy during pre-training results in approximately 49\% of all time steps being masked with a mean span length of 300ms, it also guarantees that Wav2vec2.0 is able to extract better speech representations even with the presence of large amount of mask tokens.
+
+Wav2Vec2.0 consists of a multi-layer convolutional subsampler $f_c$ and a Transformer encoder $f_e$. 
+During our online inference, for each audio prefix $\mathbf{\hat{x}}_t=(x_1,\ldots, x_{t})$, the $f_c$ first outputs streaming speech tokens $\mathbf{\hat{c}}_t=(c_1,\ldots, c_{\tau})$, where $\mathbf{\hat{c}} \in \mathbb{R}^{\tau \times d}$ and $d$ is the dimension of model and $\tau$ is the sequence length after convolutional subsampling.  
+Then, we concatenate the streaming speech tokens $\mathbf{\hat{c}}$ and $m$ mask token embeddings $\mathbf{e} \in \mathbb{R}^{d}$ along the time dimension, resulting in a longer sequence of speech tokens $\in \mathbb{R}^{(\tau + m) \times d}$. 
+The new speech tokens are then fed into the Transformer encoder $f_e$, but only the first $\tau$ encoder outputs (i.e., speech features) will be kept for the CIF module because, as discussed in Section \ref{sec:analysis}, the last $m$ speech features are of poor quality and adversely affect translation quality. 
+Then, if an acoustic boundary is detected by the CIF module, the decoder will emit new words based on \textit{wait-k} policy, otherwise, the streaming speech is continued to be read. 
+The FAI strategy is outlined in Algorithm \ref{algo:mask} in Appendix.
+
+
+\subsection{Future-Aware Distillation}
+
+Although FAI considers mask tokens as the pseudo future context, it is still preferred to leverage the future oracle speech tokens, which is unavailable during inference. 
+Therefore, we take one step further by proposing a fine-tuning method -- Future-Aware Distillation (FAD). 
+It aims to distill the knowledge from teachers with oracle future contexts into students with pseudo future contexts.
+
+The \textbf{teacher} model is the offline ST by optimizing Eq.~(\ref{eq:offline_loss}) and is frozen. 
+The \textbf{student} model has exactly the same architecture as the teacher and is initialised from the teacher. 
+However, the semantic encoder and translation decoder are frozen to retain offline-trained ST performance.
+\\
+\textbf{Training} 
+A naive solution is to distill knowledge from the full speech into every possible streaming speech for each audio. 
+However, since the length of speech tokens is typically very large, \emph{e.g.}, 300 on average, it is computationally prohibitive. 
+To this end, we propose a simple and efficient implementation via random sampling.
+
+Given a full audio waveform $\mathbf{x}$, $f_c$ outputs the speech tokens $\mathbf{c} \in \mathbb{R}^{T \times d}$.
+We randomly sample an integer $t \in [1, T]$ to construct the streaming speech token $\mathbf{c}_{\leq t}$.
+Then, we define the teacher input of $f_e$ with oracle future context as following:
+%
+\begin{equation}
+\mathbf{\hat{c}}^\mathcal{T} = \mathbf{c}_{1:t+m} \in \mathbb{R}^{(t+m) \times d},
+\end{equation}
+%
+where $m$ is a hyper-parameter to denote the number of future contexts. 
+The most straightforward approach is to use the full speech as the teacher input. 
+However, due to the bidirectional acoustic encoder, the streaming speech representation of the same position constantly changes when consuming new frames. 
+
+
+To maintain consistency with the inference method FAI, we use the mask tokens as the pseudo future context and append them to the sampled speech tokens to construct the student input. 
+%
+\begin{equation}
+\mathbf{\hat{c}}^\mathcal{S} = \operatorname{Concat}\{\mathbf{c}_{1:t}; m \times [\mathbf{e}]\} \in \mathbb{R}^{(t+m) \times d},
+\end{equation}
+%
+where $\mathbf{e} \in \mathbb{R}^{d}$ is the mask embedding. 
+
+We can obtain the streaming speech representations from teacher $f_e^\mathcal{T}$ and student $f_e^\mathcal{S}$. 
+Then the first $t$ speech representations are fed into the CIF module to derive the teacher and student weight sequence. 
+Concretely, they can be written as follows.
+%
+\begin{align}
+    \mathbf{\hat{a}}^\mathcal{T}, \mathbf{\hat{a}}^\mathcal{S} &= f_e^T(\mathbf{\hat{c}}^\mathcal{T}), f_e^S(\mathbf{\hat{c}}^\mathcal{S}) \\
+    \alpha^\mathcal{T}_{1:t}, \alpha^\mathcal{S}_{1:t} &= \operatorname{CIF}(\mathbf{\hat{a}}^\mathcal{T}_{1:t}), \operatorname{CIF}(\mathbf{\hat{a}}^\mathcal{S}_{1:t}) 
+\end{align}
+%
+Eventually, two distillation losses are proposed to reduce the speech representation gap.
+%
+\begin{align}
+    \mathcal{L}_{KD}^{\text{W2V}} &= 1-\operatorname{cosine}(\mathbf{\hat{a}}_{1:t}^\mathcal{S},\mathbf{\hat{a}}_{1:t}^\mathcal{T}) \\
+    \mathcal{L}_{KD}^{\text{CIF}} &= \sum\nolimits_{\tau=1}^t \operatorname{KL}(\alpha_\tau^\mathcal{T} \| \alpha^\mathcal{S}_\tau)
+\end{align}
+%
+The first loss is to directly minimize the streaming speech representations with cosine similarity. 
+The second loss is to learn more correct acoustic boundaries for online inference by calculating the KL-divergence between two weight distributions. 
+Note that according to previous analysis in Section \ref{sec:analysis}, the representations of the first $t$ speech tokens after $f_e^{\mathcal{T}}$ should have high quality if $m > 10$, so only the first $t$ speech representations are taken into account for loss calculation. 
+
+\textbf{Optimization} The total training objective of the FAD can be written as $\mathcal{L}=\mathcal{L}_{KD}^{\text{W2V}} + \mathcal{L}_{KD}^{\text{CIF}}$. 
+%
+The overall training procedure of the proposed method is shown in Figure \ref{fig:method}(c).
+
+
