@@ -4,7 +4,6 @@ import os
 import time
 import re
 from downloader import format_yymm_id
-from arXiv_handler import format_arxiv_id_for_key
 
 def get_paper_references(arxiv_id, delay=2):
     """
@@ -81,7 +80,7 @@ def convert_to_references_dict(references):
         # Determine the key for this reference
         if arxiv_id:
             # Use arXiv ID in yyyymm-id format
-            key = format_arxiv_id_for_key(arxiv_id)
+            key = format_yymm_id(arxiv_id)
         elif doi:
             # Use DOI as key (sanitize it)
             key = f"doi:{doi.replace('/', '_')}"

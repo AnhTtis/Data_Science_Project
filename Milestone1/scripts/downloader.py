@@ -92,10 +92,12 @@ def download(list_download: list, base_dir: str) -> None:
     print(f"Processing {arxiv_id} → {folder_arxiv}")
 
     os.makedirs(folder_arxiv, exist_ok=True)
+    tex_root = os.path.join(folder_arxiv, "tex")
+    os.makedirs(tex_root, exist_ok=True)
 
     for result in list_download:
         full_id = result.get_short_id()  # e.g. '2305.00633v4'
-        folder_version = os.path.join(folder_arxiv, result.get_short_id())
+        folder_version = os.path.join(tex_root, full_id)  # put all versions under .../<paper>/tex/<version>
         os.makedirs(folder_version, exist_ok=True)
 
         src_url = f"{ARXIV_HOST}/src/{full_id}"
@@ -108,7 +110,7 @@ def download(list_download: list, base_dir: str) -> None:
 
         # Validate and extract
         if not tarfile.is_tarfile(tar_path):
-            print(f"Invalid tar archive for {full_id}. Keeping raw file.")
+            print(f"Invalid tar archive for {full_id}. Removing file.")
             try:
                 os.remove(tar_path)
             except OSError as e:

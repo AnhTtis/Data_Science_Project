@@ -104,8 +104,8 @@ if __name__ == "__main__":
     base_data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "23127130"))
     os.makedirs(base_data_dir, exist_ok=True)
 
-    start_index = 3210
-    num_papers = 190
+    start_index = 0
+    num_papers = 5000
 
     DOWNLOAD_THREAD_COUNT = 3
     REFERENCE_THREAD_COUNT = 2
