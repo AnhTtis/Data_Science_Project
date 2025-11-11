@@ -6,17 +6,6 @@ import re
 from arXiv_handler import format_arxiv_id_for_key
 
 
-def format_authors_bibtex(authors):
-    """
-    Format authors list for BibTeX format.
-    Input: list of author names
-    Output: "Author1 and Author2 and Author3"
-    """
-    if not authors:
-        return ""
-    return " and ".join(authors)
-
-
 def get_paper_references(arxiv_id, delay=2):
     """
     Fetch references for a paper from Semantic Scholar API.

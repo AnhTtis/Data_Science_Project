@@ -75,8 +75,8 @@ if __name__ == "__main__":
     os.makedirs(base_data_dir, exist_ok=True)
 
     # User input for start index and number of papers
-    start_index = 0
-    num_papers = 10
+    start_index = 1000
+    num_papers = 1000
 
     # Thread counts (can be tuned)
     DOWNLOAD_THREAD_COUNT = 3
