@@ -3,8 +3,8 @@ import json
 import os
 import time
 import re
+from downloader import format_yymm_id
 from arXiv_handler import format_arxiv_id_for_key
-
 
 def get_paper_references(arxiv_id, delay=2):
     """
@@ -184,7 +184,7 @@ def extract_references_for_paper(paper_id, base_data_dir="../data"):
     Returns:
         dict: Statistics about the extraction
     """
-    paper_id_key = format_arxiv_id_for_key(paper_id)
+    paper_id_key = format_yymm_id(paper_id)
     paper_folder = os.path.join(base_data_dir, paper_id_key)
     
     save_references(paper_id, os.path.join(paper_folder))

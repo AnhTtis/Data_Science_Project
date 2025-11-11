@@ -1,19 +1,65 @@
 import os
 import re
-import arxiv
 import tarfile
-from arXiv_handler import format_arxiv_id_for_key
+import requests
+import string
 from metadata_collector import save_metadata
 
+ARXIV_HOST = "https://arxiv.org"
+
+def format_yymm_id(base_id: str) -> str:
+    """'2303.07856' -> '2303-07856'"""
+    return base_id.replace('.', '-')
+
+def sanitize_filename(name: str) -> str:
+    """
+    Replace unsafe characters and limit path depth to avoid errors.
+    Keeps only alphanumeric, underscores, hyphens, dots, and slashes.
+    """
+    safe_chars = f"-_.{string.ascii_letters}{string.digits}/"
+    return ''.join(c if c in safe_chars else '_' for c in name)
 
 def safe_extract_tar(tar_path: str, extract_to: str) -> None:
-    """Safely extract a tar.gz file using filter='data'."""
+    """Safely extract a tar.gz file using 'filter=data', skipping broken entries."""
     try:
         with tarfile.open(tar_path, "r:gz") as tar:
-            tar.extractall(path=extract_to, filter="data")
+            for member in tar.getmembers():
+                try:
+                    # Skip symbolic links and absolute paths (security)
+                    if member.islnk() or member.issym() or member.name.startswith("/") or ".." in member.name:
+                        continue
+                    
+                    member.name = sanitize_filename(member.name)
+                    target_path = os.path.join(extract_to, member.name)
+                    target_dir = os.path.dirname(target_path)
+                    os.makedirs(target_dir, exist_ok=True)
+
+                    # Extract safely
+                    tar.extract(member, path=extract_to, filter="data")
+                except (FileNotFoundError, OSError, tarfile.ExtractError) as inner_e:
+                    print(f"⚠️ Skipped bad entry in {os.path.basename(tar_path)}: {member.name} ({inner_e})")
+                    continue
     except Exception as e:
-        print(f"Extraction error in {tar_path}: {e}")
-        raise
+        print(f"[Error] Extraction failed for {tar_path}: {e}")
+
+
+def download_url(url: str, out_path: str) -> bool:
+    """Basic downloader (no retry, no backoff)."""
+    headers = {"User-Agent": "arxiv-downloader/1.0 (+https://github.com/your-handle)"}
+    try:
+        with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+            if r.status_code == 200:
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        if chunk:
+                            f.write(chunk)
+                return True
+            print(f"HTTP {r.status_code} for {url}")
+            return False
+    except requests.RequestException as e:
+        print(f"Download failed for {url}: {e}")
+        return False
 
 
 def cleanup_non_tex_bib_files(folder: str) -> None:
@@ -27,11 +73,10 @@ def cleanup_non_tex_bib_files(folder: str) -> None:
                     print(f"Warning: could not remove {file}: {e}")
 
 
-def download(list_download: list[arxiv.Result], base_dir: str) -> None:
+def download(list_download: list, base_dir: str) -> None:
     """
-    Downloads all versions of an arXiv paper, extracts .tex/.bib,
-    and creates separate .bib files from embedded bibliographies if needed.
-    Handles download and extraction errors robustly.
+    Downloads all versions of an arXiv paper using /src/{id} URL.
+    Extracts .tex/.bib files and saves metadata.
     """
     if not list_download:
         print("⚠️ list_download is empty — skipping.")
@@ -43,32 +88,47 @@ def download(list_download: list[arxiv.Result], base_dir: str) -> None:
         return
 
     arxiv_id = match.group(1)
-    folder_arxiv = os.path.join(base_dir, format_arxiv_id_for_key(arxiv_id))
+    folder_arxiv = os.path.join(base_dir, format_yymm_id(arxiv_id))
     print(f"Processing {arxiv_id} → {folder_arxiv}")
 
+    os.makedirs(folder_arxiv, exist_ok=True)
+
     for result in list_download:
+        full_id = result.get_short_id()  # e.g. '2305.00633v4'
         folder_version = os.path.join(folder_arxiv, result.get_short_id())
         os.makedirs(folder_version, exist_ok=True)
 
-        try:
-            tar_path = result.download_source(dirpath=folder_version)
-        except Exception as e:
-            print(f"[Error] No source for {result.get_short_id()}: {e}")
-            tar_path = None
+        src_url = f"{ARXIV_HOST}/src/{full_id}"
+        tar_path = os.path.join(folder_version, f"{full_id}.tar.gz")
+        print(f"Attempting source: {src_url}")
 
-        if tar_path and os.path.exists(tar_path) and tar_path.endswith('.tar.gz') and os.path.getsize(tar_path) > 1024:
-            try:
-                safe_extract_tar(tar_path, folder_version)
-            except Exception as e:
-                print(f"[Error] Extraction failed for {tar_path}: {e}")
+        if not download_url(src_url, tar_path):
+            print(f"Source unavailable for {full_id}")
+            continue
 
+        # Validate and extract
+        if not tarfile.is_tarfile(tar_path):
+            print(f"Invalid tar archive for {full_id}. Keeping raw file.")
             try:
                 os.remove(tar_path)
-            except Exception as e:
-                print(f"[Error] Removing {tar_path}: {e}")
+            except OSError as e:
+                print(f"Could not remove invalid file {tar_path}: {e}")
+            continue
 
+        try:
+            safe_extract_tar(tar_path, folder_version)
             cleanup_non_tex_bib_files(folder_version)
-        else:
-            print(f"[Info] No valid source file for extraction: {result.get_short_id()}")
+            print(f"✅ Extracted to {folder_version}")
+        except Exception as e:
+            print(f"⚠️ Extraction failed for {full_id}: {e}")
+        finally:
+            try:
+                os.remove(tar_path)
+            except OSError:
+                pass
 
-    save_metadata(result, folder_arxiv)
+    # Save metadata after all versions
+    try:
+        save_metadata(result, folder_arxiv)
+    except Exception as e:
+        print(f"⚠️ Metadata save failed for {arxiv_id}: {e}")
