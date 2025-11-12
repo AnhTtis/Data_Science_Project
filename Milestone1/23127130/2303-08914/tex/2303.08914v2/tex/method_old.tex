@@ -1,0 +1,83 @@
+
+\section{Method}
+In this work, we propose an approach that effectively leverages a collection of unlabeled videos and a predefined action dictionary (a potentially noisy collection of possible action text labels) to finetune the CLIP model without any ground truth annotations. The purpose of finetuning is to adapt CLIP to video data and to facilitate subsequent Zero-Shot (ZS) transfer to video recognition tasks on novel video categories which are not seen during training. We denote the predefined action dictionary as $D$, and the unlabeled video collection as $V = \{x_j | j\in I \}$, with an index set $I=\{1,...,N_V\}$. 
+
+Our pipeline is illustrated in Fig.~\ref{fig:pipeline}. We first adapt the CLIP image encoder to a video encoder for deployment on video data (Sec.~\ref{sec:clip_on_video}). Second, given the unlabeled video collection $V$ and a predefined action dictionary $D$, we use different language sources to construct a \textit{text bag} for each video (Sec.~\ref{sec:text_bag_construction}). The text bag is a (noisy) collection of texts that potentially correspond to the video contents. Third, we perform Multiple Instance Learning (MIL) to learn from the unlabeled videos and noisy text bags (Sec. \ref{sec:mil-nce}), which allows to robustly finetune CLIP in an unsupervised manner. 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% 
+%%%%%%%%%%%%%%%% CLIP on Video Data
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{CLIP on Video Data}\label{sec:clip_on_video}
+CLIP~\cite{clip} consists of a visual encoder $\phi_v(\cdot;\theta_v)$ and a text encoder $\phi_t(\cdot;\theta_t)$. 
+We aim to adapt the CLIP image encoder for processing videos.
+It is demonstrated in~\cite{rasheed2022fine} that frame-level processing on CLIP image encoder with feature pooling helps in implicitly modeling the temporal cues. This also leads to improved performance over related approaches that additionally incorporate learnable spatio-temporal components.
+% leads to outperformance of sophisticated related approaches with additional learnable spatio-temporal components.
+Therefore, following~\cite{rasheed2022fine}, given a video $x$, we pass $M$ frames into the visual encoder and compute the average of frame features as the video representation, \ie $z_{v} = \sum_m \phi_v(x^F_{m};\theta_v) / M $. 
+An advantage of this paradigm is that the network can be initialized directly from a large-scale pretrained VL model (e.g. CLIP pretrained on 400M web image-text pairs~\cite{clip}) without adding any randomly initialized parameters. This provides a good starting point with reasonable initial performance before finetuning. We also explore extending a non-randomly-initialized-parameters paradigm to include, e.g., a parameter-free temporal-aware module (see supplementary), confirming \cite{rasheed2022fine} that a sophisticated temporal module does not lead to better video adaptation from CLIP. 
+% \wei{as ViFi-CLIP~\cite{rasheed2022fine} already outperforms related work with additional learnable components, maybe we do not have to explore this in supp anymore. need to discuss. }
+
+During inference, given a set of class prompts $C=\{t_c |^{N_C}_{c=1}\}$, the text feature is computed as $z_{t_c} = \phi_t(t_c; \theta_t )$. For simplicity, we denote the L2-normalized video feature and text feature as $z_v=\bar \phi_v(x)$ and $z_t=\bar  \phi_t(t)$.
+The zero-shot classification is performed by selecting the class prompt with the maximum similarity to the video representation, \ie, $\hat c= \argmax_c \bar \phi_v(x)^\top \bar \phi_t(t_c)$. 
+
+% zero-shot inference for pseudo labels. Knowledge distillation via pseudo label guidance. 
+\subsection{Text Bag Construction}\label{sec:text_bag_construction}
+Given an unlabeled video collection $V$ and a predefined action dictionary $D$ (where each item is a short sentence or a verb phrase describing an action, see Fig.~\ref{fig:pipeline}), we construct a text bag $T_i$ for each video $x_i \in V$, \ie a noisy collection of text prompts describing the video contents. 
+
+\myparagraph{Predefined action dictionary.} In a practical scenario, we usually expect to have coarse prior knowledge of the potential action types in an unannotated video collection. The prior knowledge defines the action dictionary. To have a reasonable action dictionary, we include category names of the action dataset we use for finetuning CLIP. 
+However, the prior knowledge we could obtain in a practical case might not be completely accurate. Therefore, we also explore two cases of noisy action dictionary: a) an under-specified dictionary comprised of only part of possible actions in the set, and b) an over-specified dictionary - adding noisy verbs and verb phrases randomly collected from another text corpus. An evaluation of these settings is given in Sec.~\ref{sec:robustness_noisy_dict}.
+% \wei{Should we describe how the case in a practical scneario is? That we have some prior knowledge of the action dictionary for an unlabeled video collection. }
+
+\myparagraph{CLIP matching.} For a video $x_i\in V$, we use the original CLIP to match $x_i$ with texts in $D$ w.r.t the cosine similarity. We denote the Top-1 matched text as 
+\begin{equation}
+% \small
+\hat t_i= \argmax_{t\in D} \text{sim}(\phi_v(x_i), \phi_t(t))
+\end{equation}
+where $\text{sim}(u, v)=u^\mathsf{T}v / (\lVert u \rVert \lVert v \rVert)$ is the cosine similarity. We include $\hat t_i$ in the text bag $T_i$.
+
+The CLIP matching is a means of distilling knowledge from the original CLIP as the teacher. Common choices of unlabeled video collection $V$ are usually of much smaller scale than the original CLIP domain and might be prone to overfitting. Using knowledge from the original CLIP prevents the model from overfitting to the smaller domain $V$, preserving the generalizability learned in the pretraining stage of CLIP. This hypothesis is supported by experiments in Sec.~\ref{sec:zero_shot_action_recognition} and Sec.~\ref{sec:few_shot_action_recog}, where we show that compared to all supervised finetuning baselines, the proposed unsupervised pretraining significantly improves zero-shot transfer as well as few-shot adaptation to other novel datasets. 
+
+\myparagraph{GPT-3 text expansion.} We expand the text bag by leveraging the large-scale language model (LLM) GPT-3~\cite{brown2020language}. 
+% This is similar to in-context learning \cite{} (\wei{is this correct? we do not have output, only instructions}) where few examples of inputs and desired outputs are provided in the context window of the query. 
+We build upon the fact that GPT-3 has high performance on language instruction tasks~\cite{brown2020language}. %is instruction tuned \wei{is GPT-3 instruction tuned?}. 
+By providing the best-matched text $\hat t_i$ in the instruction for LLM requiring it to describe this text using its language (world) knowledge (see instruction example in Fig.~\ref{fig:pipeline}), we obtain a collection of expanded alternative descriptions of the action. The descriptions contain details hallucinated by the LLM leveraging its collective world knowledge. 
+We collect the verbs and verb phrases extracted from the generated expanded action descriptions. Furthermore, we perform text augmentation by including both the lemma and gerund (present participle) forms of the verbs. We add the collection of words to the text bag $T_i$. 
+% \wei{need to further check this paragraph}.
+
+\myparagraph{BLIP captioning for video to text expansion.} We employ the vision-language model BLIP~\cite{blip} for generating captions of individual frames on a video. Note that this image captioning model is not pretrained on any video domain. The frame captions provide instance-level descriptions that are dependent on the visual content of frames of the unlabeled videos. Similar to the case of GPT-3 text expansion, we collect verbs and verb phrases from these descriptions, and perform text augmentation (as stated above), adding the resulting texts to the text bag $T_i$. 
+
+\myparagraph{Filtering text bags.} 
+% \mk{Move it back to after `CLIP matching'?}
+To improve the quality of the text bags, we set a threshold $\delta_p$ on the similarity score from CLIP matching. 
+We determine $\delta_p$ such that $p\times 100\%$ of videos (or text bags) remain after thresholding. 
+% For video $x_i\in V$, when the best matched text $\hat t_i$ has a similarity above the threshold, \ie $\text{sim}(\phi_v(x_i), \phi_t(\hat t_i)) \geq \delta_p$, we keep the text bag $T_i$ for training. 
+For video $x_i\in V$, we keep the corresponding text bag $T_i$ if the best matched text $\hat t_i$ has a similarity above the threshold, \ie $\text{sim}(\phi_v(x_i), \phi_t(\hat t_i)) \geq \delta_p$.
+The filtering results in a sampled index set $I_p=\{i \,|\, \text{sim}(\phi_v(x_i), \phi_t(\hat t_i)) \geq \delta_p, \forall i\in I \}$ and video set $V_p = \{x_i \,|\, i\in I_p \}$.
+
+\subsection{Multiple Instance Learning}\label{sec:mil-nce}
+We employ Multiple Instance Learning (MIL) to learn from the unlabeled videos and noisy text bags collected above. 
+The MIL-NCE loss proposed in \cite{miech2020end} combines Multiple Instance Learning and Noise Contrastive Estimation.
+Following MIL-NCE, instead of enforcing the match of one specific positive text to each video, we softly associate a text bag $T_i$ with each video $x_i\in V$, in which one or multiple texts could be a positive match to the video.
+% \mk{what you really do, is associate to a video $x$ a union of text bags of videos that have the same pseudo-label as $x$ --- at least that's what follows from the equation; I do not think anyone will notice this, so perhaps it's safe to ignore this comment.}
+As different videos have varying numbers of texts in bag, we randomly sample $N_{\text{bag}}$ texts from the original bag in each training iteration.  %$N_{\text{bag}}$
+We refine the definition of the sampled text bag $T_i$ as $T_i=\{t_{i,n} |^{N_{\text{bag}}}_{n=1}\}$, where $N_{\text{bag}}$ is the constant bag size. 
+
+The original MIL-NCE loss encourages the instance-level match between each video and its corresponding text bag. In this work, we further propose to encourage the videos and text bags, which have the same best matched text, to be close to each other. 
+% (we remind that each video $x_i$ has a best matched text $\hat t_i$ from the dictionary from CLIP matching).
+Noting that each video $x_i$ has a best matched text $\hat t_i$ in the dictionary from CLIP matching step, than
+% \mk{what is the connection here? For example: `but we use it differently: ... '}
+ our proposed loss is 
+\begin{equation}
+\small
+    \mathcal{L}= 
+    -\frac{1}{|I_B|} \sum_{i} 
+    \log 
+    \frac{\sum_{j} \sum_{n} \exp(\bar \phi_v(x_i)^\top \bar \phi_t (t_{j,n})/\sigma)\cdot \mathbbm{1}(\hat t_i = \hat t_j)}
+    {\sum_k\sum_{n} \exp(\bar \phi_v(x_i)^\top \bar \phi_t (t_{k,n})/\sigma)}
+    % -l(i_j) \cdot \log (C^I(E(i_j; \theta^I_E) ; \theta^I_C ))
+\end{equation}
+where $i,j,k\in I_B$ and $n\in\{1,...,N_{\text{bag}}\}$. $I_B\subset I_p$ is a sampled batch of indices. 
+$t_{j,n}\in T_j$ is text in a text bag, and $\sigma$ is a temperature parameter for contrastive learning. 
+$\mathbbm{1}(\hat t_i = \hat t_j)$ is an indicator that $x_i$ and $x_j$ have the same best matched text.
+% \mk{it would be nice to highlight the differences between what you do and MIL-NCE in this section. I think there is enough difference to claim a contribution.}
+
+
+

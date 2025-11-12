@@ -1,0 +1,124 @@
+
+\vspace{-0.3em}
+\section{Method}
+\vspace{-0.3em}
+
+Our Sensitivity-aware visual Parameter-efficient Tuning consists of two stages. In the first stage, SPT measures the task-specific sensitivity for the pre-trained parameters (Section~\ref{subsec:sensitivity}). Based on the parameter sensitivity and a given parameter budget, SPT then adaptively allocates trainable parameters to task-specific important positions (Section~\ref{subsec:SPT}).
+
+\vspace{-0.3em}
+\subsection{Task-specific Parameter Sensitivity}
+\label{subsec:sensitivity}
+\vspace{-0.3em}
+
+
+Recent researches have observed that pre-trained backbone parameters exhibit varying feature patterns~\cite{raghu2021vision,naseer2021intriguing} and criticality~\cite{zhang2019all,chatterji2019intriguing} at distinct positions. 
+Moreover, when transferred to downstream tasks, their efficacy varies depending on how much pre-trained features are reused and how well they adapt to the specific domain gap~\cite{yosinski2014transferable,kumar2022finetuning,neyshabur2020being}. Motivated by these observations, we argue that not all parameters contribute equally to the performance across different tasks in VPET and propose a new criterion to measure the sensitivity of the parameters in the pre-trained backbone for a given task.
+
+Specifically, given the training dataset $\gD_t$ for the $t$-th task and the pre-trained model weights $\vw=\left\{w_1, w_2, \ldots, w_N\right\}\in \sR^N$ where $N$ is the total number of parameters, the objective for the task is to minimize the empirical risk: $\min_{\vw} E(\gD_t, \vw)$.
+We denote the parameter sensitivity set as $\gS=\{s_1, \ldots, s_N\}$ and the
+sensitivity $s_n$ for parameter $w_n$ is measured by the empirical risk difference when tuning it:
+\begin{equation}
+\vspace{-0.3em}
+    \begin{aligned}
+        s_n = E(\gD_t, \vw)-E(\gD_t, \vw\mid w_n=w_n^*),
+    \end{aligned}
+\label{eq:sensitivity}
+\end{equation}
+where $w_n^*=\underset{w_n}{\rm argmin}(E(\gD_t, \vw))$. We can reparameterize the tuned parameters as  $w_n^*=w_n+\Delta_{w_n}$, where $\Delta_{w_n}$ denotes the update for $w_n$ after tuning. Here we individually measure the sensitivity of each parameter, which is reasonable given that most of the parameters are frozen during fine-tuning in VPET. However, it is still computationally intensive to compute Eq.~(\ref{eq:sensitivity}) for two reasons. Firstly, getting the empirical risk for $N$ parameters requires forwarding the entire network $N$ times, which is time-consuming. Secondly, it is challenging to derive $\Delta_{w_n}$, as we have to tune each individual $w_n$ until convergence.
+
+\begin{algorithm}[t!]
+\caption{\label{alg:tps} Computing task-specific parameter sensitivities}
+\begin{algorithmic}
+    \STATE \textbf{Input:} Pre-trained model with network parameters $\vw$, training set $\gD_t$ for the $t$-th task, and number of training samples $C$ used to calculate the parameter sensitivities
+    \STATE \textbf{Output:} Sensitivity set $\gS=\{s_1, \ldots, s_N\}$
+    \STATE Initialize $\gS=\{0\}^N$
+    \FOR{$i\in\{1,\ldots,C\}$}
+        \STATE Get the $i$-th training sample of $\gD_t$
+	    \STATE Compute loss $E$
+		\STATE Compute gradients $\vg$
+		\FOR{$n\in\{1,\ldots,N\}$}
+                \STATE Update sensitivity for the $n$-th parameter: $s_{n} = s_{n} + g_n^2$
+		    \ENDFOR
+    \ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+
+\begin{figure*}[t]
+\begin{center}
+    \includegraphics[width=\linewidth]{pics/main.pdf}
+\end{center}\vspace{-2em}
+\caption{Overview of our trainable parameter allocation strategy. With the parameter sensitivity set $\gS$, we first get the top-$\tau$ sensitive parameters. Instead of directly tuning these sensitive parameters, we also boost the representational capability by replacing unstructured tuning with structured tuning at sensitive weight matrices that have a large number of sensitive parameters, which can be implemented by any existing structured tuning method, \eg, LoRA~\cite{hu2022lora} and Adapter~\cite{houlsby2019parameter}. Red lines and blocks represent trainable parameters and modules, while blue lines represent frozen parameters.}
+\label{fig:main}
+\vspace{-1.5em}
+\end{figure*}
+
+
+To overcome the first barrier, we simplify the empirical loss by approximating $s_n$ in the vicinity of $\vw$ by its first-order Taylor expansion:
+\begin{equation}
+\vspace{-0.3em}
+    \begin{aligned}
+        s_n^{(1)} = -g_n\Delta_{w_n},
+    \end{aligned}
+\label{eq:first-order}
+\end{equation}
+where the gradients $\vg=\partial E/\partial\vw$, and $g_n$ is the gradient of the $n$-th element of $\vg$. 
+To address the second barrier, following~\cite{liu2018darts,cai2018proxylessnas}, we take the one-step unrolled weight as the surrogate for $w_n^*$ and approximate $\Delta_{w_n}$ in Eq.~(\ref{eq:first-order}) with a single step of gradient descent. We can accordingly get $s_n^{(1)} \approx g_n^2\epsilon$,
+where $\epsilon$ is the learning rate. Since $\epsilon$ is same for all parameters, we can eliminate it when comparing the sensitivity with the other parameters and finally get 
+\begin{equation}
+\vspace{-0.3em}
+    \begin{aligned}
+        s_n^{(1)} \approx g_n^2.
+    \end{aligned}
+\label{eq:first-order-simp}
+\end{equation}
+Therefore, the sensitivity of a parameter can be efficiently measured by its potential to reduce the loss on the target domain. Note that although our criterion draws inspiration from pruning work~\cite{molchanov2019importance}, it is distinct from it. \cite{molchanov2019importance} measures the parameter importance by the squared change in loss when removing them, \ie, $\left( E(\gD_t, \vw)-E(\gD_t, \vw\mid w_n=0) \right)^2$ and finally derives the parameter importance by $\left( g_n w_n \right)^2$, which is different from our formulations in Eqs.~(\ref{eq:sensitivity}) and~(\ref{eq:first-order-simp}).
+
+In practice, we accumulate $\gS$ from a total number of $C$ training samples ahead of fine-tuning to generate accurate sensitivity as shown in Algorithm~\ref{alg:tps}, where $C$ is a pre-defined hyper-parameter. In Section~\ref{subsec:abl}, we show that employing only 400 training samples is sufficient for getting reasonable parameter sensitivity, which requires only 5.5 seconds with a single GPU for any VTAB-1k dataset with ViT-B/16 backbone~\cite{vit}.
+
+\vspace{-0.4em}
+\subsection{Adaptive Trainable Parameters Allocation}
+\label{subsec:SPT}
+\vspace{-0.4em}
+
+Our next step is to allocate trainable parameters based on the obtained parameter sensitivity set $\gS$ and a desired parameter budget $\tau$. A straightforward solution is to directly tune the top-$\tau$ most sensitive unstructured connections (parameters), which we name unstructured tuning. Specifically, we rank the parameters by their sensitivity scores in $\gS$ and directly select the top-$\tau$ weight connections to form the sensitive weight connection set $\gT$. Then, for any weight matrix $\mW\in \sR^{d_{\rm in}\times d_{\rm out}}$, we can get a binary mask $\mM\in \sR^{d_{\rm in}\times d_{\rm out}}$ computed by
+\vspace{-0.5em}
+\begin{equation}
+\vspace{-0.5em}
+    {\begin{array}{ll}
+    \small
+    \begin{aligned}
+    \mM^j =
+    \left\{\begin{array}{ll} 
+    1 ~~~~~ \mW^j \in \gT \\
+    0 ~~~~~ \mW^j \notin \gT
+    \end{array}\right.
+    \end{aligned},
+    \small
+    \end{array}}
+\label{eq:mask}
+\end{equation}
+where $\mW^j$ and $\mM^j$ are the $j$-th element in $\mW$ and $\mM$, respectively. Accordingly, we can train the sensitive parameters by gradient descent and the updated weight matrix can be formulated as $\mW'\leftarrow \mW - \epsilon\vg_{\mW}\odot\mM$, where $\vg_{\mW}$ is the gradient for $\mW$. In this way, only the sensitive parameters are updated while the remaining parameters are frozen.
+
+However, considering VPET approaches generally limit the proportion of trainable parameters to less than 1\%, tuning only a small number of unstructured weight connections might not have enough representational capability to handle the downstream datasets with large domain gaps from the source pre-training data. Therefore, to improve the representational capability, we propose to replace unstructured tuning with structured tuning at the sensitive weight matrices that have a high number of sensitive parameters. To preserve the parameter budget, we 
+can implement structured tuning with any existing efficient structured tuning VPET method~\cite{hu2022lora,chen2022adaptformer,houlsby2019parameter,jie2022convolutional} that learns to directly adjust the hidden representation. We depict an overview of our trainable parameter allocation strategy in Figure~\ref{fig:main}. For example, we can employ the low-rank reparameterization trick LoRA~\cite{hu2022lora} to the sensitive weight matrices and their updates can be formulated as $\mW'_{\rm s}\leftarrow\mW + \mW_{\rm down}\mW_{\rm up}$, where $\mW_{\rm down}\in \sR^{d_{\rm in}\times r}$ and $\mW_{\rm up}\in \sR^{r\times d_{\rm out}}$ are two learnable low-rank matrices to approximate the update of $\mW$. The rank $r$ is a hyper-parameter and $r \ll {\rm min}(d_{\rm in},d_{\rm out})$. The updated weight matrix $\mW'$ with SPT can be formulated as:
+
+\vspace{-0.8em}
+\begin{equation}
+\vspace{-0.4em}
+    {\begin{array}{ll}
+    \small
+    \begin{aligned}
+    \mW' =
+    \left\{\begin{array}{ll} 
+    \mW'_{\rm s} & ~~ \text { if } ~~ \sum_{j=0}^{d_{\rm in}\times d_{\rm out}} \mM^j \geq \sigma_{\rm opt} \\
+    \mW - \epsilon\vg_{\mW}\odot\mM & ~~ {\rm otherwise},
+    \end{array}\right.
+    \end{aligned}.
+    \small
+    \end{array}}
+\label{eq:weight_updat}
+\end{equation}
+In this way, we perform structured tuning on $\mW$ when its number of sensitive parameters exceeds $\sigma_{\rm opt}$, whose value depends on the pre-defined type of structured tuning method. For example, since implementing structured tuning with LoRA requires $2\times d_{\rm in} \times d_{\rm out} \times r$ trainable parameters for each sensitive weight matrix, we set $\sigma_{\rm LoRA} \leftarrow 2\times d_{\rm in} \times d_{\rm out} \times r$ to ensure that the number of trainable parameters introduced by structured tuning is always equal to or lower than the number of sensitive parameters.
+
+In this way, our SPT adaptively incorporates both structured and unstructured tuning granularities to enable higher flexibility and stronger representational power, simultaneously. In Section~\ref{subsec:abl}, we show that structured tuning is important for the downstream tasks with larger domain gaps and both unstructured and structured tuning contribute clearly to the superior performance of our SPT.

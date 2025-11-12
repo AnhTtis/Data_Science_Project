@@ -1,0 +1,585 @@
+\input{_constants}
+\arxiv %
+
+\pdfoutput=1
+\documentclass[10pt,twocolumn,letterpaper]{article}
+\input{cvpr_header}
+
+\begin{document}
+\title{\paperTitle}
+\author{\authorBlock} 
+\maketitle
+
+\makeatletter
+\newcommand{\rmnum}[1]{\romannumeral #1}
+\newcommand{\Rmnum}[1]{\expandafter\@slowromancap\romannumeral #1@}
+\makeatother
+
+\begin{abstract}
+Anomaly detection is widely applied due to its remarkable effectiveness and efficiency in meeting the needs of real-world industrial manufacturing.
+ We introduce a new pipeline, DiffusionAD, to anomaly detection. We frame anomaly detection as a ``noise-to-norm'' paradigm, in which anomalies are identified as inconsistencies between a query image and its flawless approximation. Our pipeline achieves this by restoring the anomalous regions from the noisy corrupted query image while keeping the normal regions unchanged. DiffusionAD includes a denoising sub-network and a segmentation sub-network, which work together to provide intuitive anomaly detection and localization in an end-to-end manner, without the need for complicated post-processing steps.
+ Remarkably, during inference, this framework delivers satisfactory performance with just one diffusion reverse process step, which is tens to hundreds of times faster than general diffusion methods.
+Extensive evaluations on standard and challenging benchmarks including VisA and DAGM show that DiffusionAD outperforms current state-of-the-art paradigms, demonstrating the effectiveness and generalizability of the proposed pipeline.
+\end{abstract}
+
+
+\section{Introduction}
+\label{sec:intro}
+
+Similar to how human perception and visual systems work, anomaly detection involves identifying and locating anomalies with little to no prior knowledge about them. Over the past decades, anomaly detection has been a mission-critical task and a spotlight in the computer vision community due to its wide range of applications, including industrial defect detection \cite{wieler2007dagm,zou2022spd,roth2022patchcore,deng2022rd4ad} and medical diagnosis \cite{wyatt2022anoddpm,baur2019medicalae}.
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=1.0\linewidth]{main_idea.pdf}
+  \caption{\textbf{The main idea of DiffusionAD.} (a) The autoencoder-based method\cite{zavrtanik2021draem,gong2019memgan,hou2021dividegan,ristea2022sspcab} reconstructs the original image from its low-dimensional representation, resulting in an invariant reconstruction of abnormal regions (indicated by a red box) and coarse reconstruction of normal regions (indicated by a green box). The reconstruction is from DRAEM\cite{zavrtanik2021draem}.
+  (b) DiffusionAD consists of denoising and segmentation sub-networks. The image is first corrupted with noise, and then its flawless approximation in the high-dimensional latent space is estimated via one-step denoising. Finally, pixel-wise anomaly scores are predicted using the segmentation sub-network.}
+  \label{fig:main idea}
+\end{figure}
+
+Given its importance, a great number of work has been devoted to anomaly detection. Due to the limited number of anomaly samples and the labor-intensive labeling process, detailed anomaly samples are not available for training. As a result, most recent studies on anomaly detection have been performed without prior information about the anomaly, \ie, unsupervised paradigm. 
+These methods include but are not limited to, deep feature embeddings and generative models.
+Deep feature embedding-based methods \cite{roth2022patchcore,deng2022rd4ad,cohen2020spade,defard2021padim,lee2022cfa,gudovskiy2022cflow,rudolph2022csflow}  often suffer from degraded performance when the distribution of industrial images differs significantly from the one used for feature extraction, as they rely on pre-trained feature extractors on extra datasets such as ImageNet.
+Generative model-based methods \cite{akcay2018ganomaly,dehaene2020FAVAE,zavrtanik2021draem,ristea2022sspcab,song2021anoseg} require no extra data and are widely applicable in various scenarios. These approaches generally use autoencoder-like networks that assume the encoder will compress the input image into a low-dimensional representation, and the decoder will reconstruct the anomalous region as normal \cite{baur2019medicalae,zavrtanik2021draem,gong2019memgan,hou2021dividegan,ristea2022sspcab}.
+However, the autoencoder-based paradigm has limitations: 
+\Rmnum{1}) it may result in an \textbf{invariant reconstruction of abnormal regions} as the low-dimensional representation compressed from the original input still contains anomalous information, leading to false negative detection. 
+\Rmnum{2}) autoencoders perform a \textbf{coarse reconstruction of normal regions} due to limited restoration capability, and introduce many false positives, especially on datasets with complex structures or textures. 
+
+To address the aforementioned issues, we propose a \emph{noise-to-norm} paradigm, illustrated in \cref{fig:main idea} (b), which utilizes Gaussian noise to corrupt the query image, thereby hiding the anomaly and making it indistinguishable from the normal appearance. 
+The proposed paradigm offers two advantages: 
+\Rmnum{1}) It performs the reconstruction after the anomalous region has completely lost its distinguishable appearance, which enables a \textbf{flawless reconstruction} of the anomalous region instead of an invariant one.
+\Rmnum{2}) 
+It aims to cover the whole distribution of normal appearance\cite{dhariwal2021diffusionbeatgans,ho2020ddpm}, which enables \textbf{fine-grained reconstruction} instead of a coarse reconstruction based on neighboring information. 
+
+
+Our proposed \emph{noise-to-norm} paradigm is analogous to the \emph{noise-to-image} procedure in diffusion models\cite{ho2020ddpm,song2020ddim}, a class of probabilistic models that learn the distribution of input data and generate a desired image by gradually removing noise from a normally distributed variable. 
+Diffusion models are known for their ability to generate high-quality images and have been successfully applied in various generative tasks \cite{rombach2022ldm,austin2021generative,avrahami2022generative}. They have also been investigated for their efficacy in perceptual tasks such as image segmentation \cite{baranchukdiffusionseg,brempong2022denoisingseg,kim2022diffusionseg,graikos2022diffusionseg}, and object detection \cite{chen2022diffusiondet}.
+Recently, AnoDDPM\cite{wyatt2022anoddpm} explores the diffusion method for medical diagnosis by denoising noisy images corrupted by Simplex noise\cite{perlin2002simplxenoise}.
+However, it requires hundreds of iterations of the diffusion denoising process to obtain the reconstruction result, which is much slower to meet real-time requirements in practical application scenarios. 
+In contrast, DiffusionAD enables a one-step diffusion denoising process, attributing to the joint training with the segmentation sub-network.
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=1.0\linewidth]{p_f_curves.pdf}
+  \caption{\textbf{Comparison of different algorithms on image AUROC and inference speed.} The Y-axis indicates the anomaly detection capability. The x-axis refers to the inference speed. These results are verified on the VisA\cite{zou2022spd} dataset.}
+  \label{fig:p-f-curves}
+\end{figure}
+
+
+DiffusionAD, consisting of a denoising sub-network and a segmentation sub-network, is trained in an end-to-end manner on both normal and synthetic anomaly samples.
+In the training phase, Gaussian noise controlled by the time step and variance schedule\cite{ho2020ddpm} is added to the input to obtain a noisy corrupted image. As the time step increases, the normal or anomalous regions of the input image gradually lose their distinguishable features. 
+The denoising sub-network then almost lossless reconstructs the normal regions and repairs the abnormal regions in the corrupted image by estimating the noise. 
+The segmentation sub-network learns to detect and localize the anomalies by exploiting the inconsistencies and commonalities between the input image and its flawless approximation. It aims at predicting the pixel-wise anomaly score as accurately as possible, which enables estimation of the anomaly region without complex post-processing\cite{zavrtanik2021draem,roth2022patchcore,deng2022rd4ad,rudolph2022csflow}. 
+During the inference phase, DiffusionAD reconstructs high-quality flawless approximation by a one-step denoising process, instead of the iterative multi-step process employed in general diffusion methods. As shown in \cref{fig:p-f-curves}, our pipeline achieves inference speed comparable to other diffusion-free paradigms and hundreds of times faster than AnoDDPM\cite{wyatt2022anoddpm} while achieving optimal anomaly detection capability. This performance truly meets the effectiveness and efficiency requirements of real-world application scenarios.
+
+The main contributions of this paper are summarized as follows:
+\begin{itemize}
+
+\item The novel pipeline, DiffusionAD, formalizes anomaly detection and localization as a \emph{noise-to-norm} paradigm in an end-to-end manner. This pipeline reconstructs a flawless approximation from a noisy corrupted image and further predicts the pixel-wise anomaly score by exploiting the discrepancy between the query image and its flawless approximation.
+
+\item DiffsuionAD enables a one-step diffusion denoising process during the inference stage, meeting the need for high performance and fast inference speed in real-world anomaly detection scenarios.
+
+\item We perform extensive experiments on two datasets to show that our approach achieves new SOTA anomaly detection and localization performance.
+
+\end{itemize}
+
+
+
+
+\section{Related Work}
+\label{sec:related}
+
+
+\textbf{Anomaly Detection.\quad}Modern methods for anomaly detection can be divided into two main paradigms, namely deep feature embedding-based approaches\cite{roth2022patchcore,deng2022rd4ad,cohen2020spade,defard2021padim,lee2022cfa,li2021cutpaste} and generative model-based approaches\cite{gudovskiy2022cflow,yu2021fastflow,rudolph2022csflow,zavrtanik2021draem,ristea2022sspcab}.
+
+Methods based on deep feature embeddings typically extract features of normal samples through a pre-trained feature extractor on ImageNet and then perform anomaly estimation. Built on top of pre-trained features, knowledge distillation\cite{bergmann2020us,salehi2021kdad,wang2021stpm,deng2022rd4ad} estimate anomalies by comparing the differences in anomaly region features between teacher and student networks. There are 
+ also extensive studies \cite{cohen2020spade,defard2021padim,kim2021semi-orthogonal,roth2022patchcore,lee2022cfa} estimating anomalies by measuring the distance between an anomalous sample and the feature space  of normal samples.
+
+On the other hand, generative model-based methods do not require additional data. The core idea of generative model-based approaches is to implicitly or explicitly learn the feature distribution of the anomaly-free training data. Generative models based on VAE\cite{dehaene2020gvae,liu2020avae} introduce a multidimensional normal distribution in the latent space for normal samples and then estimate the anomaly by the negative log-likelihood of the established distribution. GAN-based generative models\cite{schlegl2017gan,akcay2018ganomaly,yu2020cyclegan,gong2019memgan,hou2021dividegan} estimate anomalies through a discriminative network that compares the query image with randomly sampled samples from the latent space of the generative network. Besieds, there are several works that introduce proxy tasks based on the generative paradigm, such as image inpainting\cite{zavrtanik2021draem,song2021anoseg} and attribute prediction\cite{ristea2022sspcab,ye2020attribute,ulutas2020attribute}.
+In addition, Normalizing Flow-based methods\cite{rudolph2021differnet,gudovskiy2022cflow,rudolph2022csflow,yu2021fastflow} are a combination of deep feature embeddings and generative models, which estimate accurate data likelihoods in the latent space by learning bijective transformations between normal sample distributions and specified densities.  
+
+
+\textbf{Diffusion model.\quad}Diffusion models\cite{ho2020ddpm,song2020ddim,song2020scoregm}, a class of generative models inspired by non-equilibrium thermodynamics\cite{sohl2015nonequilibrium}, define a paradigm in which the forward process slowly adds random noise to the data, and the reverse constructs the desired data samples from the noise. Recently, a wide range of diffusion-based perception applications has emerged, such as image generation\cite{dhariwal2021diffusionbeatgans,ho2020ddpm,song2020scoregm,rombach2022ldm}, image segmentation\cite{kim2022diffusionseg,baranchukdiffusionseg,graikos2022diffusionseg,brempong2022denoisingseg}, object detection\cite{chen2022diffusiondet}, etc. A few previous works have tentatively explored the application of diffusion in medical anomaly detection\cite{wolleb2022diffmedical,pinaya2022difffastmedical}, such as AnoDDPM\cite{ho2020ddpm}, but its inference speed is slow and the anomalous false positive rate is high, which is nowhere near the requirements for practical deployment. To the best of our knowledge, we are the first to propose a diffusion-based pipeline with gratifying anomaly detection and localization performance as well as fast inference speed.
+
+
+\section{Approach}
+\label{sec:approach}
+
+
+
+\subsection{Preliminaries}
+\label{subsec:preliminaries}
+A family of generative models called denoising diffusion models~\cite{ho2020ddpm,song2020ddim,rombach2022ldm,sohl2015nonequilibrium} are inspired by equilibrium thermodynamics~\cite{song2020scoregm,song2019gradientsgm}. In particular, a diffusion probabilistic model specifies a forward diffusion phase in which the input data are progressively perturbed by adding Gaussian noise over several steps, and then learns to reverse the diffusion process to recover the desired noise-free data from the noisy data. 
+The forward noise process is defined as
+
+\begin{equation}
+\begin{aligned}
+    q\left(x_{t} \mid x_{0}\right)=\mathcal{N}\left(x_{t} \mid x_{0} \sqrt{\bar{\alpha}_{t}},\left(1-\bar{\alpha}_{t}\right) \mathbf{I}\right),
+\end{aligned}
+\label{eq:forward}
+\end{equation}
+
+\begin{equation}
+\begin{aligned}
+    x_{t}=x_{0} \sqrt{\bar{\alpha}_{t}}+\epsilon_{t} \sqrt{1-\bar{\alpha}_{t}}, \quad \epsilon_{t} \sim \mathcal{N}(0, \mathbf{I}),
+\end{aligned}
+\label{eq:xt}
+\end{equation}
+which transforms a data sample $x_{0}$ into a noisy sample $x_{t}$ for $t\in\{0, 1, ... , T\}$ by adding noise to $x_{0}$. Here, $\bar{\alpha}_{t}=\prod_{i=0}^{t} \alpha_{i}=\prod_{i=0}^{t}(1-\beta_{i})$ and $\beta_{i} \in(0,1)$ represents the noise variance schedule. This can be defined as a small linear schedule~\cite{sohl2015nonequilibrium} from $\beta_{1}=10^{-4}$ to $\beta_{T}=10^{-2}$~\cite{ho2020ddpm}. During training, a U-Net~\cite{ronneberger2015U-Net}-like architectures $\epsilon_{\theta}\left(x_{t}, t\right)$ is trained to predict $\epsilon$ by minimizing the training objective with $\ell_{2}$ loss\cite{ho2020ddpm}:
+
+\begin{equation}
+\begin{aligned}
+\mathcal{L}=\mathbb{E}_{t \sim[1-T], x_{0} \sim q\left(x_{0}\right), \epsilon \sim \mathcal{N}(0, \mathbf{I})}\left[\left\|\epsilon-\epsilon_{\theta}\left(x_{t}, t\right)\right\|^{2}\right].
+\end{aligned}
+\label{eq:diffusion loss}
+\end{equation}
+
+At inference stage, $x_{t-1}$ is reconstructed from noise $x_{t}$ with the model $\epsilon_{\theta}\left(x_{t}, t\right)$ according to:
+\begin{equation}
+\begin{aligned}
+x_{t-1}=\frac{1}{\sqrt{\alpha_{t}}}\left(x_{t}-\frac{1-\alpha_{t}}{\sqrt{1-\bar{\alpha}_{t}}} \boldsymbol{\epsilon}_{\theta}\left(x_{t}, t\right)\right)+\tilde{\beta}_{t} z.
+\end{aligned}
+\label{eq:xt-1}
+\end{equation}
+where $z \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$ and $\tilde{\beta}_{t}=\frac{1-\bar{\alpha}_{t-1}}{1-\bar{\alpha}_{t}} \beta_{t}$. $x_{0}$ is reconstructed from $x_{t}$ in an iterative way, \ie, $ \boldsymbol{x}_{t} \rightarrow \boldsymbol{x}_{t-1} \rightarrow \boldsymbol{x}_{t-2} \rightarrow \ldots \rightarrow \boldsymbol{x}_{0}$.
+
+In this work, we aim to address the anomaly detection task via the diffusion model. In our setting, data samples $x_0$ are images that are either normal or anomalous. We use $\boldsymbol{\epsilon}_{\theta}\left(x_{t}, t\right)$ to denote a denoising network that is trained to learn the normal appearance distribution and predict a flawless approximation $\hat{x}_0$ of the noisy corrupted input $x_t$.
+
+
+\begin{figure}
+  \centering
+  \includegraphics[width=1.0\linewidth]{architecture.pdf}
+  \caption{\textbf{An overview of the proposed pipeline DiffusionAD.} The denoising and segmentation sub-networks constitute the entire pipeline. The denoising sub-network corrupts the input by a diffusion forward process, then predicts the noise and estimates the flawless approximation in a one-step reverse process. 
+  The segmentation sub-network predicts the pixel-wise anomaly score by comparing the inconsistency between the input and its flawless approximation.}
+  \label{fig:architecture}
+\end{figure}
+
+\subsection{Architecture}
+\label{subsec:architecture}
+
+Our proposed pipeline, DiffusionAD, consists of two components: a denoising sub-network and a segmentation sub-network, as shown in \cref{fig:architecture}. The denoising sub-network reconstructs the normal regions and repairs the anomalous regions of corrupted input images by learning the entire distribution of normal appearances. The segmentation sub-network further localizes anomalous regions by comparing the difference and consistency between the input image and its flawless approximation.
+
+\textbf{Denoising Sub-network.\quad} The denoising sub-network takes as inputs either a normal image or an anomalous synthetic image (see \cref{subsec:training}).
+We follow the diffusion forward process proposed by DDPM\cite{ho2020ddpm} as shown in \cref{eq:xt}, which corrupts the input image $x_0$ at a random time step $t$ to obtain $x_t$. The input image $x_0$ gradually loses its discriminative features and approaches an isotropic Gaussian distribution as the time step becomes larger. Then $\boldsymbol{\epsilon}_{\theta}\left(x_{t}, t\right)$ is a function approximator intended to predict noise $\boldsymbol{\epsilon}$ from ${x}_{t}$, which is implemented with a U-Net\cite{ronneberger2015U-Net,dhariwal2021diffusionbeatgans}-like architecture based on PixelCNN\cite{salimanspixelcnn++}, ResNet\cite{he2016resnet-18}, and Transformer\cite{vaswani2017attention}. Notably, the latent variables in the diffusion model $\boldsymbol{\epsilon}_{\theta}\left(x_{t}, t\right)$ have the same dimensionality as the input ${x}_{0}$\cite{ho2020ddpm,rombach2022ldm}.
+With the predicted noise, the one-step normal approximation is obtained by the following process:
+\begin{equation}
+\begin{aligned}
+\hat{x}_{0}=\frac{1}{\sqrt{\bar{\alpha}_{t}}}\left(\mathbf{x}_{t}-\sqrt{1-\bar{\alpha}_{t}} \epsilon_{\theta}\left(x_{t}, t\right)\right).
+\end{aligned}
+\label{eq:xhat}
+\end{equation}
+where $\hat{x}_{0}$ is the output of the denoising sub-network as shown in \cref{fig:architecture}. 
+
+
+
+
+\textbf{Segmentation Sub-network.\quad}The segmentation sub-network employs a U-Net\cite{ronneberger2015U-Net,zavrtanik2021draem}-like architecture consisting of an encoder, a decoder, and skip connections. The input to the segmentation sub-network is a channel-wise concatenation of  $x_{0}$ and $\hat{x}_{0}$. 
+The segmentation sub-network learns to identify anomalies by exploiting the inconsistencies and commonalities between the input image $x_{0}$ and its flawless approximation $\hat{x}_{0}$ to predict the pixel-wise anomaly score without post-processing. Remarkably, the learned inconsistency reduces false positives caused by slight pixel-wise differences between the normal region and its reconstruction and highlights significantly different regions.
+
+
+
+
+\subsection{Training}
+\label{subsec:training}
+We jointly train the denoising and segmentation sub-networks and \cref{alg:diffad training algorithm} provides the pseudo-code of DiffusionAD training procedure. In particular, we add Gaussian noise to the input images of either normal or anomalous synthetic samples. The noise scale is controlled by $\alpha_t$ (in \cref{eq:forward}), with a monotonically increasing linear schedule in a random time step $t$\cite{ho2020ddpm}. 
+
+
+\begin{algorithm}[t]
+   \caption{DiffusionAD Training.}
+   \label{alg:diffad training algorithm}
+   \definecolor{codeblue}{RGB}{50,205,50}
+   \lstset{
+     backgroundcolor=\color{white},
+     basicstyle=\fontsize{7.2pt}{7.2pt}\ttfamily\selectfont,
+     columns=fullflexible,
+     breaklines=true,
+     captionpos=b,
+     commentstyle=\fontsize{7.2pt}{7.2pt}\color{citecolor},
+     keywordstyle=\fontsize{7.2pt}{7.2pt},
+   }
+   
+
+\begin{lstlisting}[language=python, mathescape=true]
+
+def train_loss(images, gt_mask):
+
+    # images: [B, 3, H, W]
+    # gt_mask: [B, 1, H, W]
+    # B: batch
+    
+    t = randint(1,T)         # time step
+    eps = randn_like(images) # [B, 3, H, W]
+    
+    # Corrupt images
+    img_crpt = sqrt(alpha_cumprod(t)) * images + 
+                       sqrt(1 - alpha_cumprod(t)) * eps
+                       
+    # Predict noise                  
+    pred_eps = Denoising_subnetwork(img_crpt, t)
+
+    # Design noise prediction loss
+    loss_noise = desgin_noise_loss(eps, pred_eps)
+    
+    #predict flawless approximation via predicted eps
+    pred_images = sqrt(1 / alpha_cumprod(t)) * img_crpt - sqrt(1 / alpha_cumprod(t) - 1) * pred_eps
+                       
+    # Predict anomaly mask                     
+    pred_mask = Segmentation_sub-network(cat((images, 
+                    pred_images),dim=1)) # [B, 1, H, W]
+    
+    # Design segmentation loss
+    loss_mask = desgin_mask_loss(gt_mask, pred_mask)
+
+    # Design total loss
+    loss = loss_noise + loss_mask
+    
+    return loss
+   
+\end{lstlisting}
+
+   \algcomment{\fontsize{7.2pt}{0em}\selectfont
+   alpha cumprod(t): cumulative product of $\alpha_{i}, \text { i.e., } \prod_{i=1}^{t} \alpha_{i}$
+   \vspace{-1.em}
+   }
+\end{algorithm}
+
+\textbf{Training losses.\quad}The denoising sub-network $\epsilon_{\theta}\left(x_{t}, t\right)$ predicts the noise of $x_t$, and then performs normal estimation $\hat{x}_0$ via \cref{eq:xhat}. The noise loss is defined as:
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{noise}=\left\|\epsilon_t-\epsilon_{\theta}\left(x_{t}, t\right)\right\|^{2}.
+\end{aligned}
+\label{eq:noise loss}
+\end{equation}
+where $\epsilon_t$ (in \cref{eq:xt}) is the Gaussian noise added to $x_0$. The segmentation sub-network exploits the commonalities and differences between $x_0$ and $\hat{x}_0$ to predict pixel-wise anomaly scores as close as possible to the ground truth mask. The segmentation loss is defined as:
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{mask}=\operatorname{Smooth}_{\mathcal{L} 1}\left(M, \hat{M}\right)+\gamma \mathcal{L}_{focal}\left(M, \hat{M}\right).
+\end{aligned}
+\label{eq:segmentation loss}
+\end{equation}
+Where $M$ is the ground truth mask of the input image and $\hat{M}$ is the output of the segmentation sub-network. Inspired by \cite{zhang2022prn}, smooth L1 loss\cite{girshick2015fast-rcnn} and focal loss\cite{lin2017focal} are applied simultaneously to reduce over-sensitivity to outliers and accurately segment hard anomalous examples. $\gamma\in \mathbb{R}^{+}$ is a hyperparameter that controls the importance of $\mathcal{L}_{focal}$. Thus, the total loss used in jointly training DiffusionAD is:
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{total}=\mathcal{L}_{noise} + \mathcal{L}_{mask}.
+\end{aligned}
+\label{eq:total loss}
+\end{equation}
+With this training objective, the denoising sub-network is required to learn the entire distribution of normal appearances in order to recover the anomalous regions to the normal ones, instead of reconstructing the anomalous regions unchanged, since the segmentation sub-network desires discriminative appearances between the anomalous regions in $x_0$ and $\hat{x}_0$. %
+Moreover, the difference between anomalies to normal appearance learned by segmentation provides a foundation for the one-step denoising process in the inference phase.
+
+
+
+
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.8\linewidth]{anomaly_synthetic.pdf}
+  \caption{\textbf{Anomaly synthetic strategy.} Visually inconsistent appearances are added to the normal samples to obtain synthetic anomalies.}
+  \label{fig:Anomaly synthetic strategy}
+\end{figure} 
+
+\textbf{Anomaly Synthetic Strategy.\quad}Since prior information about anomalies is not available for training, we synthesize pseudo-anomalies online for end-to-end training. The idea of our anomaly synthesis strategy is adding visually inconsistent appearances to the normal samples inspired by \cite{zhang2022prn,zavrtanik2021draem,yang2023memseg}, and these out-of-distribution regions are defined as the synthesized anomalous regions. \cref{fig:Anomaly synthetic strategy} illustrates the overall process of transforming a normal sample (\cref{fig:Anomaly synthetic strategy}, $N$) into a synthetic anomalous sample (\cref{fig:Anomaly synthetic strategy}, $S$). Random and irregular anomalous regions (\cref{fig:Anomaly synthetic strategy}, $P$) are first obtained from the Perlin\cite{perlin1985perlin} noise and then multiplied by the object foreground\cite{qin2022foreground,yang2023memseg} (\cref{fig:Anomaly synthetic strategy}, $F$) of the normal sample to obtain the ground truth mask (\cref{fig:Anomaly synthetic strategy}, $M$). For textural datasets, the foreground is replaced by a random part of the whole image. 
+The visual inconsistencies (\cref{fig:Anomaly synthetic strategy}, $A$) mainly arise from the self-augmentation\cite{zhang2022prn} of normal samples or the Describing Textures Dataset (DTD)\cite{cimpoi2014DTD}. Specifically, self-augmentation involves augmenting the normal image with two random sampling augmentations\cite{zavrtanik2021draem,zhang2022prn} from \{ equalize, sharpness, auto-contrast, solarize, posterize, invert, gamma-contrast \}. The resulting image is then divided into an $8\times8$ grid and randomly rearranged before being reassembled\cite{yang2023memseg,zhang2022prn}.
+The proposed synthetic anomaly (\cref{fig:Anomaly synthetic strategy}, $S$) is defined as: 
+\begin{equation}
+\begin{aligned}
+S=\beta(M \odot N)+(1-\beta)(M \odot A)+\bar{M} \odot N
+\end{aligned}
+\label{eq:anomaly synthetic}
+\end{equation}
+where $\bar{M}$ is the pixel-wise inverse operation of $M$, $\odot$ is the element-wise multiplication operation and $\beta$ is an opacity parameter designed to better fuse the anomalous and normal regions. More examples of anomalous synthetic samples are shown in \cref{fig:Anomaly synthetic strategy}.
+
+
+
+
+\begin{algorithm}[t]
+   \caption{DiffusionAD Evaluation.}
+   \label{alg:diffad evaluation algorithm}
+   \definecolor{codeblue}{RGB}{50,205,50}
+   \lstset{
+     backgroundcolor=\color{white},
+     basicstyle=\fontsize{7.2pt}{7.2pt}\ttfamily\selectfont,
+     columns=fullflexible,
+     breaklines=true,
+     captionpos=b,
+     commentstyle=\fontsize{7.2pt}{7.2pt}\color{citecolor},
+     keywordstyle=\fontsize{7.2pt}{7.2pt},
+   }
+
+\begin{lstlisting}[language=python, mathescape=true]
+
+def inference(image, $\lambda$=[100,200], K=50):
+
+    # image: [1, 3, H, W]
+    # $\color{citecolor}{\lambda}$: time steps
+    
+    pred_mask = zeros(1, 1, H, W)
+    
+    for t in $\lambda$:
+        eps = randn_like(image) # [1, 3, H, W]
+        
+        # Corrupt images
+        img_crpt = sqrt(alpha_cumprod(t)) * image + 
+                           sqrt(1 - alpha_cumprod(t)) * eps
+                           
+        # Predict noise                  
+        pred_eps = Denoising_subnetwork(img_crpt, t)
+        
+        # one-step flawless approximation 
+        pred_image = sqrt(1 / alpha_cumprod(t)) * (img_crpt - sqrt(1 - alpha_cumprod(t)) * pred_eps)
+        
+        # Predict anomaly mask at time step t                    
+        pred_mask += Segmentation_subnetwork(cat((image, pred_image),dim=1)) 
+
+    # Calculate the final pixel-wise anomaly score
+    pred_mask /= len($\lambda$)
+
+    # Calculate the image level anomaly score
+    anomaly_socre= mean(topk(pred_mask, K)[0])
+
+    return anomaly_socre, pred_mask
+   
+\end{lstlisting}
+\end{algorithm}
+
+
+\subsection{Inference}
+\label{subsec:inference}
+\cref{alg:diffad evaluation algorithm} shows the detailed procedure of the inference phase. 
+Unlike other diffusion methods that iterative reconstructs the image by applying \cref{eq:xt-1}, we perform one-step normal estimation $\hat{x}_0$ at the inference stage via \cref{eq:xhat}, which has a faster inference speed while maintaining satisfactory sampling quality for the segmentation sub-network. In addition, we adopt a partial diffusion forward process\cite{wyatt2022anoddpm}, \ie . corrupting the input image $x_{0}$ to a parameterised time step $\lambda\in\{0, 1, ... , T\}$ instead of time step $T$. As the time step $\lambda$ becomes larger, the corrupted sample $x_{\lambda}$ gradually loses its distinguishable features and gradually approaches an isotropic Gaussian distribution. While anomalous regions come in a wide range of sizes, we find that DiffusionAD facilitates successful normal approximation with relatively less noisy processes for small anomalous regions. However, larger anomalous regions require relatively more corruption for optimal recovery and accurate anomaly localization. 
+Unless stated otherwise, we corrupt the query images at time steps $\lambda_1 = 100$ and $\lambda_2 = 200$, respectively, and independently predict the anomaly score for the corrupted images at both scales. The two predictions are averaged to obtain the final pixel-level anomaly score. After that, we take the average of the top K anomalous pixels in the final prediction as the image-level anomaly score\cite{zhang2022prn}. The ablation on the $\lambda$ is detailed in \cref{subsec:Ablation Study}.
+
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Datasets}
+\label{subsec:Datasets}
+
+\textbf{VisA.\quad}VisA\cite{zou2022spd} is a challenging dataset, consisting of 10,821 images in total.
+There are 9,621 normal and 1,200 abnormal images. Visa contains 12 subsets, each corresponding to one class of objects. These 12 subsets can be divided into three broad categories based on the properties of the objects. The first category consists of four printed circuit boards (PCBS) with complex structures. The second type is a dataset with multiple instances in one view and consists of Capsules, Candles, Macaroni1 and Marcaroni2. The third type is single instances with roughly aligned objects: Cashew, Chewing gum, Fryum and Pipe fryum. Anomalous images contain a variety of imperfections, including surface defects such as scratches, dents, colored spots, or cracks, and structural defects such as misplacement or missing parts. We split the training and testing sets by the unsupervised default setting\cite{zou2022spd}.
+
+\textbf{DAGM.\quad}DAGM\cite{wieler2007dagm} consists of ten texture classes with 15,000 normal images and 2,100 abnormal images. Various defects that are visually close to the background, such as scratches and specks, constitute anomalous samples. We still perform the unsupervised paradigm, where the training set contains only normal samples\cite{zhang2022prn}.
+
+
+
+\begin{table*}[]
+\centering
+\scalebox{0.65}{
+\begin{tabular}{@{}lccccccccccc@{}}
+\toprule
+            & AnoDDPM\cite{wyatt2022anoddpm} & CFA\cite{lee2022cfa}  & DRAEM\cite{zavrtanik2021draem} & CFLOW\cite{gudovskiy2022cflow} & CutPaste\cite{li2021cutpaste} & FastFlow\cite{yu2021fastflow} & PatchCore\cite{roth2022patchcore} & PaDiM\cite{defard2021padim} & RD4AD\cite{deng2022rd4ad} & SPD\cite{zou2022spd} & \textbf{Ours} \\\midrule
+Candle      & 64.9 & 94.4 & 94.4  & 97.0  & 69.9     & 92.8     & \textbf{98.6}      & 91.6  & 92.2  & 89.1  & 94.9 \\
+Capsules    & 76.5& 72.9 & 76.3  & 93.0  & 79.0     & 71.2     & 81.6      & 70.7  & 90.1  & 68.1  & \textbf{96.4} \\
+Cashew      & 94.4 & 99.1 & 90.7  & 90.9  & 84.8     & 91.0     & 97.3      & 93.0  & \textbf{99.6}  & 90.5  & 92.5 \\
+Chewing gum  & 91.3 & \textbf{99.7} & 94.2  & 98.3  & 92.6     & 91.4     & 99.1      & 98.8  & \textbf{99.7}  & 99.3  & 99.2 \\
+Fryum       & 81.5& 91.6 & 97.4  & 91.1  & 94.0     & 88.6     & 96.2      & 88.6  & 96.6  & 89.8  & \textbf{97.8} \\
+Macaroni1   & 58.8& 98.9 & 95.0  & 69.6  & 93.4     & 98.3     & 97.5      & 87.0  & 98.4  & 85.7  & \textbf{99.3} \\
+Macaroni2   & 74.5& 93.3 & 96.2  & 77.2  & 83.6     & 86.3     & 78.1      & 70.5  & 97.6  & 70.8  & \textbf{98.9} \\
+PCB1        & 42.1& 90.0 & 54.8  & 91.4  & 83.1     & 77.4     & 98.5      & 94.7  & 97.6  & 92.7  & \textbf{99.1} \\
+PCB2        & 90.7& 75.6 & 77.8  & 96.7  & 44.9     & 61.9     & 97.3      & 88.5  & 91.1  & 87.9  & \textbf{99.2} \\
+PCB3        & 92.3& 94.9 & 94.5    & \textbf{99.6}  & 90.0       & 74.3     & 97.9      & 91.0  & 95.5  & 85.4  & 98.6 \\
+PCB4        & 98.3& 97.3 & 93.4  & 94.2  & 90.7     & 80.9     & \textbf{99.6}     & 97.5  & 96.5  & 99.1  & 98.6 \\
+Pipe fryum  & 72.5& 95.8 & 99.4   & 99.0  & 76.9     & 72.0     & \textbf{99.8}      & 97.0  & 97.0  & 95.6  & 98.9 \\\midrule
+Average     & 78.2& 92.0   & 88.7  & 91.5  & 81.9     & 82.2     & 95.1      & 89.1  & 96.0  & 87.8  & \textbf{97.8} \\\bottomrule
+\end{tabular}}
+\caption{Anomaly Detection on VisA\cite{zou2022spd}. Best results on Image AUROC are highlighted in bold.}
+\label{tab:visa image auroc}
+\end{table*}
+
+
+\subsection{Experimental Details}
+\label{subsec:Experimental Details}
+
+\textbf{Evaluation Metrics.\quad}We report the most widely used metric Area Under Receiver Operator Characteristic curve (AUROC) at anomaly detection (image level binary classification). In terms of metrics for anomaly localization (pixel level binary classification), AUROC may provide an inflated view of performance, which may pose challenges in measuring the true capabilities of the model\cite{zou2022spd}. The false positive rate is dominated by the extremely high number of non-anomalous pixels and remains low despite the false positive prediction\cite{tao2022al_survey,zhang2022prn}, which is caused by the fact that anomalous regions typically only occupy a tiny fraction of the entire image. Per Region Overlap (PRO) metric is more capable of assessing the ability of fine-grained anomaly localization, which treats anomaly regions of varying sizes equally and is widely employed by previous works\cite{deng2022rd4ad,roth2022patchcore,zhang2022prn}.
+
+\textbf{Implementation Details.\quad}All images in VisA and DAGM are resized to $256 \times 256$. For the denoising sub-network, we adopt the UNet\cite{ronneberger2015U-Net} architecture for estimating $\epsilon_{\theta}$. This architecture is mainly based on PixelCNN\cite{salimanspixelcnn++} and Wide ResNet\cite{he2016resnet-18}, with sinusoidal positional embedding\cite{vaswani2017attention} to encode the time step $t$. $T$ is set to 1000 and the noise schedule is set to linear. We set the base channel to 128, the attention resolutions to 32, 16, 8, and the number of heads to 4. We do not use  EMA. For the segmentation sub-network, we employ a U-Net-like architecture consisting of an encoder, a decoder, and skip connections. $\gamma$ in the segmentation loss $\mathcal{L}_{seg}$ is set to 5. We train for 500 epochs with a batch size of 6 consisting of 3 normal samples and 3 anomalous synthetic samples. We use Adam optimizer\cite{kingma2014adam} for optimization, with an initial learning rate $10^{-4}$. By default, we take the average prediction from corruptions $x_{\lambda=100}$ and $x_{\lambda=200}$ as the final pixel-wise anomaly score $\hat{M}$, and obtain the image-level anomaly score by taking the average of the top 50 anomalous pixels in $\hat{M}$. We compare DiffusionAD to ten previous methods, and the results are based on the implementation provided by these methods in a fair setting\cite{xie2023imiad}. 
+
+\begin{table*}[]
+\centering
+\scalebox{0.65}{
+\begin{tabular}{@{}lccccccccccc@{}}
+\toprule
+            &AnoDDPM\cite{wyatt2022anoddpm}& CFA\cite{lee2022cfa}  & DRAEM\cite{zavrtanik2021draem} & FastFlow\cite{yu2021fastflow} & PatchCore\cite{roth2022patchcore} & PaDiM\cite{defard2021padim} & RD4AD\cite{deng2022rd4ad} & SPADE\cite{cohen2020spade} & STPM\cite{wang2021stpm} &FAVAE\cite{dehaene2020FAVAE}  & \textbf{Ours} \\ \midrule
+Candle      & 74.2 & 83.3 & 93.7  & 86.7     & 94.0       & \textbf{95.7} & 92.2  & 93.2  & 91.7 & 89.8 & 94.7 \\
+Capsules    & 71.0& 34.7 & 84.5    & 33.3     & 85.5      & 76.9  & 56.9  & 36.1  & 38.6 & 23.0 & \textbf{97.6}\\
+Cashew      & 40.9& 57.2 & 51.8  & 68.3     & 94.5      & 87.9  & 79.0    & 57.4  & 72.5 & 66.9 & \textbf{88.0}   \\
+Chewing gum & 26.9& 75.9 & 60.4  & 74.8     & 84.6      & 83.5  & 92.5  & \textbf{93.9}  & 52.8 & 87.8 & 87.0   \\
+Fryum       & 23.3& 73.0  & 93.1  & 74.3     & 85.3      & 80.2  & 81.0    & 91.3  & 83.6 & 87.6 & \textbf{96.8} \\
+Macaroni1   & 68.4& 76.4 & 96.7    & 77.7     & 95.4      & 92.1  & 71.3  & 61.3  & 68.6 &81.4 & \textbf{96.8} \\
+Macaroni2   & 71.5& 40.1 & 92.6  & 43.4     & 94.4      & 75.4  & 68.0    & 63.4  & 61.0 &64.0  & \textbf{98.0}   \\
+PCB1        & 65.0& 33.4 & 24.8  & 59.9     & 94.3      & 91.3  & 43.2  & 38.4  & 37.0  &46.7  & \textbf{96.9} \\
+PCB2        & 70.9& 39.9 & 49.4  & 40.7     & 89.2      & 88.7  & 46.4  & 42.2  & 36.8 &37.2 & \textbf{92.8} \\
+PCB3        & 80.7& 66.3 & 89.7  & 61.5     & 90.9      & 84.9  & 80.3  & 80.3  & 74.2 & 80.3 & \textbf{94.4} \\
+PCB4        & 57.8& 57.4 & 64.3  & 58.8     & 90.1      & 81.6  & 72.2  & 71.6  & 72.3 & 82.4 & \textbf{95.5} \\
+Pipe fryum  & 74.9& 23.7 & 75.9  & 38.0     & \textbf{95.7}& 92.5  & 68.3  & 61.7  & 55.3 & 68.3 & 80.2 \\ \midrule
+Average     & 60.5& 55.1 & 73.1  & 59.8     & 91.2      & 85.9  & 70.9  & 65.9  & 62.0   & 67.9 & \textbf{93.2} \\ \bottomrule
+\end{tabular}}
+\caption{Anomaly Localization on VisA\cite{zou2022spd}. Best results on Pixel PRO are highlighted in bold.}
+\label{tab:visa pixel pro}
+\end{table*}
+
+
+\subsection{Anomaly Detection and Localization on VisA}
+\label{subsec:Anomaly Detection and Localization on VisA}
+The results of \textit{anomaly detection} on the VisA dataset are shown in \cref{tab:visa image auroc}. Our method achieves the highest image AUROC in 6 out of 12 classes and achieves comparable performance to SOTA in the remaining classes. Our proposed approach outperforms previous methods by a large margin on some categories, such as Capsules, Macaroni1 and Macaroni2. The average image AUROC results show that our method outperforms the previous SOTA by 1.8\%.
+
+\cref{tab:visa pixel pro} illustrates the performance of DiffusionAD and previous approaches for \textit{anomaly localization} on VisA. DiffusionAD achieves the highest PRO in 9 out of 12 classes and outperforms the previous SOTA PatchCore\cite{roth2022patchcore} by 2.0\% in terms of overall PRO, confirming that DiffusionAD is more accurate at simultaneously localizing anomalous regions of varying sizes.
+
+According to the results in \cref{fig:visa visualization}, we qualitatively assess the performance of DiffusionAD on anomaly detection and localization compared to the previous SOTA methods PatchCore\cite{roth2022patchcore} and DRAEM\cite{zavrtanik2021draem}. 
+These images are sub-datasets of the Visa dataset\cite{zou2022spd}, where the anomalous regions vary in shape, size, and number, as shown in the first and second columns of \cref{fig:visa visualization}.
+Our proposed denoising sub-network of DiffusionAD corrupts the input images by adding Gaussian noise and then performs a flawless reconstruction.
+As shown in the third column of \cref{fig:visa visualization}, DiffusionAD achieves fine-grained reconstructions of normal regions and flawless approximations of the anomalous regions.
+After that, our proposed segmentation sub-network of DiffusionAD enables the prediction of pixel-wise anomaly maps without post-processing (\cref{fig:visa visualization}, the fourth column) by exploiting the differences between the appearance of anomalous regions in input and its restoration to achieve better anomaly detection and localization performance. Additional restoration and segmentation results are provided in the \cref{sec:appendix}.
+
+
+
+
+
+\begin{table}[]
+\centering
+\scalebox{0.65}{
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+        & \multicolumn{3}{c}{Sub-networks}                                     & \multicolumn{3}{c}{Performance} \\ \cmidrule(lr){2-4}\cmidrule(lr){5-7} 
+                                & Denoising            & AE.             & Seg.                 & Image AUROC $\uparrow$     & Pixel PRO $\uparrow$  & FPS $\uparrow$ \\ \midrule
+SegmentationAD                  &                      &                 & $\checkmark$         & 89.5                       & 82.1                  &   \textbf{11.89}               \\
+${\textbf{\rm DRAEM}^+}$        &                      & $\checkmark$    & $\checkmark$         & 90.6                       & 76.1                  &   10.32                   \\
+DenoisingAD                     & $\checkmark$         &                 &                      & 76.2                       & 60.5                  &   8.57               \\
+\textbf{Ours}                   & $\checkmark$         &                 & $\checkmark$         & \textbf{97.8}              & \textbf{93.2}         &   8.21                   \\ \bottomrule
+\end{tabular}}
+\caption{Ablations of different sub-networks in DiffusionAD.}
+\label{tab:ablation on module}
+\end{table}
+
+
+
+\begin{table}[]
+\centering
+\scalebox{0.7}{
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+\multicolumn{2}{c}{$\lambda$} & \multicolumn{3}{c}{Performance} \\ \cmidrule(lr){1-2}\cmidrule(lr){3-5} 
+100                         & 200                   & Image AUROC $\uparrow$ & Pixel PRO $\uparrow$ & FPS $\uparrow$ \\\midrule
+$\checkmark$                 &                       & 97.4         & 92.4      & 8.29 \\
+                             & $\checkmark$        & 97.4         & 93.0        & \textbf{8.31} \\
+$\checkmark$                 & $\checkmark$       & \textbf{97.8}         & \textbf{93.2}      & 8.21 \\\bottomrule
+\end{tabular}}
+\caption{Impact of the time step $\lambda$ in the diffusion forward process during the inference phase.}
+\label{tab:ablation on lambda}
+\end{table}
+
+
+\subsection{Ablation Study}
+\label{subsec:Ablation Study}
+
+
+\textbf{The importance of each sub-network.\quad}We investigate the importance of each sub-network in DiffusionAD and report the results in \cref{tab:ablation on module}. The effect of the denoising sub-network on the anomaly detection performance is evaluated by removing it from the pipeline. The first row of \cref{tab:ablation on module} illustrates the results of training the segmentation sub-network (Seg.) alone, which shows a significant performance degradation compared to the full pipeline. We conjecture that this is because SegmentationAD over-fits synthetic anomalies, and there is a natural gap between synthetic and real anomalies. The second row of \cref{tab:ablation on module} shows the results of replacing the denoising sub-network with an AutoEncoder (\cref{tab:ablation on module}, AE.) such that the architecture is close to the previous image inpainting-based method DRAEM\cite{zavrtanik2021draem}. ${\textbf{\rm DRAEM}^+}$ refers to using the same anomaly synthesis strategy as in this paper for a fair comparison. It significantly underperforms our proposed pipeline. Thus, the above results demonstrate the importance of the denoising sub-network in our proposed pipeline and also illustrate the slightly slower inference speed compared to the diffusion-free approach. The effect of the segmentation sub-network is evaluated by removing it from the full pipeline, \ie, training the denoising sub-network alone, named DenoisingAD. The significant overall performance drop shown in the third row of \cref{tab:ablation on module} confirms the importance of the segmentation sub-network. High rates of false positives and false negatives will be introduced by directly calculating the difference between the input and its normal recovery.
+
+
+\textbf{The effect of $\bm{\lambda}$.\quad}Due to the variable size of the anomalous region, we adopt the average prediction from the two corruption degrees in the inference phase. It can be concluded from \cref{tab:ablation on lambda} that the average prediction achieves better anomaly detection and localization performance while maintaining comparable inference speed.
+
+
+
+
+
+
+\begin{figure*}
+  \centering
+  \includegraphics[width=0.85\linewidth]{visualization.pdf}
+  \caption{Qualitative examples on VisA\cite{zou2022spd}. Restoration and segmentation are visualizations of DiffusionAD, referring to the normal approximation of the denoising sub-network and the pixel-wise anomaly map of the segmentation sub-network, respectively. DiffusionAD enables the recovery of anomalous regions to possible normal regions and achieves more accurate localization results for various types of anomalies.
+}
+  \label{fig:visa visualization}
+\end{figure*}
+
+
+\begin{table*}[]
+\centering
+\scalebox{0.65}{
+\begin{tabular}{@{}lccccccccccc@{}}
+\toprule
+        & CFA\cite{lee2022cfa}  & CS-Flow\cite{rudolph2022csflow} & DRAEM\cite{zavrtanik2021draem} & CutPaste\cite{li2021cutpaste} & FastFlow\cite{yu2021fastflow} & FAVAE\cite{dehaene2020FAVAE} & PatchCore\cite{roth2022patchcore} & PaDiM\cite{defard2021padim} & RD4AD\cite{deng2022rd4ad} & SPADE\cite{cohen2020spade} & Ours \\ \midrule
+Class1  & 98.2 & 97.6    & 91.6  & 56.1     & 94.9     & 49.7  & 80.8      & 88.4  & 99.4  & 53.9  & \textbf{99.9} \\
+Class2  & 98.9 & 92.1    & 90.0  & 99.4     & 96.2     & 88.3  & 100       & 99.9  & 100   & 82.0    & \textbf{100}  \\
+Class3  & 97.7 & 96.2    & 95.5  & 89.8     & 83.0     & 62.9  & 92.2      & 99.0    & 92.6  & 59.9  & \textbf{100}  \\
+Class4  & 100  & 74.9    & 100   & 99.1     & 98.8     & 90.2  & 100       & 100   & 100   & 83.1  & \textbf{100}  \\
+Class5  & 95.6 & 48.9    & 100   & 76.0     & 77.0     & 59.2  & 97.7      & 98.5  & 93.1  & 72.9  & \textbf{100} \\
+Class6  & 100  & 74.6    & 100   & 96.7     & 98.7     & 67.8  & 99.9      & 99.3  & 100   & 95.9  & \textbf{100}  \\
+Class7  & 100  & 79.6    & 98.1  & 100      & 79.7     & 44.8  & 100       & 95.6  & 100   & 57.5  & \textbf{100}  \\
+Class8  & 58.2 & 51.6    & 99.4  & 51.4     & 52.8     & 52.3  & 65.7      & 60.1  & 73.6  & 46.3  & \textbf{100}  \\
+Class9  & \textbf{100}  & 65.1    & 47.0  & 82.5     & 98.9     & 93.4  & 99.4      & 99.8  & 99.1  & 94.8  & 96.1 \\
+Class10 & 99.8 & 71.2    & 86.6  & 88.1     & 93.9     & 86.2  & 100       & 98.9  & 99.9  & 67.9  & \textbf{100}  \\ \midrule
+Average & 94.8 & 75.2    & 90.8  & 83.9     & 87.4     & 69.5  & 93.6      & 94.0  & 95.8  & 71.4  & \textbf{99.6} \\ \bottomrule
+\end{tabular}}
+\caption{Anomaly Detection on DAGM\cite{wieler2007dagm}. Best results on Image AUROC are highlighted in bold.}
+\label{tab:dagm image auroc}
+\end{table*}
+
+
+\subsection{Evaluation on other benchmark}
+\label{subsec:Evaluation on other benchmarks}
+To further evaluate the effectiveness and generalization of DiffusionAD for anomaly detection and localization, we benchmark it on an additional widely used dataset, DAGM\cite{wieler2007dagm}. As illustrated in \cref{tab:dagm image auroc}, DiffusionAD outperforms previous methods in 9 out of 10 classes and achieves the highest overall image AUROC of 99.6\%. This performance approaches full-recall anomaly detection and represents a significant improvement of 3.8\% over the previous state-of-the-art method RD4AD\cite{deng2022rd4ad}.
+
+
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+In this paper, we introduced a novel pipeline called DiffusionAD that formalizes anomaly detection and localization as a \emph{noise-to-norm} paradigm. Our proposed pipeline first corrupts the input image by adding Gaussian noise and then estimates the noise to obtain a flawless approximation of the input image. After that, our pipeline learns to predict pixel-wise anomaly scores by exploiting the consistency and inconsistency between the input image and its flawless approximation. In the inference stage, DiffusionAD achieves satisfactory flawless estimation by a one-step diffusion denoising process, which is tens to hundreds of times faster than general diffusion models. We conduct extensive experiments on two benchmarks, VisA and DAGM, and DiffusionAD outperforms both numerical and qualitative results, demonstrating its efficiency and generalization capabilities.
+
+
+
+\appendix
+
+\section{Appendix}
+\label{sec:appendix}
+
+\begin{figure*}
+  \centering
+  \includegraphics[width=0.9\linewidth]{more_visa_visialization.pdf}
+  \caption{More qualitative examples on VisA\cite{zou2022spd}.
+}
+  \label{fig:more visa visualization}
+\end{figure*}
+
+\begin{figure*}
+  \centering
+  \includegraphics[width=0.9\linewidth]{dagm_visialization.pdf}
+  \caption{Qualitative examples on DAGM\cite{wieler2007dagm}.
+}
+  \label{fig:dagm visualization}
+\end{figure*}
+
+\subsection{More Qualitative Examples}
+To further evaluate the performance of DiffusionAD in terms of anomaly detection and localization, we introduce additional visualizations as part of our qualitative analysis, as shown in \cref{fig:more visa visualization} and \cref{fig:dagm visualization}. 
+Despite the wide range of sizes, shapes, and numbers of anomalies present in the three types of Visa datasets\cite{zou2022spd} (printed circuit boards, multiple instances, and single instances), our proposed Diffusion method successfully restores anomalous regions while preserving normal regions (the third column in \cref{fig:more visa visualization}). Furthermore, it accurately predicts pixel-wise anomaly scores (the fourth column in \cref{fig:more visa visualization}), demonstrating its effectiveness across different anomaly types. 
+In the case of complex texture datasets such as DAGM\cite{wieler2007dagm}, DiffusionAD also performs fine-grained restoration (the third column in \cref{fig:dagm visualization}).
+Moreover, we argue that the ground truth mask in the DAGM labels a wider range of anomaly regions than the actual anomaly itself, as illustrated in the first and second rows of \cref{fig:dagm visualization}. In contrast, our proposed DiffusionAD localizes the anomalous region more precisely (the fourth column in \cref{fig:dagm visualization}).
+
+
+
+\subsection{Ablation on the degree of corruption}
+Given the variability in the size of anomalous regions, we employ the average prediction from two different corruption degrees (time steps $\lambda_1 = 100$ and $\lambda_2 = 200$) during the inference phase. 
+As demonstrated in \cref{fig:ablation on lambda}, DiffusionAD enables a successful flawless approximation with relatively less noisy processes for small anomalous regions (the second and fourth rows of \cref{fig:ablation on lambda}), while larger anomalous regions (the first and third rows of \cref{fig:ablation on lambda}) require relatively more noisy processes for optimal restoration. However, regardless of the degree of corruption, the segmentation sub-network accurately localizes the anomalous regions (the fourth and sixth columns of \cref{fig:ablation on lambda}) by exploiting the inconsistencies and commonalities between the input and its flawless approximation.
+
+
+
+
+
+\begin{figure}
+  \centering
+  \includegraphics[width=1.0\linewidth]{lambda_visualization.pdf}
+  \caption{Impact of degree of corruption on restoration and segmentation.}
+  \label{fig:ablation on lambda}
+\end{figure}
+
+
+
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{DiffusionAD}
+}
+
+
+\end{document}

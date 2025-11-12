@@ -1,0 +1,71 @@
+\section{Lazy Data Routing}
+\label{sec:lazy}
+Next, we describe one of the core optimizations in \sys that allows for efficient and low-latency inference over decentralized models. 
+
+\subsection{Overview}
+To make \sys work, we need a way to route data to models, and potentially route the subsequent predictions to other models. This routing has to be done over a continuous stream of inputs.
+Existing distributed machine learning projects are designed for distributed training, which can have subtly different communication requirements than decentralized inference. 
+
+\noindent \textbf{Task Distribution Systems. } Task distribution systems, such as Ray~\cite{moritz2018ray} and Hoplite~\cite{hoplite}, support a basic set of communication primitives such as broadcast, gather, reduce, all-reduce. While effective for bulk tasks at scale, for decentralized model serving \emph{we need to be able to control and schedule peer-to-peer communication. } Particular nodes collecting data need to be matched with particular computing nodes.
+
+\noindent \textbf{Pipeline-Parallel Systems. } Closer to \sys are pipeline parallel training systems such as PipeDream~\cite{narayanan2019pipedream}. These systems slice neural networks into layers and place the different layers on different compute nodes. Thus, during training, the system can pipeline the processing of example batches through those layers.
+Because of the batch-wise execution pattern in model training, there is no concern about time synchronization since tasks are aligned with batches. 
+
+In the inference setting, each example comes in a stream independently. 
+Communication jitter, message re-ordering, and computational contention can cause asynchronous messages to fall out of time alignment.
+Inspired by pipeline parallel training, we need a robust message tracking system to also ensure reliable message delivery.
+Therefore, we choose to use a global message queue with different topics to route data between nodes.
+
+\subsection{Communication Protocol}
+In its simplest form, the leader acts as a message-broker system.
+Data streams publish data to the leader, and models consume data from the leader.
+With this architecture, the message broker can quickly become a point of contention since it has to process all the messages from all the different nodes.
+Furthermore, large message payloads (e.g., images) can lead to a crucial networking bottleneck at this leader.
+
+\sys uses a novel messaging protocol to efficiently transfer data between nodes without placing an undue burden on the leader.
+A message sent to the leader only contains message headers: a timestamp and a global source path.
+The actual message payloads are not transferred; instead, they are kept and indexed on the node that collected the data.
+A model subscribes to the topic and reads the headers as they come in.
+If it wants a particular data payload, it retrieves that data lazily from the source node.
+
+Figure~\ref{fig:lazy} illustrates this protocol. When collecting data, every data item added to a \texttt{DataStream} is annotated with a header (Figure \ref{fig:lazy}-1). We can think of this as a stream of $(h,d)$ tuples (header and data, respectively). After the tuple is created, the node locally writes the data to a time-indexed log (Figure \ref{fig:lazy}-2).
+After this data is durably written, the header is published to the message broker on the leader (Figure \ref{fig:lazy}-3).
+Nodes on the network can subscribe to streams of these headers.
+Model inference requires the data payload, and that can be requested from the headers (Figure \ref{fig:lazy}-4). This data is transferred in a peer-to-peer fashion, and inferences happen over these streams (Figure \ref{fig:lazy}-5).
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.8\columnwidth]{figures/lazy.png}
+    \caption{A figure illustrating the order of operations in the lazy data routing system used by \sys.}
+    \label{fig:lazy}
+\end{figure}
+
+Lazy retrieval has a number of essential benefits for typical model-serving tasks. In general, these benefits are analogous to that of lazy computation. First, many models predict at rates much slower than the rate of data collection. For example, a model that takes 30ms to evaluate can only process one example every 30ms. If the data collection rate is significantly faster than that, the model often has to downsample the input data. Lazy data routing allows us to avoid transferring the data payload to the leader in these cases. Second, the primary data transfer happens without coordination through the leader, and thus, gives us placement flexibility of placing model inference close to the data source while placing the leader far away. Finally, this strategy reduces the size of the messages processed by the message broker reducing overheads in checkpointing and serialization/de-serialization.
+
+Practically, every edge node has a limited amount of local storage. \sys handles this by having a timeout for the data payloads, where a node on the network can only send a retrieval request within that timeout.
+This allows the edge node to overwrite/free up that space periodically.
+Depending on the network, we allow users to force \sys to have eager message passing. Small messages, such as 1D arrays, can be transferred from data source nodes to worker nodes via the leader node. Essentially, this embeds the payload in the message headers.
+
+\subsection{Time-Alignment}
+A key feature in \sys is to allow models to predict on multiple streams of data. 
+For this to work, the streams of data must be time-aligned (or roughly so). 
+As we saw in the last section, multiple disparate data streams can be organized into a single topic that a model can subscribe to.
+\sys gives the programmer an illusion of stream alignment, namely, streams associated with the same topic can be thought of as synchronized from the perspective of machine learning modeling. 
+The consuming models receive tuples of headers corresponding to data from each of the sources.
+Figure \ref{fig:align} shows this point: from a programmer's perspective, the entire topic can be treated as a single stream.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.8\columnwidth]{figures/align.png}
+    \caption{A model subscribes to a single topic which might include multiple streams of data. \sys ensures that multiple streams of data are time-aligned as tuples in order to make predictions.}
+    \label{fig:align}
+\end{figure}
+
+Under the hood, \sys has to buffer streams locally to keep up this illusion.
+The different data streams will arrive at different rates and have different systems delays that cause misalignment.
+We use a time interval-based interface for specifying alignment criteria.
+Thus, every topic has a maximum allowed time-skew between headers that can be produced.
+Locally, the buffer retains a header until it receives matching header messages from other sensors. 
+Thus, we can enforce a bounded-skew synchronization on the model side. 
+This heavily depends on a reasonable time interval requested between predictions. If such time interval is too short, such synchronization can be ineffective without improving accuracy; if the time interval is too long, potential long waits can stretch end-to-end timeliness while harming accuracy due to lost high-frequency information in between. 
+Crucially, all of this synchronization can happen without the data payloads.

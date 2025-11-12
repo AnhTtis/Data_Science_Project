@@ -1,0 +1,76 @@
+\section{GeoSpark}
+Our goal is to leverage the explicit geometry clue stored in the geometric partitions to improve the feature aggregation and downsampling process. In this section, we will elaborate on these are achieved on GeoSpark. We will begin by explaining how the geometric partition is generated and embedding, followed by technical details of our \textit{Geometry-Informed Aggregation} (GIA) module as well as \textit{Geometric Downsampling} (GD) module. 
+
+\input{section/image/The_Paradigm_of_GeoSpark_Architecture}
+\subsection{Geometric Partition \& Embedding}
+The first step of the proposed GeoSpark network is to effectively learn the low-level features of point clouds and group similar points. This process significantly reduces the redundancy of point clouds and makes it possible to encode long-range context inexpensively in future steps. This module will process the entire input scene and produce an initial geometric partition, so it needs to be fast and effective. In our experiment, we tested different geometric partition methods, including VCCS\cite{Papon_2013}, Global Energy Model (GEM)\cite{Guinard2017WeaklyClouds}, Graph-Structured Method (GSM) \cite{Landrieu2019PointLearning} and SPnet \cite{Hui_2021}. The GEM \cite{Guinard2017WeaklyClouds} offers the best trade-off between speed and performance, so we integrate that into our \textit{Geometric Partition \& Embedding} module. Specifically, for each point, a set of geometric features, such as linearity, planarity, scattering, and verticality \(f_i \in \mathbb{R}^{c}\) are computed, characterizing local features and shapes. The geometrically homogeneous partition is defined as the constantly connected components and therefore as the solution to the following optimization problem\cite{Guinard2017WeaklyClouds}: 
+\begin{equation}
+ \argmin_{g \in \mathbb{R}^{c}} \sum_{i \in C} ||g_i-f_i||^2 + \lambda \sum_{(i,j)\in E_{nn}} \omega_{i, j}[g_i \neq g_j]
+ \label{optimization}
+ \vspace{-2mm}
+\end{equation}
+where \(\lambda\) is the \textit{regularization strength} that determines the coarseness of the partition, \(\omega_{i, j}\) is a weight matrix that is linearly inversely proportional to the distance between points and \([\cdot]\) is the Iverson bracket. We use the \textit{\(l_o\)-cut} pursuit algorithm\cite{LandrieuCutFunctions} to quickly find approximate solutions for Eq. \ref{optimization}, as it is impractical to find exact solutions when the number of points is really large. 
+Given point cloud set \( X = (P, F)\), the geometric partition module splits the point cloud into point subsets \([\hat{X_1}, \hat{X_2}, \hat{X_3} \dots, \hat{X_m}] \), and each set contains a different number of points. 
+
+To encode each partition into a superpoint, we adopted a lightweight MLP structure, inspired by PointNet \cite{Charles_2017}. The input point feature firstly go through MLP layers to gradually project the features of the points to higher dimension space. Points in each partition are then fused into one superpoint by applying MaxPooling in feature space \(\hat{f_i}\) and AvgPooling in coordinates space \(\hat{p_i}\). We concatenate global information of each partition \(\hat{f_{i,g}}\), such as \textit{partition diameter} into the features of the fused points, before applying other layers of MLP to reduce the feature dimension to \(c\). Formally,
+\begin{equation}
+\begin{aligned}
+ \hat{F_i} &= T_2 \ ( \text{MaxPool}\ \{{T_1\ (\hat{f_i}) \ | \ \hat{f_i}\in \hat{X_i}}\} \ \oplus \ \hat{f_{i,g}} )\\
+ \hat{P_i} &= \text{AvgPool} \ \{{\hat{p_i} \ | \ \hat{p_i}\in X_i}\} 
+\end{aligned}
+\end{equation}
+where \(T_1 : \mathbb{R}^c \xrightarrow{} \mathbb{R}^{c_{l}}\) and \(T_2 :\mathbb{R}^{c_l} \xrightarrow{} \mathbb{R}^c\) are MLP layers that enlarge and condense point feature dimensions. 
+
+\subsection{Geometry-Informed Aggregation}
+The key idea of Geometry-Informed Aggregation (GIA) is to attend point feature both from local neighbour points and global geometric partition regions, encoded in superpoints. Therefore, GIA module takes two sets of inputs: local points \( X\ = (p_i, f_i)\) and encoded superpoints \(\hat{X} =(\hat{p_i}, \hat{f_i})\). Local point features \(f_i\) and superpoint features \(\hat{f_i}\) are first processed by separated MLP layers before being fed into the \textit{GIA} module. The following explain the proposed method using Point Transformer as backbone. However, similar strategies can be incorporated with other backbone easily.
+
+\paragraph{Local Neighbor Aggregation}
+The local neighbor aggregation follows the orginal design of backbone structure. For Point Transformer, it \cite{Zhao_2021} first uses three linear projections \(\phi, \psi, \alpha\) to obtain \textit{query}, \textit{key} and \textit{value} for local points. Following \textit{vector self-attention}, a weight encoding function \(\omega\) is introduced to encode the subtraction relations between point \textit{queries} and \textit{keys}, before processing to the \textit{softmax} operation to form the attention map. A trainable parameterized position encoding, formed by an MLP encoding function \(\theta\), is added to both the attention map and the value vectors. Formally, for query point \(x_i = (p_i, f_i)\) and reference points \(x_j= (p_j,f_j)\), the local attention map is formed as follows:
+\begin{equation}
+\begin{aligned}
+ \delta_{i,j} & = \theta(p_i-p_j) \\
+w_{i,j} &= \omega(\phi(f_{j})- \psi(f_{i})+\delta_{i,j}) \\
+\end{aligned}
+\end{equation}
+\paragraph{Geometric Partition Aggregation}
+
+To learn point feature from superpoint, a feature map is built between local points and global superpoints. Specifically, \textit{key} and \textit{value} is projected from superpoint features \(\hat{f_i}\) with linear operation \(\Psi\), and \(A\) respectively. Attention is formed similarly to \textit{Local Attention}. However, an independent weight encoding function \(\Omega\) is used and the positional embedding also employs a different MLP \(\Theta\) to encode the coordinate difference between the query points and the reference superpoints. 
+\begin{equation}
+\begin{aligned}
+\Delta_{i,j} &= \Theta(p_i-\hat{p_j}) \\
+W_{i,j} &= \Omega(\phi(\hat{f_{i}})- \hat{\Psi(f_{j})} +\Delta_{i,j})\\
+\end{aligned}
+\end{equation}
+In practice, \textit{Local Neighbor Aggregation} and \textit{Geometric Partition Aggregation} are performed simultaneously and merged to form \textit{Geometry-Informed Aggregation}, formally:
+\begin{equation}
+\begin{aligned}
+f_{i,local}' &= \sum_{f_i \in K} \text{softmax}(w_{i,j}) \odot (\alpha(f_j)+\delta_{i,j}) \\
+f_{i,global}' &= \sum_{\hat{f_i} \in \hat{K}}\text{softmax}(W_{i,j}) \odot (A(\hat{f_j})+\Delta_{i,j})\\
+f_i^{'} &= \xi \left[{f_{i,local}' + f_{i,global}'}\right]
+\end{aligned}
+\end{equation}
+where \(\odot\) represents Hadamard product, \(K\) is defined as reference local points, taken from \(k_{local}\) nearest neighbour, and \(\hat{K}\) is the reference superpoints, sampled with \(k_{global}\) nearest neighbour. After merging the outputs of \textit{Local Neighbor Aggregation} and \textit{Geometric Partition Aggregation}, an MLP layer (\(\xi : \mathbb{R}^c \xrightarrow{} \mathbb{R}^{c}\)) is employed to further glue global and local features and form the final outputs. Notice that it is important to maintain a good global and local balance to ensure that both fine details and long-range dependencies are included. More details on this can be found in the ablation study.
+
+The features of superpoints \(\hat{X} =(\hat{p_i}, \hat{f_i})\) are learned in a separate global branch. In this branch, the superpoint features are projected to different dimensions at various stages to match the dimension space of the local branch. Since the number of superpoints is typically several orders of magnitude smaller than that of the local branch, the feature learning in the global branch is very fast.
+
+
+
+
+\paragraph{Loss function.} A simple yet important superpoint loss is introduced to assist feature learning in the global branch. 
+Specifically, given a local point set \(X\), and its label \(E = \{e_i \in \mathbb{R}^l \ | \ i=1,\dots, n\}\), where \(e_i\) is the one-hot vector. We generate a \textit{soft pseudo label} by calculating the label distribution in each geometric partition \(W = \{w_j \in \mathbb{R}^l\ | \ j = 1, \dots, m\} \). We optimize the global branch by minimising the distance between superpoint prediction \(u\) and \textit{soft pseudo label} \(w\). Overall, our loss is constructed with per-point prediction loss and the superpoint loss while a parameter \(\beta\) is introduced to determine the weight of the superpoint loss. Given the pre-point predication as \(e'\), the loss function is
+\begin{equation}
+ L_{total} = \frac{1}{n}\sum_{i=1}^{n}\mathcal{L}_{loss}(e_i,e_i') + \beta \frac{1}{m}\sum_{i=1}^{n}\mathcal{L}_{loss}(w_j,u_j)
+\end{equation}
+where \(\mathcal{L}_{loss}\) can be various type of loss function. Cross-entropy is selected in our experiments.
+
+\subsection{Geometric Downsampling}
+\input{section/image/Geometric_downsampling}
+
+One notable challenge in the downsampling process is the early loss of the under-representative points, such as points for small objects, leading to insufficient feature learning and unsatisfactory prediction results. Data agnostic sampling methods such as random sampling, and FPS, do not consider the uniqueness of points and are likely to cause this issue. To mitigate this problem, we develop the \textit{Geometric Downsampling} module with the help of geometric partitioning.
+The motivation is to preserve points with unique features and drop redundancy points in the downsampling process. Given a point set \( X = \{(p_i, f_i)\ |\ i=1 \dots n\}\), instead of sampling from the whole point set, we conduct sampling from each geometric partition. In particular, we set a target diameter \(a\) for new points, and further split every partition that is larger than the predetermined size \(a\) with voxel grids to obtain subsets, e.g. \([\hat{X_1}]\) to \([\hat{X_{11}}, \hat{X_{12}}, \hat{X_{13}}, \dots]\). Once this process is done, we fuse the fine partition with pooling operations, where \textit{MaxPooling} is applied at features space and \textit{AvgPooling} is conducted on coordinate space, as illustrated in Figure \ref{fig:GD}. Similar to Point Transformer, we apply MLP layers \(D: \mathbb{R}^c \xrightarrow{} \mathbb{R}^{c}\) on feature space before pooling. Mathematically: 
+\begin{equation}
+\begin{aligned}
+{f_{2,i}} = \text{MaxPool}\{Df_{1, i}|f_i\in X_{1, ii}\}\\
+{p_{2,i}} = \text{AvgPool}\{p_{1, i}|p_i\in X_{1, ii}\} 
+\end{aligned}
+\end{equation}

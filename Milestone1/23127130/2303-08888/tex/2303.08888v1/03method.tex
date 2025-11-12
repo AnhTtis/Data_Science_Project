@@ -1,0 +1,170 @@
+
+\section{Method}
+
+We now introduce our approach by first framing the problem setting and defining the necessary notation. We then describe categorical diffusion models and the conditioning procedure to produce stochastic semantic segmentation via diffusion. 
+
+\subsection{Background and notation}
+
+A denoising diffusion probabilistic model~(DDPM) is a latent variable model~$p_\theta(\x_0)=\int p_{\theta}(\x_{0:T})d\x_{1:T}$ describing the distribution of an observable variable~$\x_0\in\real^D$ using a collection of~$T$ latent variables~$\{\x_t\}_{t=1}^T$ with the same dimensionality as~$\x_0$. The joint distribution is modeled as a Markov chain~$p_{\theta}(\x_{0:T})=p(\x_T)\prod_{t=1}^T p_{\theta}(\x_{t-1}\mid\x_t)$, which is commonly known as the \emph{reverse process}. The initial~$p(\x_T)$ is set to a known, tractable distribution such as the Gaussian distribution, while the transition distribution $p_{\theta}$, parameterized by~$\theta$, is the trainable component of the model. Training a DDPM aims to approximate~$p_\theta(\x_0)$ to an empirical distribution~$q(\x_0)$ defined by a collection of samples (\eg, images from the real world). To that end, training minimizes the cross-entropy between both distributions,
+\begin{equation}
+    \label{eq:loss}
+    \min_\theta \mathbb{E}_{\x_0 \sim q(\x_0)} \left[-\log p_{\theta}(\x_0)\right],
+\end{equation}
+which is intractable as it requires marginalizing over the latent variables. Instead, a tractable distribution~$q(\x_{1:T}\mid \x_0)$ is introduced and used as an approximation to the intractable true posterior~$p(\x_{1:T}\mid \x_0)$ to define the evidence lower bound (ELBO),
+\begin{equation}
+    \label{eq:elbo}
+    \log p_{\theta}(\x_0) \ge \mathbb{E}_{\x_{1:T}\sim q(\x_{1:T}\mid \x_0)} \left[ \log \dfrac{p_\theta(\x_{0:T})}{q(\x_{1:T}\mid \x_0)} \right],
+\end{equation}
+where the expectation is approximated by Monte Carlo sampling. The lower bound is tight when the approximate posterior~$q$ equals the real posterior. Maximizing the ELBO over samples from~$q(\x_0)$ minimizes the cross-entropy loss of Eq.~\eqref{eq:loss}.
+
+The key difference between DDPMs and other latent variable models is that the approximate posterior~$q(\x_{1:T}\mid \x_0)$ is fixed and not learnable. DDPMs model this distribution as a Markov chain~$q(\x_{1:T}\mid \x_0)=\prod_{t=1}^T q(\x_t\mid \x_{t-1})$, known as the \emph{forward process}. The transition distribution~$q(\x_t\mid \x_{t-1})$ is chosen to be a tractable distribution that allows efficient sampling from~$q(\x_t\mid \x_0)$ for any~$t$. The only constraint in the design of a DDPM is that $q(\x_T\mid\x_0)\approx p(\x_T)$.
+
+The original DDPM~\cite{ho2020denoising} modeled the transition distributions of the forward and the reverse processes as Gaussian with diagonal covariance matrices, and $p(\x_T)$~as a standard multivariate normal. However, these assumptions are inadequate when the elements of~$\x_0$ belong to discrete, unordered sets, as in the task of image segmentation.
+
+\subsection{Categorical diffusion model}
+
+We now consider the denoising diffusion formulation to learn complex distributions of discrete image labelings. The observable variable~$\x_0\in \mathcal{L}^D$ is categorical, where $D$~is the number of pixels of the image and~$\mathcal{L}=\{1,\ldots,L\}$ is the set of discrete labels that can be assigned to each pixel. Following~\cite{hoogeboom2021argmax}, we consider that all latent variables in~$\x_{1:T}$ are also categorical and that the transition distributions for the forward and reverse processes are modeled as categorical distributions. For the forward process, the transition distribution acts element-wise over the previous state~$\x_{t-1}$ to produce the parameters of the distribution for~$\x_t$ as,
+\begin{equation}
+    q(\x_t\mid\x_{t-1}) = \prod_{d=1}^D q(\x_t[d] \mid \x_{t-1}[d]),
+\end{equation}
+where $\x_t[d]$~indicates the label at time~$t$ and pixel~$d$. In the following discussion, we will use~$x_t\in\mathcal{L}$ to refer to the label of a single pixel~$d$, and we will drop the index~$d$ for clarity. The pixel-wise transition distribution~$q(x_t \mid x_{t-1})$ gives the element-wise probability of the next label given the previous label as,
+\begin{equation}
+    \label{eq:q_xt_given_xt-1}
+    q(x_t\mid x_{t-1}) = \C\left(x_t ; \frac{\beta_t}{L}\mathbf{1} +
+    (1 - \beta_t) \mathbf{e}_{x_{t-1}}\right),
+\end{equation}
+where $\mathbf{1}=(1, \ldots, 1)^T$, $\mathbf{e}_\ell$ is the one-hot encoding vector with 1~in position~$\ell$ and $0$~elsewhere, and the hyperparameter~$\alpha_t = 1-\beta_t\in (0, 1)$ indicates the probability of keeping the label unchanged. $\C(x; \hat{\x})$~denotes the categorical distribution with parameter vector~$\hat{\x}\in[0,1]^L$. From the properties of categorical distributions, $\C(x\mid \hat{\x}) = \hat{\x}[x]$ and $\sum_x \hat{\x}[x] = 1$.
+
+The transition distribution of the forward process can be composed as,
+\begin{equation}
+    \label{eq:q_xt_given_x0}
+    q(x_t\mid x_0) = \C\left(x_t ; \dfrac{1 - \bar{\alpha}_t}{L}\mathbf{1} + \bar{\alpha}_t \mathbf{e}_{x_0}\right)
+\end{equation}
+with $\bar{\alpha}_t = \prod_{\tau=1}^{t} \alpha_\tau$, which enables efficient sampling of elements from the Markov chain at any location~$t$. Finally, the posterior of the transition distribution
+can be computed with the previous formulas by applying Bayes rule,
+\begin{equation}
+    q(x_{t-1}\mid x_t, x_0) = \C\left(x_{t-1} ; \bm{\pi}(x_t, x_0)\right),
+\end{equation}
+with,
+\begin{equation}
+    \label{eq:q_params}
+    \bm{\pi}(x_t, x_0) = \dfrac{1}{\tilde{\pi}}
+    \left(\frac{\beta_t}{L}\mathbf{1} + \alpha_t \mathbf{e}_{x_t}\right) \odot 
+    \left(\frac{1 - \bar{\alpha}_{t-1}}{L}\mathbf{1} + \bar{\alpha}_{t-1} \mathbf{e}_{x_0}\right)
+\end{equation}
+and $\tilde{\pi} = \frac{1 - \bar{\alpha}_t}{L} + \bar{\alpha}_t\cdot \delta_{x_t}^{x_0}$, where $\delta$~is the Kronecker delta.
+
+The transition distribution of the reverse process is also an element-wise categorical distribution,
+\begin{equation}
+    \label{eq:reverse_transition}
+    p_\theta(\x_{t-1}\mid\x_t) = \prod_{d=1}^D \C(x_{t-1} ; \hat{\x}_{t-1}),
+\end{equation}
+where $x_{t-1}=\x_{t-1}[d]$ is the label at pixel~$d$ and $\hat{\x}_{t-1} = \hat{\X}_{t-1}(\x_t)[d]$ is the estimated parameter vector for that pixel. Unlike the forward process, the parameter vector for the pixel~$d$ is not computed considering the element~$d$ of~$\x_t$ only. Instead, the function~$\hat{\X}_{t-1}:\mathcal{L}^D \to [0, 1]^{D\times L}$ considers the entire label map~$\x_t$ to produce a collection of $D$~probability distributions, thus incorporating context in this process.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.5\textwidth]{figures/Stochastic_Segmentation_with_CDM_v1904_crop.pdf}
+\caption{Illustration of the reverse process of our method. The conditional categorical diffusion model (CCDM) receives as input an image~$I$ and a categorical label map $\x^{(i)}_T$ sampled from the categorical uniform noise. The reverse process of the CCDM generates a label map $\x^{(i)}_0$, which is a sample from the learned distribution~$p(\x_0\mid I)$. When repeated for $N$~samples, we obtain an empirical approximation to the multimodal label distribution for the image~$I$, learned from the annotations of multiple expert raters. }
+\label{fig:ccdm_reverse_process}
+\end{figure}
+
+While it is possible to model~$\hat{\X}_{t-1}$ as a neural network, Ho \etal~\cite{ho2020denoising} suggested that a consistent output space for the network led to enhanced performance. Following this idea, we chose to train a network~$\hat{\X}_0:\mathcal{L}^D\times \{1,\ldots,T\} \to [0, 1]^{D\times L}$ that receives a label map~$\x_t$ and the step~$t$ and produce the probabilities of the categorical distributions for~$\x_0$ instead of~$\x_{t-1}$. We then transform the probabilities for each pixel,~$\hat{\x}_0=\hat{\X}_0(\x_t, t)[d]$, to the probabilities for the same pixel of~$\x_{t-1}$ as,
+\begin{align}
+    &\C(x_{t-1} ; \hat{\x}_{t-1}) = \\
+    &= \sum_{x_0} q(x_{t-1}\mid x_t, x_0)\cdot \C(x_0; \hat{\x}_0) \\
+    &= \sum_{x_0} \C(x_{t-1}; \bm{\pi}(x_t, x_0))\cdot \C(x_0; \hat{\x}_0),
+\end{align}
+from which,
+\begin{equation}
+    \label{eq:p_params}
+    \hat{\x}_{t-1} = \sum_{x_0} \bm{\pi}(x_t, x_0)\cdot \hat{\x}_0[x_0],
+\end{equation}
+where we have again omitted the pixel indices~$d$ for clarity. This transformation is not necessary when~$t=1$, as then~$\hat{\x}_{t-1}=\hat{\x}_0$ computed by~$\hat{\X}_0$.
+Note that the result of Eq.~\eqref{eq:p_params} differs from the probability vector computed in~\cite{hoogeboom2021argmax}, where they derive the ill-defined expression~$\hat{\x}_{t-1}=\bm{\pi}(x_t, \hat{\x}_0)$.
+
+\subsection{Conditional categorical diffusion}
+
+In stochastic segmentation, the label map~$\x_0$ for an image~$I$ is modeled by a distribution~$q(\x_0\mid I)$. We assume this distribution is too complex to be approximated by a pixel-wise categorical distribution. Instead, we use a conditional categorical diffusion model~$p(\x_0\mid I)$ (CCDM) to model the potentially complex interactions between labels and pixels.
+
+When conditioning the categorical diffusion model on an image, the forward process remains unchanged, $q(\x_{1:T}\mid \x_0, I) = q(\x_{1:T}\mid \x_0)$, as any latent variable is conditionally independent of the image given any previous variable. On the other hand, the reverse process needs to incorporate the dependency on the image in its transition distribution, $p_{\theta}(\x_{0:T}\mid I)=p(\x_T\mid I)\prod_{t=1}^T p_{\theta}(\x_{t-1}\mid\x_t, I)$. In practice, this dependency is enforced by an additional input to the neural network~$\hat{\X}_0(\x_t, t, I)$.
+
+\subsection{Training}
+
+Training is performed by maximizing the ELBO of Eq.~\eqref{eq:elbo}. Reorganizing terms and distributing expectations for variance reduction, we express the ELBO as a sum of three terms:
+\begin{align}
+    & \log p_\theta(\x_0\mid I) \ge \nonumber \\
+    & \mathbb{E}_{\x_1\sim q(\x_1\mid \x_0)}[\log p_\theta(\x_0\mid \x_1, I)] \\
+    & - \sum_{t=2}^T \mathbb{E}_{\x_t\sim q(\x_t | \x_0)}[KL(q(\x_{t-1}| \x_t, \x_0) \| p_\theta(\x_{t-1}| \x_t, I))] \\ 
+    & - KL(q(\x_T\mid \x_0) \| p(\x_T\mid I)). \label{eq:elbo_third}
+\end{align}
+
+The first two terms can be optimized by standard gradient ascent. We approximate the expectations with Monte Carlo sampling with a single sample. The sum over the time variable~$t$ is also approximated by a single uniform sample over~$\{1,\ldots,T\}$. The KL divergence of the second term is the sum of pixel-wise KL~divergences,
+\begin{equation}
+    \label{eq:kl_div}
+    KL(q\| p) = \sum_{d=1}^D KL(q(x_{t-1}|x_t, x_0) \| p_\theta(x_{t-1}|\x_t, I)),
+\end{equation}
+where the parameter vectors of distributions~$q$ and~$p$ are computed with Eqs.~\eqref{eq:q_params} and~\eqref{eq:p_params}, respectively. 
+Alg.~\ref{alg:training} shows the complete training procedure.
+
+The third term of Eq.~\eqref{eq:elbo_third} does not depend on the learnable parameters~$\theta$ and is ignored during training. Instead, it is optimized by the design of the categorical diffusion model. Since the forward process converges as
+\begin{equation}
+    \lim_{t\to\infty} q(x_t\mid x_0) = \C\left(x; \frac{\mathbf{1}}{L}\right),
+\end{equation}
+we fix~$p(\x_T\mid I)$ to the element-wise uniform distribution,
+\begin{equation}
+    p(x_T\mid I) = p(x_T) = \C\left(x_T; \frac{\mathbf{1}}{L}\right).
+\end{equation}
+This ensures that~$p(\x_T\mid I)\approx q(\x_T\mid \x_0)$, making the third term of the ELBO close to zero.
+
+
+\begin{algorithm}[t!]
+\caption{Training a CCDM with $T$~steps}
+\label{alg:training}
+\begin{algorithmic}
+\Require Training data expressed as the empirical distribution $q(\x_0, I) = q(\x_0\mid I)q(I)$.
+\Repeat
+\State $t \sim \textrm{Uniform}(\{1,...,T\})$
+\State $I \sim q(I)$
+\State $\x_0$ $\sim$ $q(\x_{0}\mid I)$\;
+\State $\x_t \sim q(\x_{t}|\x_{0})$
+\Comment{Eq.~\eqref{eq:q_xt_given_x0}}
+\State $\hat{\X}_0 \gets \hat{\X}_0(\x_t, I, t)$
+\If{$t > 1$}
+    \LineComment{Compute KL with Eqs.~\eqref{eq:kl_div}, \eqref{eq:q_params}, and~\eqref{eq:p_params}:}
+    \State $\ell \gets KL(q(\x_{t-1}|\x_{t},\x_{0})\|p_\theta(\x_{t-1}|\x_t,I))$ 
+
+\Else
+    \State $\ell \gets -\log p_\theta(\x_0\mid \x_1, I) = -\sum_d \log \C(x_0\mid \hat{\x}_0)$
+\EndIf
+\State $\theta \gets \theta - \nabla_\theta \ell$ \Comment{Gradient descent}
+\Until{converged}
+\end{algorithmic}
+\end{algorithm}
+
+At inference, the CCDM samples from~$p(\x_0\mid I)$ to generate label maps for a given image~$I$, which is achieved by traversing the Markov chain of the reverse process as outlined in Alg.~\ref{alg:segmentation} and illustrated in Fig.~\ref{fig:ccdm_reverse_process}. To minimize the noise of the generated label maps, the CCDM selects the label with maximum probability instead of sampling from~$\C(x_0\mid \hat{\x}_0)$ in the final step.
+
+
+\begin{algorithm}[ht!]
+\caption{Inference from a CCDM with $T$~steps}
+\label{alg:segmentation}
+\begin{algorithmic}[0]
+\Require Input image~$I$
+\State $\x_{T}$ $\sim$ $\C^D\left(x_T; \frac{\mathbf{1}}{L}\right)$\; 
+\State $\x_\textrm{prev}$ $\leftarrow$ $\x_{T}$
+\For{$t = T,...,1$}
+    \State $\hat{\X}_0$ $\leftarrow$ $\hat{\X}_0(\x_\textrm{prev}, I, t)$\;
+    \If{$t > 1$}
+        \State $\hat{\x}_{t-1} \gets \sum_{x_0} \bm{\pi}(x_t, x_0)\cdot \hat{\x}_0[x_0] \quad \forall d$   \Comment{Eq.~\eqref{eq:p_params}}
+        \State $\x_\textrm{prev} \sim \prod_d \C(x_{t-1}\mid \hat{\x}_{t-1})$
+    \Else
+        \State $\x_0 \gets \argmax_{\x_0} \hat{\X}_0[:,\x_0]$
+    \EndIf
+\EndFor{}
+\end{algorithmic}
+\end{algorithm}
+
+
+
+\subsection{Architecture of $\hat{\X}_0$}
+\label{subsec:conditioning}
+As described above, the neural network~$\hat{\X}_0$ receives a label map~$\x_t$, a time step~$t$, and an image~$I$ to estimate the probability parameters for~$\x_0$. The base design of~$\hat{\X}_0$ is a U-Net-like architecture~\cite{dmsBeatGans} with self-attention modules at the three innermost layers of the encoder and the decoder~\cite{dmsBeatGans}. The network processes the input label map represented as a binary tensor with $L$~channels encoding the label of each pixel as a one-hot vector. Parameters of the network are shared for all values of~$t$. The step variable $t$~is encoded with the standard transformer sinusoidal position embedding~\cite{ho2020denoising} and concatenated as additional channels to the input tensor and to the feature maps of intermediate layers. Similarly, information from the input image~$I$ is presented to the network as raw pixel values concatenated to the input tensor as additional channels. In some experiments we used a pre-trained transformer architecture Dino-ViT~\cite{Dino} to extract informative visual features from the image~$I$. In those cases, the extracted features were concatenated to the feature map of the third level of the U-Net encoder, which corresponds to a spatial shape equal to $\frac{1}{8}$ the shape of the input image.

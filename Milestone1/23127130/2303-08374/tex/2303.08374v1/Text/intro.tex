@@ -1,0 +1,212 @@
+\section{Introduction}
+\label{sec:intro}
+
+%Over the last few years, Deep Learning (DL) models have achieved state-of-the-art performance on modern problems such as recommender systems, natural language generation, and image processing. In a nutshell, DL is a subset of ML that relies on models involving deep neural networks (DNNs) that can learn implicit relationships between input and output data. DNNs consist of a matrix of weights that are first updated in order to minimize prediction loss before applying the final trained model to a dataset. In some cases such as recommender systems, DL models \cite{dlrm} can be composed of multiple DNNs and other data processing schemes (such as embedding tables). Training is highly compute-intensive, and requires massive amounts of data.
+
+Distributed DL has become the standard training method for many state-of-the-art vision \cite{gems}, language \cite{megatron-turing-nlg, meta-opt}, and recommendation \cite{dlrm-scale} DL models. As the largest models grow from hundreds of millions \cite{ResNet} to hundreds of billions of parameters \cite{megatron-turing-nlg}, new parallelization schemes have arisen to efficiently train DL models across thousands of processors \cite{zero, zero-offload, deepspeed}. While previous data-parallel DL models could heavily rely on a few collective operations (namely Allreduce), the model-parallel schemes of new models (e.g. sharding, pipeline and model parallelism, tensor slicing, etc) require a mixture of different collective and point-to-point operations \cite{dlrm, gshard, zero}. These advanced parallelization schemes rely heavily upon communication backends such as the NVIDIA Collectives Communication Library NCCL \cite{nccl} and CUDA-Aware MPI libraries \cite{openmpi, MVAPICH2}. However, modern communication backends have wildly varied performance characteristics across operations, within operations, and across releases (See Section \ref{sec:motivation} for a concrete example).
+
+% Perhaps part of a "problem statement" section? Merge as a single para and greatly shorten
+
+\subsection{Problem Statement}
+\label{sec:problem-statement}
+
+%Two leading distributed DL frameworks are Horovod \cite{horovod} and PyTorch's distributed module (upon which DeepSpeed \cite{deepspeed} is built). Horovod is primarily focused on data-parallel distributed DL, which replicates the entire DL model at each processor, and splits batches of data across the processors. As such, Horovod only supports a few key collective operations (Allreduce, Allgather, Bcast, and Alltoall at the time of writing). Further, since Horovod is a layer on top of existing DL frameworks, it can be quickly extended and installed by users. The drawbacks, however, are that Horovod does not support many of the advanced parallelism schemes that emerging models require. Further, any other communication operations required must be carried out with mpi4py \cite{mpi4py}, and the interplay between Horovod and mpi4py can quickly become complicated and error-prone. Finally, while Horovod has an experimental build option to mix communication backends, there is no support for deadlock avoidance. PyTorch's distributed module currently supports most collectives and Point-to-Point operations, but cannot mix different communication backends concurrently. Since the distributed module is built into the DL framework itself, any communication backend support besides NCCL requires a PyTorch source build, which is long and error-prone leading to lesser productivity. DL researchers studying novel parallelism schemes still often need to use makeshift custom communication layers using a more complete communication library in Python such as mpi4py to implement advanced communication operations. Finally, users could implement custom distributed training on top of existing DL frameworks exclusively with more complete communication libraries in Python such as mpi4py, but they would sacrifice performance benefits from the DL optimizations present in Horovod and PyTorch's distributed module (e.g. Tensor fusion, mixed precision, etc). 
+
+There are two primary drawbacks to existing distributed DL frameworks' communication: a lack of completeness in support for all communication operations/backends, and a lack of support for mixed-backend communication. Since modern distributed DL frameworks such as Horovod and PyTorch's Distributed module do not support all MPI or NCCL operations (e.g. vectored collectives such as Gatherv), DL researchers are required to either: \textbf{(Option 1):} implement their desired collectives via Point-to-Point operations (if point-to-point operations are supported in the chosen framework), or \textbf{(Option 2):} transfer tensors between the distributed DL framework and an external MPI Python wrapper such as mpi4py \cite{mpi4py}. Option 1 sacrifices the performance enhancements present in NCCL and most CUDA-Aware libraries, while option 2 introduces significant program complexity. For the second drawback, a lack of mixed-backend communication forces the user to decide where to sacrifice performance, since no communication backend performs all operations optimally (see Section \ref{sec:motivation} for a concrete example). These drawbacks bottleneck programmer productivity (e.g. a DL scientist must first implement an \textit{MPI\_Igather} before the intended optimization) and performance (e.g. NCCL performs well for Allreduce and MPI performs well for Alltoall. Which backend does one choose?), respectively.
+
+
+\begin{figure*}[htbp]
+  \begin{center}
+      \mbox {
+          \hspace{-1\columnsep}
+          \subfigure[Proportion of computation to communication for distributed DL training]
+          {
+              \includegraphics[width=.4\textwidth,trim=2 2 2 2,clip]{Graphs/computevcomms.png}
+              \label{fig:computevcomms}
+          }
+          \hspace{4ex}
+          \subfigure[Breakdown of individual communication operations for distributed DL training]
+          {
+              \includegraphics[width=.4\textwidth,trim=2 2 2 2,clip]{Graphs/commsbreakdown.png}
+              \label{fig:comms-breakdown}
+          }
+      }
+      \vspace*{-0.5\baselineskip}
+      \caption{Computation vs. Communication and breakdown of Communication operations breakdown for ResNet-50 (64 V100 GPUs on Lassen), DS-MoE (64 V100 GPUs on Lassen), and DLRM (32 A100 GPUs on Theta-GPU)}
+      \label{fig:comms-profiles}
+  \end{center}
+\vspace*{-1\baselineskip}
+\end{figure*}
+
+\begin{comment}
+      \mbox {
+          \hspace{-1\columnsep}
+          \subfigure[ResNet-50]
+          {
+              \includegraphics[width=0.5\columnwidth]{Graphs/computevcomms-rn50.png}
+              \label{fig:computevcomms-rn50}
+          }
+          \subfigure[DLRM]
+          {
+              \includegraphics[width=0.5\columnwidth]{Graphs/computevcomms-dlrm.png}
+              \label{fig:computevcomms-dlrm}
+          }
+          \subfigure[DS-MoE]
+          {
+              \includegraphics[width=0.5\columnwidth]{Graphs/computevcomms-dsmoe.png}
+              \label{fig:computevcomms-dsmoe}
+          }
+      }
+      
+      \mbox {
+          \hspace{-1\columnsep}
+          \subfigure[ResNet-50]
+          {
+              \includegraphics[width=0.5\columnwidth]{Graphs/comms-breakdown-rn50.png}
+              \label{fig:comms-breakdown-rn50}
+          }
+          \subfigure[DLRM]
+          {
+              \includegraphics[width=0.5\columnwidth]{Graphs/comms-breakdown-dlrm.png}
+              \label{fig:comms-breakdown-dlrm}
+          }
+          \subfigure[DS-MoE]
+          {
+              \includegraphics[width=0.5\columnwidth]{Graphs/comms-breakdown-dsmoe.png}
+              \label{fig:comms-breakdown-dsmoe}
+          }
+      }
+\end{comment}
+
+\subsection{Proposed Solution}
+\label{sec:proposed-solution}
+
+We believe that a single unified interface between a given DL framework and the desired communication backend(s) (MPI, NCCL, etc) will alleviate these performance and productivity bottlenecks, while introducing the possibility of mixed backend communication (e.g. MPI Alltoall and NCCL Allreduce).
+
+\begin{figure*}[hbtp]
+  \begin{center}
+      \mbox {
+          \hspace{-1\columnsep}
+          \subfigure[64 GPUs (16 node 4 ppn) - iAllreduce]
+          {
+              \includegraphics[width=0.4\linewidth,trim=2 2 2 2,clip]{Graphs/iallreduce-lassen-line-64gpu.png}
+              \label{fig:iallreduce-lassen-64gpu}
+          }
+          \hspace{4ex}
+          \subfigure[64 GPUs (16 nodes 4 ppn) - Alltoall]
+          {
+              \includegraphics[width=0.4\linewidth,trim=2 2 2 2,clip]{Graphs/alltoall-lassen-line-64gpu.png}
+              \label{fig:alltoall-lassen-64gpu}
+          }
+      }
+      \vspace*{-0.5\baselineskip}
+      \caption{Comparison of communication backends' collective performance on basic micro-benchmark with 64 V100 GPUs on Lassen}
+      \label{fig:colls-lassen-64gpu}
+  \end{center}
+\vspace*{-1\baselineskip}
+\end{figure*}
+
+% unused omb collectives
+\begin{comment}
+      \mbox{
+          \hspace{-1\columnsep}
+          \subfigure[64 GPUs (16 nodes 4 ppn) - Allgather]
+          {
+              \includegraphics[width=0.4\linewidth]{Graphs/allgather-lassen-line-64gpu.png}
+              \label{fig:allgather-lassen-64gpu}
+          }
+          \subfigure[64 GPUs (16 nodes 4 ppn) - Broadcast]
+          {
+              \includegraphics[width=0.4\linewidth]{Graphs/bcast-lassen-line-64gpu.png}
+              \label{fig:bcast-lassen-64gpu}
+          }
+      }
+      
+      \mbox {
+          \hspace{-1\columnsep}
+          \subfigure[64 GPUs (16 node 4 ppn) - Gather]
+          {
+              \includegraphics[width=0.4\linewidth]{Graphs/gather-lassen-line-64gpu.png}
+              \label{fig:gather-lassen-64gpus}
+          }
+          \subfigure[64 GPUs (16 nodes 4 ppn) - Scatter]
+          {
+              \includegraphics[width=0.4\linewidth]{Graphs/scatter-lassen-line-64gpu.png}
+              \label{fig:scatter-lassen-64gpu}
+          }
+      }
+\end{comment}
+
+% NOTE: I'm putting the table here until I want to deal with placement
+\renewcommand{\arraystretch}{1.5}
+\begin{table*}[htb!]
+\label{tab:related}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{|c|c|c|c|c|c|c|}
+\hline
+\multirow{2}{*}{\textbf{Studies}}                                                                  & \multicolumn{6}{c|}{\textbf{Features}}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   \\ \cline{2-7} 
+                                                                             & \textbf{\begin{tabular}[c]{@{}c@{}}Point-to-Point\end{tabular}} &
+                                                        \textbf{\begin{tabular}[c]{@{}c@{}}Collectives\end{tabular}} &
+                                                        \textbf{\begin{tabular}[c]{@{}c@{}}Vector Collectives\end{tabular}} &                             \textbf{\begin{tabular}[c]{@{}c@{}}Non-Blocking Operations\end{tabular}} &                              \textbf{\begin{tabular}[c]{@{}c@{}}Mixed-Backend Communication\end{tabular}} &  \textbf{\begin{tabular}[c]{@{}c@{}}Backend as a Class\end{tabular}} \\ \hline
+\textbf{ \begin{tabular}[c]{@{}c@{}}Horovod\end{tabular}}                                                                                                &  \xmark                    &  \cmark   &  \xmark   &  NCCL Only                                                                      &  Experimental                                                                                    &  \xmark                                                                                      \\ \hline
+\textbf{\begin{tabular}[c]{@{}c@{}}PyTorch Distributed Module\end{tabular}}     &  \cmark    & \cmark  &  \xmark                                                             & NCCL Only                                        & \xmark                          & \cmark                                                                                                                                                       \\ \hline
+\textbf{LBANN}                       &  \cmark      &  \cmark  &  \xmark        &  \cmark                                                                                                     &  \xmark                                                                               &  \xmark                                                                                      \\ \hline
+\textbf{mpi4py\cite{mpi4py}}              &  \cmark  &  \cmark  &  \cmark        & \cmark                                                                                                     & \xmark                                                                                          & \xmark                                                                                 \\ \hline
+\textbf{\color[HTML]{009901}Proposed MCR-DL}         & \color[HTML]{009901}\cmark  & \color[HTML]{009901}\cmark         & \color[HTML]{009901}\cmark                                                                                                     & \color[HTML]{009901}\cmark                          & \color[HTML]{009901}\cmark                                             & \color[HTML]{009901}\cmark                                                                              \\ \hline
+\end{tabular}
+}
+\vspace{1ex}
+\caption{Features offered by MCR-DL compared to existing frameworks}
+\vspace{-5ex}
+\end{table*}
+
+In this paper, we introduce and evaluate a \textbf{Mix-and-Match Communication Runtime for Deep Learning (MCR-DL)}. Specifically, MCR-DL is a lightweight unified interface between the DL framework (PyTorch) and any combination of ABI-compatible\footnote{An Application Binary Interface (ABI), is the low-level interface between two program modules. An ABI determines such details as how functions are called and the size, layout, and alignment of datatypes. With ABI-compatibility, programs conform to the same set of runtime conventions.} communication backends. MCR-DL users can dynamically switch between communication backends during distributed DL training. MCR-DL supports many existing communication backends (by implementing them as a high-level backend class), and provides an extensible design to enable new communication backends and performance optimizations.
+
+%Number these (P1-P4) and reference throughout paper
+
+\begin{comment}
+\begin{enumerate}
+    \item[\textbf{P1)}] Full support for all point-to-point and collective communication operations (Section \ref{sec:design-api})
+    \item[\textbf{P2)}] Support for mixed-backend communications while remaining deadlock-free (Section \ref{sec:design-mixed-backend})
+    \item[\textbf{P3)}] Built on top of existing DL framework(s) as part of the Python ecosystem (Section \ref{sec:design-extensibility})
+    \item[\textbf{P4)}] Low overhead compared to low-level pure (C/C++) libraries (Section \ref{sec:results-microbench})
+\end{enumerate}
+\end{comment}
+
+\subsection{Motivation}
+\label{sec:motivation}
+
+First, we profiled the computation and communication overhead of three representative DL models: DLRM and DeepSpeed-MoE (state-of-the-art hybrid-parallel DL models), and ResNet-50 (established data-parallel DL model). The overall computation vs. communication split as well as communication breakdown profiles are depicted in Figure \ref{fig:comms-profiles}. First, we note that data-parallelism is strongly compute-dominated, and its communication overhead is almost entirely made up of Allreduce. Therefore, data-parallel applications like ResNet-50 are able to achieve the best performance on existing monolithic distributed DL frameworks, and the choice of communication backend is simply determined by whichever library has the fastest CUDA-Aware Allreduce. We note that MCR-DL is still applicable to data-parallel frameworks with tuning (See Section \ref{sec:design-tuning} and Table \ref{tab:tuning-table} for details), but due to their much lower communication overhead, the benefits are marginal.
+
+However, DLRM and DS-MoE have a significantly higher communication overhead at scale. Further, their communication operation requirements are heterogeneous. Therefore, there is a lot of room for mixing backends according to their strengths in order to improve training throughput.
+
+\textit{Consider the case of DS-MoE. Given the communication breakdown in Figure \ref{fig:comms-breakdown} and the collective performance in Figure \ref{fig:colls-lassen-64gpu}, which communication backend should be used?} A myriad of application questions would need to be answered such as which collectives DS-MoE uses, their relative frequencies, and the range of message sizes for each collective. Any decision on a single communication backend will lose out on some collectives and at some message ranges. Specifically, since DS-MoE relies mostly on Allreduce and Alltoall, we could refer to Figure \ref{fig:colls-lassen-64gpu} and reduce communication overhead by applying MVAPICH2-GDR for Alltoall and NCCL for Allreduce. However, such a decision will need to be reevaluated at each subsequent release cycle of the communication backends. If the user is able to dynamically switch among communication backends, they could squeeze more performance out of their application while reducing the setup cost of changing communication backends if future communication backend releases change. 
+
+
+\subsection{Contributions}
+
+% Remove this para, shorten to sentence, number the list
+
+%In this section, we summarize the key contributions of this work. To the best of our knowledge, no distributed DL library provides deadlock-free mixed-backend communication while fully implementing all communication operations. We introduce MCR-DL, a thin layer bridging the DL framework (PyTorch) and communication backends (MPI, NCCL, etc). MCR-DL is capable of deadlock-free mixed-backend communication, and is easily extensible to new communication backends and optimizations. We demonstrate MCR-DL on DLRM and DeepSpeed-MoE, two state-of-the-art DL models that rely heavily on multiple collective operations. For a detailed comparison of major studies in this field, see Section \ref{sec:related}.
+
+Our contributions are as follows:
+
+% add forward pointers to some/all of these
+\begin{enumerate}
+
+    \item[\textbf{C1)}] We proposed, designed, and evaluated MCR-DL: an extensible, scalable API for DL communication operations. MCR-DL supports all point-to-point and collective communication operations on PyTorch tensors, and all collective communication libraries (Section \ref{sec:design-api})
+    
+    \item[\textbf{C2)}] We enabled deadlock-free mixed-backend DL communication via fine-grained synchronization techniques (Section \ref{sec:design-mixed-backend})
+    
+    \item[\textbf{C3)}] We fully implemented MCR-DL in a C++ backbone underneath a thin Python layer, and achieved a maximum of 5\% overhead (compared to a pure micro-benchmark written in C) for small messages and a 1\% overhead for large messages (down from 18\% and 4\% in PyTorch distributed, respectively) (Figure \ref{fig:overhead})
+    
+    \item[\textbf{C4)}] MCR-DL offers up to 31\% throughput improvement (12\% in scaling efficiency) in DeepSpeed-MoE and 25\% throughput improvement (14\% improvement in scaling efficiency) in DLRM by dynamically selecting the best-performing communication backend at each scale and message size (Figures \ref{fig:moe-results} and \ref{fig:dlrm-results})
+    
+    \item[\textbf{C5)}] Define and implement a tuning framework within MCR-DL that enables the best communication backend to be automatically selected for each communication operation (Section \ref{sec:design-tuning})
+    
+    \item[\textbf{C6)}] Demonstrate the extensibility of MCR-DL by adding support for communication compression, logging, and tensor fusion (Section \ref{sec:design-extensibility})
+    
+    %need 6 solid contributions. Perhaps #5 should be fig 10 (compute/comms breakdown). Add scaling efficiency. 
+    %to the best of our knowledge...
+    
+\end{enumerate}

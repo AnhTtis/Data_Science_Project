@@ -1,0 +1,118 @@
+\vspace{0.2cm}
+\section{Planning Framework}
+\label{sec:fram}
+\noindent %-block diagram with do path prediction, then trajectory generation with core and execute for ego
+We tackle motion planning in structured environments by searching the velocity space $v$ over future times $s$. As depicted in Figure \ref{fig:simulator}, ROPT initially receives latest positions 
+$\textbf{x}_i$, velocities $v_i$ and given map paths for the green ego car and $N_o$ other red cars (subscripted by $j$).\footnote{A traffic situation consists in this way of $N_o+1$ participants indexed with $i$.} Without prior knowledge, 
+other trajectories are predicted on their respective paths with constant velocity up to a prediction horizon $s_h$. The goal of ROPT is now to optimize parameters $\boldsymbol{\uptheta}$ from
+multiple velocity profiles $v^m$ for the ego agent. For this purpose, we alternate between adjusting $\boldsymbol{\uptheta}$ and evaluating risks $R(t)$, utility $U(t)$ and comfort $O(t)$ 
+of the arising dynamic scene for the current time $t$. Once a defined cost threshold is satisfied for each sample, $v^m$ with the lowest cost is chosen and executed within a simulation step $\Delta t$ to obtain accelerations $a_i$ 
+and jerks $r_i$. %actually when difference between function value or input value is under threshold %\footnote{We choose a plain double integrator, however vehicle dynamic models, such as the two-track model, can be added here if necessary.} %\footnote{Vehicle dynamic models, such as the two-track model, can be added if necessary. For our purposes, we choose however a plain double integrator.} 
+In doing so, the simulator either updates other vehicles from measured fixed trajectories or controls them with their own planners. %Vehicle dynamic models, such as the two-track model, can be hereby added if necessary. For our purposes, we choose however a plain double integrator. %For the simulation, we use a simple double integrator. 
+
+
+\subsection{Trajectory Optimization} 
+\label{sec:trajgen}
+
+%-Snake Trajectory \\
+In complex scenarios with more than one risk source (i.e., driving in curve while crossing crowded intersection), the cost functional is non-convex. To overcome local minima, velocity shapes with high degrees of freedom are necessary. We choose for ROPT $n=4$ segments having fixed length $s_l=\unit[2.5]{\text{sec}}$ but variable end velocities $v_{p,n}$ (see left-hand side of Figure \ref{fig:snakes}, whereby $p$ stands for one parameter in the parameter set $\boldsymbol{\uptheta}$). %The first ramp starting the current velocity $v_0$ 
+This allows to proactively plan tactical maneuvers, such as consecutively braking, keeping velocity and accelerating back. After each step $\Delta t$, the resulting ``snake'' profile is then time-shifted by an offset $o$ to match the new start velocity $v_0$ with same slopes $v_{p,n}$ for faster convergence. %After finding an optimal trajectory, $v_{p,n}$ can thus stay similar with less computational effort.        
+Because $v(s)$ is discontinuous, we furthermore introduce an adjustable first lag $\lambda_{p,0}$ in the acting acceleration $a_0$. The right-hand side of Figure \ref{fig:snakes} shows that the following ramp transitions are supplementary smoothed with a Gaussian filter $h_g$.  %for reduced peaks
+
+\begin{figure}[t!]
+      \centering
+      \resizebox{\linewidth}{!}{
+      \import{img/}{smoothed_snake.pdf_tex}}
+      \caption{Left: Parameters and shift of chosen velocity snake. Right: Lag implementation and corner smoothing.} %exemplary
+      \label{fig:snakes}
+\end{figure}
+
+ROPT uses the non-gradient Powell's optimization method \cite{powell1964} which iteratively fits for $\boldsymbol{\uptheta}$ a quadratic function to three evaluation points and finds its vertex. %for each entry in theta %\footnote{On average, it takes less than 20 iterations to reach a suitable ego trajectory.} %A suitable ego trajectory is found usually in maximum 20 iterations. 
+Soft constraints are set with penalizations for exceeding the minimal/maximal values $v_{\text{max}}$, $\lambda_{\text{min}}$, $a_{\text{min}}$ and $a_{\text{max}}$. Altogether, the optimization problem can thus be formulated as   
+\begin{equation}
+\text{min} \hspace{0.1cm} f \hspace{-0.05cm} \underbrace{(v_{p,1}, v_{p,2}, v_{p,3}, v_{p,4}, \lambda_{p,0})}_{\mbox{\footnotesize decision variables $\boldsymbol{\uptheta}$}} = \underbrace{R(t) - U(t) - O(t)}_{\mbox{\footnotesize fitness function $f$}},
+%\text{min} f(\theta) = \underbrace{(\tau_0, v_1, v_2, v_3, v_4)}_{\mbox{\footnotesize decision variables}} = \underbrace{R(t) + O(t) - U(t)}_{\mbox{\footnotesize fitness function}} = C(t)
+\label{eq: optimization}
+\end{equation}
+%\vspace{-0.1cm}
+\begin{equation}
+%\vspace{-0.4cm}
+\text{subject to } v_{p,n} \leq  v_{\text{max}}, \hspace{0.15cm} \lambda_{p,0}  \geq \lambda_{\text{min}}, \hspace{0.15cm} a_{\text{min}} \leq  a_{p,n} \leq a_{\text{max}} \nonumber
+%\text{subject to } \hspace{0.4cm} &\unit[0]{m/\text{sec}} \leq  v_i \leq  v_{\text{max}} \hspace{0.2cm} \nonumber \\ 
+%&a_{\text{min}} \leq  a_i \leq a_{\text{max}} \\ %, \hspace{0.2cm} 
+%&\unit[0]{\text{sec}} \leq  \tau_0 \leq \tau_{\text{max}} \nonumber
+\label{eq: constraints}
+\end{equation}
+\noindent with segment accelerations $a_{p,n}$. A suitable ego maneuver is usually attained in less than 20 cycles. If not, we force the termination after a firm cycle number. %If not, we terminate the optimization after a fixed cycle number.  %For real-time capabilities, the optimization ends by default after 30 cycles. 
+Besides the optimized snakes, we also sample fixed trajectories in our implementation: one constant velocity trajectory as well as one emergency stop and one acceleration trajectory. All trajectories are always evaluated in terms of their fitness, and one is in the end selected for behavior execution. Here, we introduce an hysteresis so that a switch to a different trajectory $v^m$ is done when the risk $R(t)$ of the new trajectory is relatively and absolutely smaller for a set period of time. 
+
+\subsubsection{Smoothing Discrete Snake Function} 
+%-picture with smoothing and tangent points and then next the smoothed verlauf of velocity \\
+\noindent If we assume instantaneous actuation with fixed direct velocity points, ROPT may create trajectories which are unfeasible in real vehicles. The effective jerk $r(s)$ from $v(s)$ 
+requires a continuous velocity curve. For this reason, we extrapolate the initial acceleration $a_0$ for the time $\lambda_{p,0}$ and blend its velocity line with the old ramp $(v_0,v_{p,1})$  according to   %and a weight factor $w(s)$
+\begin{equation}
+v(s) = v_0 +  (\lambda_{p,0}-s)a_0 + \frac{s}{s_l} (v_{p,1} - v_0)
+\end{equation}
+whereby $s=[0,\lambda_{p,0}]$. Afterwards, $v(s)$ is convoluted for the complete prediction interval $s_h$ with a Gaussian function %having constants $\sigma_s^2$ and $\mu_s$ given by
+\begin{equation}
+h_g(s)=N(\sigma_s^2,\mu_s=0). 
+\end{equation}
+We set the variance $\sigma_s^2$ and use $\mu_s=0$ to achieve further smoothness of the overall velocity curve without overshooting. As the derivatives $a(s)$ and $r(s)$ are numerically recalculated after the smoothing steps for $v(s)$, errors from asynchronicity are prevented. 
+
+Consequently by optimizing $\lambda_{p,0}$, ROPT is able to influence the course of $r(s)$ (i.e., gradual actuation). Limits for $\lambda_{p,0}$ have to be enforced even when high-risk situations occur. The average brake lag to decelerate at once from $0$ to $a_{\text{min}}$ amounts to $\lambda_b=\unit[0.4]{\text{sec}}$ and engine acceleration to $a_{\text{max}}$ takes $\lambda_e = \unit[0.8]{\text{sec}}$.\footnote{In contrast, the action of taking the foot off the brake or gas pedal has immediate effect on the car.} With this in mind, we qualify the minimal lag threshold $\lambda_{\text{min}}$ depending on the acceleration $a_0$ as
+\begin{equation}
+\text{if } a_0 \geq 0 \text{: } \lambda_{\text{min}} = \frac{a_0}{a_{\text{max}}} \lambda_e , \hspace{0.2cm} \text{else: } \lambda_{\text{min}} = |\frac{a_0}{a_{\text{min}}}| \lambda_b. 
+\end{equation}
+%-$\tau_{\text{min}}=\unit[0.4]{\text{sec}}$ if $a<0$, $\tau_{\text{min}}=\unit[0.8]{\text{sec}}$ if $a>0$
+Compared to employing continuous polynoms, our modified snake behaves smoothly and does not require the solution of a linear equation system to map $\boldsymbol{\uptheta}$ to the function shape.
+In non-risky scenarios, ROPT is hence able to concentrate on comfortable behaviors. %has the advantage that there is no need of solving a linear equation system.
+
+\subsection{Risk, Utility and Comfort Prediction}
+\label{sec:trajeval}
+\noindent
+In the following, we look at one future plan $v^m(s)$ for the ego vehicle combined with constant velocities $v_j(s)$ of the other vehicles. %The evaluation step treats the contained dynamic 
+This subsection describes the computation of the entire accumulated future costs $R(t)$, $U(t)$ and $O(t)$ contained in the resulting scene state sequence $\textbf{z}_{t:t+s}$, starting from time $t$ and evolving over $s$.  %\ref{sec:trajeval}
+
+For the risk analysis, we can only postulate that $\textbf{z}_{t:t+s}$ will happen with a certain probability (e.g. because of sensor inaccuracies or unkown drivers' intention). % from collision and curve
+%ROPT combines two probabilistic methods a Gaussian method for an instantaneous collision probability with the survival analysis
+%[6] to retrieve an accumulated critical event probability. 
+On this account, ROPT models accident occurences within an inhomogeneous Poisson process. The total event rate $\tau^{-1}(\textbf{z}_{t+s})$ describes the \makebox[\linewidth][s]{mean time between events. When subdivided into an escape}  \par
+\noindent rate $\tau_0$ (behavioral options mitigating dangers) and critical rates of collisions $\tau^{-1}_{\text{crit},j}$ as well as of losing control in curves $\tau^{-1}_{\text{curv}}$, we gain %\footnote{To compute $\tau_{\text{coll}}$, we take the overlap of 2D normal distributions around the expected positions between car pairs and $\tau_{\text{coll}}$ compares }
+\begin{equation}
+\tau^{-1}(\textbf{z}_{t+s}) = \tau_0 + \sum_j  \tau^{-1}_{\text{coll,j}}+\tau^{-1}_{\text{curv}}.
+\vspace{-0.04cm}
+\label{eq:taucrit}
+\end{equation} 
+In Equation (\ref{eq:taucrit}), normal distributions are additionally defined for the positions and velocities growing after each prediction step size $\Delta s$. While $\tau^{-1}_{\text{coll}}$ is dependant on the distances $d_j(s)$ of car pairs, $\tau^{-1}_{\text{curv}}$ takes the lateral ego acceleration $a_{\text{y}}(s)$ into account.\footnote{For further details about the Gaussian method, please refer to \cite{puphal2018}.} 
+
+Since the conveyed kinetic energy in a casualty is proportional to the operating masses $m_i$ and velocity vectors $\textbf{v}_i$, we use for collision and curve damage
+\begin{equation}
+D_{\text{coll},j}(s;t,\Delta s) = D_0+ \frac{m_1m_j}{2(m_1+m_j)}\| \textbf{v}_j - \textbf{v}_1 \|^2,
+\end{equation}
+\begin{equation}
+D_{\text{curv}}(s;t, \Delta s) = D_0 + \frac{1}{2}m_1 \| \textbf{v}_1 \|^2
+\end{equation}
+with an offset $D_0$. Anytime a crash is not possible conditional to kinodynamics of the cars, $D_{\text{coll},j}$ is set to $0$.
+%The kinetic energy of the accident (proportional to velocity vectors $v_i$) is 
+By introducing a survival probability that the ego entity will not be engaged in an event during $[t, t+s]$ via
+\begin{equation}
+S(s;t,\textbf{z}_{t:t+s})=\exp\{-\int_o^s \tau^{-1}(\textbf{z}_{t+s'}) \, ds'\},
+\end{equation}
+we eventually obtain $R(t)$ as the temporal integration of rates, damages and probabilities%\footnote{A straightforward numerical calculation of the integral is sufficient with small $\Delta s$.}
+\begin{equation}
+R(t) = \int_0^{\infty} (\sum_j \tau_{\text{coll},j}^{-1}D_{\text{coll},j}+\tau_{\text{curv}}^{-1}D_{\text{curv}})S \,ds.
+\label{eq: risk}
+\end{equation} 
+A straightforward numerical calculation of the integral is sufficient with small $\Delta s$, e.g. we utilize $\unit[0.05]{\text{sec}}$.
+
+Besides minimizing risk, ROPT maximizes benefit (i.e., utility and comfort) as well. The considered utility consists of the overall needed time to arrive at the goal affected from the ego velocity $v_1$ and deviations to the desired velocity $v_d$. The components are weighted with driver-specific constants $b^t$ and $b^d$ to retrieve
+\begin{equation}
+U(t) = \int_0^{\infty} (b^t |v_1| + b^d |v_1 - v_d|) S \,ds.
+\label{eq: utility}
+\end{equation} 
+Comfort returns are granted if the behavior does not change (ego acceleration $a_1\approx 0$) and the approach to planned $a_1$ is slow (ego jerk $j_1\approx 0$) so that 
+\begin{equation}
+O(t) = \int_0^{\infty} -(b^c |a_1| + b^j |j_1|) S \,ds.
+\label{eq: comfort}
+\end{equation} 
+Calibrating the occuring parameters $b^c$ and $b^j$ in combination with $b^t$ plus $b^d$ allows to reproduce different driver characteristics, such as conservative versus sporty. The costs are therefore expressed in the same unit \euro \hspace{0.04cm}. For higher $s$, we also consider the survival function $S$ in Equation (\ref{eq: utility}) and (\ref{eq: comfort}) so that predicted benefits cannot surpass risk factors. % High-risk situations should not be surpassed for benefit reasons.

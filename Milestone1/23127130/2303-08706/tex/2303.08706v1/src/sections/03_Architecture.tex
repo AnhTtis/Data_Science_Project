@@ -1,0 +1,178 @@
+\section{Architecture}\label{section:Architecture}
+
+The hardware template we rely on is the multi-core \gls{pulp} cluster~\cite{rossi_pulp_2015}, which can be extended with an external host subsystem featuring a controller core, a larger memory, and interfaces for external peripherals. The host subsystem is not area and performance-critical, and we assume it can be made fault-tolerant by means of high-overhead techniques.
+
+\subsection{Background: The PULP Cluster}
+The \gls{pulp} cluster~\cite{rossi_pulp_2015} is built around a parametric number of 32-bit CV32E40P cores~\cite{gautschi_near-threshold_2017}, enhanced for fast \gls{dsp} calculations. This open-source core is industrially verified by the OpenHW Group~\cite{group_openhw_2023}, ensuring the hardware is designed and operates as specified.
+Following the Harvard architecture template, the cores have two main interfaces. The first is the instruction interface, connected to a hierarchical instruction cache~\cite{chen_scalable_2023}. It consists of multiple private banks, one for each of the cores, each configured to store \SI{512}{B}. These private banks fetch their instruction from a larger, shared cache of \SI{4}{KiB}, improving the performance of typical applications that parallelize the same instructions across the cores for different data.
+
+The second interface is the data interface, connecting the cores to the rest of the system through dedicated de-multiplexers for direct access to the system's \gls{tcdm} and all other memory-mapped peripherals. The \gls{tcdm} comprises a parametric number of \SI{32}{bit} word-interleaved memory banks featuring single-cycle access latency. A banking factor of 2 (i.e., the number of memory banks is twice the number of cores) is typically used to minimize the memory banks contention probability, guaranteeing data sharing overhead smaller than 5\%, even for highly memory-intensive workloads. If a collision occurs, round-robin arbitration guarantees fairness and avoids starvation.
+
+Along with the connection to the \gls{tcdm}, the cores have access to a peripheral interconnect, enabling access to both memory-mapped devices within the cluster and the host domain. One of the core-local peripherals is the \gls{dma} unit, capable of up to \SI{64}{bit\per cycle} data transfers in either direction, full duplex between the external larger memories in the host subsystem and the cluster's local \gls{tcdm}.
+
+Finally, the cores directly connect to an event unit~\cite{glaser_energy-efficient_2021} responsible for synchronization barriers within the cluster. Each core attempts to read from the corresponding register within the event unit and only receives a response once all cores request the same barrier address. Furthermore, the event unit manages interrupts within the cluster, masking and forwarding incoming interrupt signals to the responsible core.
+
+To ensure the cluster can easily access the host system, the cluster has both an input and an output AXI port connected to an AXI interconnect. Through this interconnect, a host can access the cluster's internal memory and peripherals for configuration. To ensure proper operation, the instruction cache, the \gls{dma}, and the cores through the peripherals interconnect have access to the host system's memory.
+
+The \gls{pulp} ecosystem offers open-source software for parallel code execution on the multi-core cluster~\cite{montagna_streamlining_2021}. For various host systems, the software is provided to configure and boot the accelerating cluster and basic low-level drivers that allow for parallel software execution. The software ecosystem also provides a variety of parallel applications and benchmarks, enabling fast development of custom workloads. 
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\columnwidth]{src/figures/hmr-cluster-dashed.drawio.pdf}
+    \caption{Integration of the \gls{hmr} unit within the \gls{pulp} cluster.}
+    \label{fig:hmr}
+\end{figure}
+
+\subsection{System-Level Integration}
+Relying on the fact that the \gls{pulp} cluster provides an ideal foundation to exploit custom hardware modifications, we focus on implementing modular redundancy to safeguard the many parallel cores' operation. To this purpose, our design approach and experimental evaluations assume that the modules outside the cores, particularly the \gls{tcdm} and the instruction memories, are reliable and protected by dedicated safety-critical techniques, such as \gls{ecc} encodings and memory scrubbers.
+% The \gls{pulp} cluster provides an ideal foundation to implement modular redundancy, with many parallel cores and a configurable software ecosystem to support custom hardware modification. The focus of the proposed work is to exploit modular redundancy to safeguard the computing cores' operation, 
+In the \gls{hmr} cluster, the cores are grouped into lockstep, either in \gls{dcls} or \gls{tcls}. All inputs and outputs to the cores pass through a \gls{hmr} unit surrounding the cluster cores, as shown in \Cref{fig:hmr}. When configured with 12 cores in the cluster, the \gls{hmr} unit can easily divide all cores into groups of 2 and 3 for \gls{dcls} and \gls{tcls}, respectively, without remainder. Should a different number of cores be chosen, the respective mode will be unavailable for the remaining cores.
+
+To properly access the configuration registers within the \gls{hmr} unit, it exposes a peripherals memory port connected to the peripherals interconnect in the \gls{pulp} cluster. Through this interconnect, any core within the cluster and any controller outside the cluster with access to the host memory port can configure the \gls{hmr} unit. Furthermore, this memory port also allows the readout of all other memory-mapped registers within the unit, such as the current reliability state and error statistics measured within the unit. As the access to peripherals is infrequent, the system is designed with a few additional latency cycles in the peripheral interconnect to avoid tight timing constraints, which leads to access times longer than a single cycle when accessing these registers.
+
+\subsection{Hybrid Modular Redundancy Block}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\columnwidth]{src/figures/hmr-DCLS.drawio.pdf}
+    \caption{\acrfull{dmode} grouped cores.}
+    \label{fig:dmr}
+\end{figure}
+ 
+Modular redundancy requires multiple hardware instances performing the same operation to ensure correct execution, with the result being compared in a \gls{dmr} case or voted in a \gls{tmr} case. For reliable calculations, all inputs of two or three cores are directly connected with each other, ensuring that the cores receive identical signals for subsequent processing. The outputs of the cores are then connected to dedicated checkers or majority voters to ensure matching calculations or detect any faults that might have occurred and then apply a recovery. When grouped, the locked cores behave within the system as a single virtual core.
+
+While the cores are protected in case a fault occurs, the checkers and majority voters may also be vulnerable to soft errors. To mitigate this, we assume the cores implement additional protections for the bus, for example using \gls{ecc}, being checked on a protocol level within the protected core region. Thus, any error occurring within the checkers and majority voters will result in a bus error, which can then be corrected.
+
+\subsubsection{Dual-Core Lockstep}\label{subsection:DCLS}
+When configured in \gls{dmode}, the cores in the \gls{pulp} cluster are paired, identifying one main core and one helper core, as shown in \Cref{fig:dmr}. From a system perspective, one core is disabled to no longer act on the system's interconnect, while the other continues processing based on both cores' execution.
+
+The cores of each group are configured to receive the same input information, so they are expected to generate the same output results. The outputs of each core in a group are then propagated to a bitwise checker that detects whether the results produced by the two cores are different. If the results of the two cores match, the checker selects only the result of the main core as an effective output of the pair, propagating it to the rest of the system. On the other hand, in case of a mismatch, the checker raises an error signal, indicating that a fault affected the status of one of the two cores in the group. Since it is impossible to know which core produced the correct output in \gls{dmode}, the checkers gate their outputs toward the system to avoid fault propagation. Furthermore, the error is directly signaled to the system to start a recovery procedure.
+
+%\begin{figure}[b]
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\columnwidth]{src/figures/hmr-TCLS.drawio.pdf}
+    \caption{\acrfull{tmode} grouped cores.}
+    \label{fig:tmr}
+\end{figure}
+
+\subsubsection{Triple-Core Lockstep}\label{subsection:TCLS}
+In the \gls{tmode}, three cores are grouped, identifying one main core and two helper cores, as shown in \Cref{fig:tmr}, where they appear as one single virtual core to the system. As in \gls{dmode}, the inputs from the system are shared among the cores in the group, ensuring that they operate on identical data and control signals. However, unlike in \gls{dmode}, the outputs of the cores are connected back to the system through bitwise majority voters. Logic to disable the connection is unnecessary, as the voter properly selects the correct output. Each majority voter compares the outputs from the grouped cores and raises an error signal only if it detects a mismatch between them. Unlike \gls{dmode}, since it is possible to vote over the results of three cores in \gls{tmode}, the state of the faulty core can be restored using the state of the other two non-faulty cores. While not advisable with high error rates, letting the two non-faulty cores continue their operation in lockstep without correction can be enabled within the \gls{hmr} unit, delaying the faulty core's re-synchronization. However, if a second mismatch is detected, the grouped cores must enter a re-synchronization routine immediately.
+
+\subsection{Split-Lock}
+Locking cores together into redundant configurations permanently is limiting for some application domains that might tolerate the occurrence of faults and require higher performance. For example, a satellite must satisfy tighter resilience constraints during orbital maneuvers than during image processing for the satellite's payload. Thus, the proposed \gls{pulp} cluster can be configured before startup to work in the independent mode, \gls{dmode}, or \gls{tmode}, following the grouping procedure shown in \Cref{fig:split-lock}. This allows any application running on the host subsystem to configure the cluster for its purposes and reliability requirements after a cluster reset and before its boot sequence, locking the execution for the accelerated application into the specified reliability mode.
+
+The main differentiator of the cores in the cluster is their respective identifier (ID). It starts at zero and is incremented for each additional core, allowing for easy identification of work sections in a parallelized task. To keep this convenience when the reliability modes are enabled, the \gls{dmode} and \gls{tmode} grouping of the cores is performed in an interleaved fashion, as shown in the 6-cores example depicted in \Cref{fig:split-lock}. \Cref{fig:split-lock-dcls} (\gls{dmode}) shows that core 0 is grouped with core 3, while in \Cref{fig:split-lock-tcls} (\gls{tmode}), it is grouped with core 2 and core 4. This results in preserving the lowest core IDs when enabling all cores in the \gls{dmode} or \gls{tmode} reliability configurations, keeping a simple parallelization software scheme. Furthermore, each reliability group, either for \gls{dmode} or \gls{tmode}, can be configured independently. Separately enabling the reliability mode allows some cores to execute a reliable application without impeding the improved performance of the other cores, still operating in the independent mode.
+
+Changing the reliability mode is also possible at runtime, allowing the cores to start up in the individual configuration and switch into the reliability mode as demanded by the software application executed thereon. The application explicitly declares a \textit{safety-critical section} with the portion of code that must be executed reliably to enable a reliability mode.
+
+\lstset{
+  frame=single,
+  language=C,
+  basicstyle=\scriptsize,
+}
+\begin{figure}[b]
+\noindent\begin{minipage}{.50\textwidth}
+\begin{lstlisting}[language=C, caption=Safety-Critical Section Wrapping Function, label=lst:critical]
+int safety_critical_sec(int (*fn_handle)()) {
+    enable_lockstep();
+    // Interrupt locks cores together
+    int ret = fn_handle();
+    disable_lockstep();
+    return ret;
+}
+\end{lstlisting}
+\end{minipage}
+\hfill
+\begin{minipage}{.42\textwidth}
+\begin{lstlisting}[language=C, caption=Safety-Critical Section Entry Interrupt Service Routine, label=lst:entry]
+void synchronization_irq(void) {
+    store_state_to_stack();
+    store_pc_to_reg(core_id());
+    barrier();
+    // Cores are locked together
+    // Synchronous Clear Possible
+    reload_pc_and_state(core_id());
+    asm volatile ("mret");
+}
+\end{lstlisting}
+\end{minipage}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[c]{0.9\columnwidth}
+         \centering
+         \includegraphics[width=\textwidth]{src/figures/hmr-split-lock-full.drawio.pdf}
+         \caption{Split-Lock in independent mode}
+         \label{fig:split-lock-independent}
+     \end{subfigure}
+     % \hfill
+     \begin{subfigure}[c]{0.9\columnwidth}
+         \centering
+         \begin{subfigure}[t]{0.45\textwidth}
+             \includegraphics[width=\textwidth]{src/figures/hmr-split-lock-dmini.drawio.pdf}
+             \caption{Split-Lock in \gls{dmode}}
+             \label{fig:split-lock-dcls}
+         \end{subfigure}
+         \hfill
+         \begin{subfigure}[t]{0.45\textwidth}
+             \includegraphics[width=\textwidth]{src/figures/hmr-split-lock-tmini.drawio.pdf}
+             \caption{Split-Lock in \gls{tmode}}
+             \label{fig:split-lock-tcls}
+         \end{subfigure}
+     \end{subfigure}
+    \caption{Split-Lock muxing example for a 6-core group configuration.}
+    \label{fig:split-lock}
+\end{figure}
+
+% \subsubsection{Safety-Critical Section}\label{sec:safetycriticalsection}
+The \textit{safety-critical section} is a temporary reliable state of execution where two or three cores operate in lockstep. It is designed such that all cores assisting the main core for reliable execution only pause their own thread, returning to it once the \textit{safety-critical section} has completed. As the cores' internal registers (\gls{pc}, \gls{rf}, and \glspl{csr}) are used during the reliable execution, the helper cores' state is temporarily saved to the stack in the \gls{tcdm}, allowing them to retrieve it later.
+
+To enter the \textit{safety-critical section}, the main core executes a custom software routine, shown in Listing~\ref{lst:critical}, that writes the desired state (\gls{dmode} or \gls{tmode}) into the configuration register within the \gls{hmr} unit. 
+This triggers an interrupt in the cores that have to participate in the group, indicating they must start the execution of a \textit{safety-critical section}. 
+To ensure the cores are awake and available to service the interrupt, it is routed through the cluster's event unit, which properly wakes the cores even if they are asleep waiting for a barrier.
+In the cores, the interrupt service routine, outlined in Listing~\ref{lst:entry}, stores the internal state of the cores onto the stack, meaning 30 modifiable registers of the \acrfull{rf}, excluding the \gls{sp}, as well as specific \glspl{csr}, such as the \textit{MEPC}, which stores the last \acrfull{pc} executed before that interruption, are stored.
+
+Once the entire state is stored onto the stack, the \gls{sp} is stored in a memory-mapped register within the \gls{hmr} unit, indicating that this \textit{unload} phase is complete, and the \textit{reload} phase can start.
+After storing the state, the cores enter a synchronization barrier and are locked together, ensuring they all continue as one.
+Here, it is also possible to trigger a synchronous clear towards the locked cores to bring the internal flip-flops of the cores to their default value without polluting the reset network.
+As the \gls{sp} storage register is linked to the core's ID, the grouped cores that share the same ID after grouping read the \gls{sp} register and load the state back from the stack in parallel. After completion, the interrupt service routine is exited into the \textit{safety-critical section} outlined by the software.
+
+To exit the \textit{safety-critical section}, the locked cores write the new desired state (i.e., independent mode) to the \gls{hmr} unit configuration registers. This write operation frees all the cores from their locked state, so the main core can continue its execution% within 23 clock cycles, 
+, as its internal state is still consistent. On the other hand, the helper cores must return to the state before the \textit{safety-critical section} entry. Therefore, the \gls{hmr} module synchronously clears the helper cores bringing them back to the boot sequence, where they use their memory-mapped \gls{sp} register to reload their state back from the \gls{tcdm}.
+
+\subsection{Fault Recovery}
+In the \gls{dmode} and \gls{tmode} outlined above, a fault would not immediately impact the system as the outputs of the cores are either gated in \gls{dmode} or voted in \gls{tmode}. However, further execution may not be possible, as the outputs remain gated in the \gls{dmode}, and any additional errors in another core of the group in \gls{tmode} may cause complete failure. To avoid this scenario, the possibly corrupted state within the cores must be corrected, and the locked cores must be re-synchronized.
+
+\subsubsection{TCLS-Mode Software Re-synchronization Routine}\label{sec:sw-resynch}
+When an error occurs in \gls{tmode} affecting a single core, the cluster can continue operating, as the voters overrule the invalid outputs of the erroneous core. Furthermore, in \gls{tmode}, the three cores provide redundant internal state information, allowing the system to recover to a fully functional and correct state without additional hardware. This implies storing the internal state of one of the non-faulty cores into the stack placed in TCDM during the \textit{unload} stage and then reloading the state back to all three cores during the \textit{reload} stage, similar to the \textit{safety-critical section}.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.7\columnwidth]{src/figures/hmr-TCLS_FSM.drawio.pdf}
+    \caption{\gls{fsm} of the \gls{tmode} controller.}
+    \label{fig:tcls_fsm}
+\end{figure}
+
+To do this, as shown in \Cref{fig:tcls_fsm}, the \gls{tmode} \gls{fsm} of the \gls{hmr} unit enters the \textit{unload} state and sends an interrupt to the cores through the event unit, triggering an interrupt service routine. This routine stores the internal state of the non-faulty cores (i.e., \gls{rf}, \glspl{csr}, and \gls{pc}) into the stack. While all three cores are executing the \textit{unload} routine, the bitwise voter scans the content of the three cores while storing, ensuring that only the state of the non-faulty cores is stored in memory. Then, the \gls{sp} is stored in the same memory-mapped register mentioned in the \textit{safety-critical section} located within the \gls{hmr} unit. This indicates to the \gls{tmode} \gls{fsm} that the \textit{unload} stage is complete, allowing it to enter the \textit{reload} state. On this transition, the \gls{tmode} \gls{fsm} can also trigger a synchronous clear toward the locked cores if configured.
+
+To refill the cores with the correct state, the cores use the memory-mapped \gls{sp} register to reload the main core's state stored in memory back into the locked cores. Furthermore, the cores can be configured to be cleared again if another fault happens during the \textit{reload} phase, avoiding the execution of another \textit{unload} operation since a safe state was already stored in memory. To properly execute this routine even after a clear, the boot sequence of the cores directly checks the \gls{sp} register to see if the stored value is not zero. If its content is not zero, that value is used by the cores as a reload stack pointer. On the other hand, if the register content is zero, the cores continue with a normal boot sequence. Therefore, once the reload is complete, the software stores back a zero value to the \gls{sp} register in the \gls{hmr} unit, switching the \gls{tmode} \gls{fsm} back into a nominal \textit{run} state. The cores then execute an \texttt{mret} instruction, returning to the application running before the fault recovery interrupt was triggered.
+
+\subsubsection{Hardware-Based Re-synchronization and Rapid Recovery Extension}
+The software-based \textit{unload} and \textit{reload} procedures execution can be further improved by integrating dedicated hardware for \textit{rapid recovery}. As in the software-based recovery mechanism, the \textit{rapid recovery} mechanism relies on the fact that the state of each core is defined by its \glspl{csr}, \gls{pc}, and \gls{rf}. Instead of copying the state of the cores to memory and exploiting a software-based interrupt service routine, we extended the \gls{hmr} unit by introducing a hardwired recovery engine for each group of cores. \Cref{fig:rapidrecovery}a shows the cores grouped in \gls{dmode} or \gls{tmode}, connected to a bitwise checker or majority voter, the same as described in \Cref{subsection:DCLS}~and~\Cref{subsection:TCLS}. The \textit{rapid recovery} region, depicted in \Cref{fig:rapidrecovery}b, comprises four main modules: recovery \glspl{csr}, recovery \gls{pc}, recovery \gls{rf}, and a \textit{rapid recovery} controller.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{src/figures/RapidRecovery.pdf}
+    \caption{Implementation of the \textit{rapid recovery} hardware extension, highlighting a) the grouped cores, and b) the \textit{rapid recovery} region containing the ECC-protected status registers and the finite state machine of the \textit{rapid recovery} routine.}
+    \label{fig:rapidrecovery}
+\end{figure}
+
+During normal processing without any errors, a backup of the main core's \glspl{csr}, \gls{pc}, and \gls{rf} content is copied into the registers of the recovery engine. This operation is done each cycle, as the core's interface was modified to expose the write ports of \glspl{csr}, \gls{pc}, and \gls{rf} to propagate them to the backup registers. Hence, the backup write operation is accomplished in a single cycle. Furthermore, the recovery \glspl{csr}, recovery \gls{pc}, and recovery \gls{rf} can be protected with internal \gls{ecc} encoding/decoding, as can be chosen through parameter selection at design time.
+
+If checkers/voters detect a mismatch, they raise an error signal that blocks write operations to the registers in the recovery region, ensuring their content is not overwritten by a faulty state. The same error signal triggers the \textit{rapid recovery} controller that starts the recovery routine, depicted in \Cref{fig:rapidrecovery}b. The error flag from the checker/voter sends the \gls{fsm} of the \textit{rapid recovery} routine from the \textit{Idle} state to the \textit{Clear} state. This transition raises a synchronous clear signal to the faulty group, which brings the internal flip-flops of the cores to their default value without polluting the reset network. Then, the recovery routine jumps into the \textit{Halt} state, where a debug request signal is raised towards the faulty cores, forcing them to enter the debug mode. Shortly after they receive the debug request, the cores raise the halt response signal toward the \textit{rapid recovery} controller. In debug mode, the cores are halted, allowing the recovery hardware to access the internal registers without interference.
+
+Once the faulty cores have raised the halt response signal, the recovery routine jumps into the \textit{Restore} state. In this state, the \glspl{csr}, \gls{pc}, and \gls{rf} content of the faulty cores is reloaded from the recovery \glspl{csr}, recovery \gls{pc}, and recovery \gls{rf}. This process is executed sequentially, restoring the content of all 31 modifiable registers of the \gls{rf}, exploiting its two write ports in parallel. The \gls{pc} and the \glspl{csr} are reloaded in parallel to the \gls{rf}. 
+
+The same hardware introduced to enable \textit{rapid recovery} can be used to speed up the process of entering a \textit{safety-critical section}. The recovery \glspl{csr}, recovery \gls{pc}, and recovery \gls{rf} can be used to back up the state of the main core continually so that this state can be used to enter the routine safely. As the helper cores software is designed to be executed in order, they still require their state to be saved to the stack in the TCDM. Therefore, the main core immediately enters the barrier once the interrupt occurs, while the helper cores store their state to the stack and enter the barrier afterward. After all the cores have entered the barrier and are locked together, the \textit{rapid recovery} hardware executes its recovery routine, synchronizing the state of the now locked cores to continue into the safety-critical section.

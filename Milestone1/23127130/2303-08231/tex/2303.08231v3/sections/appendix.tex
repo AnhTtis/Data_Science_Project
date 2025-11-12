@@ -1,0 +1,406 @@
+\section{Appendix}
+In this appendix, we first provide the implementation details in Sec.~\ref{sec:implementation}. Then the network architecture is detailed in Sec.~\ref{sec:network}. Moreover, the detailed definition of the geometric embedding, the loss function, and the evaluation metrics are illustrated in Sec.~\ref{sec:embedding}, Sec.~\ref{sec:loss}, and Sec.~\ref{sec:metrics}, respectively. Furthermore, more quantitative and qualitative results are demonstrated in Sec.~\ref{sec:more_quantitative} and Sec.~\ref{sec:more_qualitative}, respectively. Finally, the runtime is first analyzed in Sec.~\ref{sec:runtime}, and the limitations are further discussed in Sec.~\ref{sec:limitations}.
+
+\subsection{Implementation Details}
+\label{sec:implementation}
+We implement \OURS{} with PyTorch~\cite{paszke2019pytorch}. The matching model can be trained end-to-end on a single Nvidia RTX 3090 with 24G memory. In practice, we train the model on-parallel using 4$\times$ Nvidia 3090 GPUs for $\sim$35 epochs on both 3DMatch/3DLoMatch~\cite{zeng20173dmatch,huang2021predator} and 4DMatch/4DLoMatch~\cite{li2022lepard}. It takes $\sim$35 hours and $\sim$30 hours for full convergence on 3DMatch/3DLoMatch and 4DMatch/4DLoMatch, respectively. The batch size is set to 1. We use an Adam optimizer~\cite{kingma2014adam} with an initial learning rate of 1e-4, which is exponentially decayed by 0.05 after each epoch. On 3DMatch/3DLoMatch, we select $|\mathcal{C}^\prime|=256$ superpoint correspondences with the highest scores. Based on each superpoint correspondence, we further extract the mutual top-3 point correspondences whose confidence scores are larger than 0.05 as the point correspondences. For non-rigid matching, we first pick the superpoint correspondences whose Euclidean distance is smaller than 0.75~(pick the top-128 instead if the number of selected correspondences is smaller than 128) and extract the mutual top-2 point correspondences with scores larger than 0.05. 
+
+\renewcommand\arraystretch{1}
+\begin{table*}[ht!]
+\centering
+\resizebox{0.7\textwidth}{!}{
+\begin{tabular}{c|c|c}
+\toprule
+Stage &Block &Operation  \\
+\midrule
+\midrule
+Input & &$\mathcal{P}=(\mathbf{P}, \mathbf{N}, \mathbf{X}\in \mathbb{R}^{n\times1})$  \\
+\midrule
+\multirow{8}{*}{Encoder} &\multirow{2}{*}{$\text{Block}^e_{1}(\mathcal{P})\rightarrow\mathcal{P}_1$} &AAL$(n \times 1) \rightarrow n\times 64$\\
+
+& &PAL$(n \times 64) \rightarrow n\times 64$\\
+\cline{2-3}
+
+&\multirow{2}{*}{$\text{Block}^e_{2}(\mathcal{P}_1)\rightarrow\mathcal{P}_2$} &AAL$(n \times 64) \rightarrow n / 4\times 128$ \\
+
+& &PAL$(n / 4 \times 128)\rightarrow n / 4\times 128$\\
+\cline{2-3}
+
+&\multirow{2}{*}{$\text{Block}^e_{3}(\mathcal{P}_2)\rightarrow\mathcal{P}_3$} &AAL$(n / 4 \times 128) \rightarrow n / 16\times 256$ \\
+
+& &PAL$(n / 16 \times 256) \rightarrow n / 16\times 256$\\
+\cline{2-3}
+
+&\multirow{2}{*}{$\text{Block}^e_{4}(\mathcal{P}_3)\rightarrow\mathcal{P}^\prime$} &AAL$(n / 16 \times 256) \rightarrow n / 64\times 256$  \\
+
+& &PAL$(n / 64 \times 256) \rightarrow n / 64\times 256$ \\
+\midrule
+\multirow{8}{*}{Decoder} &\multirow{2}{*}{$\text{Block}^d_{4}(\mathcal{P}^\prime)\rightarrow\hat{\mathcal{P}}_4$} &TUL $(n/64 \times 256) \rightarrow n/64\times 256$\\
+
+& &PAL: $n/64\times 256 \rightarrow n/64\times 256$\\
+\cline{2-3}
+
+&\multirow{2}{*}{$\text{Block}^d_{3}(\hat{\mathcal{P}}_4, \mathcal{P}_3)\rightarrow\hat{\mathcal{P}}_3$} &TUL$(n/64 \times 256,\; n/16 \times 256)\rightarrow n / 16\times 256$  \\
+
+& &PAL$(n / 16 \times 256)\rightarrow n / 16\times 256$ \\
+\cline{2-3}
+
+&\multirow{2}{*}{$\text{Block}^d_{2}(\hat{\mathcal{P}}_3, \mathcal{P}_2)\rightarrow\hat{\mathcal{P}}_2$} &TUL$(n / 16 \times 256,\;n / 4\times 128)\rightarrow n / 4\times 128$  \\
+
+& &PAL$(n / 4 \times 128) \rightarrow n / 4\times 128$ \\
+\cline{2-3}
+
+&\multirow{2}{*}{$\text{Block}^d_{1}(\hat{\mathcal{P}}_2, \mathcal{P}_1)\rightarrow\hat{\mathcal{P}}$} &TUL$(n / 4 \times 128,\; n\times 64)\rightarrow n\times 64$ \\
+
+& &PAL$(n \times 64)\rightarrow n \times 64$\\
+\midrule
+Output & &$\mathcal{P}^\prime=(\mathbf{P}^\prime, \mathbf{N}^\prime, \mathbf{X}^\prime); \quad \hat{\mathcal{P}}=(\hat{\mathbf{P}}, \hat{\mathbf{N}},\hat{\mathbf{X}})$  \\
+\bottomrule
+
+\end{tabular}
+}
+\caption{Detailed architecture of the PPFTrans encoder-decoder.}
+\label{tab:arch_local}
+\end{table*}
+
+\subsection{Network Architecture}
+\label{sec:network}
+\paragraph{PPFTrans Encoder-Decoder.} We detail the architecture of PPFTrans in Tab.~\ref{tab:arch_local}. The encoder part has $4\times$ encoder blocks. In each block, AAL first downsamples the points and aggregates the information in a local vicinity. PAL further enhances the features with both the pose-agnostic local geometry and highly-representative learned context. The decoder part also comprises $4\times$ decoder blocks. In each block~(except for $\text{Block}_4$), TUL first subsamples the points and incorporates the information flowing from the encoder via skip connections. The obtained features are further enhanced by the following PAL.
+
+\paragraph{Global Transformer.} The details of the global transformer are demonstrated in Tab.~\ref{tab:arch_global}. It has $3\times$ transformer blocks, each comprising a geometry-aware self-attention module~(GSM) followed by a position-aware cross-attention module~(PCM). In each transformer block, GSM first aggregates the global context individually for each point cloud. Then in PCM, the global context flows from the second frame to the first one and then from the first frame to the second one.
+
+\noindent\textbf{Feed-Forward Network.} The structure of the feed-forward network is illustrated in Fig.~\ref{fig:feedforward}. It details the feed-forward network in the context branch of GSM in Fig.~4 of the main paper.
+
+
+
+\renewcommand\arraystretch{1}
+\begin{table*}[ht!]
+\centering
+\resizebox{0.75\textwidth}{!}{
+\begin{tabular}{c|c|c|c|c}
+\toprule
+Block &\multicolumn{2}{c|}{Module} &\multicolumn{2}{c}{Operation}  \\
+\midrule
+\midrule
+Input & & &$\mathcal{P}^\prime=(\mathbf{P}^\prime, \mathbf{N}^\prime, \mathbf{X}^\prime)$ &$\mathcal{Q}^\prime=(\mathbf{Q}^\prime, \mathbf{M}^\prime, \mathbf{Y}^\prime)$  \\
+\midrule
+\multirow{3}{*}{$\text{Trans}_1$} &$\text{Self}_1(\mathcal{P}^\prime)\rightarrow\widetilde{\mathcal{P}}^\prime_1$
+&$\text{Self}_1(\mathcal{Q}^\prime)\rightarrow\widetilde{\mathcal{Q}}^\prime_1$ 
+&GSM$(n^\prime\times c^\prime) \rightarrow n^\prime\times c^\prime$ &GSM$(m^\prime\times c^\prime) \rightarrow m^\prime\times c^\prime$\\
+&\multicolumn{2}{c|}{$\text{Cross}_1(\widetilde{\mathcal{P}}^\prime_1, \widetilde{\mathcal{Q}}^\prime_1)\rightarrow\mathcal{P}^\prime_1$} &\multicolumn{2}{c}{PCM$(n^\prime\times c^\prime,m^\prime\times c^\prime) \rightarrow n^\prime\times c^\prime$}\\
+&\multicolumn{2}{c|}{$\text{Cross}_1(\widetilde{\mathcal{Q}}^\prime_1, {\mathcal{P}}^\prime_1)\rightarrow\mathcal{Q}^\prime_1$} &\multicolumn{2}{c}{PCM$(m^\prime\times c^\prime,n^\prime\times c^\prime) \rightarrow m^\prime\times c^\prime$}\\
+\midrule
+\multirow{3}{*}{$\text{Trans}_2$} &$\text{Self}_2(\mathcal{P}^\prime_1)\rightarrow\widetilde{\mathcal{P}}^\prime_2$
+&$\text{Self}_2(\mathcal{Q}^\prime_1)\rightarrow\widetilde{\mathcal{Q}}^\prime_2$ 
+&GSM$(n^\prime\times c^\prime) \rightarrow n^\prime\times c^\prime$ &GSM$(m^\prime\times c^\prime) \rightarrow m^\prime\times c^\prime$\\
+&\multicolumn{2}{c|}{$\text{Cross}_2(\widetilde{\mathcal{P}}^\prime_2, \widetilde{\mathcal{Q}}^\prime_2)\rightarrow\mathcal{P}^\prime_2$} &\multicolumn{2}{c}{PCM$(n^\prime\times c^\prime,m^\prime\times c^\prime) \rightarrow n^\prime\times c^\prime$}\\
+&\multicolumn{2}{c|}{$\text{Cross}_2(\widetilde{\mathcal{Q}}^\prime_2, {\mathcal{P}}^\prime_2)\rightarrow\mathcal{Q}^\prime_2$} &\multicolumn{2}{c}{PCM$(m^\prime\times c^\prime,n^\prime\times c^\prime) \rightarrow m^\prime\times c^\prime$}\\
+\midrule
+\multirow{3}{*}{$\text{Trans}_3$} &$\text{Self}_3(\mathcal{P}^\prime_2)\rightarrow\widetilde{\mathcal{P}}^\prime_3$
+&$\text{Self}_3(\mathcal{Q}^\prime_2)\rightarrow\widetilde{\mathcal{Q}}^\prime_3$ 
+&GSM$(n^\prime\times c^\prime) \rightarrow n^\prime\times c^\prime$ &GSM$(m^\prime\times c^\prime) \rightarrow m^\prime\times c^\prime$\\
+&\multicolumn{2}{c|}{$\text{Cross}_3(\widetilde{\mathcal{P}}^\prime_3, \widetilde{\mathcal{Q}}^\prime_3)\rightarrow\widetilde{\mathcal{P}}^\prime$} &\multicolumn{2}{c}{PCM$(n^\prime\times c^\prime,m^\prime\times c^\prime) \rightarrow n^\prime\times c^\prime$}\\
+&\multicolumn{2}{c|}{$\text{Cross}_3(\widetilde{\mathcal{Q}}^\prime_3, {\mathcal{P}}^\prime_3)\rightarrow\widetilde{\mathcal{Q}}^\prime$} &\multicolumn{2}{c}{PCM$(m^\prime\times c^\prime,n^\prime\times c^\prime) \rightarrow m^\prime\times c^\prime$}\\
+\midrule
+Output & & &$\widetilde{\mathcal{P}}^\prime=(\mathbf{P}^\prime, \mathbf{N}^\prime, \widetilde{\mathbf{X}}^\prime)$ &$\widetilde{\mathcal{Q}}^\prime=(\mathbf{Q}^\prime, \mathbf{M}^\prime, \widetilde{\mathbf{Y}}^\prime)$  \\
+\bottomrule
+
+\end{tabular}
+}
+\caption{Detailed architecture of the global transformer.}
+\label{tab:arch_global}
+\end{table*}
+
+\subsection{Geometric Embedding}
+\label{sec:embedding}
+Taking superpoints $\mathbf{P}^\prime \in \mathbb{R}^{n^\prime \times 3}$ as an instance, the geometric embedding $\mathbf{G}^\prime_P\in \mathbb{R}^{n^\prime \times n^\prime \times c^\prime}$ proposed in~\cite{qin2022geometric} depicts the pairwise geometric relationship among superpoints in a rotation-invariant fashion. It comprises a distance-based part $\mathbf{G}^\prime_D\in \mathbb{R}^{n^\prime\times n^\prime \times c^\prime}$ as well as an angle-based part $\mathbf{G}^\prime_A\in \mathbb{R}^{n^\prime\times n^\prime \times 3\times c^\prime}$.
+
+\paragraph{Euclidean Distance.} The pairwise Euclidean distance is defined as $\rho_{i, j} = \lVert\mathbf{p}^\prime_i - \mathbf{p}^\prime_j\rVert_2$, which is projected to a $c^\prime$-dimension~(note that $c^\prime$ must be an even number) embedding via the sinusoidal function~\cite{vaswani2017attention}:
+\begin{equation}
+\left\{
+\begin{array}{r}
+      \mathbf{G}^\prime_D(i, j, 2l + 1) = \sin(\frac{\rho_{i, j}/\sigma_d}{10000^{2l/c^\prime}}),\\
+       \mathbf{G}^\prime_D(i, j, 2l + 2) = \cos(\frac{\rho_{i, j}/\sigma_d}{10000^{2l/c^\prime}}),
+\end{array}
+\right.
+\label{eq:geo_distance}
+\end{equation}
+with $0\leq l < c^\prime/2$ and $\sigma_d=0.2$.
+
+\paragraph{Angles.} Given a superpoint pair $(\mathbf{p}^\prime_i, \mathbf{p}^\prime_j)$, the $3$-nearest neighbors of $\mathbf{p}^\prime_i$ w.r.t. $\mathbf{P}^\prime$ is first retrieved and denoted as $\mathcal{N}(i)$. For each $k\in \mathcal{N}(i)$, we calculate the angle between two vectors by $\alpha^k_{i, j} = \angle(\mathbf{p^\prime_k} - \mathbf{p^\prime_i}, \mathbf{p^\prime_j} - \mathbf{p^\prime_i})$~\cite{birdal2015point,deng2018ppfnet}, upon which the $c^\prime$-dimension angle-based embedding is defined as:
+\begin{equation}
+\left\{
+\begin{array}{r}
+      \mathbf{G}^\prime_A(i, j, k, 2l + 1) = \sin(\frac{\alpha^k_{i, j}/\sigma_a}{10000^{2l/c^\prime}}),\\
+       \mathbf{G}^\prime_A(i, j, k, 2l + 2) = \cos(\frac{\alpha^k_{i, j}/\sigma_a}{10000^{2l/c^\prime}}),
+\end{array}
+\right.
+\label{eq:geo_angle}
+\end{equation}
+with $0\leq l < c^\prime/2$ and $\sigma_a=15$.
+
+The pairwise geometric embedding $\mathbf{G}^\prime_P$ finally reads as:
+
+\begin{equation}
+\mathbf{G}^\prime_P = \mathbf{G}^\prime_D\mathbf{W}_D + \max\limits_{k}(\mathbf{G}^\prime_A\mathbf{W}_A),
+\label{eq:geo}
+\end{equation}
+where $\max\limits_{k}(\mathbf{G}^\prime_A\mathbf{W}_A)$ indicates the max-pooling operation over the second last dimension, and $\mathbf{W}_D, \mathbf{W}_A\in \mathbb{R}^{c^\prime\times c^\prime}$ stand for two learnable matrices.
+\begin{figure}
+  \centering
+  \includegraphics[width=0.38\textwidth]{figures/feedforward.pdf}
+  \caption{Detailed architecture of the feed-forward network. LayerNorm~\cite{ba2016layer} is used for normalization.}
+  \label{fig:feedforward}
+\end{figure}
+
+\subsection{Loss Function}
+\label{sec:loss}
+\paragraph{Superpoint Matching Loss.} We use the Circle Loss~\cite{sun2020circle} for superpoint matching. Following~\cite{qin2022geometric}, we use the overlap ratio between the vicinity of superpoints to weigh different ground truth superpoint correspondences. More specifically, for each superpoint $\mathbf{p}^\prime_i\in \mathbf{P}^\prime$ with an associated feature $\widetilde{\mathbf{x}}^\prime_i$~(unit vector after normalization), we sample a positive set of superpoints from $\mathbf{Q}^\prime$, denoted as $\mathcal{E}^P_i = \{\mathbf{q}^\prime_j \in \mathbf{Q}^\prime | \mathcal{O}(\mathbf{p}^\prime_i, \mathbf{q}^\prime_j) > \tau_r\}$, where $\mathcal{O}$ is the function that calculates the overlap ratio between the vicinity of two superpoints, and $\tau_r$ is the threshold to select positive samples~($\tau_r$=0.1 by default). The overlap ratio function is defined as:
+
+\begin{equation}
+\mathcal{O}(\mathbf{p}^\prime_i, \mathbf{q}^\prime_j) = \frac{|\{\hat{\mathbf{p}}_u\in\hat{\mathbf{G}}^P_i|\exists\hat{\mathbf{q}}_v\in \hat{\mathbf{G}}^Q_j \;\text{s.t.}\; \hat{\mathbf{p}}_u \Leftrightarrow \hat{\mathbf{q}}_v\}|}{|\{\hat{\mathbf{p}}_u \in \hat{\mathbf{G}}^P_i\}|},
+\label{eq:overlap_ratio}
+\end{equation}
+\noindent where $\Leftrightarrow$ denotes the correspondence relationship and $\hat{\mathbf{G}}^P_i$ is the group of points from $\hat{\mathbf{P}}$ assigned to $\mathbf{p}^\prime_i$ by the Point-to-Node grouping strategy~\cite{yu2021cofinet}.
+
+We further sample a negative set of superpoints $\mathcal{F}^P_i = \{\mathbf{q}^\prime_j \in \mathbf{Q}^\prime | \mathcal{O}(\mathbf{p}^\prime_i, \mathbf{q}^\prime_j) =0\}$. Then for $\mathbf{P}^\prime$, the superpoint matching loss is computed as:
+
+\begin{equation}
+\begin{split}
+    \mathcal{L}^P_c = \frac{1}{n^\prime}&\sum_{i=1}^{n^\prime}\text{log}[1 + \\
+    &\sum_{\mathbf{q}^\prime_j \in \mathcal{E}^P_i}{e^{r^j_i\beta^{i, j}_e(d^j_i-\Delta_e)}}\cdot \sum_{\mathbf{q}^\prime_k\in \mathcal{F}^P_i}{e^{\beta^{i, k}_f(\Delta_f-d^k_i)}}],
+\end{split}
+\label{eq:coarse}
+\end{equation}
+
+\noindent with $r^j_i := \mathcal{O}(\mathbf{p}^\prime_i, \mathbf{q}^\prime_j)$ and $d^j_i = \lVert\widetilde{\mathbf{x}}^\prime_i - \widetilde{\mathbf{y}}^\prime_j \rVert_2$. Moreover, $\Delta_e$ and $\Delta_f$ are the positive and negative margins~($\Delta_e$=0.1 and $\Delta_f$=1.4 by default). $\beta^{i, j}_e = \gamma(d^j_i - \Delta_e)$ and $\beta^{i, k}_f=\gamma(\Delta_f - d^k_i)$ are the weights individually determined for different samples, with $\gamma$ a hyper-parameter. The same loss for $\mathbf{Q}^\prime$ is defined in a similar way, and the overall loss reads as $\mathcal{L}_s = (\mathcal{L}^P_s + \mathcal{L}^Q_s)/2$.
+
+\paragraph{Point Matching Loss.} For each superpoint correspondence $\mathcal{C}^\prime_l = (\mathbf{p}^\prime_i, \mathbf{q}^\prime_j) \in \mathcal{C}^\prime$, we adopt a negative log-likelihood loss~\cite{sarlin2020superglue} on its corresponding normalized similarity matrix $\overline{\mathbf{C}}_l\in \mathbb{R}^{(\overline{n} + 1)\times (\overline{m} + 1)}$. We define $\mathcal{M}_l = \{(u, v)| \hat{\mathbf{p}}_u \Leftrightarrow \hat{\mathbf{q}}_v \;\text{with}\;\hat{\mathbf{p}}_u \in \hat{\mathbf{G}}^P_i, \hat{\mathbf{q}}_v \in \hat{\mathbf{G}}^Q_j\}$ as the set comprising the indices of corresponding points. We further define $\mathcal{I}_l = \{u|\hat{\mathbf{p}}_u \nLeftrightarrow \hat{\mathbf{q}}_v, \forall\hat{\mathbf{q}}_v \in \hat{\mathbf{G}}^Q_j\}$ and $\mathcal{J}_l = \{v|\hat{\mathbf{q}}_v \nLeftrightarrow \hat{\mathbf{p}}_u, \forall\hat{\mathbf{p}}_u \in \hat{\mathbf{G}}^P_i\}$ as the sets of indices of points that have no correspondence in the opposite frame, with $\nLeftrightarrow$ depicting non-correspondence relationship. Then the point matching loss on $\mathcal{C}^\prime_l$ can be defined as:
+
+
+\begin{equation}
+\begin{split}
+\mathcal{L}_f^l = -\sum_{(u, v)\in \mathcal{M}_l} \log \overline{c}^l_{u, v} &- \sum_{u\in \mathcal{I}_l} \log \overline{c}^l_{u, \overline{m} + 1} \\ &- \sum_{v \in \mathcal{J}_l} \log \overline{c}^l_{\overline{n} + 1, v} \quad ,
+\end{split}
+\label{eq:fine}
+\end{equation}
+where $\overline{c}^{l}_{u, v}:= \overline{\mathbf{C}}_l(u, v)$ stands for the entry on the $u^{th}$ row  and $v^{th}$ column of $\overline{\mathbf{C}}_l$. The overall point matching loss reads as $\mathcal{L}_p = \frac{1}{|\mathcal{C}^\prime|}\sum_{l=1}^{|\mathcal{C}^\prime|} \mathcal{L}^l_p$.
+
+
+
+
+\subsection{Detailed Metrics}
+\label{sec:metrics}
+Given a point cloud pair $\mathbf{P}\in \mathbb{R}^{n\times3}$ and $\mathbf{Q}\in \mathbb{R}^{m \times 3}$, \OURS{} generates a correspondence set $\mathcal{C}$ by matching the downsampled point cloud pair $\hat{\mathbf{P}}\in \mathbb{R}^{\hat{n}\times 3}$ and $\hat{\mathbf{Q}}\in \mathbb{R}^{\hat{m}\times 3}$. We detail all the metrics for evaluation hereafter.
+
+\paragraph{Inlier Ratio~(IR).} IR counts the fraction of putative correspondences $(\hat{\mathbf{p}}_u, \hat{\mathbf{q}}_v)\in \mathcal{C}$ whose Euclidean distance is under a threshold $\tau_1$~(0.1m on 3DMatch/3DLoMatch, 0.04m on 4DMatch/4DLoMatch) under the ground-truth transformation $\mathbf{T}^*$:
+
+\begin{equation}
+\mathcal{I}(\mathcal{C}\big| \mathbf{T}^*) = \frac{1}{|\mathcal{C}|}\sum_{(\hat{\mathbf{p}}_u, \hat{\mathbf{q}}_v)\in \mathcal{C}} \mathds{1}(\lVert\mathbf{T}^*(\hat{\mathbf{p}}_u) - \hat{\mathbf{q}}_v\rVert_2 < \tau_1),
+\label{eq:ir}
+\end{equation}
+with $\mathds{1}(\cdot)$ the indicator function.
+
+\paragraph{Feature Matching Recall~(FMR).} FMR counts the fraction of point cloud pairs whose IR is larger than a threshold $\tau_2=0.05$:
+\begin{equation}
+\mathcal{F}(\mathcal{T}) = \frac{1}{|\mathcal{T}|}\sum_{t=1}^{|\mathcal{T}|}\mathds{1}(\mathcal{I}(\mathcal{C}_t \big| \mathbf{T}^*_t) > \tau_2),
+\label{eq:fmr}
+\end{equation}
+with $\mathcal{T}$ the testing set and $\mathcal{T}_t$ the $t^{th}$ point cloud pair in the dataset.
+
+\paragraph{Registration Recall~(RR).} RR computes the fraction of point cloud pairs that are registered correctly based on the putative correspondences, measured by the \textit{Root-Mean-Square Error}~(RMSE). Following~\cite{huang2021predator}, we define RMSE on the original 3DMatch/3DLoMatch as:
+
+\begin{equation}
+\mathcal{R}_1(\mathcal{C} \big| \mathcal{C}^*) = \sqrt{\frac{1}{|\mathcal{C}^*|}\sum_{(\mathbf{p}_i, \mathbf{q}_j)\in \mathcal{C}^*}\lVert\mathbf{T}(\mathbf{p}_i) - \mathbf{q}_j\rVert_2^2},
+\label{eq:rmse1}
+\end{equation}
+with $\mathcal{C}^*$ the ground-truth correspondence set established upon $\mathbf{P}$ and $\mathbf{Q}$, and $\mathbf{T}$ the transformation estimated based on $\mathcal{C}$.
+On Rotated 3DMatch/3DLoMatch, we follow~\cite{yuan2020deepgmr,yu2022riga} and define the RMSE as:
+
+\begin{equation}
+\mathcal{R}_2(\mathcal{C}\big|\mathbf{T}^*, \mathbf{P}) \approx \frac{1}{n}\sqrt{\sum_{\mathbf{p}_i\in \mathbf{P}}\lVert\mathbf{T}(\mathbf{p}_i) - \mathbf{T}^*(\mathbf{p}_i)\rVert_2^2},
+\label{eq:rmse2}
+\end{equation}
+with $\mathbf{T}$ the transformation estimated based on $\mathcal{C}$ and $\mathbf{T}^*$ the ground-truth transformation. RR is finally calculated as:
+\begin{equation}
+\begin{split}
+\mathcal{R}(\mathcal{T}) = &\frac{1}{|\mathcal{T}|}\sum_{t=1}^{\mathcal{T}}\mathds{1}(\mathcal{R}_1(\mathcal{C} \big| \mathcal{C}^*) < \tau_3) \quad \text{or}\\
+                            &\frac{1}{|\mathcal{T}|}\sum_{t=1}^{\mathcal{T}}\mathds{1}(\mathcal{R}_2(\mathcal{C}\big|\mathbf{T}^*, \mathbf{P})) < \tau_3),\\
+\end{split}
+\label{eq:rr}
+\end{equation}
+\noindent with $\tau_3$ = 0.2m.
+
+\paragraph{Non-Rigid Feature Matching Recall~(NFMR).} NFMR counts the fraction of ground-truth correspondences $\mathcal{C}^*$ that can be recovered by the putative correspondences $\mathcal{C}$. The deformation flow $\hat{\mathbf{d}}_u$ for each putative correspondence $(\hat{\mathbf{p}}_u, \hat{\mathbf{q}}_v)\in \mathcal{C}$ is defined as $\hat{\mathbf{d}}_u = \hat{\mathbf{q}}_v - \hat{\mathbf{p}}_u$. Then for each $(\mathbf{p}_i, \mathbf{q}_j)\in \mathcal{C}^*$, the deformation flow can be computed via interpolation:
+
+\begin{equation}
+\mathbf{d}_i = \frac{\sum_{u \in \mathcal{N}(i)}w_u^i\hat{\mathbf{d}}_u}{\sum_{u\in \mathcal{N}(i)}w_u^i}, \; \text{with} \; w_u^i=\frac{1}{\lVert\mathbf{p}_i - \hat{\mathbf{p}}_u\rVert_2},
+\label{eq:flow}
+\end{equation}
+\noindent where $\mathcal{N}(i)$ indicates the $k$-nearest neighbor~($k=3$ in practice) of $\mathbf{p}_i$ w.r.t. points $\hat{\mathbf{p}}_u$ s.t. $(\hat{\mathbf{p}}_u, \hat{\mathbf{q}}_v)\in \mathcal{C}$. NFMR is finally computed by:
+\begin{equation}
+\mathcal{F}_N(\mathcal{C}^*\big| \mathcal{C}) = \frac{1}{|\mathcal{C}^*|}\sum_{(\mathbf{p}_i, \mathbf{q}_j)\in \mathcal{C}^*}\mathds{1}(\lVert\mathbf{d}_i - \mathbf{d}_i^*\rVert_2 < \tau_4),
+\label{eq:nfmr}
+\end{equation}
+\noindent with $\mathbf{d}_i^*$ the ground-truth deformation flow and $\tau_4$=0.04m in practice.
+
+
+\subsection{More Quantitative Results}
+\label{sec:more_quantitative}
+\noindent\textbf{Varying Correspondence Number on Rotated Data.} We further analyze the performance of different methods w.r.t. the varying number of correspondences on rotated data. The superiority of \OURS{} can be observed in Tab.~\ref{tab:scene_rotated}. 
+
+\renewcommand\arraystretch{0.95}
+\begin{table}[ht!]
+\centering
+
+\resizebox{0.48\textwidth}{!}{
+\begin{tabular}{lccccc|ccccc}
+\toprule
+ &\multicolumn{5}{c}{\textbf{Rotated 3DMatch}}  &\multicolumn{5}{c}{\textbf{Rotated 3DLoMatch}}\\
+\# Samples &5000 &2500 &1000 &500 &250 &5000 &2500 &1000 &500 &250 \\
+\midrule
+\midrule
+&\multicolumn{10}{c}{\textit{Feature Matching Recall} (\%) $\uparrow$}\\
+\midrule
+SpinNet~\cite{ao2021spinnet} &97.4 &97.4 &96.7 &96.5 &94.1 &75.2 &74.9 &72.6 &69.2 &61.8\\
+Predator~\cite{huang2021predator} &96.2 &96.2 &96.6 &96.0 &96.0 &73.7 &74.2 &75.0 &74.8 &73.5\\
+CoFiNet~\cite{yu2021cofinet} &97.4 &97.4 &97.2 &97.2 &97.3 &78.6 &78.8 &79.2 &78.9 &79.2\\
+
+YOHO~\cite{wang2022you} &97.8 &97.8 &97.4 &97.6 &96.4 &77.8 &77.8 &76.3 &73.9 &67.3\\
+RIGA~\cite{yu2022riga} &\textbf{98.2} &\textbf{98.2} &\textbf{98.2} &\underline{98.0} &\textbf{98.1} &84.5 &84.6 &84.5 &84.2 &84.4\\
+GeoTrans~\cite{qin2022geometric} &97.8 &97.9 &98.1 &97.7 &97.3 &\underline{85.8} &\underline{85.7} &\underline{86.5} &\underline{86.6} &\underline{86.1}\\
+\OURS{}~(\textit{Ours}) &\textbf{98.2} &\underline{98.1} &\underline{98.1} &\textbf{98.1} &\textbf{98.1} &\textbf{89.4} &\textbf{89.2} &\textbf{89.1} &\textbf{89.1} &\textbf{89.0}\\
+\midrule
+&\multicolumn{10}{c}{\textit{Inlier Ratio} (\%) $\uparrow$}\\
+\midrule
+SpinNet~\cite{ao2021spinnet} &48.7 &46.0 &40.6 &35.1 &29.0 &25.7 &23.9 &20.8 &17.9 &15.6\\
+Predator~\cite{huang2021predator} &52.8 &53.4 &52.5 &50.0 &45.6  &22.4 &23.5 &23.0 &23.2 &21.6\\
+CoFiNet~\cite{yu2021cofinet} &46.8 &48.2 &49.0 &49.3 &49.3 &21.5 &22.8 &23.6 &23.8 &23.8\\
+YOHO~\cite{wang2022you} &64.1 &60.4 &53.5 &46.3 &36.9 &23.2 &23.2 &19.2 &15.7 &12.1 \\
+RIGA~\cite{yu2022riga}  &\underline{68.5} &69.8 &70.7 &71.0 &71.2 &32.1  &33.5 &34.3 &34.7 &35.0\\
+GeoTrans~\cite{qin2022geometric} &68.2 &\underline{72.5} &\underline{73.3} &\underline{79.5} &\underline{82.3} &\underline{40.0} &\underline{40.3} &\underline{42.7} &\underline{49.5} &\underline{54.1}\\
+\OURS{}~(\textit{Ours}) &\textbf{82.3} &\textbf{82.3} &\textbf{82.6} &\textbf{82.6} &\textbf{82.6} &\textbf{53.2} &\textbf{54.9} &\textbf{55.1} &\textbf{55.2} &\textbf{55.3}\\
+\midrule
+
+&\multicolumn{10}{c}{\textit{Registration Recall} (\%) $\uparrow$}\\
+\midrule
+SpinNet~\cite{ao2021spinnet} &93.2 &93.2 &91.1 &87.4 &77.0 &61.8 &59.1 &53.1 &44.1 &30.7\\
+Predator~\cite{huang2021predator}&92.0 &92.8 &92.0 &92.2 &89.5 &58.6 &59.5 &60.4 &58.6 &55.8\\
+CoFiNet~\cite{yu2021cofinet} &92.0 &91.4 &91.0 &90.3 &89.6 &62.5 &60.9 &60.9 &59.9 &56.5\\
+
+YOHO~\cite{wang2022you}&92.5 &92.3 &92.4 &90.2 &87.4 &66.8 &67.1 &64.5 &58.2 &44.8\\
+
+RIGA~\cite{yu2022riga} &\underline{93.0} &\underline{93.0} &\underline{92.6} &\underline{91.8} &\underline{92.3} &66.9 &67.6 &67.0 &66.5 &66.2\\
+GeoTrans~\cite{qin2022geometric} &92.0 &91.9 &91.8 &91.5 &91.4 &\underline{71.8} &\underline{72.0} &\underline{72.0} &\underline{71.6} &\underline{70.9}\\
+\OURS{}~(\textit{Ours}) &\textbf{94.7} &\textbf{94.9} &\textbf{94.4} &\textbf{94.4} &\textbf{94.2} &\textbf{77.2} &\textbf{76.5} &\textbf{76.6} &\textbf{76.5} &\textbf{76.0}\\
+\bottomrule
+\end{tabular}}
+\caption{Quantitative results on Rotated 3DMatch \& 3DLoMatch with a varying number of points/correspondences.}
+\label{tab:scene_rotated}
+
+\end{table}
+
+\paragraph{Ablation Study on (Rotated) 3DMatch.} We also conduct ablation study on (Rotated) 3DMatch, as shown in Tab.~\ref{tab:ablation_3dmatch}. Similar to the ablation study on (Rotated) 3DLoMatch shown in the main paper, our default model achieves the best performance, which further confirms the significance of each individual design of \OURS{}.
+
+
+
+\renewcommand\arraystretch{0.9}
+\begin{table}[ht!]
+\centering
+\resizebox{0.48\textwidth}{!}{
+\begin{tabular}{ll|cccccc}
+\toprule
+& &\multicolumn{6}{c}{\textbf{3DMatch}}\\
+\midrule
+& &\multicolumn{3}{c|}{\textbf{Origin}} &\multicolumn{3}{c}{\textbf{Rotated}}\\
+Category & Model &FMR &IR &RR  &FMR &IR &RR \\
+\midrule
+\midrule
+\multirow{4}{*}{a. Local}
+ &\;\ 1. PT~\cite{zhao2021point}&96.7 &71.0 &87.6 &96.4 &69.5 &90.5\\
+&*2. PPF+PT~\cite{zhao2021point} &97.9 &80.1 &91.2 &97.8 &79.8 &93.9\\
+& \; 3. $\Delta$xyz+Ours &-&-&-&-&-&-\\
+& *4. \textit{Ours} &\textbf{98.0} &\textbf{82.6} &\textbf{91.9} &\textbf{98.2} &\textbf{82.3} &\textbf{94.7}\\
+\midrule
+\multirow{3}{*}{b. Aggregation}& *1. max pooling &97.9&80.8&90.7&97.8&80.8&94.1\\
+& *2. avg pooling  &\textbf{98.1} &81.8&\textbf{92.1}&\textbf{98.2} &81.8 &\textbf{94.8}\\
+& *3. \textit{Ours} &98.0 &\textbf{82.6} &91.9 &\textbf{98.2} &\textbf{82.3} &94.7\\
+\midrule
+\multirow{2}{*}{c. Backbone}&\;\ 1. KPConv~\cite{thomas2019kpconv} &97.9&74.6&91.1&97.3&72.8&94.3\\
+& *2. \textit{Ours} &\textbf{98.0} &\textbf{82.6} &\textbf{91.9} &\textbf{98.2} &\textbf{82.3} &\textbf{94.7}\\
+\midrule
+\multirow{2}{*}{d. Global}&*1. GeoTrans~\cite{qin2022geometric} &97.9 &\textbf{82.6} &90.8 &98.0 &\textbf{82.3} &94.5\\
+&*2. \textit{Ours} &\textbf{98.0} &\textbf{82.6} &\textbf{91.9} &\textbf{98.2} &\textbf{82.3} &\textbf{94.7}\\
+\midrule
+\multirow{4}{*}{e. \#Global}
+& *1. $g=0$ &\textbf{98.5} &65.8 &90.9 &98.3 &65.9 &93.7  \\
+& *2. $g=1$ &98.4 &74.8 &90.8 &\textbf{98.5} &74.8 &94.2 \\
+& *3. $g=3$~(\textit{Ours}) &98.0 &\textbf{82.6} &\textbf{91.9} &98.2 &\textbf{82.3} &\textbf{94.7}\\
+& *4. $g=5$ &98.1&82.0&91.7 &98.0 &82.0 &94.6\\
+
+\bottomrule
+\end{tabular}}
+\caption{\small Ablation study on (Rotated) 3DMatch. 5,000 points/correspondences are leveraged. * indicates the methods with intrinsic rotation invariance.}
+\label{tab:ablation_3dmatch}
+\end{table}
+
+
+
+
+
+\subsection{More Qualitative Results}
+\label{sec:more_qualitative}
+
+\paragraph{Indoor Scenes: 3DLoMatch.} We show more qualitative results on the challenging 3DLoMatch benchmark in Fig.~\ref{fig:indoor_more}.
+\noindent\textbf{Deformable Objects: 4DLoMatch.} More qualitative results of the 4DLoMatch benchmark consisting of partially-scanned deformable objects are demonstrated in Fig.~\ref{fig:deform_more}.
+\begin{table}
+\centering
+\resizebox{0.39\textwidth}{!}{
+\begin{tabular}{lccccc}
+\toprule
+Method &Data~(s)$\downarrow$ &Model~(s)$\downarrow$ &Total~(s)$\downarrow$\\
+\hline
+\hline
+Lepard~\cite{li2022lepard} &0.444 &\textbf{0.051} &0.495\\
+GeoTrans~\cite{qin2022geometric}  &\underline{0.194} &\underline{0.076} &\underline{0.270}\\
+\OURS{}~(\textit{Ours}) &\textbf{0.023} &0.210 &\textbf{0.233}\\
+
+\bottomrule
+\end{tabular}
+}
+\caption{Runtime comparison.}
+\label{tab:runtime}
+\end{table}
+\subsection{Runtime}
+We show the runtime comparison with Lepard~\cite{li2022lepard} and GeoTrans~\cite{qin2022geometric} in Tab.~\ref{tab:runtime}. We run all the methods on a machine with a single Nvidia RTX 3090 GPU and an AMD Ryzen 5800X 3.80GHz CPU. All the models are tested without CPU parallel and with a batch size of 1. All the reported time is averaged over the 3DMatch testing set that consists of 1,623 point cloud pairs. The column "Data" counts the runtime for data preparation, and the column "Model" reports the time for generating descriptors from the prepared data. As shown in Tab.~\ref{tab:runtime}, \OURS{} has the highest data preparation and overall speed while the lowest model speed. That is mainly due to the relatively low speed of the attention mechanism compared to convolutions, e.g., KPConv~\cite{thomas2019kpconv} used in both Lepard and GeoTrans, and also because we do the Farthest Point Sampling~(FPS) and $k$-nearest neighbor search on GPU, which is counted into the model time.
+
+\label{sec:runtime}
+
+\subsection{Limitations}
+\label{sec:limitations}
+\noindent\textbf{Further Discussion.}
+Although \OURS{} achieves remarkable performance on both the rigid and non-rigid scenarios, we also notice the drawbacks of our method. The first is the efficiency of the attention mechanism. Although our local attention mechanism runs faster compared to that of Point Transformer~\cite{zhao2021point}, its running speed is still lower than that of convolutions, as shown in Tab.~\ref{tab:runtime}. Moreover, the intrinsic rotation invariance comes at the cost of losing the ability to match symmetric structures~(see the 4DLoMatch data of Fig.~\ref{fig:failed_more}). Furthermore, \OURS{} mainly relies on feature distinctiveness to implicitly filter out the occluded areas during the matching procedure, which makes it fail in cases with extremely limited overlap~(see the 3DLoMatch data of Fig.~\ref{fig:failed_more}). Finally, as normal data augmentation cannot work on intrinsically rotation-invariant methods, more data is required to train a larger model. 
+
+\paragraph{Failure Cases.} We further show some failure cases in Fig.~\ref{fig:failed_more}. It can be observed that the failure on 3DLoMatch is caused by an extremely limited overlap on the flattened areas. In the first row, the overlap ratio is only $17.6\%$, and the overlap region is mainly on the floor. In the second row, the overlap region is even more limited~(with an overlap ratio of $10.7\%$) and mainly on a wall. For the 4DLoMatch, the failure is mainly due to the extremely limited overlap and the ambiguity caused by the symmetric structure. The first row shows a case with the two frames of point cloud showing a horse's left and right parts, with only $18.1\%$ overlap in the middle. The second row with $17.9\%$ overlap ratio also has a strong left-right ambiguity due to the symmetric structure of a pig, which accounts for many left-right mismatches.
+
+\begin{figure*}[h!]
+  \centering
+  \includegraphics[width=0.96\textwidth]{figures/visualization_indoor_more.pdf}
+  \caption{More qualitative results on 3DLoMatch. GeoTrans~\cite{qin2022geometric} is used as the baseline.}
+  \label{fig:indoor_more}
+\end{figure*}
+
+\begin{figure*}[ht!]
+  \centering
+  \includegraphics[width=0.98\textwidth]{figures/visualization_deform_more.pdf}
+  \caption{More qualitative results on 4DLoMatch. Lepard~\cite{li2022lepard} is used as the baseline.}
+  \label{fig:deform_more}
+\end{figure*}
+
+
+\begin{figure*}[h!]
+  \centering
+  \includegraphics[width=0.96\textwidth]{figures/visualization_failed_cases.pdf}
+  \caption{Failed cases on 3DLoMatch and 4DLoMatch.}
+  \label{fig:failed_more}
+\end{figure*}

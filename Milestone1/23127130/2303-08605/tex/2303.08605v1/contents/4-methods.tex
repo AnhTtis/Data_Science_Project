@@ -1,0 +1,126 @@
+\section{Methodology}
+\label{method}
+Our goal is to recover decomposed geometry surface of the objects and background within a scene from the images and semantic masks inputs. To this end, we first review the SDF-based neural implicit representation and how to use the semantic logits for compositional reconstruction in Section~\ref{method-background}. Next, we propose two types of regularizations on unobserved regions to address the partial observation problem: patch-based background smoothness~(Section~\ref{method-bgloss}) and object-background relation~(Section~\ref{method-obj-scene}). Finally, we introduce the overall optimization procedure in Section~\ref{method-train}. An overview of our method is provided in Fig~\ref{fig:method}.
+
+\subsection{Background}
+\label{method-background}
+
+\boldparagraph{Volume Rendering of SDF-based Implicit Surface}
+For implicit reconstruction, the geometry of the scene is represented as the signed distance function~(SDF) $s(\bp)$ of each spatial point $\bp$, which is the point's distance to the closest surface. In practice, the SDF function is implemented as a multi-layer perceptron~(MLP) network $f(\cdot)$. The appearance of the scene is also defined as an MLP $g(\cdot)$:
+\begin{equation}
+    \begin{aligned}
+        f & : \bp\in\nR^3 \mapsto (s\in\nR,\bff\in\nR^{256}) \\
+        g & : (\bp\in\nR^3, \bn\in\nR^3, \bv\in\nS^2, \bff\in\nR^{256}) \mapsto \bc\in\nR^3
+    \end{aligned}
+\end{equation}
+where $\bff$ is a geometry feature vector, $\bn$ is the normal at $\bp$, $\bv$ is the viewing direction and $\bc$ is the view-dependent color.
+We adopt the unbiased rendering proposed in \cite{wang2021neus} to render the image. 
+For each camera ray $\br=(\bo, \bv)$ with $\bo$ as the ray origin, $n$ points $\{\bp(t_i) = \bo + t_i\bv|i=0,1,\dots,n-1\}$ are sampled, and the pixel color can be approximated as: 
+\begin{equation}
+    \hat{\bC}(\br) = \sum_{i=0}^{n-1}T_i\alpha_i\bc_i.
+    \label{eq-volume-rendering}
+\end{equation}
+The $T_i$ is the discrete accumulated transmittance derived from $T_i=\prod_{j=0}^{i-1}(1-\alpha_j)$, and $\alpha_i$ is the discrete density value defined as 
+\begin{equation}
+    \alpha_i = \max\left(\frac{\Phi_u(s(\bp(t_i))) - \Phi_u(s(\bp(t_{i+1})))}{\Phi_u(s(\bp(t_i)))}, 0\right),
+\end{equation}
+where $\Phi_u(x) = (1+e^{-ux})^{-1}$  and $u$ is a learnable parameter. By minimizing the difference between predicted and ground-truth pixel colors, we can learn the SDF and appearance function of the desired scene.
+
+\boldparagraph{Learning SDF with Semantic Logits}
+In this work, we consider compositional reconstruction of $k$ objects given their masks. Note that we also consider the background as an instantiated object for brevity as in \cite{wu2022object} and follow their network structure.
+In detail, for a scene with $k$ objects, the SDF MLP $f(\cdot)$ now outputs $k$ SDFs at each point, and the $j$-th~($1\leq j\leq k$) SDF represents the geometry of $j$-th object. Without loss of generality, we set $j=1$ as the background category and others for objects in Fig.~\ref{fig:method} and the rest of the paper.
+The \textit{scene} SDF is the minimum of $\{s_j\}$, which is used for sampling points along the ray and aforementioned volume rendering~(Eq.~\ref{eq-volume-rendering}). Moreover, each point's $k$ SDFs can be transformed into semantic logits $\bh(\bp)$ as
+\begin{equation}
+    \begin{aligned}
+        h_j(\bp) &= \gamma / (1 + \exp(\gamma\cdot s_j(\bp))), \\
+        \bh(\bp) &= [h_1(\bp), h_2(\bp),...,h_k(\bp)],
+    \end{aligned}
+\end{equation}
+where $\gamma$ is a fixed parameter. Using volume rendering to accumulate the semantic logits of all the points along a ray, we can get the semantic logits $\bH(\br)\in \nR^k$ of each pixel. During training, the cross-entropy loss applied to $\bH(\br)$ is backpropagated to the SDF values, allowing for learning the compositional geometry.
+
+\subsection{Patch-based Background Smoothness}
+\label{method-bgloss}
+
+Although the volume rendering can propagate gradients along the entire ray, the optimization mainly focuses on the surface-hitting point, as its accumulated weight can be much larger than the others. As a result, the geometry of the points behind the first-hit surface can not be optimized correctly. In the indoor scenes, the occluded part of the background surface is invisible in all the images, 
+% and this part of the background surface 
+which
+can be with holes and random artifacts~(see Fig.~\ref{fig:intro-objsdf-edit}).
+
+Since we cannot tell the exact color, depth or normal of the occluded part, it is intractable to optimize this region \wrt its ground truth. Therefore, we propose to regularize the geometry of the occluded background to be \textit{smooth}, thus preventing some clearly wrong artifacts.
+
+In detail, we regularize the smoothness of rendered depth and normal of background surface within a small patch region. To save the computation budget, we randomly sample a $\cP\times \cP$ size patch every $\cT_{\cP}$ iterations in the given image and sample points along the patch rays using the \textit{background SDF} only. 
+We compute depth map $\hat{D}(\br)$ and normal map $\hat{N}(\br)$ of the sampled patch following \cite{yu2022monosdf}, $\br$ denotes the sampled ray in patch. The semantic map of the patch is also computed and transformed into a patch Mask $\hat{M}(\br)$:
+\begin{equation}
+    \hat{M}(\br) = \mathbbm{1}[\arg\max (\bH(\br)) \neq 1],
+\end{equation}
+which means the mask value is $1$ if the rendered class is not the background, so that only the occluded background is regularized. Taking rendered depth as an example, the patch-based background smoothness loss is
+\begin{equation}
+\label{eq-smooth-depth-loss}
+    \begin{aligned}
+        \cL(\hat{D}) =& \sum_{d=0} ^3 \sum_{m,n=0}^{\cP-1-2^d} \hat{M}(\br_{m,n}) \odot (|\hat{D}(\br_{m,n}) - \\
+        &\hat{D}(\br_{m,n+2^d})| + |\hat{D}(\br_{m,n}) - \hat{D}(\br_{m+2^d,n})| ).
+    \end{aligned}
+\end{equation}
+Here the smoothness is applied on different intervals controlled by $d$. $m$ and $n$ are the pixel indices within the patch and the mask is multiplied at each position with hadamard product $\odot$. The normal smoothness loss $\cL(\hat{N})$ can be obtained similarly. We define the overall background smoothness loss $\cL_{bs}$ as:
+\begin{equation}
+    \cL_{\text{bs}} = \cL(\hat{D}) + \cL(\hat{N}).
+\end{equation}
+Here in contrast to \cite{niemeyer2022regnerf} which applies a patch-based regularization to visible regions in other views, we instead regularize the \textit{occluded} regions of the background.
+
+\begin{figure}[!htbp]
+\begin{center}
+\includegraphics[width=\linewidth]{contents/figs/fig4_new.pdf}
+\end{center}
+   \caption{\textbf{Toy-case analysis.} A bird-eye view of an object against the background is shown here, the SDF and surface of object is shown in red and background's in blue. (a)~In \cite{wu2022object} the minimum SDF is used for volume rendering and semantic loss, so on object's visible surface where object SDF is optimized to $0$ and the background SDF here is positive, and similar for the visible background surface. Since the scene is partially observed from left, the right part of object surface is open and unobserved background region is unconstraint. (b)~With the smoothness prior the background surface can be plausible, (c)~and object point SDF loss close the object surface but still have intersections, (d)~finally the reversed depth loss optimizes the entire ray thus the object can be within the background.}
+\vspace{-1em}
+\label{fig:obj-case-vis}
+\end{figure}
+
+\subsection{Object-background Relation as Regularization}
+\label{method-obj-scene}
+
+With the help of the patch-based background smoothness loss, most artifacts of the background are resolved, yielding a smooth surface. We further leverage this smooth background surface to regularize the SDF fields of other objects, leveraging a key prior knowledge that \textit{all the other objects are confined to the room}, \ie, the background surface.
+
+In the original framework of \cite{wu2022object}, if an object is partially observed, \eg against the background, the object's reconstructed surface won't be a ``closed" surface~(see Fig.~\ref{fig:intro} and Fig.~\ref{fig:intro-objsdf-edit}).
+We refer to the toy-case analysis shown in Fig.~\ref{fig:obj-case-vis} for the reason of the current unsatisfactory reconstruction.
+To encourage the reconstruction to be \textit{watertight}, we design two types of regularization on the SDF fields of objects.
+
+\boldparagraph{Object Point-SDF Loss}
+A straightforward solution is to directly regularize the objects' SDFs on every sampled point behind the background surface. To be more specific, the regular volume rendering only guarantees a single change of the sign (positive SDF to negative) when a ray hits a visible surface. For watertight objects, the ray should hit another occluded surface (negative SDF to positive). With the prior that the object is confined within the room, the occluded object surface should be closer than the background surface, meaning that the object SDFs of points behind the background surface should all be positive~(Fig.~\ref{fig:obj-case-vis}~(c)).
+
+We implement an object point-SDF loss based on the above analysis. For the sampled points along the rays, we first utilize the root-finding algorithm among the background SDF of these points and find the zero-SDF ray depth $t'$. Then the object point-SDF loss can be formulated as
+\begin{equation}
+    \cL_{\text{op}} = \frac{1}{k-1}\sum_{j=2}^{k}\max\left(0, \epsilon - \bs_j(\bp(t_i))\right)\cdot\mathbbm{1}[t_i > t'] ,
+\end{equation}
+which pushes the objects' SDFs at points behind the surface larger than a positive threshold $\epsilon$.
+
+\boldparagraph{Reversed Depth Loss}
+Although the $\cL_{\text{op}}$ can effectively regularize the SDF fields of each object, in practice we find the reconstructed object surface can still have intersections with the background surface~(Fig.~\ref{fig:obj-case-vis}~(c)). The reason is that the sampled points are discrete and in most cases, the background surface is between two sampled points. Therefore, the sign change of the occluded surface may still occur after hitting the background surface.
+
+Since per-point optimization can not effectively propagate to the distribution of the entire ray. To optimize the entire ray's SDF distribution for better regularization, we compute a \textit{reversed depth} along each ray. With the help of $\cL_{\text{op}}$, the sign of the object SDF along one ray now is positive-negative-positive, which enables rendering a depth value backward. We first transform the ray depth $\{t_i|i=0,1,\dots,n-1\}$ into the reversed ray depth named $\{\hat{t}_i|i=0,1,\dots,n-1\}$, where
+\begin{equation}
+    \hat{t}_i = (t_0 + t_{n-1}) - t_{n-1-i}.
+\end{equation}
+With the reversed ray depth values, we use the background and object SDF both in reversed order to compute the accumulated weight and get the reversed depth respectively. Remarkably, in order to compute the exact correct depth, the points should be re-sampled along the reverse direction. 
+Here we directly use the sampled points to avoid computation overhead, and empirical results prove its effectiveness. We only compute the reverse depth of one pixel if satisfying two conditions: 1)~this pixel's $\hat{M}(\br)=1$; 2)~the SDF value of the rendered object at the furthest point is positive. Note that the second condition is usually satisfied when the object point-SDF loss is applied. By computing the reversed depth $d_o$ of the hitting object~(determined by the pixel's rendered semantic) and $d_b$ of the background, we can get the reversed depth loss:
+\begin{equation}
+    \cL_{\text{rd}} = \max(0, d_b - d_o),
+\end{equation}
+which pushes the object surface within the background as illustrated in Fig.~\ref{fig:obj-case-vis}~(d).
+
+\subsection{Training Details}
+\label{method-train}
+
+\boldparagraph{Loss Functions} Monocular geometric cues are essential for indoor scene reconstruction as proved in~\cite{yu2022monosdf}. Following \cite{yu2022monosdf}, we add the depth and normal consistency loss~($\cL_{\text{D}}$,$\cL_{\text{N}}$) with pseudo ground truth from Omnidata~\cite{eftekhar2021omnidata} model. In experiments, we also add the monocular cues on \cite{wu2022object} to get a stronger baseline for a fair comparison.
+
+The SDF network is also regularized by an Eikonal~\cite{gropp2020implicit} loss item $\cL_{\text{E}}$. We further use the semantic loss $\cL_{\text{S}}$ proposed in \cite{wu2022object} to learn the compositional geometry. The overall loss function for compositional reconstruction is:
+\begin{equation}
+    \begin{aligned}
+        \cL =& \cL_{\text{RGB}} + \lambda_{\text{D}}\cL_{\text{D}} + \lambda_{\text{N}}\cL_{\text{N}} + \lambda_{\text{E}}\cL_{\text{E}} + \lambda_{\text{S}}\cL_{\text{S}} \\
+    &+ \lambda_{\text{bs}}\cL_{\text{bs}} + \lambda_{\text{op}}\cL_{\text{op}} + \lambda_{\text{rd}}\cL_{\text{rd}}.
+    \end{aligned}
+\end{equation}
+We set $\lambda_{\text{bs}},\lambda_{\text{op}},\lambda_{\text{rd}}=0.1$ in our experiments. The detailed weight setting and calculation of other losses can be found in supplementary.
+
+\boldparagraph{Implementation Details}
+We implement our method in PyTorch~\cite{paszke2019pytorch}. We use the Adam~\cite{kingma2014adam} optimizer with a learning rate of 5e-4 for 50k iterations and sample 1024 rays per iteration. The weight initialization scheme for SDF MLP is identical to \cite{yariv2021volume,wang2021neus,wu2022object}. The $u$ is initialized as $0.05$ and we set $\gamma$=$20$ as proposed in \cite{wu2022object}. $\cP$, $\cT_{\cP}$ and $\epsilon$ are set as $32$, $10$ and $0.05$ respectively. All the reconstructions are acquired by using marching cube~\cite{lorensen1987marching} at the resolution of $512$. More implementation details can be found in the supplementary.

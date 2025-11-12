@@ -1,0 +1,325 @@
+\section{Optimization of Deployments on GPU}
+\label{sec:alg}
+% The overall architecture of the proposed high performance accelerator is shown in Fig xxx. It is accelerated on NVIDIA GPU and hosted by an ARM CPU processor. 
+% Backbone is implemented to regress linear combination coefficients.
+% 8155 Conv is adopted to assemble pixel-adaptive filters.
+% Einstein is invented to apply adaptive filters to the upsampled image.
+
+\subsection{Dictionary Compression}
+\label{sec:pruning}
+
+% The SR framework we chose from \cite{SR-2020NIPS-LAPAR} already shows the lightweight model which performs the state-of-art 
+% results in practice with a limited size of parameters($<$1M) and retrained number of MultiAdds operations. 
+The state-of-the-art SR model LAPAR \cite{SR-2020NIPS-LAPAR} shows outstanding performance with a limited size of parameters ($<1$M). 
+% However, to fulfill a real-time video super-resolution requirement, we pick up the model sliming as the very first step of our speed enhancement framework. 
+% To fulfill the real-time video super-resolution requirement, running-time profiling and model sliming are adopted in our framework to compress the model. 
+However, even using the state-of-the-art NVIDIA TensorRT \cite{GPU-NVIDIA-TensorRT}, the inference performance cannot meet the demanding real-time requirement. 
+The reason is that the high-resolution feature maps play the key role instead of the parameters in the SR models, as mentioned above in \Cref{sec:sr-algorithm}. 
+The running time profiling is shown in \Cref{fig:time-breakdown}. 
+The time distribution demonstrates that dictionary learning consumes the most time and is obviously the bottleneck. 
+Such analysis result comes from the fact that the existing tools and methods, \textit{e.g.}, TensorRT, as effective in acceleration for normal DNN kernels such as convolution, ReLU. 
+For certain layers in the computation graph with less customized efficient implementation from TensorRT, they will cost inevitably a large amount of time. 
+
+% \begin{figure}[tb!]
+%     \centering
+%     \includegraphics[width=.66\linewidth]{profiling} 
+%     \caption{Time profiling (in milliseconds) on different parts of LAPAR SR inference process. Model is deployed on NVIDIA GTX 2080ti. Time cost breaks into 3 
+%     separate components: (1) common kernels such as Convolution and ReLU; (2) data reformatting, concatenation or other operations; (3) dictionary query and filtering step}
+%     \label{fig:time-breakdown}
+% \end{figure}
+% We observe that the state-of-the-art SR model LAPAR has all kinds of layers. 
+% We use the roofline model to implement a layer by layer profiling in terms of both computation and data transfer. 
+% Each layer in the computation graphs has different shapes of tensors, which can cause dissimilar computation and communication behaviors.
+% As shown in figure \Cref{fig:time-breakdown}, it is easy to find out the dictionary learning occupies the major part of the inference time. 
+
+% We selected the most $\vec{\alpha}$ representative layers where $\vec{\alpha} \in (0, 1)$ and ignore the redundant ones with a selective strategy. 
+% We reduce $\alpha$ to accelerate the dictionary query step repeatedly until a precision threshold was met. 
+
+Compressing the dictionary can ease both the computation and communication workloads, as has been analyzed in \Cref{sec:sr-algorithm}. 
+Consequently, a structural dictionary selection strategy is proposed in this paper to compress the dictionary. 
+On the one hand, an ideal dictionary $\vec{D}$ can provide sufficient information for the restoration of image details. 
+On the other hand, the dictionary $\vec{D}$ is expected to be less bulky to perform an inference within the required time limit, without degradation to the quality of results. 
+A threshold value $\alpha \in (0, 1)$ is set to specify the sparsity of the dictionary $\vec{D} \in \mathbb{R}^{L\times k^2}$, 
+\textit{i.e.}, after compression, only the most representative $\alpha \cdot L$ items from $L$ will be reserved.  
+To avoid the greedy compression which would fall into the local optimum, the dictionary items are compressed iteratively until the sparsity threshold $\alpha$ is reached. 
+In step $t$, the compression ratio is set to be $\alpha_t$, with $\alpha_t < \alpha_{t-1}$. The most representative $\alpha_t L$ items are reserved while others are discarded. 
+In the next step, we set $\alpha_{t+1}=\alpha_t -\Delta_{\alpha}$, to further prune more items. 
+Meanwhile, parameters $\vec{W}$ of the \textit{LaparNet} is fine-tuned accordingly to minimize the reconstruction error \cite{SPEED-he2019filter-He,SPEED-ICCV2017-He,SPEED-huang2018data-Huang}. 
+The problem can be formulated as:
+% \todo{as indicated by \cite{SPEED-ICCV2017-He}}:
+\begin{equation}
+    \label{eq:prune}
+    \begin{array}{rl}
+        \vec{\beta}, \vec{W} ={}& \mathop{\arg\min}_{\vec{\beta}, \vec{W}} \frac{1}{N} \left\|\vec{Y} - \sum_{i=0}^{L} \beta_{i}\vec{\Phi} \vec{D}\right\|_{2}^{2}, \\[2\jot]
+        \mathrm{s.t.} \ & \vec{\Phi} = \textit{LaparNet}(\vec{X}, \vec{W}), \\[2\jot]
+        & \| \vec{\beta}\|_{0} \leq \alpha L,
+    \end{array}
+\end{equation}
+where $N$ is the size of input batch of images, $\vec{\Phi}$ is the coefficient vector extracted from \textit{LaparNet} with parameters $\vec{W}$ and $\vec{Y}$ is the output matrix of this layer after dictionary query. 
+$\vec{\beta}$ is the selecting vector on filters of $\vec{D}$ where $\beta_{i} = 0 $ means the $i$-th item in the dictionary will be ignored during the compression process. 
+% within the selected Dictionary $\vec{\beta}\vec{D}$'s i-th item on channel-dimension will be ignored for slimming purpose.
+% We can make modifications to the problem as the $\vec{Y}$ output is not the final result of the SR flow. 
+
+\begin{figure}[tb!]
+    \centering
+    \includegraphics[width=0.9\linewidth]{dictionary-compression_2/dictionary-compression} 
+    \caption{Visual illustration of dictionary compression, the upper flow represents original dictionary query and filtering, namely stage 3 + stage 4 in \Cref{fig:LAPAR-architecture}, 
+    The flow below demonstrates the compression process of the dictionary query. }
+    \label{fig:prune}
+\end{figure}
+
+Further, we improve \Cref{eq:prune} by considering the loss of the final results of the SR flow. 
+In other words, the filtering stage after the dictionary query stage is considered, to guarantee the quality of results after compression. 
+% Within the minimization objective in \Cref{eq:prune}, the dictionary filtering step is not involved for dictionary item selection. 
+% We can simply insert this step to the loss function by computing the difference between ground truth high-resolution image $\vec{H}_{gt}$ and re-write the objective function: 
+The reconstruction error $\mathscr{L}$ of the dictionary compression is defined as the difference between the ground truth high-resolution image $\vec{H}_{gt}$ and the images generated by the compressed model, as shown in \Cref{eq:prune_2}. 
+\begin{equation}
+    \label{eq:prune_2}
+    \begin{array}{rl}
+        % \mathscr{L} ={}& \frac{1}{N} \left\|\vec{H}_{gt} - \vec{F}_{W,\beta}\vec{B}^{\top}\right\|_{2}^{2}, \\ [2\jot]
+        \vec{\beta}, \vec{W} ={}& \mathop{\arg\min}_{\vec{\beta}, \vec{W}} \frac{1}{N} \left\|\vec{H}_{gt} - \vec{F}_{W,\beta}\vec{B}^{\top}\right\|_{2}^{2}, \\ [2\jot]
+        \mathrm{s.t.} \ \ & \vec{F}_{W,\beta} = \sum_{i=0}^{L} \beta_{i}\vec{\Phi} \vec{D}, \\ [2\jot]
+        & \vec{\Phi} = \textit{LaparNet}(\vec{X}, \vec{W}), \\ [2\jot]
+        & \| \vec{\beta}\|_{0} \leq \alpha L.
+    \end{array}
+\end{equation}
+With two objectives $\vec{W}$ and $\vec{\beta}$, to solve this optimization problem efficiently, an alternating method including two steps is adopted. 
+The first step is to search the suitable selecting vector $\beta$ corresponding to the required $\alpha_t$. 
+The second step is to tune the parameters $\vec{W}$ corresponding to the reserved dictionary items with the minimization objective in \Cref{eq:prune_2}. 
+The first step is actually an NP-hard problem. 
+\cite{SPEED-ICCV2017-He} suggested to relax the problem to $\ell_{1}$ regulation. % $\ell_{0}$
+Therefore the objective $\vec{\beta}$ can be solved by utilizing the LASSO regression with parameter $\lambda$, as shown in \Cref{eq:lasso}. 
+\begin{equation}
+    \label{eq:lasso}
+    \begin{array}{rl}
+        \vec\beta=&\mathop{\arg\min}_{\vec\beta} \frac{1}{N}{}\left\|\vec{H}_{gt} - \vec{F}_{W,\beta}\vec{B}^{\top}\right\|_{2}^{2} + \lambda\|\vec{\beta}\|_{1}, \\[2\jot]
+        & \mathrm{s.t.} \|\vec{\beta}\|_{0} \leq \alpha L. 
+    \end{array}
+\end{equation}
+The complete selection strategy is illustrated in \Cref{alg:Pruning Strategy}. 
+
+\begin{algorithm}
+    \small
+    \caption{Dictionary Selection Strategy}
+    \label{alg:Pruning Strategy}
+    \begin{algorithmic}[1]
+    \State {\textbf{Input:} $\vec{D} \in \mathbb{R}^{L\times k^2}$, small $\lambda_{0}$, target $\alpha$, tolerance $\epsilon$}; 
+    \State {\textbf{Input:} pre-trained $\vec{W}_{0}$ , coefficient matrix $\vec{\Phi}$};
+    % \State {\textbf{Input:} loss function $\mathscr{L}$ (reconstruction error in \Cref{eq:prune_2})};
+    \State $t\leftarrow 0$, $\alpha_{0} \leftarrow 1.0$, $\beta_{0}\leftarrow\vec{1} \in \mathbb{R}^{L}$, $\gamma_{0}\leftarrow\vec{1} \in \mathbb{R}^{L}$;
+    \State {$\mathscr{L} \leftarrow$ reconstruction error \Comment{\Cref{eq:prune_2}}}
+    \Repeat 
+    \State {$\alpha_{t+1} \leftarrow\alpha_{t} - \Delta\alpha$; }
+    \State {$\lambda_{t+1} \leftarrow \lambda_{t}$;}
+        \While {$|\beta_{t+1}|_{0} \textgreater \alpha_{t+1} \cdot L$}
+        \State {Fix $\vec{W}_{t}$, update $\beta_{t+1} \leftarrow \mathop{\arg\min}_{\vec{\beta}} \mathscr{L}(\vec{W}_{t}, \vec{\beta}\vec{D})$ \Statex{$ + \lambda_{t+1}\left|\vec{\beta}\right|$; \Comment{\Cref{eq:lasso}}} }
+        \State {$\lambda_{t+1} \leftarrow 2 \cdot \lambda_{t+1}$}
+        \EndWhile
+        \State {$\lambda_{left} \leftarrow 0.5\lambda_{t+1}$, $\lambda_{right} \leftarrow \lambda_{t+1}$; }
+        \While{$\left|\alpha_{t+1} \cdot L - \left|\beta_{t+1}\right|_{0}\right| \textgreater \epsilon \cdot L$}
+        \State {$\lambda_{t+1} = 1/2(\lambda_{left} + \lambda_{right})$; }
+        \State {Fix $\vec{W}_{t}$, update $\beta_{t+1} \leftarrow \mathop{\arg\min}_{\vec{\beta}} \mathscr{L}(\vec{W}_{t}, \vec{\beta}\vec{D})$ \Statex{$ + \lambda_{t+1}\left|\vec{\beta}\right|$;}}
+        \If{$\left|\beta_{t+1}\right|_{0} \textless \alpha_{t+1} \cdot L$}
+        \State {$\lambda_{left} \leftarrow \lambda_{t+1}$;}
+        \ElsIf {$\left|\beta_{t+1}\right|_{0} \textgreater \alpha_{t+1} \cdot L$}
+        \State {$\lambda_{right} \leftarrow \lambda_{t+1}$;}
+        \EndIf
+        \EndWhile
+    \State {Fix $\beta_{t+1}$, update $\vec{W}_{t+1} \leftarrow \mathop{\arg\min}_{\vec{W}} \mathscr{L}(\vec{W}, \beta_{t+1}\vec{D}) $; } \Statex{\Comment{\Cref{eq:weight}}}
+    % \State {$Precision_{t+1} \leftarrow \vec{\Phi} (\vec{W}, Batch_{test}, \beta_{t+1}\vec{D})$}
+    \State {$t = t + 1$; }
+    \Until {$\alpha_{t} \leq \alpha$ }
+    \end{algorithmic}
+\end{algorithm}
+
+For channel selecting, we accumulated a batch of input feature map from the \textit{LaparNet} prior to the dictionary query step as well as the ground-truth high-resolution images. 
+The LASSO regression feature will be randomly sampled from the input feature map within width each plane. 
+The $\lambda$ in \Cref{eq:lasso} is carefully set to adjust the pruning ratio for filters. 
+We begin with a tiny $\lambda$ and increase the value exponentially until the reduced filter fits the required number. 
+% Then a binary search with the range of each step will be put into use on the pruning numbers in case the step size for $\lambda$ is too large.
+In lines 12--20 in \Cref{alg:Pruning Strategy}, a binary search is applied on $\lambda_{t+1}$ within the range of last step size to adjust the compression ratio close to $\alpha_{t+1}$.
+% In line.6 of Algo.\ref{alg:Pruning Strategy}, to tune the parameters of the whole model to fit the new dictionary at each step is time-consuming. As shown in \Cref{eq:weight}, The 
+% $\vec{D^\prime}$ is the Dictionary which is the compressed dictionary with layers neglected in the previous LASSO step. 
+
+The second step is to update the parameters in line 21 of \Cref{alg:Pruning Strategy}. The problem is formulated into:
+\begin{equation}
+    \label{eq:weight}
+    \vec{W} = \mathop{\arg\min}_{\vec{W}} \frac{1}{N} \left\|\vec{H}_{gt} - \vec{F}_{W,D^\prime}\vec{B}^{\top}\right\|_{2}^{2}. 
+\end{equation}
+To fine-tune the parameters of the whole model to fit the new dictionary through training at each step is time-consuming. As shown in \Cref{eq:weight}, The 
+$\vec{D}^\prime$ is the Dictionary which is the compressed dictionary with layers neglected in the previous LASSO step. 
+We can use linear regression in the iterative steps to reconstruct the parameters of the dictionary query layer which generates coefficient vector $\vec{\Phi}$ for 
+fast tuning requirement. 
+We note parameters of this layer as $\vec{W}_{D^\prime}$ and parameters at $i$-th channel will be adjusted by the regression coefficient $\vec{\gamma}$. The iterative tuning step 
+of \Cref{eq:weight} will be re-written into \Cref{eq:weight_2} where $\vec{W}_{D^\prime}^{new}$ is the updated parameters. Note that $\vec{\gamma}$ is actually a weight coefficient on $\vec{W}_{D^\prime}$ along channel dimension for update.
+The weighted coefficient matrix $\mathbf{\Phi}^{\prime}$ is the new query to the selected dictionary $\vec{D}^\prime$.
+The whole modified dictionary query and filtering flow are illustrated in \Cref{fig:prune}.
+\begin{equation}
+    \label{eq:weight_2}
+    \begin{array}{rl}
+         \vec{\gamma} = \mathop{\arg\min}_{\vec\gamma} {}& \frac{1}{N} \left\|\vec{H}_{gt} - \sum_{i=0}^{L} \gamma_{i}\vec{F}_{W,{D}^\prime}\vec{B}^{\top}\right\|_{2}^{2}, \\[2\jot]
+          &\vec{W}_{D^\prime}^{new} =  \vec{\gamma}\vec{W}_{D^\prime}. 
+    \end{array}
+\end{equation}
+
+As shown in \Cref{fig:prune_ratio_performance}, the pruning process sustains the SR performance with barely no accuracy degradation. 
+Essentially the well trained backbone network is capable of extracting sparse information for dictionary so the zero-out layers of the dictionary will not incur information loss. 
+We can shrink to dictionary to size of 10\% without noticeable accuracy loss. 
+Compared with other widely-used SR models, \textit{e.g.}, \cite{SR-eccv2016-frcnn, SR-2016cvpr-vsdr} , our performance is the optimal. 
+
+\begin{figure}[tb!]
+    \centering
+    \hspace{-.2in}
+    \subfloat{
+        \includegraphics[height=0.28\linewidth]{psnr-ssim/psnr}  
+    }
+    \hspace{-.1in}
+    \subfloat{
+        \includegraphics[height=0.28\linewidth]{psnr-ssim/ssim} 
+    }
+    \hspace{-.2in}
+    \caption{Single image super-resolution (SISR) performance of our model with different dictionary compression ratios, in comparison with other SR methods. 
+    LAPAR-A (Per.\%) represents our model with dictionary size shrunk to Per.\%. PSNR means peak signal-to-noise ratio. SSIM means structural similarity index measure. 
+    PSNR and SSIM are two common metrics to measure the quality of images. The higher the better. }
+    \label{fig:prune_ratio_performance}
+\end{figure}
+
+\subsection{Constraint-Based Optimization of Deployments On GPU}
+\label{sec:cuda}
+After shrinking the volume of the dictionary, we successfully slim the volume of the model. 
+Another bottleneck for accelerating the computations is the filtering operation following the dictionary query, which can be regarded as a Hadamard product of matrices followed by a reducesum operation along channel dimension. 
+Such kind of computations are common in SR tasks but ignored by the existing deployment tools. % normally arise at the very end of some SR flows. 
+In this section, we take advantage of the parallelizing mechanism of GPU to improve the computation throughput from a low-level perspective.
+An example of the proposed computation engine is shown in \Cref{fig:engine}. 
+
+\begin{figure}[tb!]
+    \centering
+    \includegraphics[width=\linewidth]{engine} 
+    \caption{An example of the proposed computation engine for image filtering operation.}
+    \label{fig:engine}
+\end{figure}
+
+The data (either images or filters) are stored in the NCHW format in linear memory addresses continuously, as shown in \Cref{fig:engine}. 
+The data with the same color are assigned to the same block to conduct the computations, \textit{e.g.}, the data in purple are assigned to block 0, and the data in orange are assigned to block 1. 
+The data with the same index but from various channels are assigned to the same thread. 
+For example, the data at location $(1, 1)$ from these channels are all assigned to thread 0 in block 0, while the data at $(1, 2)$ are assigned to thread 1 in block 0. 
+Two values with the same location index from $\vec{F}$ and $\vec{B}$ are firstly multiplied. 
+Then, the products of the data with the same location index but from various channels are summed up as the final result. 
+In other words, each thread in \Cref{fig:engine} computes the product of two vectors, where each vector contains the data from all of the channels. 
+Note that in our implementation, each thread directly adds each intermediate product to the final result. 
+With this implementation, all of the threads can execute the same code segment and achieve parallel reduction perfectly without falling into the paradox of thread divergence \cite{CUDA-C-Programming}. 
+Moreover, frequent cache interaction with main memory is avoided with our design. Blocks within an SM share same shared memory/L1 cache as shown in \Cref{fig:gpu-architecture}.
+Thus cache miss rate is reduced since data assigned to consecutive blocks in each channel is carefully stored consequently on memory as illustrated in \Cref{fig:engine}.
+
+The resources in GPU are limited, which concurrently restricts the computation patterns with respect to the threads, blocks, and \textit{etc}. 
+Different GPUs have distinct compute capabilities. For clarity, the edge embedded GPU NVIDIA Jetson Xavier NX which uses the Volta microarchitecture is taken as an example to illustrate this. 
+From the perspective of hardware architectures, there are 6 streaming multiprocessors (SMs) in it. 
+Each SM occupies a 96 KB shared memory/L1 cache. Each SM is further partitioned into 4 processing blocks. 
+Every processing block has 16 FP32 cores, 8 FP64 cores, 16 INT32 cores, 2 Tensor cores, and a 64 KB shared register file.
+Besides, each processing block has a warp scheduler, to schedule the threads assigned to this processing block. 
+From the perspective of the programming model, the computation kernel is executed as a grid of thread blocks. 
+Each thread block (different from the processing block mentioned above) is assigned to a single streaming multiprocessor. 
+Once the block is scheduled to an SM, threads in this block are further partitioned into warps. 
+Every warp consists of 32 consecutive threads and all threads in a warp are executed in SIMT fashion. 
+While the warps within a thread block may be scheduled in any order, the number of active warps is limited by SM resources. 
+Four processing blocks in every SM of NX means there are at most four active warps in executing at the same moment. 
+Besides, the number of warps in a thread block is constrained by the programming model to fit the sizes of warp schedulers, instruction registers, and \textit{etc}. 
+Sharing data in the shared register files among the parallel threads in the same processing block, or sharing data among the processing blocks in the same SM 
+may cause a race condition: multiple threads accessing the same data in the memory simultaneously. 
+Once a warp idles for the race conditions, the SM is free to schedule other available warps. 
+The number of warps for a thread block can be determined as follows:
+\begin{equation}
+    \textrm{Warps Per Block} = \left \lceil \frac{\textrm{Threads Per Block}}{\textrm{Warp Size}} \right \rceil,
+\end{equation}
+where $\textrm{Warp Size}=32$ for mainstream NVIDIA GPUs. 
+% From the hardware perspective, the high-dimensional thread block is a 1-dimensional collection of warps. 
+% For example, a 2-dimensional block with 36 threads in the $x$ dimension and 2 threads in the $y$ dimension will be groups as 3 warps, while the last warp has only 12 threads. 
+% Although the left 20 threads in the third warp are unused, the resources are still consumed. 
+
+Suitable choices of blocks usually strike a good balance between the parallelism and resource race conditions and therefore stimulating the computations. 
+In summary, the sizes of the blocks are constrained by the sizes of input data and the available on-board resources. 
+Meanwhile, to accelerate the computations as much as possible, once the resources are available, the tasks will be assigned to occupy the resources. 
+In other words, the parallelism is maximized so as to reach the upper-bound value of the resource utilization. 
+Assume that the size of the three-dimensional input data is $D=H \times W \times C$, corresponding to the three dimensions of the thread blocks. 
+Denote the number of SMs in GPU as $S$, the number of processing blocks in each SM as $P$, the size of register file in each processing block as $R$, the maximum number of threads in each warp as $WS$. 
+The GPU compute capability constrains the number of warps in each block as smaller than $T_{sm}$. 
+Denote the three dimensions of the thread block as $(nx, ny, nz)$. 
+Therefore, we have the following equations and constraints: 
+\begin{equation}
+    \begin{aligned}
+        & T_r = (H \times W \times C) / (S \times P \times R), \\
+        & T \leq \min(T_r, T_{sm}), \\
+        & nx \times ny \times nz \leq WS \times P \times T, \\
+    \end{aligned}
+    \label{eq:constraints}
+\end{equation}
+where $T_r$ is computed by distributing data evenly to different SMs.  
+The computational resources are implicitly organized and scheduled by the processing blocks. 
+Therefore constraints on the computational resources are reflected in $T_{sm}$, which is a constant value determined by the compute capability. 
+Constrained by $T_r$ and $T_{sm}$, $T$ represents the upper bound of the number of warps assigned to each processing block.
+Besides, the sizes are also constrained by the size of input data as follows:
+\begin{equation}
+    \begin{aligned}
+        & 1 \leq nx \leq H, \\ 
+        & 1 \leq ny \leq W, \\ 
+        & 1 \leq nz \leq C.
+    \end{aligned}
+\end{equation}
+These constraints are usually ignored by designers, which wastes lots of optimization workloads. 
+For examples, for $T \in [T_r, T_{sm}]$, these $T$ values are legal while on-board resources are not fully utilized and the system parallelism can be further improved. 
+With the above constraints, the feasible domain of the block sizes is shrunken significantly. 
+The visualization view of the constraints are shown in \Cref{fig:space}. 
+To the best of our knowledge, this is the first to consider these constraints for deployments of DNN models on GPUs, 
+compared with previous arts, \textit{e.g.}, \cite{SPEED-OSDI2018-TVM}. 
+
+\begin{figure}[tb!]
+    \centering
+    \input{./pgfplot/space}
+    \caption{The visualized solution space. The solution points below the dotted points are legal configurations. }
+    \label{fig:space}
+\end{figure}
+
+\begin{table*}[tb!]
+    \centering
+    \caption{Inference Time (ms) and Acceleration ratios}
+    \label{tab:runtime}
+    %\resizebox{1\linewidth}{!}
+    {
+        \begin{tabular}{c|c|ccccc|ccc}
+            \toprule
+            \multirow{2}{*}{Input size} & \multirow{2}{*}{Scale} & \multicolumn{5}{c|}{NVIDIA GeForce RTX 2080 Ti} & \multicolumn{3}{c}{NVIDIA  Jetson  Xavier  NX} \\
+            \cline{3-10}
+            & & PyTorch & TensorRT & Ours & Acc. (PyTorch) & Acc. (TensorRT) & TensorRT & Ours & Acc. (TensorRT) \\
+            \midrule
+            \multirow{3}{*}{$64\times64$}    &$\times$2  &   6.94    &   1.30    &  1.02 & $\times$680.39\% & $\times$127.45\%   &   12.37 &     9.04   &  $\times$136.84\% \\ 
+                                             &$\times$3  &   8.26    &   1.94    &  1.40 & $\times$590.00\% & $\times$138.57\%   &   22.62 &    14.28   &  $\times$158.40\% \\ 
+                                             &$\times$4  &   9.86    &   2.79    &  1.88 & $\times$524.46\% & $\times$148.40\%   &   35.83 &    20.54   &  $\times$174.44\% \\ \midrule
+            \multirow{3}{*}{$128\times128$}  &$\times$2  &   8.74    &   3.59    &  2.66 & $\times$328.57\% & $\times$134.96\%   &   52.12 &    37.25   &  $\times$139.92\% \\ 
+                                             &$\times$3  &  13.04    &   6.19    &  4.16 & $\times$313.46\% & $\times$148.80\%   &   90.33 &    54.26   &  $\times$166.48\% \\ 
+                                             &$\times$4  &  18.07    &   9.71    &  6.13 & $\times$294.78\% & $\times$158.40\%   &  144.34 &    81.29   &  $\times$177.56\% \\ \midrule
+            \multirow{3}{*}{$180\times320$}  &$\times$2  &  17.12    &  12.40    &  9.25 & $\times$185.08\% & $\times$134.05\%   &  177.57 &   124.12   &  $\times$143.06\% \\ 
+                                             &$\times$3  &  30.83    &  21.66    & 14.63 & $\times$210.73\% & $\times$148.05\%   &  325.07 &   200.02   &  $\times$162.52\% \\ 
+                                             &$\times$4  &  44.69    &  34.69    & 22.12 & $\times$202.03\% & $\times$156.82\%   &  534.99 &   318.60   &  $\times$167.92\% \\ \midrule
+            \multirow{3}{*}{$360\times640$}  &$\times$2  &  67.36    &  50.26    & 37.47 & $\times$179.77\% & $\times$134.13\%   &  748.72 &   530.23   &  $\times$141.21\% \\ 
+                                             &$\times$3  & 105.32    &  88.45    & 59.20 & $\times$177.90\% & $\times$149.41\%   & 1466.91 &   973.25   &  $\times$150.72\% \\ 
+                                             &$\times$4  & 406.93    & 141.08    & 91.09 & $\times$540.02\% & $\times$154.88\%   &       - &        -   &                -  \\ \midrule
+            Average                          & -         &  61.43    &  31.17    & \textbf{20.91} & \textbf{$\times$352.27\%} & \textbf{$\times$144.49\%}   & 328.26  &   \textbf{214.81}   & \textbf{$\times$156.28\%} \\ \bottomrule
+        \end{tabular}
+        \begin{tablenotes}
+            \small
+            \item Inference time on NVIDIA Jetson Xavier NX with input size $360\times640$ and scale 4 is not available due to the memory limit of the edge device. 
+          \end{tablenotes}
+    }
+\end{table*}
+
+
+With the target of minimizing the inference latency, we tend to build a regression model with respect to candidate values of $nx$, $ny$, and $nz$. 
+The key challenge is that the clear form is the objective function is unknown because of the invisible execution process of GPU and CUDA programming model. 
+Bayesian optimization is adopted in this paper as the searching algorithm to search the optimal configuration of the blocks 
+with Gaussian process (GP) model utilized as the surrogate model \cite{ML-2018NeurIPS-GPyTorch}. 
+Firstly, several configurations are randomly sampled from the design space to initialize the GP model. 
+And then the Bayesian optimization is used to iteratively select new configurations which have higher predictive performance reported by the GP model. 
+The GP model is further optimized with newly sampled configurations and their on-chip inference latencies. 
+Finally, the best configuration selected by the Bayesian algorithm in this exploration process is our optimal design. 
+
+

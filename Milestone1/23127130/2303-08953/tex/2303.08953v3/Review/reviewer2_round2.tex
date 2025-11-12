@@ -1,0 +1,103 @@
+\newpage
+\section*{Response to reviewer \#2}
+\rpy{(Responses are highlighted in red. Corresponding code changes are highlighted in red as well in the manuscript.)}
+
+\subsection*{Major comments}
+\paragraph{Comment 1} 
+This revision addresses most of my comments in my previous review. I have one more mathe- matical question, and some minor editing suggestions.
+
+The mathematical question is regarding the implementation of BCGS2-TSQR-GMRES in section 5. It is possible to implement GMRES without computing the explicit columns of the Q matrix, since we only need to multiply by Q or $Q^T$ , which can be cheaper for TSQR. Does the authors’ implementation take advantage of this optimization, or do they form Q explicitly? Either way, they should document this.
+
+\rpy{Thank you for raising this question. This is indeed a very intriguing question. For discussion purposes, we would like to first establish the notation and concepts regarding implicit Q factor in TSQR. Here, we borrowing the notation in [19] where a matrix $A$ can be factorized using TSQR as (Equation 1 in Section 4.1 of [19]):
+
+\[
+A = \begin{pmatrix}
+A_0 \\ 
+A_1 \\ 
+A_2 \\ 
+A_3
+\end{pmatrix} 
+= \left( \begin{array}{cccc}
+Q_{00} & & & \\
+ & Q_{10} & & \\
+ & & Q_{20} & \\
+ & & & Q_{30}
+\end{array} \right)
+\cdot \left( \begin{array}{cc}
+Q_{01} & \\
+ & Q_{11}
+\end{array} \right) 
+\cdot Q_{02} \cdot R_{02}
+\]
+
+(We only show 3 stages as an illustration.) The final Q factor is a product of all the $Q_{ij}$ matrices. Instead of computing the $Q$ factor explicitly, all operations involving multiplying by $Q$ or $Q^T$ can be achieved by multiplying the $Q_{ij}$ factors implicitly. The action of explictly computing the $Q$ factor from $Q_{ij}$ incurs the same communication cost (same number of messages) as applying $Q$ or $Q^T$ to a vector. The communication pattern is akin to a broadcast operation (with custom communication tree pattern).
+
+In this work, our original implementation of TSQR was using the \textbf{explicit} $Q$ factorization where we explicitly compute the $Q$ matrix and store it. This is largely because we implemented the TSQR algorithm using the \texttt{SLEPC} library and the implementation in \texttt{SLEPC} provides only explicit $Q$ factorization. For reproducibility, we did not modify the implementation in \texttt{SLEPC}.
+
+Regarding the implicit version, we find that the use of implicit representation of $Q$ factor is indeed possible since we do not actually require explicit entries of the $Q$ factor. But whether the implicit representation brings any performance gain is worth some in-depth discussion. This is mostly because that the \textit{intra-orthogonalization} TSQR kernel needs to be evaluated in the context of block QR scheme where TSQR needs to be coupled with the \textit{inter-orthogonalization} scheme BCGS2. We feel the performance is largely dependent on the implementation. To elaborate on this, we summarize the BCGS2\-TSQR\-GMRES alrogithm below as a block QR algorithm:
+\begin{algorithm}
+\caption{Block QR using BCGS2 and TSQR}
+\begin{algorithmic}[1]
+\REQUIRE Step size \textit{s}, index $i$, Krylov basis matrix $V$ of size $N\times s$, orthogonal basis matrix $Q_{1:i}$ of size $N\times i$.
+\ENSURE Orthogonal basis matrix $Q_{i+1:i+s}$ of size $N\times s$, upper triangular matrix $R_{1:i+s,i+1:i+s}$ of size $(i+1) \times s$.
+\STATE $k = i+1:i+s$
+\STATE
+\STATE $W = Q_{1:i}^TV$ \COMMENT{First BCGS}
+\STATE $V = V- Q_{1:i}W$
+\STATE $[\,Q_{k},\, Z\,] = \mbox{TSQR}(V^TV, \Omega)$ \COMMENT{First TSQR}
+\STATE
+\STATE $R_{1:i, k} = Q_{1:i}^TQ_{k}$ \COMMENT{Second BCGS}
+\STATE $Q_{k} = Q_{k} - Q_{1:i}R_{1:i, k}$
+\STATE $[\,Q_{k},\, \tilde{Z}\,] = \mbox{TSQR}(Q_{k}^TQ_{k}, \Omega)$ \COMMENT{Second TSQR}
+\STATE
+\STATE $R_{1:i, } = W_{:,1:s} + R_{1:i, k}Z$ \COMMENT{Combine both steps}
+\STATE $R_{k, k} = \tilde{Z}Z$
+\end{algorithmic}
+\end{algorithm}
+Here, we have replaced the Partial CholQR in Algorithm 3.2 with TSQR. We assume the adaptive step size is exactly $s$ (i.e., no truncation) to simplify the discussion. (The adaptive nature of Partial CholQR can be easily enabled via a condition number estimator after each TSQR.) At each TSQR stage, the $Q_k$ factor can be implicitly constructed as a product of multiple $Q_{ij}$ matrices (with some abuse of notation here). 
+
+We investigate the trade-offs between using implicit and explicit $Q$ representations from a few aspects.
+\begin{enumerate}
+	\item For the first TSQR, if the $Q_k$ matrix is expressed implicitly. The second step of BCGS needs to be adjusted since it does require an update to the $Q_k$ matrix (at line 8 of the above algorithm). It is possible to use an implicit representation of $Q_k$ and store the product of $Q_{1:i}R_{1:i, k}$ first, then later compute the $Q_{k}^TQ_{k}$ matrix at line 9 via factorization (i.e., $(Q_{k} - Q_{1:i}R_{1:i, k})^T(Q_{k} - Q_{1:i}R_{1:i, k})$). However, this incurs additional storage cost for the term $Q_{1:i}R_{1:i, k}$. With explicit representation of $Q_k$, it is almost trivial to implement the second BCGS and we only need to store the $Q_k$ matrix itself without the need to store other auxiliary $Q_{ij}$ matrices. 
+	\item In terms of communication cost, although implicit representation of $Q_k$ factor saves a communication step that is similar to a broadcast operation within the TSQR kernel, we still need to apply the orthogonal matrix at line 8 and 9 in the second BCGS step. Hence, the number of messages sent is the same as the explicit representation. The latency cost also stays relatively at the same order since TSQR kernel still requires a global communication call to compute the $R$ factor.
+	\item As we have demonstrated in the Weak Scaling results (Fig. 12), the efficient utilization of BLAS-3 kernels is crucial in achieving good performance on the hardware. Using explicit $Q$ representation has the advantage to fully leverage high-optimized BLAS-3 kernels provided by software vendors/developers. Implicit $Q$ representation requires multiplication of small-scale $Q_{ij}$ matrices that might hinder the optimization provided by BLAS-3 libraries.
+	\item As our algorithm adaptively selects the number of the orthogonal bases at each block iteration, truncation of irrelevant orthogonal bases can be done efficiently if the $Q$ matrix is represently explicitly. For instance, with an initial step size of $s_0$ and an adaptive step size of $s^*$, truncation of orthogonal basis vectors means $s_0 - s^*$ column vectors can be removed from storage. With implicit representation, this is non-trivial as only the last $Q_{ij}$ matrix can be truncated, while $Q_{i0}$ would still have to contain the entire $s_0$ column vectors.
+\end{enumerate}
+
+In summary, the use of implicit $Q$ representation is allowed for the adaptive $s$-step algorithm, but the potential savings acheived by implicit $Q$ representation has to be balanced off by efficient implementation of the related kernels. As the exact software implementation of optimized kernels for TSQR is outside the scope of this work, we would like leave this pursuit of implicit $Q$ version of TSQR in adaptive $s$-step GMRES as future work. Nonetheless, we have added clarification in Section 5 (line 765).
+}
+
+\subsection*{Minor comments}
+
+\paragraph{Comment 1}
+1. Page 12, line 400: The reference to Fig. 2 should be to Fig. 1. All later references to figures in the text seem to be off-by-one as well.
+
+\rpy{Thank you for your feedback about the wrong numbering of figures. This was similarly pointed out by the other referee. The numbering mistake has been tracked down to an erroneous LaTex command in the previous manuscript, which incorrectly incremented the numbering of all figure references by 1. In other words, all references to Figure $x$ were incorrectly compiled to Figure $x+1$ in text. We apologize for the technical error. This has been fixed in the revised manuscript.}
+
+\paragraph{Comment 2}
+2. Page 18, line 562: “restart cycle” should be “restart cycles”.
+
+\rpy{Thank you for your feedback. We have corrected the typo at line 559}
+
+\paragraph{Comment 3}
+3. Page 21, line 641: When the ILU preconditioner is used, how were the rows and columns ordered, since this could impact convergence? The same question applies to other uses of ILU.
+
+\rpy{We would like to first clarify that the rows and columns are not ordered before solving the linear system. For ILUTP though, pivoting is used to assist in accelerating convergence. 
+
+We would also like to re-iterate that the goal of our algorithm (adaptive s-step GMRES) is to acheive the same level of accuracy as the conventional GMRES with minimal communication costs. Hence, the purpose of these tests is to demonstrate the agreement with GMRES under different scenarios. We acknowledge that using ordering could potentially accelerate convergence, but we do not spend effort on tuning the preconditioner for the best possible convergence acceleration since that's outside the scope of this work. 
+}
+
+\paragraph{Comment 4}
+4. Page 29, line 785: “$16B \times 10^9$” should probably be “$16 \times 10^9$”.
+
+\rpy{Thank you for your feedback. We have corrected the typo at line 777}
+
+\paragraph{Comment 5}
+5. Page 30, caption for Figure 12: Describing the timing as SpMV/MPK as “inverted”, which presumably means appearing as negative values below the 0 line, is confusing. This should be explained more clearly.
+
+\rpy{Thank you for your feedback. The SpMV/MPK timing is shown below the x-axis to separate it from the timing of Orthogonalization steps. This is to avoid stacking all timings together and to help readers to visually observe the scalability of each compoenent. We have added some clarification in the caption to explain this.}
+
+\paragraph{Comment 6}
+6. Page 30, line 849: The phrase “exponential increase” appears to refer to going from O(s) to O($s^2$), which is only polynomial, not exponential.
+
+\rpy{Thank you for your feedback. We agree the use of 'exponential increase' is technically incorrect and it should be polynomial. We have corrected the typo at line 813.}

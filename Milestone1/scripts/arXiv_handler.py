@@ -86,6 +86,33 @@ def get_IDs_All(start_month, start_year, start_ID, end_month, end_year, end_ID):
 
     return ids
 
+def get_IDs_network(start_month, start_year, start_ID, end_month, end_year, end_ID, total_paper):
+    """Get all valid arXiv IDs in the given range."""
+    ids = []
+    y, m = start_year, start_month
+    n_start = start_ID
+    n_end = None
+    while True:
+        if y == end_year and m == end_month:
+            n_end = end_ID
+        else:
+            n_end = total_paper - end_ID + start_ID - 1
+            if n_end is None:
+                n_end = 0  # No papers this month
+
+        if n_start <= n_end:
+            ids.extend(get_IDs_month(m, y, n_start, n_end))
+
+        if y == end_year and m == end_month:
+            break
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+        n_start = 1  # reset numbering
+
+    return ids
+
+
 def format_arxiv_id_for_key(arxiv_id):
     """
     Convert arXiv ID from YYMM.NNNNN format to yyyymm-id format.
@@ -100,3 +127,4 @@ def format_arxiv_id_for_key(arxiv_id):
         yyyy = f"20{yy}"
         return f"{yyyy}{mm}-{id_num}"
     return arxiv_id  # Return as-is if format doesn't match
+

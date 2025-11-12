@@ -1,0 +1,256 @@
+\begin{figure*}
+  % \vspace{-1em}
+  \centering
+  \subfloat[]{ \includegraphics[width=.76\linewidth]{nitho} \label{fig:nitho}}
+  \subfloat[]{ \includegraphics[width=.19\linewidth]{prev} \label{fig:prev}}
+  \caption{
+    (a) The overall aerial image prediction pipeline of Nitho framework, which separates mask-related linear operations from optical kernel regression using coordinate-based $\operatorname{\mathbb{C}MLP}$.
+    (b) Comparison with SOTA learning-based image-to-image frameworks, TEMPO~\cite{ISPD-2020-TEMPO}, DOINN~\cite{DAC22-DOINN-Yang}.
+  }
+  \label{fig:flow}
+\end{figure*}
+\section{Framework}
+
+This section covers the design flow of physics-informed Nitho,
+including analysis of optical kernel dimensions,
+details about optical kernel regression strategy using complex-valued neural fields,
+and a new training paradigm for simulating forward lithography.
+
+
+
+
+
+\subsection{Design of Predicted Optical Kernel Dimensions}
+\label{subsec:tcc_dim}
+For simplicity, the aerial intensity $\vec{I}$ in \Cref{eq:socs} can be written as,
+\begin{equation}
+  \vec{I}=\sum_{i}^{r} \left|\mathcal{F}^{-1}\left( \mathcal{K}_i  \odot \mathcal{F}(\boldsymbol{M})\right)\right|^2 ,
+\end{equation}
+where $\mathcal{K}_i$ is the $i$-th optical kernel, $r$ is the total number of kernels.
+
+To design the predicted kernel dimensions, we find Mack introduced the \textit{theoretical resolution} in ~\cite{DFM-B2008-Mack}.
+Let $R$ represents the resolution element (the line-width or the space-width) of mask patterns, the resolution is given by
+$R = 0.5 * (\lambda / {N\!A})$. $\lambda$ is the exposure wavelength.
+${N\!A}$ (\textit{numerical aperture}) is an important factor for the \textit{resolution limit} of the projection system,
+which can be regarded as the ``\textit{collection efficiency}'' of the projector.
+The smallest pitch that can be printed would put the first diffracted order at the largest angle that could pass through the lens,
+defined by ${N\!A}$.
+Using this description, we can set the kernel width and height as,
+\begin{equation}
+ m = (W \times \frac{2 * {N\!A}}{\lambda}) \times 2 +1,~
+ n = (H \times \frac{2 * {N\!A}}{\lambda}) \times 2 +1,
+ \label{eq:kernel_mn}
+\end{equation}
+where we use one-pixel width/height to represent 1$nm$,
+the mask pitch can be replaced by mask image width $W$, height $H$.
+Since the eigenvalues $\alpha_i$ in \Cref{eq:socs} rapidly decay in magnitude,
+truncating the summation at order $r$ can be a decent approximation with error bounds proven in~\cite{Pati94}.
+With discussions above, we can set a hyperparameter $r$ and design the optical kernel dimension as $\mathcal{K} \in \mathbb{C}^{r \times n \times m}$.
+Given commonly used $\lambda\!=\!193 nm$, $N\!A\!=\!1.35$, we can obtain in \Cref{eq:kernel_mn}, $m\approx0.028*W$, $n\approx 0.028*H$.
+Previous image learning-based models need to cover the prediction on $\mathbb{R}^{C\times W\times H}$ space while
+Nitho is performing regression on a much smaller space $\mathbb{C}^{r\times n\times m}$ ($r < 60$ in our settings).
+This can fundamentally contribute to our smaller model size.
+Besides, we will show in subsequent experiments, due to the \textit{resolution limit},
+even if $\lambda$ and $N\!A$ are unknown, the optical kernel dimensions can be obtained through a simple hyperparameter search.
+
+
+
+
+
+
+\subsection{Complex-Valued Neural Fields for Optical Kernel Regression}
+\label{subsec:cvnerf}
+To predict the optical kernels, there are two critical issues to consider.
+First, the optical kernels $\mathcal{K}$ are in a complex-valued formulation.
+However, the vast majority of building blocks and architectures of previous
+methods are based on real-valued operations and representations.
+So we design a series of atomic complex-valued activation functions and layers
+to assemble a complex-valued multilayer perceptron ($\operatorname{\mathbb{C}MLP}$) in \Cref{subsubsec:cvmlp}.
+Second, the implicit optical kernel values need to be decoded from the mask-aerial image pairs.
+The network's input should be carefully designed to eliminate the effect of mask layer types or data distribution.
+Observing \Cref{eq:tcc}, TCC spectrum values in the spatial frequency domain are integrals over the frequency points $(f, g)$,
+which means there will be a mapping between the spectrum coordinates and TCC optical kernel values.
+Therefore, inspired by NeRF~\cite{ECCV-2020-NeRF},
+we leverage ($\operatorname{\mathbb{C}MLP}$) in \Cref{subsubsec:nfokr} to perform optical kernel regression from coordinates.
+
+
+
+\subsubsection{Complex-valued multilayer perceptron}
+\label{subsubsec:cvmlp}
+A complex number $z = a + ib$ has a real component $\Re(z)\!:=\!a$, and an imaginary component $\Im(z)\!:=\!b$.
+The complex-valued neuron can be defined as $ o = \phi(\vec{x} \cdot \vec{w} + b)$, with an activation function $\phi$, applied to the input $\vec{x} \in \mathbb{C}^{n}$.
+We can arrange complex neurons into a complex linear layer  ($\operatorname{\mathbb{C}Linear}$), $o = \phi(\vec{x}\vec{W} + b)$. $\vec{W}$ is layer weight.
+\iffalse
+In order to perform the equivalent of a traditional real-valued linear operation in the complex domain,
+with which we can simulate complex arithmetic using real-valued entities and construct complex-valued linear operations.
+We multiply a complex weight matrix $\vec{W} = \vec{A} + i\vec{B}$ by a complex vector $\vec{h} = \vec{x} + i\vec{y}$,
+where $\vec{A}$ and $\vec{B}$ are real matrices and $\vec{x}$ and $\vec{y}$ are real vectors. We obtain:
+\begin{equation}
+  \vec{W} \vec{h}  = (\vec{A} \vec{x} - \vec{B} \vec{y}) + i(\vec{B}\vec{x} + \vec{A}\vec{y}),
+\end{equation}
+\fi
+The differentiability of complex-valued linear operations can be proved in the paper~\cite{DeepCplxNets}.
+Complex rectified linear unit ($\operatorname{\mathbb{C}ReLU}$) is applied as the activation function:
+\begin{equation}
+  \operatorname{\mathbb{C}ReLU}(z)=\operatorname{ReLU}(\Re(z))+i \operatorname{ReLU}(\Im(z)).
+\end{equation}
+As illustrated in \Cref{fig:nitho}, the $\operatorname{\mathbb{C}MLP}$ is further constructed as,
+\begin{equation}
+  \operatorname{\mathbb{C}MLP}: \operatorname{\mathbb{C}Linear}\!\to\!(\operatorname{\mathbb{C}Linear}\!\to\!\operatorname{\mathbb{C}ReLU})\!\times\!N\!\ldots\!\to\!\operatorname{\mathbb{C}Linear},
+\end{equation}
+where $\times N$ means there are $N$ hidden blocks $(\operatorname{\mathbb{C}Linear}\!\to\!\operatorname{\mathbb{C}ReLU})$.
+
+
+\subsubsection{Neural fields for optical kernel regression}
+
+% DNF: Appendix A
+A recent trend in computer vision and graphics research is replacing discrete representations with
+\textit{coordinate-based neural representations}.
+Given the recent success of view synthesis,
+NeRF~\cite{ECCV-2020-NeRF} presents a continuous scene as a 5D vector-valued function whose input is a 3D location $\vec{x}\!=\!(x, y, z)$ and viewing direction $(\theta, \phi)$,
+and whose output is an emitted color $\vec{c}\!=\!(r, g, b)$ and volume density $\sigma$ at that location.
+Then NeRF approximates the continuous 5D scene representation with an MLP network $F_{\Theta}:(\mathbf{x}, \mathbf{d})\!\to\!(\mathbf{c}, \sigma)$
+and optimizes its weights $\Theta$ to map from each input 5D coordinate to its corresponding volume density and directional emitted color.
+
+
+
+
+\label{subsubsec:nfokr}
+Considering the industrial case, as drawn in \Cref{fig:lens},
+the lithographic imaging system consists of a source, a pupil, and a set of lenses, independent of masks.
+As mentioned, imaging functions are location-dependent on the wafer plane,
+meaning there is an implicit mapping between the optical kernel coordinates and values.
+Similar to NeRF, Nitho takes the 2D coordinates $(x, y)$ in optical kernel dimension space $\mathbb{R}^{n \times m}$,
+a constant matrix independent of mask types or data distribution,
+as the inputs of our $\operatorname{\mathbb{C}MLP}$.
+Then leverage the $\operatorname{\mathbb{C}MLP}$ as the implicit mapping function to best recover the complex-valued optical kernels $\mathcal{K}$ from coordinates:
+\begin{equation}
+  \hat{\mathcal{K}} = \operatorname{\mathbb{C}MLP}(\vec{v}; \Theta) .
+\end{equation}
+Each of input coordinate $\vec{v}_i=(x,y)$ specify the index of diffraction orders of mask / TCC spectrum.
+And the outputs of neural fields stand for the predicted optical kernels $\hat{\mathcal{K}}$, \ie TCC spectrum matrix, as depicted in \Cref{fig:nitho}.
+The predicted aerial image $\hat{\vec{I}}$ can be obtained using SOCS formula in \Cref{eq:socs}.
+Physically, each predicted kernel $\hat{\mathcal{K}}_i$ represents \textit{a coherent point on the source}~\cite{DFM-B2008-Mack}.
+Using coordinates as input also ensures a fair comparison with previous works,
+since no extra information is needed beyond mask-aerial pairs.
+Like the real simulator,
+the separation of kernel regression and mask processing eliminates the dependence on data distribution to the greatest extent possible,
+thus improving generalization and accuracy.
+
+\subsubsection{Positional encoding}
+To compensate for $\operatorname{MLP}$'s inability to represent high-frequency signals,
+NeRF uses \textit{positional encoding} (PE) to map the coordinates from $\mathbb{R}$ to a higher dimensional space $\mathbb{R}^{2L}$:
+\begin{equation}
+  \small
+  \gamma(\vec{v})\!=\!\left[\sin (2^{0}\pi\vec{v}),\!\cos (2^{0}\pi\vec{v}),\!\ldots,\!\sin\!\left(2^{L-1}\pi \vec{v}\!\right),\!\cos\!\left(2^{L-1}\pi\vec{v}\!\right)\right]^{\mathrm{T}}\!,
+  \label{eq:nerf_pe}
+\end{equation}
+here $\gamma(\cdot)$ is a positional mapping applied separately on each of the two coordinate values in $\vec{v}$, $L$ is a hyperparameter.
+The fidelity of NeRF depends critically on the positional encoding,
+as it allows $\operatorname{MLP}$ to parameterize both low-frequency and high-frequency embeddings.
+However, Nitho confronts varied challenges.
+Directly utilizing of the NeRF's PE will cause a failure.
+The PE of NeRF in \Cref{eq:nerf_pe} employs solely on-axis frequencies, which is ideal for NeRF's ray rendering tasks.
+Nonetheless, due to the absence of a strong prior of optical kernel frequency distribution,
+the axis-aligned mapping used in NeRF will decrease the performance of Nitho.
+Therefore, we adopt Gaussian random Fourier feature (RFF)~\cite{tancik2020rff} mapping, which has an isotropic frequency distribution,
+as our positional encoding:
+\begin{equation}
+  \gamma(\vec{v})=[\cos (2 \pi \vec{B v})*(1+j),~\sin (2 \pi \vec{B v})*(1+j)]^{\mathrm{T}},
+  \label{eq:cplx_gaussian_pe}
+\end{equation}
+where each entry in $\vec{B} \in \mathbb{R}^{l\times d}$ is sampled from $\mathcal{N}(0, \sigma^2)$, and $\sigma$ is a hyperparameter for standard deviation.
+Coordinates $\vec{v}$ will be normalized to lie in $[0, 1]$, and each $\sin$ and $\cos$ entry will be multiplied by $(1+j)$ to map the coordinates to complex-valued fields.
+Now the optical kernels are predicted as:
+\begin{equation}
+  \hat{\mathcal{K}} = \operatorname{\mathbb{C}MLP}(\gamma(\vec{v}); \Theta) .
+\end{equation}
+
+
+
+
+
+
+
+
+\subsection{Forward Training Procedure of Nitho}
+\label{subsec:forward_training}
+
+\begin{algorithm}[h]
+  \caption{\fname~Forward Training Procedure}
+    \begin{algorithmic}[1]
+        \Require Mask image set $\mathcal{M}_{tr}$, aerial image set $\mathcal{I}_{tr}$.
+        \Ensure Predicted TCC optical kernels  $\mathcal{\hat{K}}$
+        \State $m, n \gets$ optical kernel width, height using \Cref{eq:kernel_mn} \label{ag1:line:get_mn}
+        \State $\vec{v} \gets$ coordinate space of $\mathbb{R}^{n\times m}$ \label{ag1:line:get_xy}
+        \State $\vec{v}_p \gets \gamma(\vec{v})$ \Comment{Complex-valued positional encoding.}
+        \ForAll{$\vec{M} \in \mathcal{M}_{tr}$} \label{ag1:line:start_training}
+        \State $\vec{I} \in \mathcal{I}_tr \gets$ the aerial image ground truth of $\vec{M}$ \label{ag1:line:get_aerial}
+        \State $\mathcal{F}(\vec{M}) \gets \texttt{fftshift}(\texttt{fft2}(\vec{M}))$ \label{ag1:line:fftm}
+        \State $\mathcal{F}(\vec{M}) \gets $ Crop $\mathcal{F}(\vec{M})$ centrally to width $m$, height $n$ \label{ag1:line:fftm_crop}
+        \State $\hat{\mathcal{K}} = \operatorname{\mathbb{C}MLP}(\vec{v}_p ; \Theta)$  \Comment{Predicting kernels $\hat{\mathcal{K}}$.} \label{ag1:line:get_tcc}
+        \State $r \gets$ order number of predicted kernel $\hat{\mathcal{K}} \in \mathbb{C}^{r \times n \times m}$ \label{ag1:line:order_n}
+        \For{$ i \in \{1, \ldots r\}$ } \Comment{SOCS formula.} \label{ag1:line:socs_start}
+        \State $ \vec{E}_i = \mathcal{F}^{-1}(\hat{\mathcal{K}}_i * \mathcal{F}(\vec{M}))$ \Comment{Electric field $\vec{E}_i$} \label{ag1:line:ei}
+        \State $\hat{\vec{I}} = \hat{\vec{I}} + |\vec{E}_i * \vec{E}_i^{*}|$  \Comment{Converting to intensity} \label{ag1:line:socs_end}
+        \EndFor
+        \State $Loss = \operatorname{MSE}(\vec{I}, \hat{\vec{I}})$  \Comment{Predicted aerial image $\hat{\vec{I}}$} \label{ag1:line:mse}
+        \EndFor
+    \end{algorithmic}
+  \label{alg:Nitho}
+\end{algorithm}
+
+
+\Cref{alg:Nitho} shows the forward training procedure of Nitho framework, also illustrated in \Cref{fig:nitho}.
+In \cref{ag1:line:get_mn}, we calculate the kernel width/height based on \Cref{eq:kernel_mn} to set up dimensions of learning target $\hat{\mathcal{K}}$.
+Next, in \cref{ag1:line:get_xy}, the kernel coordinates are flattened as a matrix: $[(0, 0), \ldots, (0, m), \dots, (n, m)]^{\mathrm{T}}$,
+then get positional encoding in a higher dimension of complex fields by \Cref{eq:cplx_gaussian_pe}.
+The training process starts from \cref{ag1:line:start_training}.
+We select training pairs $\vec{M}$ and $\vec{I}$, and get mask spectrum $\mathcal{F}(\vec{M})$ by 2D-FFT with necessary shifting.
+Then crop the central region of mask spectrum to match the kernel dimension. (\Cref{ag1:line:get_aerial,ag1:line:fftm,ag1:line:fftm_crop}).
+In \cref{ag1:line:get_tcc}, the positional encoding of kernel coordinates $\gamma(\vec{v})$ is provided as input to a $\operatorname{\mathbb{C}MLP}$
+parameterized by complex-valued weight $\Theta$, whose outputs are the predicted optical kernels $\hat{\mathcal{K}}$.
+Finally, we can get the predicted aerial image $\hat{\vec{I}}$ using SOCS formula in \Cref{eq:socs} (\cref{ag1:line:socs_start,ag1:line:ei,ag1:line:socs_end}).
+Note that $\vec{E}_i^{*}$ in \cref{ag1:line:socs_end} is the complex conjugate of $\vec{E}_i$, thus $\hat{\vec{I}}$ is a real-valued matrix.
+We can apply $\operatorname{MSE}$ loss on predicted aerial image $\hat{\vec{I}}$ and its ground truth $\vec{I}$ (\cref{ag1:line:mse}).
+As FFT is a differentiable linear operation, the whole Nitho is differentiable. The weight $\Theta$ can be optimized by gradient descent.
+\subsubsection{Fast lithography}
+Nitho also significantly accelerates forward lithography.
+Different from previous work, Nitho has no network inference process after training.
+The predicted optical kernels can be stored in the same manner as the actual TCC kernels to perform SOCS calculation (\cref{ag1:line:get_aerial,ag1:line:fftm,ag1:line:fftm_crop,ag1:line:get_tcc,ag1:line:order_n,ag1:line:socs_start,ag1:line:ei,ag1:line:socs_end}).
+We also propose a hierarchical GPU acceleration strategy for SOCS.
+In \cref{ag1:line:fftm}, the FFT is operated on GPU using the well-optimized \texttt{PyTorch} FFT library.
+And the summation in \cref{ag1:line:socs_start} can be performed parallelly to get the final aerial image.
+
+
+
+\subsection{Comparisons between Nitho and SOTA}
+
+\begin{table}[htb!]
+	\centering
+	\caption{Comparisons between Nitho and SOTA.}
+	\label{tab:diff}
+	\begin{tabular}{l|ccccc}
+		\toprule
+		                  & TEMPO~\cite{ISPD-2020-TEMPO}  & DOINN~\cite{DAC22-DOINN-Yang}  & Nitho            \\ \midrule
+    Training pair     & Mask-Aerial                  & Mask-Resist                    & Mask-Aerial        \\
+		Network Modeling  & $S(\mathcal{T} * G(\cdot))$ & $H(S(\mathcal{T} * G(\cdot)))$ & $\mathcal{F}(\mathcal{T})$        \\
+	  Network Arch.    & cGAN                        & FNO+CNN          & $\operatorname{\mathbb{C}MLP}$    \\
+	  Network Size      & $\sim$ 31 MB              & $\sim$1.3 MB          &  0.41 MB   \\ \bottomrule
+	\end{tabular}
+\end{table}
+
+To compare Nitho and SOTA with greater clarity,
+the lithography model can be reduced to:
+\begin{equation}
+  \vec{I} = S(\mathcal{T} * G(\vec{M})), ~ \vec{Z} = H(\vec{I} - I_{thres}),
+\end{equation}
+where $S$, $G$ are mask-related linear operations.
+$H$ is an image binarization function.
+$\mathcal{T}$ is a constant optical matrix.
+In \Cref{tab:diff}, we list two previous works TEMPO~\cite{ISPD-2020-TEMPO} and DOINN~\cite{DAC22-DOINN-Yang},
+which are the SOTA of the aerial image stage and resist image stage, respectively.
+As illustrated in \Cref{fig:prev},
+TEMPO uses cGAN to model the mask-to-aerial process $S(\mathcal{T} * G(\cdot))$.
+DOINN learns the mask-to-resist process $H(S(\mathcal{T} * G(\cdot)))$.
+Differently, Nitho models the mask independent optical kernels $\mathcal{F}(\mathcal{T})$, which contributes to superior generalizability with a smaller model size.

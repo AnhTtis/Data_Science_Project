@@ -1,0 +1,213 @@
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.00\linewidth,trim={0 1cm 0 1cm},clip]{octotiger_sample.png}
+    \caption{Snapshot of a double white dwarf merger with Octo-Tiger. Between the two stars, an aggregation belt is formed and mass from the smaller right star is transferred to the larger star on the left. The color shows the velocity magnitude of the stream, with red being high velocities.}
+    \label{fig:octo_output}
+\end{figure}
+\section{Real-World Application as a Benchmark: Octo-Tiger}
+\label{sec:octotiger}
+The application driving our development efforts in this work is Octo-Tiger, as
+we aim to run it on the Kokkos SYCL execution space. Octo-Tiger, itself, benefits
+from the work shown here by gaining an additional execution space, allowing it
+to target a wider range of platforms in the future.
+
+Octo-Tiger is also an ideal benchmark to test integrations like the HPX-SYCL
+one planned here, due to the tight interleaving of GPU and CPU work. Even in
+small, single-node scenarios, we launch thousands of GPU compute kernels each
+time step, tightly interleaved with CPU pre- and post-processing. 
+Furthermore, it still contains CUDA and HIP
+kernels for the main solvers, allowing us to compare performance using
+multiple backends.
+ 
+In the following, we introduce Octo-Tiger and briefly outline its solvers,
+data structure and required software dependencies. Afterward, we describe its
+execution model, based on all the required software, in more detail.
+
+\subsection{Octo-Tiger: Scientific Application, Data-Structure and Solvers}
+Octo-Tiger is a C\texttt{++} astrophysics code, used to study binary star
+systems and their eventual outcomes, such as stellar
+mergers~\cite{marcello2021octo}. These star systems contain two stars,
+bound together by gravity. When close enough, they interact by slowly
+exchanging mass. This can either be a stable transfer, occurring over millions
+of years, or on unstable one which will disrupt one of the stars. Depending on
+the system, this can lead to various outcomes, ranging from a Type Ia
+supernovae, to the formation of another star. Figure~\ref{fig:octo_output}
+shows a snapshot of a binary-star simulation done with Octo-Tiger at a point
+where there's visible mass transfer occurring. In the past, Octo-Tiger was
+already used to investigate R Coronae Borealis
+stars~\cite{lauer2019evolving,staff2018role} and the merger of bipolytropic
+stars~\cite{kadam2018numerical}.
+
+The stars are modeled as self-gravitating astrophysical fluids, using the
+inviscid Navier-Stokes equation and Newtonian gravity. Hence, Octo-Tiger
+contains two coupled solvers: A hydrodynamics solver using finite volumes and a
+gravity solver~\cite{marcello2017very} using the fast-multipole-method (FMM).
+These solvers operate on a 3D grid. Octo-Tiger uses adaptive mesh refinement,
+maximizing the refinement for the area of interest, which usually is the
+atmosphere between the stars. The data structure utilized for this is an
+adaptive octree. For efficiency, instead of having just one cell per tree-node,
+we use an entire sub-grid of cells per tree-node. The size of these sub-grids
+is configurable at compile time, but the default we use is $8 \times 8 \times
+8$ giving us $512$ per sub-grid (as larger sub-grids have adverse effects
+regarding adaptivity, data-distribution, and FMM performance as it uses the
+tree-structure for approximations).
+
+Highlighting its portability, Octo-Tiger was previously used on supercomputers
+such as NERSC's Cori~\cite{heller2019harnessing}, Piz
+Daint~\cite{10.1145/3295500.3356221} and ORNL's Summit~\cite{diehl2021octo}.
+Recently, we began to target NERSC's Perlmutter and Riken's Supercomputer\
+Fugaku.
+It achieves this portability by using a mixture of HPX, Kokkos and other
+frameworks as will be outlined in the next section.
+%\footnote{\url{https://www.hpci-office.jp/output/hp210311/outcome.pdf?1668567633}}.
+
+\subsection{Octo-Tiger's Software-Stack}
+
+\subsubsection{Tasks and Distributed Computing with HPX}
+HPX is an Asynchronous Many-Task Runtime system~\cite{kaiser2020hpx}. It is not
+only itself implemented in C\texttt{++}, but also implements all C\texttt{++}
+20 APIs regarding parallelism and concurrency (including for example
+functionality like \lstinline[language=c++]{hpx::mutex}). With HPX, we can
+build an explicit task graph using HPX futures. Asynchronous operations return
+futures, which can be chained together using continuations to form such a
+graph. This way, subsequent work and communication is triggered automatically
+whenever a task finishes. HPX also works in distributed scenarios, allowing us
+to call functions on remote components asynchronously, getting futures in
+return. 
+Once their respective task dependencies are fulfilled, the HPX tasks within this task graph are executed by a pool of HPX worker
+threads (each task by a single worker), with us usually using one worker thread per available CPU core. This means, while we may have
+a lot of tasks available, we just have a few worker threads executing them over time.
+
+Octo-Tiger is built entirely upon HPX, using the task-based programming framework
+for efficient tree-traversals and for distributed computing. To this end, each
+of the aforementioned sub-grids in the octree is a HPX component. This component contains
+all required data for its sub-grid and communicates with other sub-grids using
+remote function calls (via HPX) and HPX channels to fill its ghost layers and
+coordinate computing. This makes each sub-grid as self-contained unit for
+computing, easing distribution.
+
+Consequently, all compute kernels only operate on one sub-grid (and its ghost
+layers) at a time. However, we can usually invoke the compute kernels
+concurrently for different sub-grids.
+
+\subsubsection{Portable Compute Kernel with Kokkos and HPX-Kokkos} 
+Octo-Tiger's compute kernels themselves were originally written for single-core
+execution, with multiple kernels usually running at the same time for different
+sub-grids. Over time, they were ported to support
+Vc~\cite{https://doi.org/10.1002/spe.1149, Pfander18acceleratingFull}, CUDA and
+HIP. To unify these separate kernels, we finally settled on Kokkos. Kokkos
+implements a programming model for developing portable kernel~\cite{9485033}.
+It contains multiple execution and memory spaces, allowing us to run kernels on
+various devices (such as AMD and NVIDIA GPUs). Kokkos also already includes an
+experimental SYCL execution and memory space, allowing its users to target Intel
+GPUs. 
+%, especially since it allows using explicit SIMD via C\texttt{++} types (similar to Vc), yet also supports GPU execution for the same kernel (using scalar instantiation for the SIMD types).
+
+Moreover, Kokkos is tightly integrated with HPX: Both an HPX execution space
+(using HPX worker threads to execute a Kokkos kernel) and an HPX-Kokkos
+integration layer exist, the latter allows returning futures for Kokkos kernels
+running on supported execution spaces (the
+CUDA, HIP and HPX execution
+space)~\cite{daiss2021beyond}.  With the HPX-SYCL integration introduced in
+this work, the list of supported execution spaces now also includes the SYCL
+execution space (as HPX-Kokkos directly utilizes the \lstinline{get_future}
+functionality developed in this work).
+%execution space (as HPX-Kokkos directly utilizes the \lstinline{get_future}
+%functionality for the respective underlying API of each execution space that we
+%implement here).
+
+\subsubsection{SIMD - Kokkos SIMD and \protect\lstinline[language=c++]{std::experimental::simd}} 
+Kokkos kernels allow using explicit SIMD vectorization with C\texttt{++}
+types~\cite{sahasrabudhe2019portable}. In our own kernels, we use this with the
+Kokkos SIMD types\footnote{\url{https://github.com/kokkos/simd-math}},
+enabling us to instantiate the types with, for example, AVX512 types when
+compiling for CPUs and scalar double types when compiling for GPUs. The same
+implementation also works using
+\lstinline[language=c++]{std::experimental::simd} on various CPUs. In previous
+work, we investigated the performance difference between these two type libraries and
+added SVE types~\cite{daiss2022simd} for Fujitsu A64FX\textsuperscript{\texttrademark} CPUs.
+
+\subsubsection{Work Aggregation and Memory Optimizations - CPPuddle} 
+Given the small, default size of the sub-grids with $512$ cells each, and the
+fact that the compute kernels only work on one sub-grid at time, the workload
+per compute kernel is of essential importance for our GPU performance. 
+Invoking just one such kernel is too little work to even come close to fully
+utilize a GPU. As new sub-grids might be created over the duration of the
+simulation and old ones may be deleted and migrated (all depending on the
+adaptive mesh refinement as the simulation evolves), a static work aggregation
+approach (defining sets of sub-grids to always be executed as one kernel) would
+not work well for Octo-Tiger either.
+
+Short of increasing the size of the sub-grids itself (negatively impacting
+refinement), there are two ways of dealing with this: We can either rely on
+executing enough GPU kernels concurrently (using multiple GPU executors) or
+dynamically aggregate kernels as they are scheduled depending on the load of
+the GPU. For dynamic aggregation, we introduced work aggregation executors in
+Octo-Tiger~\cite{daiss2022aggregation}. As these can be used in other HPX
+applications, we extracted them into another software dependency, CPPuddle.
+This library also contains memory pools for device-side buffers, which proved
+to be handy when running the same task repeatedly for different sub-grids. If
+the underlying GPU executor is currently busy, these aggregation executors will
+start to bunch up compatible kernels (usually the same kernel but running on a
+different sub-grid) as they are being scheduled. These will be launched as one
+larger kernel when either an user-defined maximum number of aggregated kernels
+is reached or the underlying GPU executor becomes idle and can work on it
+immediately. For more details we refer to~\cite{daiss2022aggregation}.
+
+\subsubsection{Other Dependencies}
+Octo-Tiger uses some other dependencies, such as HDF5 and Silo, for the input
+and output files. Dependencies like HWLOC and Boost are also indirectly
+included in HPX.  Also, there are some older parts of Octo-Tiger that still use
+Vc, however, we are in the process of removing those since we deprecated the Vc
+support within Octo-Tiger in favor of using Kokkos kernels with explicit SIMD
+types.
+
+\subsection{Octo-Tiger's Execution Model}
+\begin{figure}[t]
+\centering
+\includegraphics[width=.48\textwidth]{figures/model_sycl_2.pdf}  
+\caption{Octo-Tiger's execution model, adapted from~\cite{daiss2022simd} for the SYCL integration and associated execution space.}
+\label{fig:model_sycl}
+\end{figure}
+During solver iterations, such as the gravity solver, Octo-Tiger traverses the
+oct-tree that contains its grid-structure. To do so, we simply call the
+methods executing the solver of neighboring (or child) tree-nodes. Thanks to
+HPX, it does not matter whether they are actually located on the current
+compute node or a remote node, as each tree-node is an HPX component.
+Calling these methods via HPX returns futures, which we can use to chain
+dependent tasks together. For example, we can first collect the data from
+neighboring tree-nodes to fill the ghost layer of the current node, using the
+associated future to chain an asynchronous Kokkos kernel launch.
+%operating on both the local tree-node's data and those ghost layers.
+
+In turn, the compute kernels work on the sub-grid of the current tree-node and
+its ghost layer. The Kokkos kernel itself is launched asynchronously using
+HPX-Kokkos, giving us yet another future. Each kernel itself can be executed in
+either a CPU execution space, usually the Kokkos HPX execution space which
+splits the kernel into HPX tasks that will be executed by one or more of the
+worker threads, or a GPU execution space, such as the Kokkos CUDA execution
+space. Depending on the execution location, we instantiate the appropriate SIMD
+types within the kernel, either with scalar types on GPUs or types using the
+appropriate SIMD instructions on CPUs to make use of SIMD operations and masks.
+We outline this execution model and where to plug in the HPX-SYCL integration,
+in Figure~\ref{fig:model_sycl}.
+Of course, we could already use the Kokkos SYCL execution space, albeit
+only synchronously. However, to make the whole machinery described above work with
+SYCL as it does with the supported execution spaces, we need HPX-Kokkos to be
+able to return a future for the underlying SYCL kernel. Otherwise, the
+asynchronous creation of the task graph using the futures would become
+synchronous, impacting the overall performance. 
+
+Lastly, also part of Octo-Tiger's execution model but not shown in this figure:
+We usually use a pre-allocated pool of GPU executors, each being able to work
+on GPU data-transfers/kernels independently. We can either use
+only one of those (disabling concurrent GPU kernels altogether) or up to $128$
+(theoretically more are possible but yield no further benefits). As working on
+one sub-grid at a time might not be enough work to fully utilize some devices,
+even given concurrent GPU kernels, we further employ the aforementioned dynamic
+work aggregation by using the aggregation executors that can dynamically aggregate kernel
+launches of the same kernel on different sub-grids. As shown in detail in
+\cite{daiss2022aggregation}, this is beneficial on
+NVIDIA A100 GPUs and crucial on AMD MI100
+GPUs.
+

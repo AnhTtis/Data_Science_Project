@@ -1,0 +1,71 @@
+\section{Communication Primitives}
+\label{sec:lazy}
+Next, we describe one of the core optimizations in \sys that allow for efficient and low-latency data movement. 
+
+\subsection{Overview}
+The machine learning setting has a number of key traits that differ from typical stream processing deployments:
+\begin{itemize}
+    \item \textbf{Large Message Payloads.} In a number of sensing and imaging applications, each message processed by the message broker can be quite large, e.g., a high-resolution image. 
+    
+    \item \textbf{Operator Revision.} As models are redesigned and retrained, the core operators in the streaming pipeline change.   When the computational characteristics of the model change, the entire pipeline might have to change. For example, if a smaller model is replaced by a larger model, the stream might have to be down-sampled to avoid backlog.
+
+\end{itemize}
+
+\subsection{Distributed Task Model}
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.6\columnwidth]{figures/aggregate-distribute.pdf}
+    \caption{Aggregate and Shared Queue Operators}
+    \label{fig:aggregate-distribute}
+\end{figure}
+Before describing how data are communicated, it is worth clarifying the semantics of the task model in \sys
+\sys has two key distributed operators illustrated in Figure~\ref{fig:aggregate-distribute}:
+\texttt{aggregate(delay)} and \texttt{shared\_queue()}. These are analogous to their non-streaming counterparts (e.g., reduce). These two operators sit between data consumers and producers to ensure that computation is appropriately placed in the network.
+They can actually be thought of as special ``models'' in our system whose sole purpose is multiplexing and demultiplexing data streams.
+
+\noindent \texttt{aggregate(delay).} Whenever streaming data from multiple nodes need to be combined in order to make a prediction, the \textit{aggregate} operator is applied. An aggregate operator consumes data from multiple streams and produces a single iterator interface for a data consumer.
+The operator takes a user-specified delay as a parameter --- the longest tolerable time skew between data sources.
+The operator waits until the skew timeout is met for data from all senders to arrive and yields a combined tuple.
+This tuple might contain missing values for streams that did not produce data within the time window.
+
+\noindent \texttt{shared\_queue().}
+The \texttt{shared\_queue()} operator multiplexes a stream into multiple streams of data, or demultiplexes multiple streams into one stream of data.
+Nodes can consume data from each individual stream and perform model inferences.
+After inference, we can also use an \texttt{aggregate} operator to merge the predictions back into a single time-synchronized stream.
+
+\subsection{Lazy Data Routing}
+A message broker system consists of a leader that orchestrates the entire message flow and multiple producers/consumers as message endpoints.
+Data streams as producers publish data to the leader, and models as consumers consume data from the leader.
+With this architecture, the leader can quickly become a point of contention since it has to process all the messages from/to all the different nodes.
+Furthermore, large message payloads (e.g., images) can lead to a crucial networking bottleneck at the leader, as message broker systems are not designed to handle large messages.
+
+\sys uses a novel messaging protocol to efficiently transfer data between nodes without placing an undue burden on the leader.
+A message sent to the leader only contains message headers: a timestamp and a global source path.
+The actual message payloads are not transferred; instead, they are kept and indexed on the node that collected the data.
+A model subscribes to the topic and reads the headers as they come in.
+If it wants a particular data payload, it retrieves that data lazily from the source node.
+
+Figure~\ref{fig:lazy} illustrates this protocol. When collecting data, every data item added to a \texttt{DataStream} is annotated with a header (Figure \ref{fig:lazy}-1). We can think of this as a stream of $(h,d)$ tuples (header and data, respectively). After the tuple is created, the node locally writes the data to a time-indexed log (Figure \ref{fig:lazy}-2).
+After this data is durably written, the header is published to the message broker on the leader (Figure \ref{fig:lazy}-3).
+Nodes on the network can subscribe to streams of these headers.
+Model inference requires the data payload, and that can be requested from the headers (Figure \ref{fig:lazy}-4). This data is transferred in a peer-to-peer fashion, and inferences happen over these streams (Figure \ref{fig:lazy}-5).
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.8\columnwidth]{figures/lazy.png}
+    \caption{A figure illustrating the order of operations in the lazy data routing system used by \sys.}
+    \label{fig:lazy}
+\end{figure}
+
+Lazy retrieval has a number of essential benefits for typical model-serving tasks. In general, these benefits are analogous to that of lazy computation. First, many models predict at rates much slower than the rate of data collection. For example, a model that takes 30ms to evaluate can only process one example every 30ms. If the data collection rate is significantly faster than that, the model often has to downsample the input data. Lazy data routing allows us to avoid transferring the data payload to the leader in these cases. 
+Next, this strategy reduces the size of the messages processed by the message broker reducing overheads in checkpointing and serialization/de-serialization.
+As a result, we also find that it can enable increased parallelism as well.
+Both of these benefits can be tied back to the traits of the machine learning setting mentioned above.
+
+\subsubsection{Other Considerations}
+Practically, every edge node has a limited amount of local storage. \sys handles this by having a timeout for the data payloads, where a node on the network can only send a retrieval request within that timeout.
+This allows the edge node to overwrite/free up that space periodically.
+
+In certain cases, we allow users to force \sys to have eager message passing. Small messages, such as 1D arrays, can be transferred from data source nodes to worker nodes via the leader node. Essentially, this embeds the payload in the message headers.
+In some networks, peer-to-peer communication is not available or not efficient.
+We can default to eager message passing when needed to support these cases.

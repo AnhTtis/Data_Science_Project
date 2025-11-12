@@ -1,0 +1,89 @@
+\section{Method}
+\subsection{Problem setup}
+We assume a fixed dataset of $D$ trajectories, each comprised of a sequence of observations $\x_t$ and/or actions $\y_t$. Where actions are not explicitly provided, in many cases we can infer actions based on the difference between consecutive observations.
+Our goal is to learn, for each timestep, behavioral representations $\z_t$ that capture both global-information such as the strain of the mouse or the time of day, as well as temporally-localised representations such as the activity each mouse is engaged in at a given point in time. As obtaining labeled datasets for realistically-useful scales of agent population and diversity of behavior is impractical, we aim to learn representations in a purely self-supervised manner.
+
+Our approach addresses two critical challenges of modeling naturalistic behavior. In Section 2.2, we introduce a distributional-relaxation of the reconstruction-based learning objective. In Section 2.3, we introduce an architecture and self-supervised learning objectives that support the learning of behavior at different levels of temporal granularity. 
+
+\subsection{Histogram of Actions (\hist): A novel objective for predicting future}
+Modeling behavior dynamics can be done by training a model to predict future actions. This reconstruction-based objective becomes challenging when behavior is complex and non-stereotyped. Let us consider the example of a mouse scanning the room, rotating its head from one side to the other. It is possible to extrapolate the trajectory of the head over a few milliseconds, but prediction quickly becomes impossible, not because this particular behavior is complex but because any temporal misalignment in the prediction leads to increasing errors.
+
+We propose to predict the distribution of future actions rather than their sequence. The motivation behind this distributional-relaxation of the reconstruction objective lies in blurring the exact temporal unfolding of the actions while preserving their behavioral fingerprint. 
+
+\vspace{-2mm}
+\paragraph{Predicting histograms of future actions.}
+Let $\y_t \in \mathbb{R}^N$ be the action vector at time $t$. Each feature in the action vector can, for example, represent the linear velocity of a joint or the angular velocity of the head. Given observations $[\x_0, \ldots, \x_t]$ of the behavior at timesteps $0$ through $t$, the objective is to predict the distribution of future actions over the next $L$ timesteps.
+For each $i$-th element of the action vector, we compute a one-dimensional normalized histogram of the values it takes between timesteps $t+1$ and $t+L$.
+We pre-partition the space of action values into $K$ equally spaced bins, resulting in a $K$-dimensional histogram that we denotes as $\mathbf{h}_{t, i}$, for all keypoints $1\leq i \leq N$.
+
+We introduce a predictor $g$, that given the extracted representation $\z_t$, predicts all feature-wise histograms of future actions. The predictor is a multi-layer perceptron (MLP) with an output space in $\R^{N \times K}$. The output is split into $N$ vectors, which are normalized using the softmax operator. We obtain $\hat{\mathbf{h}}_{t, 1}, \ldots, \hat{\mathbf{h}}_{t, n}$, each estimating the histogram of the $i$-th action feature following timestep $t$.
+
+\vspace{-2mm}
+\paragraph{EMD$^2$ loss for histograms.}
+To measure the loss between the predicted and target histograms, we use the Discrete Wasserstein distance, also known as the Earth Mover's Distance (EMD). This distance is obtained by solving an optimal transport problem that consists in moving mass from one distribution to the other while incurring the lowest transport cost. In our case, the cost of moving mass from one bin to another is equal to the number of steps between the two bins.
+
+Because our histogram has equally-sized bins, the EMD is equivalent to the Mallows distance which has a closed-form solution \cite{937632, hou2016squared}. In particular we use EMD$^2$ which has been shown to be easier to optimize and converge faster \cite{shalev2009stochastic}. The loss is defined as follows:
+
+\vspace{-5mm}
+\begin{equation}
+    \mathcal{D}_{\mathrm{EMD}^2}(\mathbf{h}_{t,i}, \hat{\mathbf{h}}_{t,i}) = \sum_{k=1}^K (\mathrm{CDF}_k(\mathbf{h}_{t,i}) - \mathrm{CDF}_k(\widehat{\mathbf{h}}_{t,i}))^2,
+\end{equation}
+where $\mathrm{CDF}_k(\mathbf{h})$ is the $k$-th element of the cumulative distribution function of $\mathbf{h}$.
+
+The total loss is obtained by summing over all features of the action vector, which leaves us with the following loss at time $t$:
+\begin{equation}
+    \mathcal{L}_t = \sum_{i=1}^N \mathcal{D}_{\mathrm{EMD}^2}(\mathbf{h}_{t,i}, \widehat{\mathbf{h}}_{t,i}).
+\end{equation}
+
+\subsection{Multi-timescale bootstrapping in a temporally-diverse architecture}
+In order to form richer and multi-scale representations of behavior, we also use another self-supervised learning objective. We turn to latent predictive losses that can help to build stable and robust invariances over time.
+
+We introduce a new approach to build representations across different scales while preserving the granularity in each. We achieve this by building an architecture where we separate the short-term and long-term representations then bootstrap within each representation space. This approach enables us to learn from otherwise incompatible representation learning objectives \cite{sterkenburg2021no, tian2020contrastive}. 
+
+\subsubsection{Two latent spaces are better than one}
+Our goal is to capture and separate short-term and long-term dynamics in two different spaces.
+We use the Temporal Convolutional Network (TCN) \cite{bai2018tcn} as our building block. The TCN produces a representation at time $t$ that only depends on the past observations \cite{oord2016wavenet}.
+
+
+We design an architecture that separates the different timescales by using two TCN encoders:
+A {\bf short-term encoder} $f_{s}$, that captures short-term dynamics and targets momentary behaviors such as drinking, running or chasing; A {\bf long-term encoder} $f_{l}$, that captures long-term dynamics and targets longstanding factors that modulate behavior (strain of mouse, time of day).
+Architecturally, the difference between the two is that we increase the number of layers and use larger dilation rates \cite{chen2018encoder} for the long-term encoder, thus effectively covering a larger receptive field (more history) in the input sequence. All feature embeddings extracted by the TCNs are concatenated, to produce the final embedding, $\z_t = \mathbf{concat}[\z^{s}_t, \z^{l}_t]$.
+
+
+\subsubsection{Bootstrapping Across Multiple Scales}
+\begin{wrapfigure}{r}{0.35\textwidth}
+\vspace{-4em}
+\includegraphics[width=0.35\textwidth]{figures/bams_positive_examples.pdf}
+\vspace{-1.75em}
+\caption{\footnotesize{\em Definition of the positive range}. Positives are selected within a window. The window is small for short-term embeddings and large for long-term embeddings.
+\vspace{-3.5em}}  \label{fig:positives}
+\end{wrapfigure}
+We draw inspiration from recent work \cite{grill2020bootstrap, brave,guo2020bootstrap} that uses latent predictive losses to learn representations without the need for negative examples; this happens by encouraging positive views to be mapped to similar points in the latent space.
+
+In the context of temporal representation learning, a common assumption is that points that are nearby in time can also be constrained to lie nearby in the latent space \cite{yue2022ts2vec, azabouusing}. In our case, we can bootstrap and find positive views at both the short-term and also at a more long-term scale, as illustrated in Figure~\ref{fig:positives}.
+
+\vspace{-2mm}
+\paragraph{Bootstrapping short-term representations.}
+We randomly select samples, both future or past, that are within a small window $\Delta$ of the current timestep $t$. In other words, $\delta \in [-\Delta, \Delta]$.
+We use a predictor $q_s$ that takes in the short-term embedding $\z^s_{t}$ and learns to regress $\z^s_{t+\delta}$ using the loss:
+\begin{equation}
+    \mathcal{L}_{r,short} = \left \|\frac{q_s(\z^s_{t})}{\|q_s(\z^s_{t})\|_2} - \mathrm{sg}\left [ \frac{\z^s_{t+\delta}}{\|\z^s_{t+\delta}\|_2} \right] \right \|_2^2,
+\end{equation}
+where $\mathrm{sg}[\cdot]$ denotes the stop gradient operator. Unlike \cite{grill2020bootstrap}, we do not use an exponential moving average of the model, but simply increase the learning rate of the predictor as in \cite{brave}.
+
+\vspace{-2mm}
+\paragraph{Bootstrapping long-term representations.}
+For \ltb embeddings which should be stable at the level of a sequence, we sample any other time point in the same sequence, i.e. $t^\prime \in [0, T]$.
+We use a similar setup for the \ltb embedding, where predictor $q_l$ is trained over longer time periods or in the limit, over the entire sequence.
+%using the following loss:
+\begin{equation}
+    \mathcal{L}_{r,long} = \left \|\frac{q_l(\z^l_{t})}{\|q_l(\z^l_{t})\|_2} - \mathrm{sg}\left [ \frac{\z^l_{t^\prime}}{\|\z^l_{t^\prime}\|_2} \right] \right \|_2^2
+\end{equation}
+\vspace{-6mm}
+\subsection{Putting it all together}
+\paragraph{Combined loss.}
+Finally, we optimize the proposed multi-task architecture with a combined loss:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_t + \alpha \mathcal{L}_{r,short} + \alpha \mathcal{L}_{r,long}
+\end{equation}
+where $\alpha$ is a scalar that is used to weight the contribution of each term. In practice, we find that we simply need to choose $alpha$ that re-scales the bootstrapping losses to the same order of magnitude as the \hist~prediction loss.

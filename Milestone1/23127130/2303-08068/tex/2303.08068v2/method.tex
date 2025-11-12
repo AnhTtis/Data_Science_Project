@@ -1,0 +1,223 @@
+\section{Method}
+% 本節では提案するスタイル特徴を抽出する方法について述べる．
+In this section, we describe the proposed method for style feature extraction.
+% \cref{fig:overview} に示すように，提案手法は CL を条件とする CVAE と，相互情報量の推定器によって構成される．
+The proposed method includes a CVAE conditioned by CL and an MI estimator, as shown in \cref{fig:overview}.
+\begin{figure*}[t]
+    \centering
+    \begin{tikzpicture}[%
+    data/.style={draw, circle, minimum height=0.7cm, inner sep=0cm, font=\vphantom{Ag}, fill=blue!10, align=center},%
+    ldata/.style={data, rectangle, rounded corners=3mm, minimum width=1cm, inner sep=2mm},%
+    op/.style={draw, rectangle, fill=white},%
+    nnet/.style={op, minimum height=1cm, minimum width=1.5cm, fill=green!10, align=center},%
+    flow/.style={-{Latex[length=1.5mm]}},%
+    mycallout/.style={rectangle callout, draw, densely dotted, fill=white},%
+    ]
+        \node[fill=black!5, text=black!70, anchor=south west, align=left, text width=11.3cm] at (0.7, -0.1) {Style extracting CVAE\\[1.3cm]\strut};
+
+        \node[ldata] (input) at (0, 0) {$x$\\[1mm]\includegraphics[width=0.6cm]{fig/overview_input.pdf}};
+        \node[nnet] (enc_im) at (1.7, 0.8) {Encoder\\ $E_\phi$};
+        \node[nnet, fill=green!10!gray!50] (enc_ex) at (1.7, -0.8) {CL\\ $f_\psi$};
+        \node[data, right=1.5cm, yshift=-0.5cm] (mean) at (enc_im) {$\mu$};
+        \node[data, right=1.5cm, yshift=0.5cm] (std) at (enc_im) {$\sigma$};
+        \node[op, right=2.5cm] (sampling) at (enc_im){\rotatebox{270}{Sampling}};
+        \node[ldata, right=4cm] (z_im) at (enc_im) {Style feature\\ $z_\text{style}$};
+        \node[ldata, right=3cm] (z_ex) at (enc_ex) {Style-independent feature\\ $z_\text{content}$};
+        \node[nnet] (dec) at (11, 0.8) {Decoder\\ $D_\theta$};
+        \node[nnet] (sn) at (11, -0.8) {SN\\ $T_\xi$};
+        \node[ldata] (output) at (13, 0.8) {$\hat{x}$\\[1mm]\includegraphics[width=0.6cm]{fig/overview_reconstruction.pdf}};
+        \node[data] (mine) at (13, -0.8) {$\hat{I}$};
+
+        \draw[flow] (input) -- (enc_im.west);
+        \draw[flow] (input) -- (enc_ex.west);
+        \draw[flow] (enc_im) -- (mean);
+        \draw[flow] (enc_im) -- (std);
+        \draw[flow] (mean) -- (mean-|sampling.west);
+        \draw[flow] (std) -- (std-|sampling.west);
+        \draw[flow] (sampling) -- (z_im);
+        \draw[flow] (enc_ex) -- (z_ex);
+        \draw[flow] (z_im) -- (dec);
+        \draw[flow] (z_ex) -- (dec.west);
+        \draw[flow] (z_im) -- (sn.west);
+        \draw[flow] (z_ex) -- (sn);
+        \draw[flow] (dec) -- (output);
+        \draw[flow] (sn) -- (mine);
+
+        \node[mycallout, callout absolute pointer=(enc_ex.south), yshift=-1cm] at (enc_ex){Pretrained and freezed};
+        \node[mycallout, callout absolute pointer=(z_ex.south), yshift=-1cm] at (z_ex){Typically related to label. e.g.~``7''};
+        \node[mycallout, callout absolute pointer=(z_im.north), yshift=1cm] at (z_im){e.g.~Thickness, slant, size};
+        \node[mycallout, callout absolute pointer=(mine.south), yshift=-1.2cm, align=center] at (mine){Estimated mutual information\\ between $z_\text{style}$ and $z_\text{content}$};
+    \end{tikzpicture}
+    \caption{%
+    Overview of the proposed method. The VAE conditioned by the CL model extracts the style features.
+    In the training procedure, the estimated mutual information of the two feature vectors $z_\text{content}$ and $z_\text{style}$ is evaluated to encourage the features to be statistically independent.
+    }
+    \label{fig:overview}
+\end{figure*}
+
+% 以下では最初にスタイル抽出のための CVAE を構築する．
+We construct the CVAE for style extraction,
+% 次に，CVAE の条件としてスタイルに独立な特徴を抽出できる CLと，CVAE がスタイル特徴のみを抽出するのを助けるための相互情報量に基づいた制約を導入する．
+and introduce CL that extracts style-independent features as the condition of the CVAE.
+Then, we present a constraint based on MI that helps CVAE extract only style information.
+% 最後に，提案手法の学習方法および，学習のための損失関数をまとめる．
+Finally, we explain the training procedure and loss function of the proposed method.
+
+\subsection{Style Extracting CVAE}
+% データがスタイルとそれ以外の情報によって生成されると考えると，観測データ $X = \{x_1, \dots, x_N\}$ が得られたとき，その生成モデルは
+Assume that data $X = \{x_1, x_2, \dots, x_N\}$ are generated based on style and other information.
+Then, we consider a generative model
+\begin{equation}
+    x \sim p_\theta(x|z_\text{content}, z_\text{style}),
+    \label{eq:cvae_generative_model}
+\end{equation}
+% と書ける．
+% ここで，$z_\text{content}$ はスタイルに独立な変数，$z_\text{style}$ はスタイルの情報を含む変数である．
+where $\theta, z_\text{content}$, and $z_\text{style}$ are the parameter of the distribution $p$, a style-independent variable, and a style-dependent variable, respectively.
+% スタイル独立変数はラベルに対応するものである．
+The style-independent variable $z_\text{content}$ typically corresponds to class labels.
+
+% スタイルに独立な $z_\text{content}$ が所与であり，$z_\text{style}$ が標準正規分布に従うと仮定すれば，$z_\text{content}$ を条件とする CVAE~\cite{Kingma2014a,Sohn2015} の枠組みで $p_\theta$ を観測データから推定できる．
+Given $z_\text{content}$ and assuming $z_\text{style}$ is drawn from standard Gaussian distribution, %we can estimate $p_\theta$ using CVAE~\cite{Kingma2014a,Sohn2015} conditioned by $z_\text{content}$.
+CVAE~\cite{Kingma2014a,Sohn2015} is used as a method for estimating $p_\theta$ conditioned by $z_\text{content}$.
+% より具体的には，観測できないスタイル情報を含む変数である $z_\text{style}$ を予測するためのエンコーダ $q_\phi(z_\text{style}|x)$ を導入し，変分下界
+In the framework of CVAE, we introduce an encoder $q_\phi(z_\text{style}|x)$ that estimates unobserved $z_\text{style}$, and then find $p_\theta, q_\phi$ that maximize the lower bound
+\begin{align}
+    \log p_\theta(x) \geq &-\text{KL}\left(q_\phi(z_\text{style}|x) \| p(z_\text{style})\right)\nonumber\\
+    &+ \mathbb{E}_{q_\phi(z_\text{style}|x)}\left[\log p_\theta(x|z_\text{style}, z_\text{content})\right],
+    \label{eq:elbo}
+\end{align}
+% を最小化するような $p_\theta, q_\phi$ を求める．
+% ただし，$\text{KL}(\cdot\|\cdot)$ は KL ダイバージェンス，$p(z_\text{style})$ は標準正規分布である．
+where $\text{KL}(\cdot\|\cdot)$ represents the Kullback--Leibler divergence (KLD) and $p(z_\text{style})$ represents standard Gaussian distribution.
+% AE の文脈では，$q_\phi$ はスタイル特徴を抽出するエンコーダであり，$p_\theta$ はふたつの特徴ベクトル $z_\text{content}, z_\text{style}$ から $x$ を再構成するデコーダである．
+In the context of AEs, $q_\phi$ corresponds to the encoder that extracts style features, and $q_\theta$ corresponds to the decoder that reconstructs input $x$ from feature vectors $z_\text{content}$ and $z_\text{style}$.
+Note that $z_\text{content}$ is not fed to the encoder $q_\phi$ unlike in the typical setups of CVAE~\cite{Kingma2014a,Sohn2015} because our goal is to obtain an encoder that extracts style features from only the input data.
+
+% 実際の学習に際しては，ディープニューラルネット (deep neural network; DNN) で構成されるエンコーダ $E_\phi$ およびデコーダ $D_\theta$ を用いる．
+In practice, we utilize DNNs for implementing the encoder and decoder, which are denoted by $E_\phi$ and $D_\theta$, respectively.
+% 潜在変数 $z_\text{style}$ が標準ガウス分布に従うことに注意し，また $p_\theta$ が分散の固定された等方ガウス分布と仮定すれば，学習に用いる具体的な損失関数は
+Assuming that $p_\theta$ is an isotropic Gaussian distribution, the DNNs are trained using the empirical loss function given as
+\begin{align}
+    L_\text{CVAE}(\theta, \phi; X) =& \lambda_\text{KL} \frac{1}{2}\sum_{i=1}^{|X|}\left[1+\log(\sigma_i^2)-\mu_i^2-\sigma_i^2\right] \nonumber\\
+    &\hspace{-1cm} + \lambda_\text{recon} \frac{1}{N}\sum_{x\in X} \|D_\theta(x; z_\text{style}, z_\text{content}) - x\|^2,
+    \label{eq:loss_vae}
+\end{align}
+% と書ける．
+% ここで，$\lambda_\text{KL}, \lambda_\text{recon}$ はそれぞれ KL ダイバージェンスと再構成誤差の重みであり，$\mu, \sigma$ はエンコーダ $E_\phi(x)$ の出力である．
+where $\lambda_\text{KL}$ and $\lambda_\text{recon}$ represent the weights of the KLD and reconstruction loss, respectively, and $\mu$ and $\sigma$ represent the output of encoder $E_\phi(x)$.
+
+\subsection{CL as a Style-Independent Feature Extractor}
+% 次に，\cref{eq:cvae_generative_model} では所与であるとした $z_\text{content}$ を CL によって求める方法を述べる．
+We introduce CL to obtain $z_\text{content}$ that we assumed given in \cref{eq:cvae_generative_model}.
+% CL~\cite{SimCLR,MoCo,SimSiam} は，元データが同じであれば異なるデータ拡張を適用しても特徴ベクトルは等しくなるべきであるというアイデアの自己教師あり表現学習手法である．
+CL~\cite{SimCLR,MoCo,SimSiam} is a self-supervised representation learning framework based on a simple idea: the two feature vectors should be the same if they are derived from the same data, but with different data augmentation operations.
+% データ拡張をスタイルの摂動と捉えれば，CL はスタイルに独立な特徴を抽出していると考えられる~\cite{Kugelgen2021}．
+CL models can be seen as style-independent feature extractors when considering data augmentation as a perturbation in styles~\cite{Kugelgen2021}.
+% したがって，学習済みの CL モデルがあれば，スタイルに独立な特徴ベクトル $z_\text{content}$ を出力する特徴抽出器として利用できる．
+Therefore, we can use pretrained CL models for the feature extractors that output $z_\text{content}$.
+
+% CL の具体的な構成法を，CL 手法のひとつである MoCo~\cite{MoCo} に基づいて紹介する．
+We briefly review a CL framework based on MoCo~\cite{MoCo}, which is popular and relatively lightweight.
+% MoCo では，パラメータ $\psi$ をもつ特徴抽出器 $f_\psi$ を学習するための損失関数に InfoNCE
+In MoCo, a feature extractor $f_\psi$ with parameter $\psi$ is trained by minimizing InfoNCE given by
+\begin{gather}
+    L_\text{CL}(\psi) = -\log\frac{\exp(q\cdot k_+ / \tau)}{\exp(q\cdot k_+ / \tau) + \sum_{i=1}^K \exp(q\cdot k_- / \tau)},
+    \label{eq:loss_cl}\\
+    q = \text{MLPHead}(z_\text{content}), z_\text{content} = f_\psi(x),
+\end{gather}
+% を用いる．
+% ただし，$x$ は入力データ，$q$ は $x$ に対応する中間表現，$k_+$ は $q$ と同じ表現になるべき正例，$k_-$ は $q$ と違う表現になるべき負例，$K$ は負例の数であり，また，$\|q\| = \|k_+\| = \|k_-\| = 1$ である．
+where $x, q, k_+, k_-$, and $K$ represent the input data, representation corresponding to $x$, positive key, negative key, and number of negative keys, respectively.
+Note that $q, k_+$, and $k_-$ are normalized (i.e., $\|q\| = \|k_+\| = \|k_-\| = 1$).
+% 正例 $k_+$ は $x$ と同じデータに異なるデータ拡張を適用したものに対応する表現，負例 $k_-$ は $x$ とは異なるデータに対応する表現である．
+The positive key $k_+$ is the representation corresponding to the same data as $x$ but with different data augmentation.
+The negative key $k_-$ is the representation corresponding to the data different from $x$.
+% 一般的に CL において InfoNCE を用いるときは特徴ベクトルそのものではなく，2 層程度の全結合層からなる関数 $\text{MLPHead}(\cdot)$ の出力を評価する．
+In general CL, we use the output of $\text{MLPHead}(\cdot)$ which consists of a few fully-connected layers to evaluate InfoNCE.
+% したがって，CL の成果物としての特徴ベクトルは，MLPHead の直前の出力である $z_\text{content}$ となる．
+Once $f_\psi$ is trained, we employ $z_\text{content}$, which is the input of MLPHhead, for the inferred feature vector of the trained CL models.
+
+% 安定した学習のためには $K$ を大きくする必要があるため~\cite{SimCLR} 計算量のボトルネックとなるが，MoCo では $f_\psi$ に徐々に追従する momentum encoder を用意することで効率よい計算が可能である．
+% \cref{eq:loss_cl} に基づく学習により，ImageNet~\cite{ILSVRC15} をよく線形分離できる特徴抽出器 $f_\psi$ が得られることが知られている~\cite{SimCLR,MoCo,SimSiam}．
+
+\subsection{Mutual Information Constraint by MINE}
+% CVAE による特徴ベクトル $z_\text{style}$ にスタイル情報のみが抽出されるよう，スタイルに独立な特徴ベクトルである $z_\text{content}$ との独立性を担保する制約を設けることを考える．
+To ensure that the feature vector of the CVAE ($z_\text{style}$) only contains style information, we introduce a constraint to encourage the independence between $z_\text{content}$ and $z_\text{style}$.
+% \cref{eq:cvae_generative_model} で与えられる生成モデルは $z_\text{content}$ と$z_\text{style}$ の独立性を仮定しているが，エンコーダ $E_\phi$ とデコーダ $D_\theta$ の自由度によっては，必ずしも $\cref{eq:loss_vae}$ の最小化によって $z_\text{style}$ がスタイル情報のみを含むような解を得られない．
+The generative model presented in \cref{eq:cvae_generative_model} assumes that $z_\text{content}$ and $z_\text{style}$ are independent; however, this assumption does not always hold.
+% より具体的には，$z_\text{content}$ を無視し，$z_\text{style}$ のみを使って再構成誤差を下げることでも\cref{eq:loss_vae} で与えられる損失関数の値を小さくすることができる．
+Specifically, the loss function of the CVAE given by \cref{eq:loss_vae} can be lowered by ignoring the condition $z_\text{content}$ when DNNs $E_\phi$ and $D_\theta$ have high degrees of freedom. % 「自由度」の言い方、もうちょっと考えたい。
+% この場合，$z_\text{style}$ はスタイル情報以外にも $z_\text{content}$ に含まれる情報を持っており，両者は独立とはいえない．
+In this case, $z_\text{style}$ has sufficient information for reconstructing the input.
+This means that $z_\text{style}$ contains features other than styles, and $z_\text{style}$ and $z_\text{content}$ are not independent.
+To alleviate this problem, we evaluate the independence of the two feature vectors.
+% ふたつの変数の独立性を測る指標のひとつが，相互情報量である~\cite{Bishop2006}．
+MI is used as a measure to evaluate the independence between two variables~\cite{Bishop2006}.
+
+% 相互情報量を DNN を用いて推定する方法である MINE~\cite{MINE} を用いることで，$z_\text{content}$ と$z_\text{style}$ の独立性を評価できる．
+By using the DNN-based MI estimator, MINE~\cite{MINE}, we measure the independence between $z_\text{content}$ and $z_\text{style}$.
+% MINE の枠組みでは，DNN によって構成される statistics network (SN) $T_\xi$ を用いて $z_\text{content}$ と $z_\text{style}$ の相互情報量の下界
+In the MINE framework, we introduce a DNN $T_\xi$ called statistics network (SN) and determine $T_\xi$ that maximizes the lower bound of the MI given as
+\begin{align}
+    I(z_\text{content}; z_\text{style}) &\geq \hat{I}_\xi(z_\text{content}; z_\text{style}) \nonumber\\
+    &\hspace{-2cm}= \mathbb{E}[T_\xi(z_\text{content}, z_\text{style})] - \log\left(\mathbb{E}[T_\xi(z_\text{content}, \bar{z}_\text{style})]\right),
+    \label{eq:mine_kl}
+\end{align}
+% を最大化することによって相互情報量の推定値とする．
+% ただし，$\bar{z}_\text{SD}$ は $z_\text{style}$ と同じ分布に従う変数である．
+where $\bar{z}_\text{style}$ represents a variable distributed the same as $z_\text{style}$.
+We can draw $\bar{z}_\text{style}$ from standard Gaussian distribution because we assumed $z_\text{style}$ is standard Gaussian distributed in the CVAE.
+The estimated MI is the maximized value of $\hat{I}_\xi$.
+% \cref{eq:mine_kl} は導出の過程で対称性のない KL ダイバージェンスを用いており実際に SN を学習させると不安定になるという指摘がある~\cite{MINE,DeepInfomax} ため，本稿では，代わりに JS ダイバージェンスを用いた変種である推定値~\cite{DeepInfomax}
+The actual learning procedure of SN tends to be unstable because the estimator given in \cref{eq:mine_kl} is based on asymmetric KLD~\cite{MINE,DeepInfomax}.
+To alleviate this, we use a variant of the estimator that uses the Jensen--Shannon divergence instead of KLD~\cite{DeepInfomax};
+\begin{align}
+    \hat{I}_\xi^\text{JS}(z_\text{content}; z_\text{style})
+    =\ & \mathbb{E}[-\text{sp}(-T_\xi(z_\text{content}, z_\text{style}))] \nonumber\\
+    &- \mathbb{E}[\text{sp}(T_\xi(z_\text{content}, \bar{z}_\text{style}))],
+    \label{eq:mine_jsd}
+\end{align}
+% を用いる．ただし，$\text{sp}(\cdot)$ は softplus 関数~\cite{Softplus}である．
+where $\text{sp}(\cdot)$ represents a softplus function~\cite{Softplus}.
+% 観測データ $X$ とそれに対応する CL および VAE の特徴ベクトルの集合 $Z_\text{SI} = \{z_\text{content}^{(1)}, \dots, z_\text{content}^{(N)}\}, Z_\text{SD} = \{z_\text{style}^{(1)}, \dots, z_\text{style}^{(N)}\}$ が与えられたとき，この推定値は
+Given observations $X$ and the corresponding feature vectors $Z_\text{content} = \{z_\text{content}^{(1)}, \dots, z_\text{content}^{(N)}\}$ and $Z_\text{style} = \{z_\text{style}^{(1)}, \dots, z_\text{style}^{(N)}\}$, the empirical form of \cref{eq:mine_jsd} becomes
+\begin{align}
+    \hat{I}_\xi^\text{Emp}(Z_\text{content}; Z_\text{style}) &=  \frac{1}{N}\sum_{n=1}^N -\text{sp}(-T_\xi(z_\text{content}^{(n)}, z_\text{style}^{(n)})) \nonumber\\
+    &\hspace{2em}- \frac{1}{N}\sum_{n=1}^N\text{sp}(T_\xi(z_\text{content}^{(n)}, \bar{z}_\text{style}^{(n)})).
+    \label{eq:emp_mine}
+\end{align}
+% となる．
+% 学習時にはこれを VAE の損失関数である\cref{eq:loss_vae} に加えることで，$z_\text{content}$ と $z_\text{style}$ のもつ情報が独立になるように促す．
+We ensure $z_\text{content}$ and $z_\text{style}$ are independent by adding this empirical MI estimator to the loss function of CVAE (\cref{eq:loss_vae}) in the training procedure.
+
+\subsection{Training and Loss Function}
+% 提案するモデルである，MINE による情報量制約のある CL の特徴ベクトルによる条件つき VAE の概要を\cref{fig:overview} に示す．
+% 提案手法の学習はふたつのステップからなる．
+The training procedure of the proposed method consists of two steps.
+% まず，CL のモデル $f_\psi$ を事前に学習しておき，重みを固定する．これにより，$f_\psi$ をスタイルに独立な特徴の抽出器として用いる．
+As the first step, we train the CL model $f_\psi$ using any existing CL methods and freeze the parameters of the model.
+The trained $f_\psi$ can be employed as a style-independent feature extractor.
+% 次に，スタイル特徴抽出のための CVAE を学習する．CVAE の学習に際しては，MINE によって CL と VAE が抽出する特徴ベクトルが独立になるよう制約を加えることで，CVAE がスタイル特徴のみを抽出することを補助する．
+In the second step, we train the CVAE for style feature extraction.
+The training of CVAE is constrained by MINE to ensure that $z_\text{content}$ and $z_\text{style}$ are independent.
+This constraint helps CVAE extract only style features.
+
+% VAE のエンコーダ $E_\phi$ およびデコーダ $D_\theta$ に対する損失関数は，\cref{eq:loss_vae} で与えられる CVAE としての損失に $z_\text{content}$ と $z_\text{style}$ の相互情報量を加えた
+The loss function for the encoder $E_\phi$ and the decoder $D_\theta$ is given as a linear combination of the CVAE loss (\cref{eq:loss_vae}) and the estimated MI (\cref{eq:emp_mine});
+\begin{align}
+    &L(\theta, \phi, \xi; X, Z_\text{content}, Z_\text{style}) \nonumber\\
+    &= L_\text{CVAE}(\theta, \phi; X) + \lambda_\text{MINE} \hat{I}_\xi^\text{Emp}(Z_\text{content}; Z_\text{style})
+\end{align}
+% とする．
+% ただし，$\lambda_\text{MINE}$ は MINE の重みである．
+where $\lambda_\text{MINE}$ represents the weight of the MI.
+% 一方で，相互情報量の推定値 $\hat{I}_\xi^\text{Emp}$ は\cref{eq:emp_mine} で与えられる下界で与えられるため，$T_\xi$ を学習することで下界を最大化する必要がある．
+The estimated MI $\hat{I}_\xi^\text{Emp}$ needs to be maximized by training $T_\xi$.
+Thus, the proposed model that consists of the CVAE and SN is trained using the min-max problem
+\begin{equation}
+    \min_{\theta, \phi} \max_{\xi} L(\theta, \phi, \xi; X, Z_\text{content}, Z_\text{style}).
+\end{equation}
+% によって学習する．
+% これは generative adversarial networks をはじめとした敵対的学習~\cite{GAN}に類似した問題であり，同様の方法で最適化できる．
+This problem is similar to that of adversarial learning (e.g., generative adversarial networks~\cite{GAN}) and can be optimized in the same manner.

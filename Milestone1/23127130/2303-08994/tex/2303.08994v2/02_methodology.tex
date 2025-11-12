@@ -1,0 +1,80 @@
+This section lays out how we train a \gls{NN} that shall be used in time-domain simulations, how the physical equations can be incorporated transforming the \gls{NN} to a dtNN and a \gls{PINN}, and how the resulting approximation is assessed.
+
+\subsection{Approximating the solution to a dynamical system}
+A dynamical system is characterised by its temporal evolution being dependent on the system's state variables $\bm{x}$, the algebraic variables $\bm{y}$ and the control inputs $\bm{u}$:
+\begin{subequations}
+\begin{align}
+    \frac{d}{dt}\bm{x} &= \bm{f}_{\text{DAE}}\left(\bm{x}(t), \bm{y}(t), \bm{u}\right)\label{eq:f_DAE}\\
+     \bm{0} &= \bm{g}_{\text{DAE}}\left(\bm{x}(t), \bm{y}(t), \bm{u}\right)\label{eq:g_DAE}.
+\end{align}
+\end{subequations}
+For clarity and ease of implementation, we express \labelcref{eq:f_DAE,eq:g_DAE} as
+\begin{align}
+        \bm{M}\frac{d}{dt}\bm{x} &= \bm{f}(\bm{x}(t), \bm{u}).\label{eq:dynamical_system}
+\end{align}
+by incorporating $\bm{y}$ into $\bm{x}$ and adding $\bm{M}$, which is a diagonal matrix to distinguish if a state $x_i$ is differential $(M_{ii} \neq 0)$ or algebraic $(M_{ii} = 0)$. We will use a \gls{NN} to define an explicit function $\hat{\bm{x}}(t)$ that shall approximate the solution $\bm{x}(t)$ for all $t \in [t_0, t^{\max}]$, i.e., for the entire \textit{trajectory}, starting from the initial condition $\bm{x}(t_0) = \bm{x}_0$.
+
+\subsection{Neural network as function approximator}
+We use a standard feed-forward \gls{NN} with $K$ hidden layers that implements a sequence of linear combinations and non-linear activation functions $\sigma(\cdot)$. In theory, a \gls{NN} with a single hidden layer already constitutes a universal function approximator \cite{cybenko_approximation_1989} if it is wide enough, i.e., the hidden layer consists of enough neurons $N_K$. In practice, restrictions on the width and the process of determining the \gls{NN}'s parameters might limit this universality as \cite{goodfellow_deep_2016} elaborates. Still, a multi-layer \gls{NN} in the form of \eqref{eq:NN_equations} provides us with a powerful function approximator:
+\begin{subequations}\label{eq:NN_equations}
+\begin{alignat}{2}
+    [t, \bm{x}_0^\top, \bm{u}^\top]^\top &= \bm{z}_0 &&\label{eq:NN_input}\\
+    \bm{z}_{k+1} &= \sigma{(\bm{W}_{k+1} \bm{z}_k + \bm{b}_{k+1})} && \quad \forall k = 0, 1, ..., K-1\label{eq:NN_hidden_layers}\\
+    \hat{\bm{x}} &= \bm{W}_{K+1} \bm{z}_K + \bm{b}_{K+1}.&&\label{eq:NN_output}
+\end{alignat}
+\end{subequations}
+The NN output \NNoutput{} is the system state at the prediction time $t$. The input \NNinput{} is composed of the prediction time $t$, the initial condition $\bm{x}_0$ and the control input $\bm{u}$. The weight matrices $\bm{W}_k$ and bias vectors $\bm{b}_i$ form the adjustable parameters $\bm{\theta}$ of the \gls{NN}.
+
+For the training process, we compile a training dataset \dataset{train}, that maps $\NNinput \mapsto \Foutput$ for a chosen input domain $\mathcal{Z}$ and contains $N = |\dataset{train}|$ points. For our purposes, the input domain is a discrete set of the prediction time, e.g. from \SI{0}{\second} until \SI{10}{\second} with a step size of \SI{0.2}{\second}, and a set of different initial conditions and control inputs, e.g. different power disturbances. The output domain is the rotor angle and frequency at each of the prediction time steps and for each of the studied disturbances.
+\begin{align}
+    \dataset{train}: \NNinput \mapsto \Foutput \qquad \NNinput \in \mathcal{Z}. \label{eq:dataset_definition}
+\end{align}
+During training we adjust the \gls{NN}'s parameters $\bm{\theta}$ with an iterative gradient-based optimisation algorithm to minimise the so-called \textit{loss} $\mathcal{L}$ for $\mathcal{D}_{train}$
+\begin{subequations}\label{eq:NN_optimisation}
+\begin{align}
+    \min_{\bm{\theta}} \quad &\mathcal{L}(\dataset{train})\\
+    \text{s.t.} \quad & \eqref{eq:NN_input} - \eqref{eq:NN_output}.
+\end{align}
+\end{subequations}
+We do not aim for optimality of \labelcref{eq:NN_optimisation} -- this would lead to over-fitting -- but rather search for parameters $\bm{\theta}$ (i.e., values of the weights and biases) and hyper-parameters (e.g., number of layers $K$ and neurons per layer $N_K$) that yield a low generalisation error $\mathcal{L}(\dataset{test})$ which we assess on a separate test dataset \dataset{test}. During training we use a validation dataset \dataset{validation} to obtain an estimate of the generalisation error, so that the final evaluation with \dataset{test} remains unbiased. It is important, that all three datasets stem from the same sampling procedure and input domain $\mathcal{Z}$.
+
+\subsection{Loss function and regularisation: \glspl{NN}, dtNNs, and \glspl{PINN}}
+
+\subsubsection{Loss Function for Neural Networks}
+The simplest loss function for such a problem is to define the loss as the mismatch between the \gls{NN} prediction \NNoutput{} and the ground truth or target \Foutput{}, and measure it using the L2-norm. To account for different orders of magnitude (for example, the voltage angles in radians are often much larger than frequency deviations expressed in \si{\pu}) and levels of variations of the individual states $\bm{x}$, we first apply a scaling factor \scalelossx{} to the error computed per state $i$. A physics-agnostic choice of \scalelossx{} could be to use the state's standard deviation in the training dataset; for more details please see \cref{subsec:NN_setup}. We then apply the squared L2-norm for each data point $j$ and take the average across the dataset \dataset{} to obtain the loss \lossx{}
+\begin{align}
+    \lossx(\dataset{}) &= \frac{1}{|\dataset{}|}\sum_{j=1}^{|\dataset{}|} \norm{\left(\frac{\hat{x}_i^j- x_i^j}{\scalelossx{}}\right)}{2}^2\label{eq:loss_data}.
+\end{align}
+
+\subsubsection{dtNNs}
+As an intermediate step between standard \glspl{NN} and \glspl{PINN}, in this subsection we introduce a new regularisation term to loss function \eqref{eq:loss_data}. We do so to avoid the previously mentioned over-fitting and improve the generalisation performance of the \glspl{NN}. To the best of our knowledge, this paper is the first to introduce a regularisation term based on the update function \Ffunction{}(\Foutput{}) from \eqref{eq:dynamical_system}. Using the tool of \gls{AD} \cite{baydin_automatic_2018}, we can compute the derivative of the \gls{NN}, i.e., the time derivative of the approximated trajectory, $\frac{d}{dt}\NNoutput{}$ and compute a loss analogous to \eqref{eq:loss_data} (with a scaling factor \scalelossdt{}):
+\begin{align}
+    \lossdt(\dataset{}) &= \frac{1}{|\dataset{}|}\sum_{j=1}^{|\dataset{}|} \norm{\left(\frac{\frac{d}{dt}\hat{x}_i^j- \frac{d}{dt} x_i^j}{\scalelossdt{}}\right)}{2}^2\label{eq:loss_dtNN}
+\end{align}
+
+\subsubsection{PINNs}
+As \cite{lagaris_artificial_1998,raissi_physics-informed_2018} introduced generally, and \cite{misyris_physics-informed_2020} for power systems, we can also regularise such a \gls{NN} by comparing the derivative of the \gls{NN} $\frac{d}{dt}\NNoutput{}$ with the update function evaluated based on the estimated state \Ffunction{}(\NNoutput{}):
+\begin{align}
+    \lossf(\mathcal{D}_f) &= \frac{1}{|\mathcal{D}_f|}\sum_{j=1}^{|\mathcal{D}_f|} \norm{\left(\frac{M_{ii}\frac{d}{dt}\hat{x}_i^j - f_i(\hat{\bm{x}}^j)}{\scalelossf{}}\right)}{2}^2\label{eq:loss_PINN}
+\end{align}
+This physics-loss does not require the ground truth state \Foutput{} or its derivative. Quite the contrary, this loss can be queried for any desired point without requiring any form of simulation. We therefore can evaluate a dataset $\mathcal{D}_f$ of randomly sampled or ordered \textit{collocation points} that map to 0
+\begin{align}
+    \mathcal{D}_f: \NNinput \mapsto \bm{0} \qquad \NNinput \in \mathcal{Z}. \label{eq:collocation_definition}
+\end{align}
+to essentially assess how well the \gls{NN} approximation follows the physics - any point where this physics loss equals zero is in line with the governing physics of \eqref{eq:dynamical_system}. However, \eqref{eq:collocation_definition} defines a mapping that is not bijective, hence, $\mathcal{L}_{f}(\mathcal{D}_f) = 0$ does not imply that the desired trajectory is perfectly matched, only that a trajectory complying with \eqref{eq:dynamical_system} is matched. As an example, an exact prediction of the steady state of the system will yield $\mathcal{L}_{f}(\mathcal{D}_f) = 0$ even though the target trajectory in \dataset{train} is different.
+
+\subsubsection{Combined loss function during training}
+To obtain a single objective or loss value for the training problem \eqref{eq:NN_optimisation}, we weigh the three terms as follows:
+\begin{align}
+    \mathcal{L} &= \lossx + \weightlossdt \lossdt + \weightlossf \lossf,
+\end{align}
+where \weightlossdt{} and \weightlossf{} are hyper-parameters of the problem. Subsequently, we refer to a \gls{NN} trained with $\weightlossdt{} = 0, \weightlossf{} = 0$ as \say{vanilla NN}\footnote{In \cite{hastie_elements_2009} \say{vanilla \gls{NN}} refers to a feed-forward \gls{NN} with a single layer, we adopt the term nonetheless for clarity as it expresses the idea of a \gls{NN} without any regularisation well.}, with $\weightlossdt{} \neq 0$, $\weightlossf{} = 0$ as \say{dtNN}, and with $\weightlossdt{} \neq 0, \weightlossf{} \neq 0$ as \say{\gls{PINN}}.
+
+\subsection{Accuracy metrics}
+
+To compare across the different methods and setups, we monitor the loss $\mathcal{L}_x$ in \eqref{eq:loss_data} as the comparison metric throughout the training and evaluation process and as an accuracy metric for the performance assessment. To get a more detailed picture, we also consider the loss value of single points, i.e., before calculating the mean in \labelcref{eq:loss_data}.
+However, the loss is dependent on the chosen values for $\scalelossx{}$ and does not provide an easily interpretable meaning. Therefore, we use the maximum absolute error 
+\begin{align}
+    \max AE_{\mathcal{S}} &= \max_{i \in \mathcal{S}, j \in \dataset{test}}\left(\left|\hat{x}_i^j- x_i^j\right|\right)\label{eq:max_abs_error}
+\end{align}
+as an additional metric for assessment purposes, i.e., based on \dataset{test}, but not during training. Whereas a state-by-state metric would capture most details, we opt to compute the maximum absolute error across meaningful groups of states $i \in \mathcal{S}$ that are of the same units and magnitudes. This aligns with the engineering perspective on the desired accuracy of a method.

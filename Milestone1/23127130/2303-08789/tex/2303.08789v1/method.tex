@@ -1,0 +1,85 @@
+\section{\appr\ architecture and training \label{sec:method}}
+
+\subsection{Intuition}
+
+The motivation behind the \appr\ architecture is that the size and structure of $\mtvd$, $\vmt$, and $\ttd$ dataset categories makes them suitable for three complementary goals: 
+
+\textbf{(1) Learning to execute general state transitions.} Visuomotor trajectories from $\vmt$, if collected on the target robotic manipulator or a similar one using, e.g., an exploratory policy, show the robot how to \emph{execute} a wide variety of state transitions. Namely, by sampling observation-action tuples $\langle o_{t-H}, \ldots, o_{t}, a_{t}, o_{t+L}\rangle$, where $t$ is the current time step, $H$ is an observation history length, and $L$ is a lookahead parameter, the agent can learn to infer $a_{t}$ from $o_{t-H}, \ldots, o_{t}$, and $o_{t+L}$ using \emph{inverse dynamics}. 
+
+Note that the observations $o_i$ are generally a combination of $M$ modalities (proprioceptive states, camera images, depth maps, etc). In \appr, they are passed through a vector $\phi = (\phi_m)_{m=1}^M$ of modality-specific encoders $\phi_m$, e.g., ResNets~\cite{he2016deep}, whose outputs are then concatenated into a vector in some low-dimensional \emph{embedding} space $\mathscr{E}_o$. The agent's inverse dynamics inference operates on these low-dimensional observation embeddings. In order to implicitly induce an embedding space $\mathscr{E}_o$ that makes actions easier for inverse dynamics to infer, while learning inverse dynamics using an action loss $\LL_{EX}$ we can allow $\LL_{EX}$'s gradients to backpropagate through the modality encoders $\phi_m$.
+
+\emph{Note also that since $\vmt$ data is typically task-agnostic, so is \appr's knowledge of inverse dynamics.} 
+
+\textbf{(2) Learning to plan for general tasks.} In order to recommend a meaningful action at each step, inverse dynamics inference needs to be provided with an embedding of the desired next observation in the aforementioned embedding space $\mathscr{E}_o$. Determining the next desired observation (and hence its embedding) \emph{given a task description} is something that can be learned from multi-task video-only data $\mtvd$, since this data shows what progress towards a successful completion of a specified task should \emph{look} like.
+
+Note, however, that the process of learning to predict (an embedding of) the next observation shouldn't modify the observation embedding $\mathscr{E}_o$. If it does, it can cause $\mathscr{E}_o$ to degenerate to a constant vector, since this would trivially minimize prediction loss.
+
+\textbf{(3) Improving target-task performance.} While learning to plan and execute on diverse $\mtvd$ and $\vmt$ data can result in a robotic manipulation foundation model~\cite{fm2021} with strong zero-shot performance, on many tasks it may be far from perfect. Small diverse datasets $\ttd$ of high-quality target-task demonstrations are critical to address this issue. The demonstrations in these datasets are likely to come from people teleoperating a robot or performing the task themselves, with a degree of randomness and irregularity inherent in human actions. A general robotic manipulation model architecture needs to be able to learn efficiently from small amounts of such data. 
+
+
+\subsection{Architecture} 
+
+\begin{figure}[!]
+\centering
+\includegraphics[width=\linewidth]{PLEX.png}
+\caption{\setlength{\parindent}{12pt}
+\small \textbf{\appr\ architecture.} \appr\ is optimized w.r.t. the planner's loss $\LL_{PL}$, whose computation is shown with black arrows ($\uparrow$), and executor's loss $\LL_{EX}$, whose computation is shown with gray arrows (${\textcolor{gray} \uparrow}$). The `\textbf{=}' and `\textbf{\textcolor{gray} =}' symbols denote stopgrads, where backpropagation of the corresponding loss's gradients halts. \\
+%
+\indent \appr\ is trained mostly on a multi-task dataset $\mtvd$ of task-annotated video-only demonstrations $g, I_{1:T}$ that may also contain return-to-go data $R_{1:T}$, and a dataset $\vmt$ of task-agnostic visuomotor trajectories $I_{1:T}, p_{1:T}, a_{1:T}$ that contain matching video, proprioception, and action sequences. \\
+%
+\indent Each input modality $m$ is embedded using a modality-specific encoder $\phi_m$. Then, video demonstration embeddings $\tilde g, \tilde I_{1:T}$, and, optionally, $\tilde R_{1:T}$ are used to train the embedding-space planner with an embedding prediction loss $\LL_{PL}$. Visuomotor trajectory embeddings $\tilde I_{1:T}, \tilde p_{1:T}, \tilde a_{1:T}$ are passed to the executor to train it with inverse dynamics loss $\LL_{EX}$. Note that if the image encoder $\phi_I$ isn't frozen, $\LL_{EX}$'s gradients will train it and thereby shape the embedding space in which the planner is expected to operate. The planner's own loss $\LL_{PL}$ cannot affect $\phi_I$ -- stopgrads in $\LL_{PL}$'s computation path prevent this. Thus, if $\phi_I$ is trained by $\LL_{EX}$, executor training needs to be done before planner training.}
+\label{fig:transformer}
+\end{figure}
+
+The \appr\ architecture, designed to efficiently learn generalizable robotic manipulation policies from $\mtvd$, $\vmt$, and $\ttd$ data following the above intuitions, is depicted in \Cref{fig:transformer}. It consists of two transformer-based parts, a \emph{planner} and an \emph{executor}. The executor is trained using only $\vmt$ and possibly $\ttd$ trajectories, if the latter are available. The planner is trained using only $\mtvd$ and any available $\ttd$ trajectories.
+
+
+In the diagram, we assume trajectories to have the general form $\tau = g, R_1, I_1, p_1, a_1 \ldots, R_T, I_T, p_T, a_T = g,  R_{1:T}, I_{1:T}, p_{1:T}, a_{1:T}$. Here, $g$ is a task specification, $I_t$ is a tuple of camera image observations, $p_t$ is a proprioceptive state, $a_t$ is an action, and $R_t$ is a return-to-go at time $t$. The length $T$ can vary across trajectories.  As \Cref{fig:transformer} shows, \appr\ processes these input modalities using corresponding encoders $\phi_g$, $\phi_I$, $\phi_p$, $\phi_a$, and $\phi_R$ to obtain an embedded sequence $\tilde g, \tilde R_{1:T}, \tilde I_{1:T}, \tilde p_{1:T}, \tilde a_{1:T}$. In most trajectories encountered at training as well as execution time, some of these modalities are missing; e.g., few practically available robotic manipulation demonstrations come with rewards and return-to-go data. These missing modalities are replaced by trainable placeholder vectors during embedding.
+
+Since \appr's executor is designed to be trained mostly on task-agnostic visuomotor $\vmt$ data, and the planner --- mostly on task-conditioned video-only demonstrations $\mtvd$, each of these components in \Cref{fig:transformer} is ``specialized'' to operate only on the (embeddings of) trajectory modalities available in its prevalent training data. In particular, per \Cref{fig:transformer}, task description and return embeddings $\tilde g$ and $\tilde R_{1:T}$ don't get routed to the executor transformer, since they are missing from $\vmt$ data. Similarly, the planner transformer only receives $\tilde g$, $\tilde I_{1:T}$ and, optionally, $\tilde R_{1:T}$ embeddings, since they are present in $\mtvd$ data. This holds even at deployment time, when the trajectory being generated by the robot's interaction with the environment may have all modalities simultaneously. 
+
+As a result, the planner's sole purpose is to determine \emph{where} the agent should go in the observation embedding space. As shown in \Cref{fig:transformer}, given an embedding $\tilde g, \tilde I_{1:T}$ of a task-conditioned video-only training demonstration, the planner transformer outputs a sequence $\hat I_{L:T+L}$ of embeddings corresponding to the observations the agent should ideally see $L$ steps in the future from its current time step. $L$ is a tunable lookahead parameter. The planner's training minimizes the prediction loss
+%
+\begin{equation}
+\LL_{PL}(\tilde g, \tilde R_{1:T}, \tilde I_{1:T}) = \sum_{t=1 + L}^{T + L}\|\tilde I_t- \hat I_t \|_2^2.
+\label{eq:pred_loss}
+\end{equation}
+%
+To compute it, we set $\tilde I_t = \tilde I_T$ for $t = T+1, ..., T+L$. 
+
+Crucially, $\LL_{PL}$'s gradients don't backpropagate into the encoders $\phi_g$ and $\phi_I$, to prevent representation collapse of the embedding space $\mathscr{E}_o$; note the stopgrad symbols on $\LL_{PL}$'s computation paths in \Cref{fig:transformer}.
+
+The embedding space $\mathscr{E}_o$ either comes from pretrained and frozen encoders or is learned along with inverse dynamics during executor training. At deployment time the executor, like the planner, has a specific role. Given an observation-action sequence $o_{1:t}, a_{1:t}$ so far, as well as the embedding $\hat I_{t+L}$ of a target observation produced by the planner, the executor needs to infer an action $\hat a_t$ for the current step. The executor should do this in a task-agnostic way: the knowledge of the task is already incorporated by the planner into the $\hat I_{t+L}$ prediction. To learn to do this, for an input $\vmt$ trajectory we optimize the inverse dynamics loss
+\begin{equation}
+\LL_{EX}(I_{1:T}, p_{1:T}, \hat I_{1+L:T+L}, a_{1:T}, ) = \sum_{t=1}^{T-1} \|a_t- \hat a_t \|_2^2
+\label{eq:invd_loss}
+\end{equation}
+A major difference between $\LL_{EX}$ and $\LL_{PL}$ optimization is that the former's gradients can backpropagate into the encoders $\phi_I$, $\phi_o$, $\phi_p$, and $\phi_a$ --- note that the computation path for $\LL_{EX}$ through these encoders in \Cref{fig:transformer} doesn't have a stopgrad. In particular, this allows executor training to shape the embedding space $\mathscr{E}_o$.
+
+
+\subsection{Relative positional encoding for human data}
+
+The transformers \appr\ uses as its planner and executor are derived from the GPT-2-based version of the Decision Transformer (DT)~\cite{chen2021decision}. Like in DT, we feed inputs into \appr\ by embedding each modality instance (e.g., an image or an action) as a single unit. This is different to the way, e.g., Gato~\cite{gato} and Trajectory Transformer~\cite{janner2021reinforcement} do it, by splitting each input into fragments such as image patches and embedding each fragment separately.
+
+\appr's components' most significant difference from DT, other than admitting different sets of modalities, is the use of relative positional encoding. The original DT uses the ``global'' positional encoding, which assigns a separate encoding vector for each trajectory time step, up to some maximum horizon $T$. This works well for finite-horizon tasks that assume the same fixed horizon for all trajectories, or in settings with a lot of trajectories for every length. However, in robotic manipulation settings, where tasks are usually goal-oriented and training demonstrations vary a lot in the number of steps they take to reach the goal, global positional embedding performs poorly, as our experiments demonstrate. We show that a fixed absolute positional embedding common in NLP transformers~\cite{vaswani2017attention} performs much better, and the relative embedding~\cite{orig} performs better yet on human-collected demonstrations in low-data regimes. We adopt relative positional encoding as the default in our \appr\ implementation.
+
+
+\subsection{Training \appr}
+
+Training \appr\ generally involves both pretraining and finetuning, although in the experiments (\Cref{sec:gen_exp}) we show that after pretraining alone, even if it is done on modest amounts of data, \appr\ has a solid zero-shot performance on unseen tasks.
+
+\textbf{Pretraining} \appr\ consists of two sub-stages:
+\begin{enumerate}[leftmargin=*]
+\item \emph{Pretraining the executor} for some number of epochs by optimizing the $\LL_{EX}$ loss (\Cref{eq:invd_loss}) over a $\vmt$ dataset. 
+
+\item \emph{Pretraining the planner} for some number of epochs by optimizing the $\LL_{PL}$ loss (\Cref{eq:pred_loss}) over a $\mtvd$ dataset.
+\end{enumerate}
+
+If the observation encoders are expected to be trained or finetuned by the inverse dynamics loss $\LL_{EX}$, rather than pretrained and frozen beforehand, it is critical for executor pretraining to be done before training the planner. Indeed, the planner is expected to make predictions in the observation encoders' embedding space, which will change if the inverse dynamics loss affects the encoders. If the encoders are frozen from the start, however, the pretraining stages can proceed asynchronously.
+
+
+\textbf{Finetuning} involves adapting \appr\ using a target-task demonstration dataset $\ttd$. As with any finetuning, this involves deciding which part of \appr\ to adapt. 
+
+Since $\ttd$  can be viewed both as a small $\mtvd$ and a small $\vmt$ dataset, it can be used to train any part of any subcomponent of \appr ---executor, planner, and observation encoders --- using the appropriate combination of losses $\LL_{PL}$ (\Cref{eq:pred_loss}) and $\LL_{EX}$ (\Cref{eq:invd_loss}). As with pretraining, if $\ttd$ is used for finetune the encoders, it is critical to complete their finetuning before finetuning the planner. In \Cref{sec:gen_exp}, we show that finetuning just the last layer of the planner's transformer, which constitutes 5\% of the parameters of the \appr\ instance in the experiment, is sufficient for significantly boosting a pretrained \appr's performance.
+
+$\ttd$ can also be employed for optimizing a behavior cloning loss $\LL_{BC}$, which is equivalent to a stopgrad-free version of $\LL_{EX}$, whose gradients are allowed to backpropagate through the entire \appr\ model, including the planner and/or the encoders. The experiments in \Cref{sec:enc_exps} demonstrate the efficiency of BC-based finetuning thanks to the use of a relative position encoding.

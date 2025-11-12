@@ -1,0 +1,146 @@
+\section{LayoutDM}
+Our LayoutDM builds on discrete-state space diffusion models~\cite{austin2021structured,gu2022vector}.
+We first briefly review the fundamental of discrete diffusion models in \cref{subsec:discrete_diffusion}.
+\cref{subsec:layout_diffusion_unconditional} explains our approach to layout generation within the diffusion framework while discussing features inherent in layout compared with text.
+\cref{subsec:layout_diffusion_conditional} discusses how we extend denoising steps to perform various conditional layout generation by imposing conditions in each step of the reverse process.
+
+\subsection{Preliminary: Discrete Diffusion Models}
+\label{subsec:discrete_diffusion}
+
+
+Diffusion models~\cite{sohl2015deep} are generative models characterized by a forward and reverse Markov process.
+While many diffusion models are defined on continuous space with Gaussian corruption, D3PM~\cite{austin2021structured} introduces a general diffusion framework for categorical variables designed primarily for texts.
+Let $T \in \mathbb{N}$ be a total timestep of the diffusion model, we first explain the forward diffusion process.
+For a scalar discrete variable with $K$ categories $z_{t} \in \{1,2,\ldots,K\}$ at timestep $t \in \mathbb{N}$, probabilities that $z_{t-1}$ transits to $z_{t}$ are defined by using a transition matrix $\bm{Q}_{t} \in [0,1]^{K \times K}$, with $[Q_{t}]_{mn} = q(z_{t}\!=\!m | z_{t-1}\!=\!n)$,
+
+\begin{equation}
+q(z_{t}|z_{t-1}) = \bm{v}(z_{t})^{\!\top} \mathbf{Q}_{t} \bm{v}(z_{t-1}),
+\end{equation}
+where $\bm{v}(z_{t}) \in \{0,1\}^{K}$ is a column one-hot vector of $z_{t}$.
+The categorical distribution over $z_{t}$ given $z_{t-1}$ is computed by a column vector $\mathbf{Q}_{t} \bm{v}(z_{t-1}) \in [0,1]^{K}$.
+Assuming the Markov property,
+we can derive $q(z_{t}|z_{0}) = \bm{v}(z_{t})^{\!\top}\overline{\mathbf{Q}}_{t}\bm{v}(z_{0})$ where $\overline{\mathbf{Q}}_{t}\!=\!\mathbf{Q}_{t}\mathbf{Q}_{t-1}\cdots\mathbf{Q}_{1}$ and:
+\begin{align}
+    &q(z_{t-1}|z_{t}, z_{0}) = \frac{
+        q(z_{t}|z_{t-1}, z_{0})\,q(z_{t-1}|z_{0})
+    }{
+        q(z_{t}|z_{0})
+    } \nonumber \\
+    &= \frac{
+        \left(\bm{v}\!\left(z_{t}\right)^{\!\top}\!\mathbf{Q}_{t}\bm{v}\!\left(z_{t-1}\right)\right)
+        \left( \bm{v}\!\left(z_{t-1}\right)^{\!\top}\overline{\mathbf{Q}}_{t-1}\bm{v}\!\left(z_{0}\right) \right)
+    }{
+        \bm{v}\!\left(z_{t}\right)^{\!\top}\overline{\mathbf{Q}}_{t}\bm{v}\!\left(z_{0}\right)
+    }. \label{eq:q_posterior}
+\end{align}
+Note that due to the Markov property, $q(z_{t}|z_{t-1}, z_{0})=q(z_{t}|z_{t-1})$.
+When we consider $N$-dimensional variables $\bm{z}_{t} \in \{1,2,\ldots,K\}^{N}$, the corruption is applied to each variable $z_{t}$ independently.
+In the following, we explain with $N$-dimensional variables $\bm{z}_{t}$.
+
+
+In contrast to the forward process, the reverse denoising process considers a conditional distribution of $\bm{z}_{t-1}$ over $\bm{z}_{t}$ by a neural network $p_{\theta}(\bm{z}_{t-1}|\bm{z}_{t}) \in [0,1]^{N \times K}$.
+$\bm{z}_{t-1}$ is sampled according to this distribution.
+Note that the typical implementation is to predict unnormalized log probabilities $\log p_{\theta}(\bm{z}_{t-1}|\bm{z}_{t})$ by a stack of bidirectional Transformer encoder blocks.
+D3PM uses a neural network $\tilde{p}_{\theta}(\tilde{\bm{z}}_{0}|\bm{z}_{t})$, combines it with the posterior $q(\bm{z}_{t-1}|\bm{z}_{t},\bm{z}_{0})$, and sums over possible $\tilde{\bm{z}_{0}}$ to obtain the following parameterization:
+\begin{equation}
+p_{\theta}(\bm{z}_{t-1}|\bm{z}_{t}) \propto \sum_{\tilde{\bm{z}}_{0}}q(\bm{z}_{t-1}|\bm{z}_{t},\tilde{\bm{z}}_{0})~\tilde{p}_{\theta}(\tilde{\bm{z}}_{0}|\bm{z}_{t}). \label{eq:single_step_in_inference}
+\end{equation}
+
+In addition to the commonly used variational lower bound objective $\mathcal{L}_\mathrm{vb}$, D3PM introduces an auxiliary denoising objective. The overall objective is as follows:
+\begin{equation}
+    \mathcal{L}_{\lambda} = \mathcal{L}_\mathrm{vb} + \lambda
+    \underset{\substack{ \bm{z}_{t} \sim q(\bm{z}_{t}|\bm{z}_{0}) \\ \bm{z}_{0} \sim q(\bm{z}_{0})}}{\mathbb{E}}
+    \left[ -\log \tilde{p}_{\theta}\left(\bm{z}_{0}|\bm{z}_{t}\right) \right], \label{eq:total_loss}
+\end{equation}
+where $\lambda$ is a hyper-parameter to balance the two loss terms.
+
+Although D3PM proposes many variants of $\mathbf{Q}_{t}$, VQDiffusion~\cite{gu2022vector} offers an improved version of $\mathbf{Q}_{t}$ called mask-and-replace strategy.
+They introduce an additional special token \texttt{[MASK]}
+and three probabilities $\gamma_{t}$ of replacing the current token with the \texttt{[MASK]} token, $\beta_{t}$ of replacing the token with other tokens, and $\alpha_{t}$ of not changing the token.
+The \texttt{[MASK]} token never transitions to other states.
+The transition matrix $\mathbf{Q}_{t} \in [0,1]^{(K+1)\times(K+1)}$ is defined by:
+\begin{equation}
+\mathbf{Q}_{t} = \begin{bmatrix}
+\alpha_{t}+\beta_{t} & \beta_{t} & \cdots & \beta_{t} & 0  \\
+\beta_{t} & \alpha_{t}+\beta_{t} & \cdots & \beta_{t} & 0  \\
+\vdots & \vdots & \ddots & \beta_{t} & 0  \\
+\beta_{t} & \beta_{t} & \beta_{t} & \alpha_{t}+\beta_{t} &  0  \\
+\gamma_{t} & \gamma_{t} & \gamma_{t} & \gamma_{t} & 1 \\
+\end{bmatrix}.
+\label{eq:Q_mask_and_replace}
+\end{equation}
+$(\alpha_{t}, \beta_{t}, \gamma_{t})$ is carefully designed so that $z_{t}$ converges to the \texttt{[MASK]} token for sufficiently large $t$.
+During testing, we start from $\bm{z}_{T}$ filled with \texttt{[MASK]} tokens and iteratively sample new set of tokens $\bm{z}_{t-1}$ from $p_{\theta}(\bm{z}_{t-1}|\bm{z}_{t})$.
+
+\subsection{Unconditional Layout Generation}
+\label{subsec:layout_diffusion_unconditional}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\hsize]{images/overview.pdf}
+    \caption{
+        Overview of the corruption and denoising processes in LayoutDM.
+        For simplicity, we use a toy layout consisting of two elements and the model generates three elements at maximum.
+    }
+    \label{fig:overview}
+\end{figure}
+
+A layout $l$ is a set of elements represented by $l = \left\{\left(c_{1}, \bm{b}_{1}\right), \ldots, \left(c_{E}, \bm{b}_{E}\right) \right\}$. $E \in \mathbb{N}$ is the number of elements in the layout. $c_{i} \in \{1, \ldots, C\}$ is categorical information of the $i$-th element in the layout. $\bm{b}_{i} \in [0,1]^4$ is the bounding box of the $i$-th element in normalized coordinates, where the first two values indicate the center location, and the last two indicate the width and height.
+Following previous works~\cite{arroyo2021variational,gupta2021layout,kong2022blt} that regard layout generation as generating a sequence of tokens, we
+quantize each value in $\bm{b}_{i}$ and obtain $[x_{i}, y_{i}, w_{i}, h_{i}]^\top \in \{1, \ldots, B\}^4$, where $B$ is a number of the bins. The layout $l$ is now represented by $l = \left\{\left(c_{1}, x_{1}, y_{1}, w_{1}, h_{1}\right), \ldots \right\}$.
+
+In this work, we corrupt a layout in a modality-wise manner in the forward process, and we denoise the corrupted layout while considering all elements and modalities in the reverse process, as we illustrate in \cref{fig:overview}.
+Similarly to D3PM~\cite{austin2021structured}, we parameterize $p_{\theta}$ by a Transformer encoder~\cite{vaswani2017attention}, which processes an ordered 1D sequence.
+To process $l$ by $p_{\theta}$ while avoiding the order dependency issue~\cite{kong2022blt}, we randomly shuffle $l$ in element-wise manner and then flatten it to produce $l_\mathrm{flat} = (c_{1}, x_{1}, y_{1}, w_{1}, h_{1}, c_{2}, x_{2}, \ldots )$.
+
+
+\paragraph{Variable length generation}
+Existing diffusion models generate fixed-dimensional data and are not directly applicable to the layout generation because the number of elements in each layout varies.
+To handle this, we introduce a \texttt{[PAD]} token and define a maximum number of elements in the layout as $M \in \mathbb{N}$.
+Each layout is fixed-dimensional data composed of $5M$ tokens by appending $5(M-E)$ \texttt{[PAD]} tokens.
+\texttt{[PAD]} is treated similarly to the ordinary token in VQDiffusion and $\mathbf{Q}_{t}$'s dimension becomes $(K+2) \times (K+2)$.
+
+\paragraph{Modality-wise diffusion}
+Discrete state-space models assume that all the standard tokens are switchable by corruption. However, layout tokens comprise a disjoint set of token groups for each attribute in the element. For example, applying the transition rule \cref{eq:Q_mask_and_replace} may change a token representing an element's category to another token representing the width.
+To avoid such invalid switching, we propose to apply disjoint corruption matrices $\mathbf{Q}_{t}^{c},\mathbf{Q}_{t}^{x},\mathbf{Q}_{t}^{y},\mathbf{Q}_{t}^{w},\mathbf{Q}_{t}^{h}$ for tokens representing different attributes $c, x, y, w, h$, as we show in \cref{fig:overview}. The size of each matrix is $(C+2) \times (C+2)$ for $\mathbf{Q}_{t}^{c}$ and otherwise $(B+2) \times (B+2)$, where $+2$ is for \texttt{[{PAD}]} and \texttt{[{MASK}]}.
+
+\paragraph{Adaptive Quantization}
+The distribution of the position and size information in layouts is highly imbalanced; e.g., elements tend to be aligned to either left, center, or right.
+Applying uniform quantization to those quantities as in existing layout generation models~\cite{arroyo2021variational,gupta2021layout,kong2022blt} results in the loss of information.
+As a pre-processing, we propose to apply a classical clustering algorithm, such as KMeans~\cite{macqueen1967classification} on $x$, $y$, $w$, and $h$ independently to obtain balanced position and size tokens for each dataset.
+We show in \cref{sec:ablation_study} how quantization strategy affects the resulting quality.
+
+\paragraph{Decoupled Positional Encoding}
+Previous works apply standard positional encoding to a flattened sequence of layout tokens $l_\mathrm{flat}$~\cite{arroyo2021variational,gupta2021layout,kong2022blt}.
+We argue that this flattening approach could lose the structure information of the layout and lead to inferior generation performance.
+In layout, each token has two types of indices: $i$-th element and $j$-th attribute.
+We empirically find that independently applying positional encoding to those indices improves final generation performance, which we study in \cref{sec:ablation_study}.
+
+
+
+
+\subsection{Conditional Generation}
+\label{subsec:layout_diffusion_conditional}
+We elaborate on solving various conditional layout generation tasks using pre-trained frozen LayoutDM.
+We inject conditional information in both the initial state $\bm{z}_{T}$ and sampled states $\{\bm{z}_{t}\}_{t=0}^{T-1}$ during inference but do not modify the denoising network $p_{\theta}$.
+The actual implementation of the injection differs by the type of conditions.
+
+\paragraph{Strong Constraints}
+The most typical condition is partially known layout fields.
+Let $\bm{z}^\mathrm{known} \in \mathbb{Z}^{N}$ contain the known fields and $\bm{m} \in \{0, 1\}^{N}$ be a mask vector denoting the known and unknown field as $1$ and $0$, respectively. In each timestep $t$, we sample $\hat{\bm{z}}_{t-1}$ from $p_{\theta}(\bm{z}_{t-1}|\bm{z}_{t})$ in \cref{eq:single_step_in_inference} and then inject the condition by $\bm{z}_{t-1} = \bm{m} \odot \bm{z}^\mathrm{known} + (\bm{1} - \bm{m}) \odot \hat{\bm{z}}_{t-1}$, where $\bm{1}$ denotes a $N$-dimensional all-ones vector and $\odot$ denotes element-wise product.
+
+\paragraph{Weak Constraints}
+We may impose a weaker constraint during generation, such as an element in the center. We offer a way to impose such constraints in a unified framework without additional training or external neural network models.
+We propose to adjust the logits to inject weak constraints in log probability space by
+\begin{equation}
+    \log \hat{p}_{\theta}(\bm{z}_{t-1}|\bm{z}_{t}) \propto \log p_{\theta}(\bm{z}_{t-1}|\bm{z}_{t}) + \lambda_{\pi} \bm{\pi}, \\ \label{eq:prior_addition}
+\end{equation}
+where $\bm{\pi} \in \mathbb{R}^{N \times K}$ is a prior term that weights the desired outputs, and $\lambda_{\pi} \in \mathbb{R}$ is a hyper-parameter.
+The prior term can be defined either hard-coded (Refinement in \cref{sec:quantitative_evaluation}) or through differentiable loss functions (Relationship in \cref{sec:quantitative_evaluation}).
+Let $\{\mathcal{L}_i\}_{i=1}^L$ be a set of differentiable loss functions given the prediction, the later prior definition can be written by:
+\begin{equation}
+    \bm{\pi} = -\nabla_{p_{\theta}(\bm{z}_{t-1}|\bm{z}_{t})} \sum_{i=1}^{L} \mathcal{L}_{i}\left(p_{\theta}\left(\bm{z}_{t-1}|\bm{z}_{t}\right)\right). \\ \label{eq:prior_addition_by_gradient}
+\end{equation}
+Although the formulation of \cref{eq:prior_addition_by_gradient} resembles steering diffusion models by gradients from external models ~\cite{dhariwal2021diffusion,liu2022compositional}, our primal focus is incorporating classical hand-crafted energies for aesthetics principles of layout~\cite{o2014learning} that do not depend on an external model.
+In practice, we tune the hyper-parameters for imposing weak constraints, such as $\lambda_{\pi}$.
+Note that these hyper-parameters are only for inference and are easier to tune than the other training hyper-parameters.

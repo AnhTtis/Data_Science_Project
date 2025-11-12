@@ -1,0 +1,292 @@
+Our study of multi-site ensembles includes five phases: (1) comparing our performance to a state-of-the-art workflow system, (2) studying the system-level efficiency of our software, (3) exploring the space of steering policies, (4) studying the sources of inefficiency to better guide future multi-site workflows, and (5) testing observations on a second application.
+
+\subsection{Comparing to State-of-the-Art}\label{sec:comparetoparsl}
+
+
+\begin{figure}
+    \centering
+    \includegraphics[trim=0 0 0 0, clip]{figures/parsl-comparision_latencies.pdf}
+    \includegraphics[trim=0 0.1cm 0 0.1cm, clip]{figures/parsl-comparision_active-learning-performance.pdf}
+    \caption{Comparison of different implementations of the multi-site active learning pipeline. An implementation using only Parsl (Parsl), Parsl using \proxystore{} with Redis to transfer data, and \funcx{} to transmit requests and \globus{} to transfer data. (a) Median time required to reorder a task queue and median idle time for simulation workers. Error bars represent the 40th and 60th percentiles. (b) Number of top-performing molecules found as a function of simulation time expended.}
+    \label{fig:parslcomparison}
+\end{figure}
+
+% \kyle{I somewhat wonder if this should be at the end of the section as it sort of introduces the results that follow in subsequent sections. And doesn't really provide as much description.}
+% \logan{Yea, it's kind of a re-hash of the introduction. I'm going to comment the whole thing out to see how it feels.}
+% \funcx{} and \proxystore{} do not introduce a new capability to perform multi-site computational campaigns, but instead simplify the configuration.
+% Instead of using network configurations that require incoming and outgoing connections from each site (e.g., via SSH tunnels), our solution routes connections through a service such that no direct links need be created or maintained.
+% An important question is therefore: ``how much performance does one lose to gain this convenience?''
+% In this section, we contrast the performance of our molecular design application against an approach that uses SSH tunnels.
+
+
+% We compare our system against Parsl, a Python-based workflow engine capable of managing workloads across multiple sites~\cite{babuji19parsl}.
+% Task requests and results are sent between systems using ZeroMQ pipelines that require opening and maintaining SSH tunnels between multiple systems---a common approach employed by many workflow systems.
+% We test both this native configuration where both result and data are passed over ZeroMQ with a version where the data are passed via \proxystore{} with a Redis backend (requiring another SSH tunnel).
+% Parsl is also integrated with \colmena{}, allowing us to use the exact same steering policy with Parsl as we did with \funcx{}.
+
+We study the performance differences between workflow systems (see \S\ref{sec:workflow}) with two metrics: responsiveness of the simulation and machine learning tasks, and active learning performance.
+The key responsiveness need by our application is time to update the task list given new data, and rate at which new simulations are evaluated.
+We define the time to update tasks as the time from when the steering policy requests models to be retrained to when the results from all inference tasks are used to reprioritize the task queue.
+As shown in \autoref{fig:parslcomparison}a, the \funcx{} implementation completes the ML tasks faster (\num{820}~s, on average) than native Parsl (\num{900}s) and comparable to Parsl using \proxystore{} backed by Redis (\num{790}~s). 
+The comparable task completion times suggest that the additional latency incurred by tasks being routed through a cloud service is rather small, only increasing makespan by 5\%. 
+
+\logan{Going to add some details on why I think Parsl is faster than funcX once I pass this off to Rajeev for reading}
+\logan{I'm betting I can see the difference in the time to resolve data proxies}
+\logan{It's now late Friday and I haven't done it. Future work then. I would move this section until after we characterize the latency in funcX so I've already introduced what kinds of latency we expect to find.}
+
+The other key measure we consider is how long simulation workers wait for work.
+We measure this latency by the downtime between when a worker completes one simulation and starts the next.
+In the span between those events, the system must report the completed result to the \colmena{} Thinker and dispatch the next task selected by the thinker back to the worker.
+Parsl without \proxystore{} and \funcx{} with \globus{} preform similarly on this metric with median idle times of approximately 380~ms in contrast to 256~ms for Parsl (see \autoref{fig:parslcomparison}a).
+Parsl with \proxystore{} backed by Redis is significantly more performant, with an idle time of only 96~ms.
+While the \funcx{} implementation is about four times slower than Parsl with ProxyStore, we note that all Task Server implementations achieve a utilization of $>$99\% for our tasks, due to their average 90~s duration.
+% In short, we do find advantages to using direct connections between workers but find they are insignificant if workers are running tasks longer than 60s.
+
+The overall scientific outcomes of the application using \proxystore{} to send data between sites are equivalent regardless of whether one uses \funcx{} or Parsl.
+We compared the scientific outcomes by measuring how many molecules with an IP of greater than 14 were found after 12 node hours of compute, and averaged the value over three runs of each implementation.
+Our best-effort with open ports, Parsl+Redis, has equivalent outcomes to our \funcx{}+\globus{} implementation (179.3 vs.\ 178.8). 
+The results are within the margin of error of the measurement, noting that the \funcx{}+\globus{} system varied between 170 and 188 across repeats of the experiments.
+We therefore conclude that direct connections between computing providers are an unnecessary complication to deploying our multi-site application given the identical scientific outcomes.
+
+
+\subsection{Assessing System Responsiveness}
+\label{sec:computational-efficiency}
+
+An effective computation steering system must have minimal time between when new data are acquired, decisions made, and decisions are acted upon.
+The ``decision responsiveness'' is composed of at least three forms of latency:
+(a) lag between results completing and being available to the Thinker (reaction time),
+(b) lag between results being received and new decisions being made (decision time),
+and (c) lag between decisions made and new computations started (dispatch time).
+% \logan{There is also inefficiencies within the workflow execution system for how well it keeps nodes busy given work. I'm concerned that funcX is not performing well for this.} \yadu{Might be smarter to frame this as responsiveness and latency/overheads, and avoid utilization} \logan{Agreed. Low utilization is a FuncX problem and, I'd imagine, a focus of a different paper}
+
+\subsubsection{Reaction Time}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.9\columnwidth,trim=0.4cm 0.5cm 0.35cm 0.4cm,clip]{figures/latency-analysis_reaction-time.pdf}
+    \caption{Above: Time between when a tasks finishes computing and when the Thinker is notified that the computation has finished. Below: How long the Thinker waits to access the result data.}
+    \label{fig:rxntime}
+\end{figure}
+
+The reaction time latency has two components: the time until the Thinker process is notified of a task and the time until the data from the result are available.
+The use of \proxystore{} means that the two processes occur separately.
+Of the two, the time to notify that a result is complete is distinctly faster and never requires more than 1 second (see Fig. \ref{fig:rxntime})
+The notification process includes serializing the data, creating a proxy object, and the result message being communicated (without the proxied data) to the Redis queue used to alert the Thinker.
+The notification process for the simulation tasks is faster (median \num{50}~ms) as it does not require initializing a \globus{} transfer because the Thinker and simulation worker share a filesystem.
+Starting the transfer requires making a HTTPS request to \globus{} which incurs a latency on the order of \num{100}~ms, which explains why the latencies are longer for the training and simulation tasks.
+
+The data transfer latency is only notable when data must be transferred between sites (i.e., inference, training).
+The transit times for a result data are subject to interference from other users of the computing facility, so we see a variation from 1 to 5~seconds for the data transfer times.
+Some \globus{} transfers complete while the Thinker is processing results of previous tasks, which is visible in inference data latencies that are sub-\num{500}~ms.
+
+Overall, we conclude that the most promising route to achieving more reactive simulation steering tools is to shorten the time to communicate results.
+Decoupling the result notification and data transfer comes with the advantage of being able to use high-performance data transfer systems, and identifying the appropriate subsystem for a particular application is a problem we study further in \S\ref{sec:subsystems}.
+
+\subsubsection{Decision Time}
+%We define the ``decision time'' as the time between when a result is placed in the result queue and the Thinker finishes using it to decide what to do next.
+There are a few points latency in decision making is time-critical.
+First, the time between receiving a completed simulation and choosing the next is needed to maintain simulation worker utilization.
+The time between receiving the last inference result and the task list being updated controls how quickly better simulations can be performed, and the time between an updated model being received and new inference tasks submitted is key in keeping the newly-idle accelerator busy. 
+We study each point in detail.
+
+The decision to submit the next simulation does not require knowing the result of the previous, which makes it particularly fast.
+The median time between when a Thinker receives a completed simulation and the next one is sent to the Task server is only \num{4}~ms.
+% In contrast, the median time until the task is submitted to \funcx{} by the Task Server is \num{194}~ms. 
+% While larger, the latency of submitting to \funcx{} is not significant given that it is \num{0.1}\% of the average task runtime and 
+% that its 95th percentile is only \num{300}~ms.
+The minimal ($<5$ ms) time for the Thinker to respond shows our use of multi-threaded Python in \colmena{} is not an issue in spite of Python's Global Interpreter Lock. % (GIL).
+
+Decisions based on completed model training and inference results involve reading the contents of a result, which requires both resolving the \proxystore{} proxy and deserializing the message.
+Responding to model training events is the slightly longer of these two decision processes at a median \num{4}~s compared to \num{3}~s for inference, and both of these times are primarily waiting for the data transfer to complete (as in \autoref{fig:rxntime}).
+The importance of the time to receive data from remote systems is, again, our most important factor in improving application performance.
+
+\subsubsection{Dispatch Time}
+The time for a chosen task to begin executing on a remote system, the ``dispatch'' time, is the final type of latency we consider.
+%Latency in tasks starting on a worker is not hidden by a task backlog occurs three places: 
+The task start latency is often hidden by maintaining a backlog of queued tasks but this latency cannot be hidden in three places: when we begin training models, when a batch of inference tasks are submitted after the first model completes training, and when a simulation worker completes. 
+In all of these cases, we know at least one worker on one of the sites is available and seek to provide new work with the least delay.
+
+The inference and training tasks require transferring data across multiple sites, and this is the primary source of latency.
+The mean latency for starting the first inference task and a training task are \num{21.2} and \num{10.8}~s, respectively, 
+and resolving the data proxy accounts for an average of \num{20.9}~s (99\%) and \num{8.9}~s (82\%) of that latency. 
+Each of these latencies are significant in terms of the average task times. The inference latency, in particular, is almost half of the average runtime of the task (52s).
+The effect of data movement latency is not as severe for later inference tasks, an average of 8~s for the second inference, because the data movement can occur while the first task is in-progress.
+Further, 25\% of the second tasks read the inputs from \proxystore{}'s in memory cache and gather inputs in $<1$~ms.
+\greg{Should we explain globus is more optimized for fewer large transfers rather than many small ones so our application does not take advantage of globus' strengths? These transfer times look really bad which is good for motivating our future work but bad for justifying why we choose globus.}
+\logan{I agree. I'll keep your suggestion in until someone resolves it.}
+Overall, high data movement costs further motivate a need for further research in data fabrics for multi-site computing.
+
+The latency of the simulation dispatch times is minimal.
+The time is dominated by communicating the task request via \funcx{}, which is a median of 330~ms.
+As noted in the comparison to Parsl, this time is less than 1\% of the total runtime and, consequently, not our main target for improvement.
+
+\subsubsection{Assessment} Our multi-site application requires a maximum of \num{10}~s to respond to a computation completing.
+As illustrated in the previous sections, \colmena{} is alerted of a new result within a median of \num{1.5}~s.
+Acting on the results can require up to \num{3}~s if they must be transferred from a remote system, 
+and the task startup time of a remote system occurs in \num{1}~s.
+The effective total latency of $O(10)$~s per task, in our case, can be easily mitigated through the careful design of the steering program.
+For example, we maintain a queue of more simulation tasks than workers so that \funcx{} workers are able to continue working as the next simulation is being sent and submit inference tasks as soon as the associated model is retrained.
+
+\subsection{Quantifying Tradeoffs of Steering Policy}\label{sec:policy}
+
+\begin{figure*}[h]
+    \centering
+    \includegraphics[trim=0 0.4cm 0 0.1cm,clip]{figures/policy-comparison_pareto-plot.pdf}
+    \caption{Comparison of different policies for scheduling machine learning and simulation tasks. Each point represents the CPU or GPU resources consumed and time required to find 175 molecules with an ionization potential of above 14V for different strategies. The continuous strategy launches new tasks as soon as resources are available, where the other strategies (differing colors and shapes) employ different approaches for conserving resources with different adjustable parameters ($N$) (shade).}
+    \label{fig:policy}
+\end{figure*}
+
+Bridging a computational campaign across multiple sites introduces opportunities for optimizing the cost of the computational campaigns.
+Successful deployment of a campaign will require balancing the time-to-solution with the resource utilization at each site.
+We quantify those trade-offs for our example application by fixing the available resources and measuring the performance of our search application under different scheduling policies.
+
+The main mechanisms for controlling the resource utilization in our application  are varying how often the machine learning tasks are performed, the size of the buffer for simulation tasks, and whether the buffer is refilled while machine learning tasks are active.
+We start with a ``continuous'' strategy where machine learning tasks are started with \textit{any} new data is acquired and the buffer is refilled with enough tasks to keep all simulation workers busy.
+The continuous strategy prioritizes time-to-solution and does not employ any control for reducing system utilization.
+We compare to three other strategies:
+\begin{enumerate}
+    \item \textbf{Delay retrain} where we retrain after $N$ simulations complete successfully and continually fill the simulation buffer, conserving GPU resources %but not CPU resources.
+    \item \textbf{Batch retrain} where we retrain after $N$ simulations complete successful and do not refill the buffer during retraining, which conserves both GPU and CPU resources at the expense of time-to-solution.
+    \item \textbf{Interleaved} where we maintain a large buffer of $N$ simulation requests that we do not refill during retraining. Training tasks are started after any simulation completes successfully. This strategy conserves GPU and CPU resources, and overlaps machine learning and simulation tasks to decrease time-to-solution.
+\end{enumerate}
+
+\autoref{fig:policy} shows the resources required to find 175 molecules with a target ionization potential ($>$14 V) with different scheduling strategies.
+We find no single configuration that optimizes all performance metrics.
+The continuous strategy finds the molecules nearly the fastest ($\approx105$ minutes) but at a large expenditure of CPU resources. 
+In general, only strategies that continue to perform simulations while machine learning tasks are underway solve the problem in less than 2 hours. 
+Halting the simulations does offer significant improvements in CPU resource usage ($\approx33\%$ lower) at the cost of only slightly more GPU utilization but major increases in the time-to-solution.
+The batch scheduling approach where neither type of task overlaps takes twice as long as the continuous strategy, yet achieves only marginal improvements in CPU or GPU cost compared interleaving.
+In short, each strategy offers distinct trade-offs that can be tuned for the needs of different users.
+From these limited examples, we believe there must be significant open space for devising optimal control policies for maximizing the efficiency of multi-site computations and assert that system software must be available for implementing such approaches.
+\logan{To preachy?}
+\greg{maybe a bit. I don't think anyone would disagree with using specialized hardware for different tasks is better, its really a question of is the overhead of getting it working worth the performance improvement (and colmena reduces that setup overhead).}
+\kyle{I dont think this is bad}
+
+
+\subsection{Detailed Benchmarks of Subsystems}\label{sec:subsystems}
+%[and compare to other tools?] \logan{Greg + Ryan|Yadu?}}
+
+In this section, we investigate aspects of the \proxystore{} and \funcx{} subsystems used by \colmena{}.
+The motivation is to characterize the properties of these subsystems to better understand the performance trends noted in \S\ref{sec:computational-efficiency}.
+
+\subsubsection{Avoiding \funcx{} Overheads with \proxystore{}}
+
+\begin{figure}
+    \centering
+    \includegraphics[trim=0 0.3cm 0 0, clip,width=\columnwidth]{figures/proxystore/colmena_overheads.png}
+    \caption{
+    Median times for different components of the end-to-end execution of a no-op task with \colmena{}.
+    For small (1~kB) and large (1~MB) inputs to tasks, transferring objects via \proxystore{} can reduce communication overheads.
+    \proxystore{} can avoid repeated serializations and deserializations of object transmitted through the Task Server and \funcx{} service.
+    }
+    \label{fig:proxystore-overhead}
+\end{figure}
+
+\begin{figure*}[h]
+    \centering
+    \includegraphics[width=\textwidth]{figures/proxystore/overheads_input_size.png}
+    \caption{
+    Mean times of various components during the lifetime of a \colmena{} task. 
+    The Redis, file system, and \globus{} \proxystore{} backends are used to proxy inputs, ranging in size from 10~KB to 100~MB, to no-op tasks.
+    The Redis backend provides low latency while the file system backend performs well with large objects ($\sim$100~MB).
+    Mean time of a task spent on a worker increases with \globus{} because the task must wait on the web-based data transfer to complete.
+    }
+    \label{fig:proxystore-input-size}
+\end{figure*}
+
+We first compare the performance achieved when communicating task inputs with \funcx{} and two \proxystore{} backends: shared file system and Redis.
+Specifically, we aim to quantify overhead improvements to the Task Server and \funcx{} systems by transferring large objects via alternative means through \proxystore{}.
+
+We execute no-op tasks that return no output to focus on the \colmena{} overheads and perform the experiment twice: with 10~KB inputs and with 1~MB inputs.
+The input sizes are chosen based on characteristics of the \funcx{} cloud service.
+\funcx{} stores function arguments and results less than 20~kB in an Amazon ElastiCache Redis store and objects greater than 20~kB in Amazon S3. % the cumulative size of objects cannot exceed 10~MB in \funcx{}.
+In all experiments, the Thinker and Task Server are located on a Theta login node, and we use an endpoint on Theta which submits tasks to a single Theta node.
+We execute 50 tasks and record the the times for different stages in the task's life cycle.
+
+%\logan{I've joined the mention of the figure to the paragraph explaining what you measured}
+%We report the median time to transfer tasks and data between the Thinker, Task Server, and worker as well as the serialization time, time spent on the worker, and overall lifetime of the task, and the results are presented in~\ref{fig:proxystore-overhead}.
+The communication times between the Thinker, Task Server, and worker are measured as well as the serialization time, time spent on the worker, and overall lifetime of the task, and the results are presented in~\autoref{fig:proxystore-overhead}.
+The \emph{serialization} time is the total time spent serializing and deserializing tasks on the Thinker, Task Server, and worker.
+When serializing tasks, \colmena{} scans for objects in the tasks (inputs or outputs) whose size exceeds the \proxystore{} threshold.
+If these large objects are found, the object will be proxied and the lightweight proxy will be serialized along with the task instead.
+Therefore, the serialization time reflects proxying time which includes time spent communicating objects to Redis or writing objects to disk.
+%\logan{does the serialization time include saving the data to disk/redis. be clear}
+%Subsequently, the serialization time includes the time to place objects in \proxystore{} and get a proxy in return.
+The \emph{time on worker} is the time between the task starting on the worker and the worker returning the completed task.
+This time includes deserialization of the task, possible resolving of proxies, the execution of the task itself (which in this case is a no-op), and the serialization of the results.
+The \emph{task lifetime} is the time between a task being created by the Thinker and the result being received by the Thinker.
+
+Communication between the Task Server and worker dominates the overall task lifetime because this communication must go through \funcx{}'s cloud service.
+For small 10~kB inputs, passing objects via proxies can reduce the Task Server to worker communication time by 2-3$\times$.
+The improvements provided by \proxystore{} increase to an order of magnitude for 1~MB task inputs.
+The increase in \funcx{} overheads with larger data sizes is due to more data needing to be transmitted over the Internet and because \funcx{} uses the slower S3 for the transient storage of the larger data sizes.
+%\funcx{} stores the 1~MB inputs in S3 where as the smaller 10~kB inputs are stored in a faster Redis server.
+
+\proxystore{} also improves communication times between the Thinker and Task Server for larger objects.
+The communication between the Thinker and Task Server is handled via Redis queues.
+Therefore, sending small objects (e.g., 10~kB) via \proxystore{} with a Redis backend will have the same performance characteristics but also incurs additional small \proxystore{} overheads and is therefore slower.
+However, this is not the case for larger objects.
+Once a task is sent from the Thinker to the Task Server, the Task Server deserializes the task to determine the corrent endpoint the task needs to be executed on and then the Task Server serializes the task again to send it to \funcx{}.
+This additional deserialization and serialization on the Task Server is negligible for small task inputs but for large task inputs, such as in the 1~MB case, can make a large difference in the Thinker to Task Server communication time.
+
+The key conclusion here is that \colmena{} and \funcx{} overheads scale with data size so having an alternative method of object communication that can enable direct exchange of objects between the Thinker and workers is vital to avoid overloading intermediate systems and building a scalable workflow system.
+
+\subsubsection{\proxystore{} Backends}
+
+We explore the performance of \proxystore{} in more detail in \autoref{fig:proxystore-input-size}. Specifically, we measure components of the task life cycle in \colmena{} with three different \proxystore{} backends, Redis, file system, and \globus{}, across a range of task input sizes varying from 10~KB to 100~MB.
+We use the same no-op and no-output tasks as in the prior experiment as well as the same Theta KNL node endpoint.
+The Redis and file system backends enable intra-site communication so we place the Thinker and Task Server on a Theta login node.
+The \globus{} backend is used for inter-site communication so we place the Thinker and Task Server on a local workstation.
+
+These three backend choices cover a wide-range of use cases but exhibit very different performance. % as a result.
+E.g., Redis will typically be faster than file system I/O but opening the ports necessary to use Redis may not be possible in all circumstances. 
+Here we explore the effect that different backends have on the various stages in a task's life cycle in \colmena{}.
+
+Comparing the performance of Redis-backed \proxystore{} with file system-backed \proxystore{}, we find the only significant differences to be in serialization time, which includes storing objects in the \proxystore{} backend.
+Redis has much lower latency for smaller objects; however, with the largest 100~MB objects, the Redis and file system backends exhibit similar performance.
+The ``time on worker'' is consistent between the Redis and file system backends and across task input sizes.
+
+The serialization time is similar between the file system and \globus{} backends.
+%This is because with the \globus{} backend, 
+Objects are still written to the shared file system prior to starting a \globus{} transfer operation.
+Thus, the serialization performance in both cases is a reflection of the I/O performance of the file system.
+The \globus{} backend does incur higher overheads in the time spent on the worker, because a proxy must wait for the \globus{} transfer of its target object to finish before the proxy can resolve itself.
+This can take up to a few seconds, but the performance is constant with task input size (up to 100~MB) which indicates the communication bottleneck is due to the \globus{} web services latency rather than bandwidth limitations of the Thinker.
+%, which is on a 300~Mbps residential internet connection, or endpoint, which has a commercial-grade internet connection.
+
+Overall, there are clear trade offs between backends for \proxystore{}.
+%Overall, we find that \proxystore{} provides access to many data storage and communication methods, and switching between backends can be done with a single line of code, enabling workflows to be easily optimized. % their workflows with ease.
+A Redis backend is optimal for low latency access to smaller objects within a single site, whereas a shared file system backend is easier to use and provides good performance for very large objects such as ML models.
+As observed in \S\ref{sec:computational-efficiency}, \globus{} can enable multi-site workloads with low overheads when networking restrictions limit other options.
+All of these choices are accessible by changing a single line of code in \proxystore{}, enabling workflows to be easily optimized.
+
+\subsection{Testing on a Second Application}
+
+\begin{figure}
+    \centering
+    \includegraphics[trim=0 0.2cm 0 0.1cm, clip]{figures/surrogate/overhead-comparison.pdf}
+    \includegraphics[trim=0 0.5cm 0 0.1cm, clip]{figures/surrogate/error-comparison-barh.pdf}
+    \caption{Comparison of (a) median overheads per task type and (b) performance of the surrogate model on a test set, for three different workflow systems. (a) The time spent waiting for result data is shown in gray for the systems where \proxystore{} is used to transfer data separately from task instructions (Redis store with Parsl, Globus store with FuncX). (b) Error bars are the standard error of the mean.}
+    \label{fig:surrogate}
+\end{figure}
+
+We studied a second application, training surrogate models for quantum mechanical calculations (see \S\ref{sec:hydronet}), to see how our observations hold more generally. 
+To summarize, we have identified that the overhead for performing tasks on a remote site is dominated by the time to transfer data from workers to steering process (Fig.~\ref{fig:rxntime}), and that the larger relative overheads of using \globus{} to transfer data has little effect on overall application performance.
+We also noted that the costs for using Globus remain constant at several seconds per data transfer in detailed benchmarks.
+% Here, we test if these observations hold more generally.
+
+The time to transfer data is still the main source of overhead for tasks executed on remote systems.
+As shown in \autoref{fig:surrogate}a, data transfer time accounts for 1.35 of 1.43~s of the median overheads of evaluation tasks for Parsl plus Redis \proxystore{} and 3.7 of 4.2~s for the FuncX plus Globus.
+We attribute the large performance improvement of Parsl with Redis to small message sizes ($<10$~MB).
+Our detailed benchmarks show that the larger start-up costs of Globus are worthwhile when transfers are larger than 100~MB.
+
+In locally executed tasks, the data transfer costs are comparable to the time to transmit result messages. 
+Both data transfer and result notification are on the order of 100~ms, which is negligible compared to the task durations of at least 10~s.
+The time for a task to begin on a Parsl worker is high, due to how idle workers are notified when new work is available.
+Even after improving this part of Parsl, we do not anticipate significant improvements over FuncX for locally executed tasks, because FuncX is already close to the 100~ms limit imposed by data transfer costs.
+
+No implementation of the multi-site workflow is conclusively better in terms of scientific output.
+Each produces a model that predicts forces on atoms with a root-mean-squared deviation (RMSD) of approximately 3~eV/$\AA$. 
+Any improvements are small compared to run-to-run variation.
+The difference in the overheads for each tasks, though large relative to each other, are small compared to the overall duration of these tasks (\num{1000}~s).
+In short, we again find that scientific output does not suffer when using \funcx{} and \globus{} to avoid networking challenges.
