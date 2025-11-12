@@ -96,7 +96,10 @@ def get_IDs_network(start_month, start_year, start_ID, end_month, end_year, end_
         if y == end_year and m == end_month:
             n_end = end_ID
         else:
+            print(total_paper, start_ID, end_ID)
             n_end = total_paper - end_ID + start_ID - 1
+            print(m, y)
+            print(n_end)
             if n_end is None:
                 n_end = 0  # No papers this month
 

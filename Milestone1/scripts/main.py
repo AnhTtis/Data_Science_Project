@@ -2,16 +2,17 @@ import threading
 import queue
 import time
 import arxiv
-from arXiv_handler import get_IDs_All
+from arXiv_handler import get_IDs_All, get_IDs_network
 from downloader import download
 from reference_extractor import extract_references_for_paper
 import os
 import random
 
 
-def fetch_ids_worker(start_month, start_year, start_ID, end_month, end_year, end_ID, start_index, num_papers, id_queue):
+def fetch_ids_worker(start_month, start_year, start_ID, end_month, end_year, end_ID, total_paper, start_index, num_papers, id_queue):
     print("[Step 1] Fetching arXiv IDs...")
-    ids = get_IDs_All(start_month, start_year, start_ID, end_month, end_year, end_ID)
+    #ids = get_IDs_All(start_month, start_year, start_ID, end_month, end_year, end_ID)
+    ids = get_IDs_network(start_month, start_year, start_ID, end_month, end_year, end_ID, total_paper)
     selected_ids = ids[start_index:start_index + num_papers]
     print(f"[Step 1] Fetched {len(selected_ids)} IDs.")
     for arxiv_id in selected_ids:
@@ -101,6 +102,7 @@ if __name__ == "__main__":
     end_month = 4
     end_year = 2023
     end_ID = 4606
+    total_paper = 15000
     base_data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "23127130"))
     os.makedirs(base_data_dir, exist_ok=True)
 
@@ -117,7 +119,7 @@ if __name__ == "__main__":
     print("Starting pipeline...")
 
     t1 = threading.Thread(target=fetch_ids_worker, args=(
-        start_month, start_year, start_ID, end_month, end_year, end_ID, start_index, num_papers, id_queue))
+        start_month, start_year, start_ID, end_month, end_year, end_ID, total_paper, start_index, num_papers, id_queue))
     t1.start()
 
     download_threads = []
