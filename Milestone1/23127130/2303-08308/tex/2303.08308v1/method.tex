@@ -1,0 +1,260 @@
+\section{Methodology}
+\begin{figure*}[t]
+	\centering
+	\includegraphics[width=1.05\textwidth]{hyperspace1.png}	
+	\vspace{-4.5ex}
+	\caption{(a) We simplify space search into model search process; (b) Illustration of  our hyperspace. A sampled search space is encoded by a sequential elastic stages.  Contents in blue are searched: an elastic stage can search its block type and channel number list. }
+	\label{fig:hyperspace}
+\end{figure*}
+\vspace{-1ex}
+\subsection{The Core Design Concept}
+\vspace{-1ex}
+ In this section, we present our methodology for automatically designing a specialized quantization-friendly search space for any target hardware.  Different from architecture search, where the goal is to find the single best model from the space,  we aim to discover a \textit{model population} that contains billions of accurate and INT8 latency-friendly architectures. 
+We draw inspiration from the neural architecture search process and propose to use an evolutionary search algorithm to explore such a quantization-friendly model population. To achieve this, we introduce {\algname}, which is built on the following three techniques.
+
+First, we need a metric that quantifies how quantization-friendly a candidate search space is. We define a Q-T score that is efficiently measured by top-tier subnets' INT8 accuracy-latency (\cref{sec:qt}).
+
+
+Second, existing evolutionary search algorithms are designed for searching a single model architecture rather than a large search space encompassing billions of architectures. we propose a novel approach that we call the "elastic stage." By factorizing the search space into a sequence of elastic stages ((\cref{sec:elasticstage}), we enable traditional aging evolution methods, such as the aging evolution~\cite{real2019regularized}, to be directly applied to search the space (\cref{sec:search}). 
+
+Third, searching a search space with a maximum Q-T score can be prohibitively costly since the corresponding supernet must be trained from scratch for accuracy evaluation. We propose a block-wise search space quantization scheme to significantly reduce the training cost(\cref{sec:bkd}).
+
+
+ 
+
+%{\algname} is built on three key techniques: \textit{(i)} we define Q-T score measured by top-tier subnets' INT8 accuracy-latency to quantify how quantization-friendly a candidate search space is; \textit{(ii)} we introduce an evolutionary search algorithm that conduct search space search with maximizing the proposed \textit{Q-T} score; \textit{(iii)}  we introduce the block-wise quantization scheme to reduce the huge cost of search space quality evaluation.
+ %suggests  no one-for-all quantization-friendly space for all devices, which motivates our work to design hardware-aware search space that can better utilize INT8 quantization on real-world devices
+
+%\noindent\textbf{Opportunities and challenges}.  Our analysis suggests there is a huge room for design space improvement of quantized model on real-world devices.
+%Thus, we aim to  design specialized search space for each device, which comprises optimal quantization-friendly operators and configurations. While manual design for each device is impractical, we target at automatic search space design. Unfortunately, existing auto-design methods~\cite{nse,autoformerv2} cannot be applied to search a quantization-friendly  space for two reasons.
+%NSE~\cite{nse} and S3~\cite{autoformerv2} can shrink  better search spaces without any human efforts. However, they  focus on optimizing the accuracy and cannot be applied to search a quantization-friendly  space for two reasons. 
+%Firstly, none of them search the space for both operator types and configurations, which are the crucial factors impacting INT8 latency; Secondly, they train each candidate  space from scratch to evaluate quality. Due to the expensive training cost, the number of current search iterations is limited by 10.  However, both operator types and configurations construct a huge hyperspace, while 10 iterations may be insufficient to find the optimal candidate.
+
+
+%To address these challenges, we propose {\algname} to  automatically design a hardware-aware, quantization-friendly space for once-for-all supernet NAS with three key techniques: \textit{(i)} we define Q-T score measured by top-tier subnets' INT8 accuracy-latency to quantify how quantization-friendly a candidate search space is; \textit{(ii)} we simplify the complex space design into neural architecture search scheme  and leverage aging evolution for space search; \textit{(iii)}  we introduce the block-wise quantization scheme to reduce the huge cost of search space quality evaluation.
+
+\subsection{Search Space Quality Score}
+\label{sec:qt}
+\noindent\textbf{Latency-aware space quality of Q-T score}. Before space search, we need a score to quantify how quantization-friendly a search space is, which serves as the search objective. Since our ultimate goal is to search the best quantized models from the searched space, we treat a space with good quality if its \textbf{top-tier} subnets achieve optimal quantized accuracy under latency constraints $T$. Due to the fact that real-world applications usually have different deployment requirements, we use \textbf{multiple INT8 latency constraints} to measure a space's quality. 
+For search space $\mathcal{A}$ and  a set of quantized latency constraints $T_{1,...,n}$,  we treat every constraint equally important, and define Q-T score as   the  sum of each constraint:  $\mathcal{Q}(\mathcal{A}, T_{1,...,n})$= $\mathcal{Q}(\mathcal{A}, T_{1})$+$\mathcal{Q}(\mathcal{A}, T_{2})$+..., $\mathcal{Q}(\mathcal{A}, T_{n})$,  $\mathcal{Q}(\mathcal{A}, T_{i})$ is defined as:
+\begin{equation}
+	\label{eq:score}
+	\begin{aligned}
+		\displaystyle \mathcal{Q}(\mathcal{A}, T_{i})= \mathbb{E}_{\alpha\in \mathcal{A}, LAT(\alpha)\leq T_i}[ Acc_{int8}(\alpha) ]
+	\end{aligned}
+\end{equation}
+where $\alpha$ denotes a top-tier (best searched) subnet in $\mathcal{A}$ and
+$Acc_{int8}(\alpha)$ is its  top-1 quantized accuracy evaluated on ImageNet validation set, $LAT(\alpha)$ predicts the quantized latency on target device.
+
+However, it's non-trivial to obtain the top-tier subnets from a candidate search, as if often involves an expensive full architecture search process.  We adopt a \textit{zero-cost} policy.  Specifically, we randomly sample 5k subnets and select top 20   that under the latency constraints as the top-tier models to approximate the expectation term. The top 20 subnets are rapidly identified through the use of an accuracy look-up-table and a quantized latency predictor (\cref{sec:bkd}).
+
+\subsection{Elastic Stage and Problem Formulation}
+\vspace{-1ex}
+\label{sec:elasticstage}
+ We  observe that existing two-stage NAS adopt a chain-structured search space~\cite{ofa,bignas,attentivenas}, which  can be factorized as a sequence of STEM, HEAD and $N$ searchable stages. Each stage defines  a range of configurations $c$ (e.g., kernel size, channel width, depth) for a specific block type $b$, and allows NAS to find the optimal architecture settings. 
+
+\noindent\textbf{Elastic stage}. Without loss of generality, we define a stage structure in a search space  as elastic stage $E_{b,c}$, which has elastic configurations $c$ for a fixed block $b$. 
+Suppose a search space $\mathcal{A}$ has $N$ stages, it can be modularized as:
+\begin{equation}
+		\begin{aligned}
+			\label{eq:searchspace}
+\displaystyle \mathcal{A}=STEM \circ E_{b,c}^{1},... \circ E_{b,c}^{N} \circ HEAD
+\end{aligned}
+\end{equation}
+For instance, the search space in OQAT~\cite{oqa} and BatchQuant~\cite{batchquant} can be factorized as 6 elastic stages and STEM (first Conv) and a classification head. Each elastic stage represents a set of configuration choices for the MBv3 block. Through the definition of elastic stage, we can simply use ~\cref{eq:searchspace} to denote the contents of a  model popuation.  
+
+\vspace{2pt}
+\noindent\textbf{Problem definition}. Operator type $b$ and  configuration $c$ are two crucial objectives when searching quantization-friendly search space.
+Through the definition of elastic stage, the task of space search  can be simplified to find a search space with optimal elastic stages, which has a similar goal with  neural architecture search.
+We formulate our problem as:
+
+\begin{equation}
+	\label{eq:problem}
+	\begin{aligned}
+		\scalemath{0.86}{\mathcal{A}(E_{b,c}^{1}\circ E_{b,c}^{2}\circ...\circ E_{b,c}^{N})^*=\mathop{\arg\max}\limits_{E_{b,c}^i\in \mathcal{H}^i}{\mathcal{Q}(\mathcal{A}(E_{b,c}^{1}\circ E_{b,c}^{2}\circ ...\circ E_{b,c}^{N}), T)}
+	}\end{aligned} 
+\end{equation}
+where $\mathcal{A}(\cdot)$  denotes the search space, and $E_{b,c}^i$ is the $i^{th}$ elastic stage of  $\mathcal{A}(\cdot)$. $\mathcal{H}$ denotes the hyperspace  which covers all possible search spaces.  $\mathcal{Q}$ is the Q-T score for measuring a  search space's quality. Given the constraints $T$ (i.e., a set of targeted quantized latency),
+{\algname} aims to find the optimal  elastic stages ($E_{b,c}^{1}\circ E_{b,c}^{2}\circ...\circ E_{b,c}^{N}$)$^*$ from the $1^{st}$ to $N^{th}$ stage for $\mathcal{A}^*$ that has the maximum Q-T score: the top-tier quantized  models  can achieve best accuracy under the constraint $T$. Fig.~\ref{fig:hyperspace}(a) illustrates the overall process.  In this work, we focus on the latency of INT8 quantized models.  Our approach can be generalized to lower bits once they are supported on standard devices.
+
+\subsection{Searching the Search Space}
+\label{sec:search}
+We now describe our evolutionary search algorithm that solves the problem in \cref{eq:problem}.
+
+\noindent\textbf{Hyperspace design}. Analogous to  NAS, hyperspace $\mathcal{H}$  defines which search space a search algorithm might discover. Defining a hyperspace to cover many candidate search spaces for space search is a second-order problem for NAS, which can easily introduce high complexity. Fortunately, we can easily construct a large hyperspace through search space modularization in ~\cref{eq:searchspace}.
+
+
+% which has a similar structure with a neural architecture. %This design can effectively reduce complexity of automatically searching a quantization-friendly search space.  %This design can effectively reduce the search complexity. 
+We construct a large hyperspace in Fig.~\ref{fig:hyperspace}, in which 
+%Analogous to  NAS, hyperspace $\mathcal{H}$ defines which search space a search algorithm might discover in principle. We factorize a search space into elastic stages and then search  the optimal setting (i.e., operator type and configurations) for each elastic stage. 
+%As  in Fig.~\ref{fig:hyperspace}, 
+a search space can be encoded by $N$=6 sequential elastic stages along with STEM and HEAD.
+%Each elastic block is defined by a block structure and its configuration that
+%allows each elastic block to use dynamic numbers of layers $d$; for each layer, it also allows to use dynamic numbers of channels $cout$, dynamic kernel sizes $k$ and expand ratios $e$. 
+We search the following two dimensions for an elastic stage:
+\vspace{-1ex}
+\begin{itemize}
+	\item Block (operator) type $b$:  MBv1~\cite{mobilenet}, MBv2~\cite{mobilenetv2}, MBv3~\cite{mobilenetv3}, residual bottleneck~\cite{resnet}, residual bottleneck with SE, FusedMB~\cite{efficientnetv2} and FusedMB with SE. Conv is the major operator in residual bottleneck and FusedMB, thus they are quantization-friendly blocks; the efficiency of MB blocks relies on the device. For example, DWConv and SE are less quantization-efficient on Intel CPU. 
+	\item Output channel width list $cout$. In Sec.~\ref{sec:analysis}, we observe that quantized models can better utilize hardware  under a larger channel number setting. However, directly increasing the channel numbers will also lead to longer latency. Therefore,  we search the optimal stage-wise channel width list $cout$: $\{w_{min}^*, ..., w_{max}^*\}$, which provides better channel width choices for final INT8 model search. 
+	Specifically, as described in Fig.~\ref{fig:hyperspace}(b), we  predefined a wide range of $[w_{min}, w_{max}]$ by enlarging the channel widths in existing search spaces, and allow each elastic stage to choose a subset of $cout$ from $[w_{min}, w_{max}]$.  
+	%To better utilize on-device INT8 quantization, the channel widths are constrained to be divisible by 8 on Pixel4 and 16 on Intel VNNI  (see supplementary materials).  For example,  given a predefined range of [32, 64] and $ck$=2, the channel number lists $cout$ can be    \{32,48\} or \{48, 64\} for Intel VNNI.
+	
+	%	the optimal channel widths $cout$=$(c_{min}, c_{min}$+$step, ..., c_{max})$ for each stage, where $step$ is the channel step size. In our experiment, we set $step$=8 for Pixel4 and $step$=16 for Intel VNNI.  To limit the size of a search space, we use $ck$ to denote the numbers of channel choices.  Fig.~\ref{fig:hyperspace} lists out the search range for $cout$ per layer. For instance, given a range of 32-64 and $ck$=2,  candidate $cout$ can be \{32,48\} or \{48, 64\} for Intel VNNI. 
+\end{itemize}
+\vspace{-1ex}
+Besides channel widths, other configuration dimensions (e.g., kernel size) also impact a model's quantized latency. However, searching all dimensions leads to a large amount of   choices in one stage, which exponentially enlarges the hyperspace size. Fortunately, other dimensions usually have a small space (e.g., kernel size selects from \{3,5,7\}). It's easy to find the optimal  value for a model in the final NAS process. Therefore, we follow existing practices to configure the choices of kernel size, depth, and expand ratios.  Our final searched INT8 model architectures {\sysname} suggest that the optimal quantization-friendly kernel sizes and expand ratios are chosen. For example, 
+kernel size of 3×3 brings more INT8 latency speedups for DWConv, and it is the dominate kernel size choice in DWConv related blocks. 
+
+%Our hyperspace has a distinct advantage of balancing the trade-off between accuracy and quantization efficiency. 
+Suppose that a stage has $m$ choices of channel widths, there would be 7 (operator types) $\times m$ candidates for each stage. In total, for a typical search space with $N=6$ stages, the hyperspace has $\sim$10$^9$ candidate search spaces, which is extremely large and poses challenges for efficient search. 
+
+
+
+
+
+
+%Unlike the existing design-then-quantize methods, our work conduct NAS  to directly find the optimal quantized models for target hardware. Concretely, we formulate our problem as:
+%\begin{equation}
+%\label{eq:overallproblem}
+%\begin{aligned}
+%\displaystyle \alpha^*_\mathcal{A}=\mathop{\arg\min}\limits_{\alpha\in \mathcal{A}}{\mathcal{L}_{val}}(W^*_\alpha) && \mathrm{ s.t. }\;   LAT(\alpha) \leq T;
+%\end{aligned} 
+%\end{equation}
+
+
+%where $\alpha$ and $W_\alpha$ denote the network architecture and the \textit{quantized} network parameters, respectively. $\mathcal{A}$ is the search space. {\sysname} aims to find the optimal quantized network $\alpha^*_\mathcal{A}$ that has the minimum cross-entropy loss, $\mathcal{L}$, while the \textit{quantized} latency (denoted by $LAT$) also meets the constraint, $T$. 
+
+%To meet the deployment requirements on the diverse devices, we decouple the optimization problem in Eq.~\ref{eq:overallproblem} into three steps:
+% 1) search a quantization-friendly space $\mathcal{A}_h$ that are optimized for the target hardware $h$, 2) encode the space and train a quantization-for-all supernet that contains different sizes of quantized models (i.e., INT8 model) for various levels of INT8 latency requirements, and 3) conduct evolution search over the supernet for the optimal quantized model  under constraint $T$. 
+
+
+%\begin{figure}[t]
+%	\centering
+%	\includegraphics[width=1\columnwidth]{figs/searchspace2.png}	
+%	\caption{(a) An elastic block; (c) we encode all possible search spaces (a space is a path) into a hyper space; (d) we search the optimal layer-wise elastic block for the hardware-quantized space.
+	%	To reduce search space training cost, we conduct block-wise knowledge distillation and quantization (b).    }
+%	\label{fig:method}
+%\end{figure}
+
+
+ 
+
+\vspace{2pt}
+\noindent\textbf{Evolutionary space search}.  The structure of hyperspace is similar to a typical model search space in NAS~\cite{spos}, so we can easily apply existing NAS search algorithms.  Taking this advantage, we leverage  aging evolution~\cite{real2019regularized} to search the large hyperspace. We first randomly initialize a population of $P$ search spaces, where each sampled space is encoded as  ($E_{b,c}^{1}\circ E_{b,c}^{2}\circ...\circ E_{b,c}^{N}$). Each individual  is rapidly evaluated with  Q-T  score. After this, evolution improves the initial population in mutation iterations. At each iteration, we sample $S$ random candidates from the population and select the one with highest score as the \textit{parent}. Then we alternately mutate the \textit{parent} for block type and widths to generate two \textit{children} search spaces. For instance, suppose the $i^{th}$  stage $E_{b,c}^{i}$   is selected for mutation, we first randomly modify its block type and produce $E_{b^{*},c}^{i}$ for child 1, then we mutate the widths and produce   $E_{b,c^{*}}^{i}$ for child 2. We evaluate their Q-T scores and add them to current population. The oldest two are removed for next iteration.
+%Once the children are constructed, 
+%we evaluate their Q-T scores. We add the children to current population and remove the oldest two for next iteration.
+%We use the equation~\ref{eq:score} to evaluate the Q-T score for the children. At the end of each iteration, we remove the oldest ones in the current population. 
+After all iterations finish, we collect all the sampled space and select the one with best score as the final search space. 
+
+
+
+%To efficiently search the large hyperspace, a population of candidate search space $P$ is initialized randomly. Each individual of $P$ is rapidly evaluated with a P-T search space quality score (in next section)  by our blockwise quantizer (to be elaborated in next section). At each evolutionary step, we sample $s$ candidates from $P$ and select the one with  highest score as the parent. We conduct random elastic block mutations on parent to produce two children. Specifically, we first keep the block type and mutate a new width; then we fix the channel width and mutate a layer's block type for the second child. The two children are then evaluated to measure the P-T score. At the end of each iteration, we remove the oldest two children in the current population and add the two children for the next iteration. After the evaluation finishes, we collect all the explored search spaces and select the best individual with the best score as the final search space. 
+
+
+
+
+%To speed up the accuracy evaluation, {\algname} uses block-wise  knowledge distillation to build a quantized accuracy look-up-table. This amounts to a one-time cost. To reduce the latency measurement cost, {\algname} leverages nn-Meter~\citep{nnmeter} to build accurate latency predictor for quantized models. 
+
+%Given a candidate search space, it requires to evaluate the quantized accuracy and latency for a large scale of sub-networks  to measure the P-T score. The most accurate evaluations are to get accuracy by training a supernet (search space) from scratch~\citep{nse,autoformerv2} and measure latency on device. However, it's impractical to search our huge hyperspace due to the prohibitive cost. For example, it costs more than 10 days to train a supernet on 8 V100 GPUs. To speed up the accuracy evaluation, {\algname} uses block-wise  knowledge distillation to build a quantized accuracy look-up-table. This amounts to a one-time cost. To reduce the latency measurement cost, {\algname} leverages nn-Meter~\citep{nnmeter} to build accurate latency predictor for quantized models. 
+
+%Following RegNet~\cite{regnet} and S3~\cite{autoformerv2}, we measure a model distribution instead of individual models. Specifically, we sample a set of models from $\mathcal{A}$ and measure both the quantization latency and loss for the distribution.
+
+
+
+
+
+
+%\noindent\textbf{Elastic block}. As shown in Fig.~\ref{fig:method}(a), we define $b(C)$ represent an instance of elastic block, where $b$ denote the block architecture and $C$ is the configuration space. $C$ is consisting of 4 search dimensions: depths, kernel size, expansion ratio and channels. Then we can factorize a search space $\mathcal{A}$ into  STEM layer, HEAD layer and a sequence of $l$ elastic blocks 
+%a sequence of elastic blocks (shown in Fig.~\ref{fig:method}(b)).  Existing  hardware-aware NAS~\cite{proxylessnas,ofa,fbnet,donna} and quantization-aware NAS~\cite{haq,apq,batchquant,oqa} mainly use the single-elastic-block search spaces. For instance, OFA~\cite{ofa} configures all the layer to MbV2 block. For each layer, MbV2 is allowing to choose from a pre-defined configuration space $C$, where the depth is chosen from \{2,3,4\}; the kernel size is chosen from \{3,5,7\}; expansion ratio is chosen from \{3,4,6\}.
+%However, as analyzed in Sec.~\ref{sec:analysis}, the choice of block type $b$ and configuration space $C$ significantly impact the INT8 latency. Improper choices can lead to quantization-unfriendly search spaces, where all models contain latency-slow blocks.  To eliminate this gap, we propose to design a hardware-quantized space $\mathcal{A}_h$ that is optimized to find layer-wise elastic blocks for target hardware,  so that it contains many high quality quantized models. Consequently, it's much easier to obtain superior results (i.e., high accuracy and low latency) from our space.  
+
+
+
+%\noindent\textbf{Hyper space}. To search for the hardware-quantized search space, we encode all possible spaces into a hyper space. As shown in Fig.~\ref{fig:method} (b), each  layer has a set of candidate elastic blocks, and our goal is to find an optimal path (i.e., a search space) of layer-wise elastic block. 
+
+%To consider both the quantization efficiency and accuracy, we first construct the candidate block set as \{MbV1, MbV2, MbV3, ResNet, ResNet\_SE\}. We further propose the configuration space optimizer to tune for the search values in each dimension. We inherit the existing configuration space and then  apply our observed quantization-friendly rules in Sec.~\ref{sec:analysis} to optimize them. Specifically, we reduce the kernel size space to \{3,5\} for \{MbV1, MbV2, MbV3\} for Intel VNNI via rule 1; we enlarge the channels for each layer and the expansion ratio via rule 3; we constrain the channel number sampling with 8-divisible for Pixel4 and 16-divisible for Intel VNNI via  rule 2.  For any new device, our configuration space optimizer can generalize well via adding a set of rules in Sec.~\ref{sec:analysis}.
+
+
+
+%We set $l=6$ elastic blocks in our search space. Then the hyper space has $5^6$ possible hardware-quantized spaces. To find the optimal space, the search algorithm faces two challenges. First, we need a  score that considers both the INT8 latency and accuracy to evaluate the quality of each space. To solve this, we propose a quantization-aware metric called P-T score. Second, the hyper space size is extremely large and the computation of  each search space' quality is time-consuming. Therefore, we propose a block-wise knowledge distillation quantizer that predicts the quantization loss and a latency predictor that predicts the quantized latency.
+
+
+
+
+%\noindent\textbf{Search space quality P-T score}. For a candidate space $\mathcal{A}$, we propose to use P-T score to quantify the quality of $\mathcal{A}$. Following RegNet~\cite{regnet} and S3~\cite{autoformerv2}, we measure a model distribution instead of individual models. Specifically, we sample a set of models from $\mathcal{A}$ and measure both the quantization latency and loss for the distribution. %P part measures the empirical probability of sampling a model within the target quantized latency constraint $T$; T part measures the average quantization loss of top-tier models that meet the $T$ constraint. 
+%We define the P-T score as follows:
+
+%\begin{equation}
+%	\label{eq:reward}
+%	\begin{aligned}
+	%		\displaystyle Score (\mathcal{A})= Loss \times   \left[ \frac{p(LAT(\alpha)\leq T)}{P} \right ]^w,&&where&& w=\begin{cases}
+		%			0, & \text{if}\;p\geq T\\
+		%			w_\alpha, & \text{otherwise}
+		%		\end{cases}
+	%	\end{aligned}
+%\end{equation}
+%where $Loss$ measures the average quantization loss of top-tier models in the distribution that meet the given latency constraint $T$.  $p(T)$ measures the empirical probability of sampling a model within $T$. A larger $p(T)$ indicates that this space contains a large portion of low-latency models  and it's more likely to search a high accuracy model. $P$ is the expected probability for the final space. $w$ is a weight factor that controls the latency and accuracy trade-off. In our experiments, we set $w=0$ if $p(T)$ of the candidate space already meets the final expected $P$. In this case, we search for the space with the lowest quantization loss. Otherwise, we set $w=w_
+%\alpha$ to penalize the score and encourage the search algorithm to find a space with lower latency. $w_\alpha$ is a negative number, and in our experiment, we empirically set $w_\alpha=-1$. 
+%\begin{equation}
+%\label{eq:reward2}
+%\begin{aligned}
+%\displaystyle S(\mathcal{A})=S(\mathcal{A}, T_1)+S(\mathcal{A}, T_2)+...+S(\mathcal{A}, T_n)
+%\end{aligned}
+%\end{equation}
+
+%\begin{equation}
+%\label{eq:reward1}
+%\begin{aligned}
+%\displaystyle S(\mathcal{A}, T)= Avg(Topk (Acc)) \times   \left[ \frac{p(LAT(\alpha\in  (\mathcal{A}) )\leq T)}{P} \right ]^w,&&where&& w=\begin{cases}
+	%0, & \text{if}\;p\geq T\\
+	%w_\alpha>0, & \text{otherwise}
+	%\end{cases}
+	%\end{aligned}
+	%\end{equation}
+	
+	%P part measures the empirical probability of sampling a model within the target quantized latency constraint $T$; T part measures the average quantization loss of top-tier models that meet the $T$ constraint. 
+	\vspace{-1ex}
+	\subsection{Efficient Search Space Quality Evaluation}
+	\vspace{-1ex}
+	\label{sec:bkd}
+	\begin{figure}[t]
+		\centering
+		\includegraphics[width=1.01\columnwidth]{bkd.png}	
+		\vspace{-4ex}
+		\caption{ We adopt block-wise knowledge distillation to  reduce search space quality evaluation cost. We add two linear transformation layers (Conv 1x1) to match teacher's feature map widths. }
+		\label{fig:bkd}
+	\end{figure}
+	%Given a candidate search space, it requires to evaluate the quantized accuracy and latency for a large scale of sub-networks  to measure the P-T score. The most accurate evaluations are to get accuracy by training a supernet (search space) from scratch~\citep{nse,autoformerv2} and measure latency on device. However, it's impractical to search our huge hyperspace due to the prohibitive cost. For example, it costs more than 10 days to train a supernet on 8 V100 GPUs. To speed up the accuracy evaluation, {\algname} uses block-wise  knowledge distillation to build a quantized accuracy look-up-table. This amounts to a one-time cost. To reduce the latency measurement cost, {\algname} leverages nn-Meter~\citep{nnmeter} to build accurate latency predictor for quantized models. 
+	
+	We now address the  efficiency challenge caused by Q-T score evaluation. The most accurate  evaluation  is to get accuracy by training a supernet (search space) from scratch and measure latency on target device. However, it's impractical to conduct large-scale search due to the prohibitive cost. For example, it costs more than 10 days to train a supernet on 8 V100 GPUs~\cite{bignas}. To reduce the cost, we  build an accurate INT8 latency predictor by nn-Meter~\cite{nnmeter}, then we introduce block-wise quantization scheme.
+	
+	
+	
+	\noindent\textbf{Block-wise knowledge distillation (BKD)} is firstly proposed in DNA~\cite{dna} and then further improved in DONNA~\cite{donna}. It originally uses block-wise representation of existing models (teacher) to supervise a corresponding student model block. In our work, we extend BKD to
+	supervise the training of all elastic stages (each contains a large amount of blocks). Since a stage size is much smaller than search space size,  the training time is greatly reduced. %Inspired by this, we adopt BKD to train all the elastic stages in our hyperspace. 
+	
+	
+	%To reduce the supernet training time, DNA~\citep{dna} and DONNA~\citep{donna} propose block-wise knowledge distillation (BKD), that firstly divides a whole supernet into blocks, then distill each block from a paired teacher block independently. Since  $\mathcal{A}$ has been modularized as a sequence of elastic blocks in Section~\ref{sec:problem}, it's naturally to adopt BKD for efficient supernet training. 
+	
+	Fig.~\ref{fig:bkd} illustrates the BKD process. In the first step, 
+	we  use EfficientNet-B5 as the teacher, and separately train each elastic stage to mimic the behavior of corresponding teacher block by minimizing the NSR loss~\cite{donna} between their output feature maps. Specifically, the $i^{th}$ stage receives the output of $(i-1)^{th}$ teacher block as the input and is optimized to predict the output of  $i^{th}$ teacher block with NSR loss.
+	Since an elastic stage contains many blocks with different channel widths, we add two learnable linear transformation layers at the input and output for each elastic stage to match teacher's feature map shape. Moreover, we adopt sandwich rule ~\cite{bignas} to sample four paths to improve the training efficiency. Each elastic stage is firstly trained for 5 epochs and then performed 1 epoch LSQ+~\cite{lsqplus} for INT8 quantization. 
+	
+	%We train these elastic stages  in a parallel way and the training can be finished in 1 day.
+	%This amounts a one-time cost. 
+	
+	%Fig.~\ref{fig:arch}(b) illustrates the BKD process.  We use EfficientNet-B5 as the teacher. For each elastic stage, we train it independently to mimic the behavior of the corresponding teacher block by minimizing the NSR loss~\citep{donna} between their output feature maps. Since an elastic stage contains much more sub-paths than DNA and DONNA, we apply sandwich rule~\citep{bignas} to sample four sub-paths at each batch to improve the training efficiency. 
+	%We first train a full-precision elastic stage for 5 epochs then conduct LSQ+~\citep{lsqplus}  for 1-epoch INT8 quantization.  As all the elastic stages are distilled separately, we can concurrently train them and finish  in 1 day. %This amounts a one-time cost. 
+	
+\noindent\textbf{Accuracy lookup table}.	In the second step, we construct a INT8 accuracy lookup table to reduce the evaluation cost.  Specifically, we evaluate all possible blocks in each elastic stage and record their NSR losses on the validation set in the lookup table. The quantized loss of a model is estimated by summing up the NSR loss of all its blocks by rapidly looking up each elastic stages from the table. We inverse the measured loss to approximate the quantized accuracy for Q-T score evaluation.
+	
+	In our work, the BKD and lookup table construction can be sped up in a parallel way and finished in 1 day, which amounts a one-time cost before aging evolution search. 
+	
+%	\subsection{INT8 Model Specialization for Deployment}
+%	\vspace{-1ex}
+%	Once {\algname} discovers a quantization-friendly search space for the target device, we train a \textit{quantized-for-all} supernet.  %The advantage is that the searched subnet can directly inherit supernet weights for deployment with comparable accuracy to those retrained from scratch, which eliminates the huge cost of training or quantization of each subnets individually. 
+%	We start by pretraining a full-precision supernet without quantizers on ImageNet for 360 epochs. We adopt the sandwich rule and inplace distillation  in BigNAS~\cite{bignas}.  Then, we perform quantization-aware training (QAT) on the trained supernet for 50 epochs, which follows the same training protocol (i.e., sandwich rule and inplace distillation). We use LSQ+ as the QAT algorithm for better quantized accuracy. To derive INT8 model for deployment, we perform evolution search over the quantized-for-all supernet with our INT8 latency predictor. 
+%	The searched models can be directly deployed without retraining.
+	
+	
+	% we perform two-stage neural architecture search to derive the Pareto-frontier quantized models. The first stage is to train a \textit{quantized-for-all} supernet, which follows OQAT~\cite{oqa}. We start by pretraining a full-precision supernet without quantizers on ImageNet. We adopt the sandwich sampling rule and inplace distillation introduced in ~\cite{bignas}.  Then, we perform quantization-aware training (QAT) on the trained supernet.  This step follows the same training protocol (i.e., sandwich rule and inplace distillation). To better quantize MB-based blocks, we use LSQ+ as the QAT algorithm. In the second stage, we search Pareto-frontier models from the quantized-for-all supernet with a INT8 latency predictor, which is built based on  nn-Meter~\cite{nnmeter}. Note all the quantized models can be directly deployed without retraining or finetuning.

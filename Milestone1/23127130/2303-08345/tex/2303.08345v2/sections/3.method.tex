@@ -1,0 +1,177 @@
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.88\linewidth]{figures/fig2.pdf}
+  \caption{%
+    \textbf{Overall architecture of our algorithm.} The whole framework consists of three modules: the \textit{pre-ranking module} aims to obtain coarse anchor rank by modeling inter-anchor context; the \textit{re-ranking module} aims to obtain content-enhanced anchor rank by supplementing anchors with detailed content; the \textit{regression module} aims to adjust anchor boundaries.
+  }
+  \label{fig:framework}
+  \vspace{-5pt}
+\end{figure*}
+
+\section{Method}\label{sec:method}
+%
+This section presents a detailed introduction to our proposed framework.
+%
+As depicted in \cref{fig:framework}, our method takes a long-form video and a sentence query as input, and predicts the video moment that is semantically related to the query in an end-to-end manner. 
+%
+Specifically, our framework consists of three modules:
+%
+\textit{(1) Pre-ranking with Anchor Knowledge} aims to encode the inter-anchor context by employing cascaded temporal swin transformer blocks. 
+%
+Then, a coarse anchor rank is obtained by sorting the context-based matching scores concerning the query.
+%
+\textit{(2) Re-ranking with Frame Knowledge} is designed to model the intra-anchor content knowledge, and calculate the content-based matching scores concerning the query. The anchor candidates are re-ranked by summing the context-based and content-based matching scores.
+%
+\textit{(3) Boundary Regression} aims to adjust anchor boundaries, leveraging both inter-anchor context and intra-anchor content. 
+Our method outputs the adjusted boundaries of the top-$n$ anchors as the final predictions.
+
+
+\subsection{Feature Extractor}
+Given an untrimmed video $V=\{f_{t}\}_{t=1}^{T}$ and a sentence query $Q=\{w_{m}\}_{m=1}^{M}$, where $T$ and $M$ represent the number of frames and words respectively, the LVTG task requires to localize the target moment $(\tau_{s}, \tau_{e})$ that corresponds to query. To achieve this, we adopt off-the-shelf pretrained models to extract visual features $\mathbf{V}=\{\mathbf{v}_{1}, \mathbf{v}_{2}, ..., \mathbf{v}_{N}\}\in\mathbb{R}^{N \times D}$ as well as textual features $\mathbf{Q}=\{\mathbf{q}_{\text{cls}}, \mathbf{q}_{1}, \mathbf{q}_{2}, ..., \mathbf{q}_{M}\}\in\mathbb{R}^{(M+1) \times D}$. $N,M$ represent the numbers of extracted frame features and word features respectively, and $D$ represents the feature dimension. 
+The query feature $\mathbf{q}$ is extracted in different ways depended on the type of pretrained model.
+For models pretrained with multi-modalities (\textit{e.g.}, CLIP~\cite{radford2021learning}), we take out the class token embedding $\mathbf{q}_{\text{cls}}$ as query feature. While for other models (\textit{e.g.}, BERT~\cite{devlin2018bert}), we pass the word embeddings through a trainable LSTM \cite{hochreiter1997long} layer to acquire the query feature.
+We then feed the video features $\mathbf{V}$ and query feature $\mathbf{q}$ into our network for next process.
+
+\subsection{Pre-ranking with Anchor Knowledge}
+\noindent\textbf{Multi-scale anchor generation.}
+%
+Due to the computational complexity of global self-attention is quadratic to the sequence length,
+%
+the standard transformer is heavily computational on modeling full-length frame sequences of long-form video. 
+%
+To mitigate the computational burden, we first employs a single convolutional layer to produce non-overlapping base anchors from successive frames. The formulation is as follow:
+%
+\begin{equation}
+    \mathbf{E}^{0} = \text{Conv1d}(\mathbf{V}),
+\end{equation}
+where $\mathbf{E}^{0} \in \mathbb{R}^{\frac{N}{C_{0}}\times D}$, and $C_{0}$ denotes the length of base anchor.
+Then we adopt $L$ cascaded temporal swin transformer blocks with pooling layers to encode inter-anchor context knowledge and obtain multi-scale context-based anchor features $\mathbf{E} = [\mathbf{E}^{1}; \mathbf{E}^{2}; ...; \mathbf{E}^{L}]$, where $L$ represents the number of scales. Each anchor feature $\mathbf{e}_{i} \in \mathbf{E}$ corresponds to a unique clip proposal $(t_{s}^{i}, t_{e}^{i})$. For the anchors of $l$-th scale, the corresponding anchor length is
+\begin{equation}
+    C_{l} = C_{l-1}r_{l},
+\end{equation}
+where $r_{l}$ denotes the receptive field of $l$-th pooling layer.
+
+\noindent\textbf{Temporal swin transformer block.}
+%
+We have incorporated the shifted window-based self-attention approach, as proposed in Swin Transformer~\cite{liu2021swin}, into 1-dimensional sequence encoding. 
+%
+This technique effectively implements self-attention in local windows, while also establishes connections between consecutive windows to bolster the modeling capabilities. 
+%
+In this way, the computational complexity is linearly scaling with the sequence length.
+%
+Specifically, each temporal swin transformer block consists of a local-window self-attention layer ($\text{W-MSA}$), a shifted-window self-attention layer ($\text{SW-MSA}$) and two multi-layer perceptrons ($\text{MLP}$), which can be formulated as:
+\begin{equation}
+\begin{split}
+    & \hat{z}^{l} = \text{W-MSA}(\text{LN}(z^{l})) + z^{l}, \\
+    & \Tilde{z}^{l} = \text{MLP}(\text{LN}(\hat{z}^{l})) + \hat{z}^{l}, \\
+    & \Tilde{z}^{l+1} = \text{SW-MSA}(\text{LN}(\Tilde{z}^{l})) + \Tilde{z}^{l}, \\
+    & z^{l+1} = \text{MLP}(\text{LN}(\Tilde{z}^{l+1})) + \Tilde{z}^{l+1},
+\end{split}
+\end{equation}
+where $\text{LN}$ represents the LayerNorm~\cite{ba2016layer} operation. 
+
+For each context-based anchor feature $\mathbf{e}_{i} \in \mathbf{E}$, the context-based matching score is obtained by computing the cosine similarity between anchor feature and query feature, then scaling it to [0, 1] via Sigmoid function:
+\begin{equation}
+    S_{\text{ctx}}^{i} = {\rm Sigmoid}(\frac{\mathbf{e}_{i} \cdot \mathbf{q}}{\Vert \mathbf{e}_{i} \Vert\Vert \mathbf{q} \Vert}), 1 \leq i \leq \sum\limits_{l=1}^{L} \frac{N}{C_{l}}.
+\end{equation}
+Finally a coarse anchor rank can be acquired by sorting $S_{\text{ctx}}$ in a descending order.
+
+
+\subsection{Re-ranking with Frame Knowledge}
+To mitigate the temporal information loss caused by the anchor partition and pooling operation in \textit{pre-ranking module}, the \textit{re-ranking module} models the detailed content inside anchors and re-rank anchor candidates. 
+%
+Given the coarse anchor rank, we first collect the indices of the top-$m$ anchors from each scale separately to set up an anchor subset, then for $i$-th anchor of $l$-th scale in this subset, we fetch the intra-anchor frame features $\mathbf{V}_{i}=\{\mathbf{v}_{i}^{k}\}_{k=1}^{C_{l}}$ and adopt standard multi-head self-attention module (\text{MSA}) to model the intra-anchor frame correlation:
+\begin{equation}
+    \hat{\mathbf{V}}_{i} = \text{MSA}(\text{LN}(\mathbf{V}_{i} + f_{\text{pos}}(\mathbf{V}_{i})) + \mathbf{V}_{i},
+\end{equation}
+where $f_{\text{pos}}$ is trainable positional embeddings used to inject positional information.
+The content-based matching score of $i$-th anchor is obtained by first computing cosine similarity between each frame feature and query feature, then averaging frame-wise similarities and scaling it to $[0, 1]$ via Sigmoid function:
+\begin{equation}
+    S_{\text{ctn}}^{i} = {\rm Sigmoid}(\frac{1}{C_{l}}\sum\limits_{k=1}^{C_{l}}\frac{\hat{\mathbf{v}}_{i}^{k} \cdot \mathbf{q}}{\Vert \hat{\mathbf{v}}_{i}^{k} \Vert\Vert \mathbf{q} \Vert}), 1 \leq i \leq mL.
+\end{equation}
+We sum the context-based score and content-based score as the final matching score for re-ranking:
+\begin{equation}
+    S = \Tilde{S}_{\text{ctx}} + S_{\text{ctn}},
+\end{equation}
+where $\Tilde{S}_{\text{ctx}} \subsetneqq S_{\text{ctx}}$ is the context-based scores of subset.
+%
+
+\subsection{Boundary Regression}
+To achieve flexible localization, the \textit{boundary regression module} is employed to adjust anchor boundaries inward or outward.
+%
+For $i$-th anchor of $l$-th scale in anchor subset, given context-based anchor feature $\mathbf{e}_{i}$ and content-based anchor feature $\hat{\mathbf{V}_{i}}$, we fuse them with query to obtain multi-modal fused feature, and pass it through a MLP header to predict the start and end bias:
+\begin{equation}
+\begin{split}
+    & \mathbf{f}^{i} = [\mathbf{e}_{i} \odot \mathbf{q}; {\rm Att}(\hat{\mathbf{V}}_{i}) \odot \mathbf{q}], \\
+    & (\delta_{s}^{i}, \delta_{e}^{i}) = {\rm MLP}(\mathbf{f}^{i}),
+\end{split}
+\end{equation}
+where $\odot$ is element-wise multiplication. ${\rm Att}(\hat{\mathbf{V}}_{i})$ represents the self-attentive accumulation of $\hat{\mathbf{V}}^{i}$:
+\begin{equation}
+\begin{split}
+    & \alpha_{i}^{k} = \mathbf{W}\hat{\mathbf{v}}_{i}^{k}, \\
+    & \mathbf{a}_{i} = {\rm Softmax}([\alpha_{i}^{1}, \alpha_{i}^{2}, ..., \alpha_{i}^{C_{l}}]), \\
+    & {\rm Att}(\hat{\mathbf{V}}_{i}) = \sum\limits_{k=1}^{C_{l}} \mathbf{a}_{i}^{k}\hat{\mathbf{v}}_{i}^{k},
+\end{split}
+\end{equation}
+where $W \in \mathbb{R}^{1 \times D}$ is a learnable weight matrix. Then given the original anchor boundaries $(t_{s}^{i}, t_{e}^{i})$, we add the predicted start and end bias respectively to obtain adjusted boundaries:
+\begin{equation}
+\begin{split}
+    & \hat{t}_{s}^{i} = t_{s}^{i} + \delta_{s}^{i} \times (t_{e}^{i} - t_{s}^{i}), \\
+    & \hat{t}_{e}^{i} = t_{e}^{i} + \delta_{e}^{i} \times (t_{e}^{i} - t_{s}^{i}).
+\end{split}
+\end{equation}
+Finally we output the adjusted boundaries $(\hat{t}_{s}, \hat{t}_{e})$ of the top-$n$ anchors as final predictions.
+
+\subsection{Training}
+Two loss terms are adopted to optimize the network: (1) Cross-modal alignment loss $\mathcal{L}_{\text{align}}$, and (2) Boundary regression loss $\mathcal{L}_{\text{reg}}$. The total loss is a weighted combination of the two loss terms:
+\begin{equation}
+    \mathcal{L}_{\text{total}} = \lambda_{1} \mathcal{L}_{\text{align}} + \lambda_{2} \mathcal{L}_{\text{reg}},
+\end{equation}
+where $\lambda_{1}$ and $\lambda_{2}$ are hyper-parameters used to control the contribution of $\mathcal{L}_{\text{align}}$ and $\mathcal{L}_{\text{reg}}$ respectively.
+
+\subsubsection{Cross-modal Alignment Loss}
+We define the cross-modal alignment loss as a combination of context-based alignment loss $\mathcal{L}_{\text{ctx}}$ and content-based alignment loss $\mathcal{L}_{\text{ctn}}$:
+\begin{equation}
+    \mathcal{L}_{\text{align}} = \mathcal{L}_{\text{ctx}} + \mathcal{L}_{\text{ctn}}.
+\end{equation}
+For $\mathcal{L}_{\text{ctx}}$ and $\mathcal{L}_{\text{ctn}}$, we propose a dual-form approximate rank loss that adopts two ApproxNDCG~\cite{qin2010general} loss terms to optimize the anchor rank and query rank simultaneously. We first revisit the ApproxNDCG loss and introduce the dual-form approximate rank loss, then give out formal definitions of $\mathcal{L}_{\text{ctx}}$ and $\mathcal{L}_{\text{ctn}}$.
+
+\noindent\textbf{ApproxNDCG loss.}
+Given large amounts of anchor candidates, we aim to obtain such an anchor rank: the anchor semantically related to query should be ranked in front of the unrelated ones. To achieve this goal, rather than point-wise or pair-wise rank losses which are commonly used in existing methods, we adopt the list-wise ApproxNDCG loss to optimize the anchor rank from the global perspective: 
+\begin{equation}
+    \mathcal{L}_{ar}(S, y) = 1 - Z_{m}^{-1} \sum\limits_{i=1}^{K} \frac{2^{y_{i}}-1}{\log (1+\hat{\pi}_{i})},
+\end{equation}
+where $S$ denotes the matching scores of anchor candidates, $K$ is the number of anchor candidates and $Z_{m}$ refers to the discounted cumulative gain of the best rank. $y_{i}$ represents the matching degree between the $i$-th anchor and query that equals to the temporal IoU of their bounding boxes:
+\begin{equation}
+    y_{i} = {\rm IoU}((t_{s}^{i}, t_{e}^{i}), (\tau_{s}, \tau_{e})).
+\end{equation}
+$\hat{\pi}_{i}$ is a differentiable approximation to the rank of $i$-th anchor:
+\begin{equation}
+    \hat{\pi}_{i} = 1+ \sum\limits_{u \neq i}\frac{\exp(-\alpha(S_{i}-S_{u}))}{1+\exp(-\alpha(S_{i}-S_{u}))},
+\end{equation}
+where $\alpha$ denotes a temperature parameter. For each anchor, the ApproxNDCG loss compares it with all other anchors to decide its rank, taking full advantage of the semantic relationship in long-form videos.
+
+\noindent\textbf{Dual-form approximate rank loss.} Besides the anchor rank optimization, considering the unique characteristic of long-form video dataset, we introduce an \textit{``one video with batch queries''} data sampling strategy that samples one video with a batch of queries grounded in this long video at one training step, and employ another ApproxNDCG loss to optimize the query rank simultaneously: 
+\begin{equation}
+    \mathcal{L}_{dar}(S^{a}, S^{q}, y) = \mathcal{L}_{ar}(S^{a}, y) + \mathcal{L}_{ar}(S^{q}, y),
+\end{equation}
+where $S^{a}$ and $S^{q}$ denotes the matching scores of anchor candidates and query candidates, respectively.
+Now, we define the context-based alignment loss $\mathcal{L}_{\text{ctx}}$ and content-based alignment loss $\mathcal{L}_{\text{ctn}}$ as :
+\begin{equation}
+\begin{split}
+    & \mathcal{L}_{\text{ctx}} = \mathcal{L}_{dar}(S_{\text{ctx}}^{a}, S_{\text{ctx}}^{q}, y), \\
+    & \mathcal{L}_{\text{ctn}} = \mathcal{L}_{dar}(S_{\text{ctn}}^{a}, S_{\text{ctn}}^{q}, y),
+\end{split}
+\end{equation}
+where $S_{\text{ctx}}^{a}$ and $S_{\text{ctn}}^{a}$ represents the full-length context-based anchor matching scores and $mL$-length content-based anchor matching scores respectively. Likewise, $S_{\text{ctx}}^{q}$ and $S_{\text{ctn}}^{q}$ denotes the context-based and content-based query matching scores respectively.
+
+\subsubsection{Boundary Regression Loss}
+We define the boundary regression loss as follows:
+\begin{equation}
+    \mathcal{L}_{\text{reg}} = \frac{1}{mL} \sum\limits_{i=1}^{mL} \mathcal{L}_{iou}((\hat{t}_{s}^{i}, \hat{t}_{e}^{i})),
+\end{equation}
+where the $(\hat{t}_{s}^{i}, \hat{t}_{e}^{i})$ is the adjusted boundaries of $i$-th anchor. IoU loss~\cite{yu2016unitbox} is adopted to regress the start and end bias between anchor boundaries and groundtruth moment:
+\begin{equation}
+    \mathcal{L}_{iou}((\hat{t}_{s}^{i}, \hat{t}_{e}^{i})) = -\ln ({\rm IoU}((\hat{t}_{s}^{i}, \hat{t}_{e}^{i}), (\tau_{s}, \tau_{e})).
+\end{equation}
