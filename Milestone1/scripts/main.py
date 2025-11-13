@@ -15,8 +15,12 @@ def fetch_ids_worker(start_month, start_year, start_ID, end_month, end_year, end
     ids = get_IDs_network(start_month, start_year, start_ID, end_month, end_year, end_ID, total_paper)
     selected_ids = ids[start_index:start_index + num_papers]
     print(f"[Step 1] Fetched {len(selected_ids)} IDs.")
+    
+    # Add all IDs to queue
     for arxiv_id in selected_ids:
         id_queue.put(arxiv_id)
+    
+    # Add sentinel values for each download thread
     for _ in range(DOWNLOAD_THREAD_COUNT):
         id_queue.put(None)
 
@@ -41,14 +45,15 @@ def download_with_retries(client, arxiv_id, max_retries=5):
     raise RuntimeError(f"[Download] Failed after {max_retries} retries for {arxiv_id}")
 
 
-def download_worker(id_queue, download_queue, base_data_dir, delay=2):
+def download_worker(id_queue, base_data_dir, delay=2):
     client = arxiv.Client()
     processed = 0
     while True:
         arxiv_id = id_queue.get()
         if arxiv_id is None:
-            download_queue.put(None)
+            # Signal that this download thread is done
             print(f"[Download] Thread finished. Total papers downloaded: {processed}")
+            id_queue.task_done()
             break
 
         try:
@@ -69,12 +74,13 @@ def download_worker(id_queue, download_queue, base_data_dir, delay=2):
             download(list_download, base_data_dir)
             processed += 1
             print(f"[Download] Finished: {arxiv_id} (Total: {processed})")
-            download_queue.put(arxiv_id)
+            # download_queue.put(arxiv_id)  # Commented out - no reference processing
             time.sleep(delay)  # Respect API rate
 
         except Exception as e:
             print(f"[Download] Error for {arxiv_id}: {e}")
-            continue
+        finally:
+            id_queue.task_done()
 
 
 def reference_worker(download_queue, base_data_dir, delay=2):
@@ -83,6 +89,7 @@ def reference_worker(download_queue, base_data_dir, delay=2):
         arxiv_id = download_queue.get()
         if arxiv_id is None:
             print(f"[Reference] Thread finished. Total papers processed: {processed}")
+            download_queue.task_done()
             break
         try:
             print(f"[Reference] Starting: {arxiv_id}")
@@ -92,7 +99,8 @@ def reference_worker(download_queue, base_data_dir, delay=2):
             time.sleep(delay)
         except Exception as e:
             print(f"[Reference] Error for {arxiv_id}: {e}")
-            continue
+        finally:
+            download_queue.task_done()
 
 
 if __name__ == "__main__":
@@ -106,39 +114,75 @@ if __name__ == "__main__":
     base_data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "23127130"))
     os.makedirs(base_data_dir, exist_ok=True)
 
-    start_index = 1000
+    start_index = 10000
     num_papers = 1000
 
-    DOWNLOAD_THREAD_COUNT = 3
-    REFERENCE_THREAD_COUNT = 2
+    DOWNLOAD_THREAD_COUNT = 8
+    REFERENCE_THREAD_COUNT = 2  # Not used currently - references disabled
 
-    id_queue = queue.Queue(maxsize=DOWNLOAD_THREAD_COUNT * 2)
-    download_queue = queue.Queue(maxsize=REFERENCE_THREAD_COUNT * 2)
+    print("="*60)
+    print("DATA SCRAPING PIPELINE - THREADED VERSION")
+    print("="*60)
+    print(f"Papers to process: {num_papers} (starting from index {start_index})")
+    print(f"Download threads: {DOWNLOAD_THREAD_COUNT}")
+    # print(f"Reference threads: {REFERENCE_THREAD_COUNT}")  # References disabled
+    # print("⚠️  References extraction is DISABLED")
+    print("="*60)
+
+    # Use larger queue sizes to avoid blocking
+    id_queue = queue.Queue(maxsize=num_papers + DOWNLOAD_THREAD_COUNT)
+    # download_queue = queue.Queue(maxsize=num_papers + REFERENCE_THREAD_COUNT)  # Not needed - references disabled
 
     start_time = time.time()
     print("Starting pipeline...")
 
+    # Step 1: Start ID fetcher
     t1 = threading.Thread(target=fetch_ids_worker, args=(
         start_month, start_year, start_ID, end_month, end_year, end_ID, total_paper, start_index, num_papers, id_queue))
     t1.start()
 
+    # Step 2: Start download threads
     download_threads = []
-    for _ in range(DOWNLOAD_THREAD_COUNT):
-        t = threading.Thread(target=download_worker, args=(id_queue, download_queue, base_data_dir, 2))
+    for i in range(DOWNLOAD_THREAD_COUNT):
+        t = threading.Thread(target=download_worker, args=(id_queue, base_data_dir, 2))
+        t.daemon = False
         t.start()
         download_threads.append(t)
 
-    reference_threads = []
-    for _ in range(REFERENCE_THREAD_COUNT):
-        t = threading.Thread(target=reference_worker, args=(download_queue, base_data_dir, 2))
-        t.start()
-        reference_threads.append(t)
+    # Step 3: Start reference threads (DISABLED)
+    # reference_threads = []
+    # for i in range(REFERENCE_THREAD_COUNT):
+    #     t = threading.Thread(target=reference_worker, args=(download_queue, base_data_dir, 2))
+    #     t.daemon = False
+    #     t.start()
+    #     reference_threads.append(t)
 
+    # Wait for ID fetcher to complete
+    print("Waiting for ID fetcher to complete...")
     t1.join()
+    print("ID fetcher completed.")
+
+    # Wait for all download threads to complete
+    print("Waiting for download threads to complete...")
     for t in download_threads:
         t.join()
-    for t in reference_threads:
-        t.join()
+    print("All download threads completed.")
+
+    # Reference processing is DISABLED
+    # # Signal reference threads to stop
+    # for _ in range(REFERENCE_THREAD_COUNT):
+    #     download_queue.put(None)
+
+    # # Wait for reference threads to complete
+    # print("Waiting for reference threads to complete...")
+    # for t in reference_threads:
+    #     t.join()
+    # print("All reference threads completed.")
 
     end_time = time.time()
-    print(f"Pipeline complete. Total time: {end_time - start_time:.2f} seconds")
+    print("\n" + "="*60)
+    print("PIPELINE COMPLETE")
+    print("="*60)
+    print(f"Total time: {end_time - start_time:.2f} seconds")
+    print("⚠️  Note: References extraction was DISABLED")
+    print("="*60)

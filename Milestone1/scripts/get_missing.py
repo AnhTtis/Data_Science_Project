@@ -10,8 +10,18 @@ import random
 
 # ...existing code...
 MISSING_TAILS = [
-    "08161","08163","08164","08182","08301","08302","08304","08306","08307",
-    "08308","08309","08310","08313","08314","08316","08318","08320","08321","08345"
+    "13718","13746","13747","13748","13749","13750","13751","13752","13753","13754",
+    "13755","13756","13757","13758","13759","13760","13761","13762","13763","13764",
+    "13765","13766","13767","13768","13769","13770","13771","13772","13773","13774",
+    "13775","13776","13777","13778","13779","13780","13781","13782","13783","13784",
+    "13785","13786","13787","13788","13789","13790","13791","13792","13793","13794",
+    "13795","13796","13797","13798","13799","13800","13801","13802","13803","13804",
+    "13805","13806","13807","13808","13809","13810","13811","13812","13813","13814",
+    "13815","13816","13817","13818","13819","13820","13821","13822","13823","13824",
+    "13825","13826","13827","13828","13829","13830","13831","13832","13833","13834",
+    "13835","13836","13837","13838","13839","13840","13841","13842","13843","13844",
+    "13845","13846","13847","13848","13849","13850","13851","13852","13853","13854",
+    "13855","17016","17019","17020","17021","17026","17030","17031","17036",
 ]
 MISSING_YM = "2303"  # year-month part for all these IDs
 
@@ -46,14 +56,15 @@ def download_with_retries(client, arxiv_id, max_retries=5):
     raise RuntimeError(f"[Download] Failed after {max_retries} retries for {arxiv_id}")
 
 
-def download_worker(id_queue, download_queue, base_data_dir, delay=2):
+def download_worker(id_queue, base_data_dir, delay=2):
     client = arxiv.Client()
     processed = 0
     while True:
         arxiv_id = id_queue.get()
         if arxiv_id is None:
-            download_queue.put(None)
+            # Signal that this download thread is done
             print(f"[Download] Thread finished. Total papers downloaded: {processed}")
+            id_queue.task_done()
             break
 
         try:
@@ -74,12 +85,13 @@ def download_worker(id_queue, download_queue, base_data_dir, delay=2):
             download(list_download, base_data_dir)
             processed += 1
             print(f"[Download] Finished: {arxiv_id} (Total: {processed})")
-            download_queue.put(arxiv_id)
+            # download_queue.put(arxiv_id)  # Commented out - no reference processing
             time.sleep(delay)  # Respect API rate
 
         except Exception as e:
             print(f"[Download] Error for {arxiv_id}: {e}")
-            continue
+        finally:
+            id_queue.task_done()
 
 
 def reference_worker(download_queue, base_data_dir, delay=2):
@@ -88,6 +100,7 @@ def reference_worker(download_queue, base_data_dir, delay=2):
         arxiv_id = download_queue.get()
         if arxiv_id is None:
             print(f"[Reference] Thread finished. Total papers processed: {processed}")
+            download_queue.task_done()
             break
         try:
             print(f"[Reference] Starting: {arxiv_id}")
@@ -97,7 +110,8 @@ def reference_worker(download_queue, base_data_dir, delay=2):
             time.sleep(delay)
         except Exception as e:
             print(f"[Reference] Error for {arxiv_id}: {e}")
-            continue
+        finally:
+            download_queue.task_done()
 
 if __name__ == "__main__":
     start_month = 3
@@ -113,36 +127,73 @@ if __name__ == "__main__":
     start_index = 0
     num_papers = len(MISSING_TAILS)
 
-    DOWNLOAD_THREAD_COUNT = 3
-    REFERENCE_THREAD_COUNT = 2
+    DOWNLOAD_THREAD_COUNT = 5
 
-    id_queue = queue.Queue(maxsize=DOWNLOAD_THREAD_COUNT * 2)
-    download_queue = queue.Queue(maxsize=REFERENCE_THREAD_COUNT * 2)
+    REFERENCE_THREAD_COUNT = 2  # Not used currently - references disabled
+
+    print("="*60)
+    print("MISSING PAPERS RECOVERY PIPELINE")
+    print("="*60)
+    print(f"Papers to process: {num_papers} missing papers")
+    print(f"Download threads: {DOWNLOAD_THREAD_COUNT}")
+    # print(f"Reference threads: {REFERENCE_THREAD_COUNT}")  # References disabled
+    print("⚠️  References extraction is DISABLED")
+    print("="*60)
+
+    # Use larger queue sizes to avoid blocking
+    id_queue = queue.Queue(maxsize=num_papers + DOWNLOAD_THREAD_COUNT)
+    # download_queue = queue.Queue(maxsize=num_papers + REFERENCE_THREAD_COUNT)  # Not needed - references disabled
 
     start_time = time.time()
     print("Starting pipeline for missing IDs...")
 
+    # Step 1: Start ID fetcher
     t1 = threading.Thread(target=fetch_ids_worker, args=(
         start_month, start_year, start_ID, end_month, end_year, end_ID, start_index, num_papers, id_queue))
     t1.start()
 
+    # Step 2: Start download threads
     download_threads = []
-    for _ in range(DOWNLOAD_THREAD_COUNT):
-        t = threading.Thread(target=download_worker, args=(id_queue, download_queue, base_data_dir, 2))
+    for i in range(DOWNLOAD_THREAD_COUNT):
+        t = threading.Thread(target=download_worker, args=(id_queue, base_data_dir, 2))
+        t.daemon = False
         t.start()
         download_threads.append(t)
 
-    reference_threads = []
-    for _ in range(REFERENCE_THREAD_COUNT):
-        t = threading.Thread(target=reference_worker, args=(download_queue, base_data_dir, 2))
-        t.start()
-        reference_threads.append(t)
+    # Step 3: Start reference threads (DISABLED)
+    # reference_threads = []
+    # for i in range(REFERENCE_THREAD_COUNT):
+    #     t = threading.Thread(target=reference_worker, args=(download_queue, base_data_dir, 2))
+    #     t.daemon = False
+    #     t.start()
+    #     reference_threads.append(t)
 
+    # Wait for ID fetcher to complete
+    print("Waiting for ID fetcher to complete...")
     t1.join()
+    print("ID fetcher completed.")
+
+    # Wait for all download threads to complete
+    print("Waiting for download threads to complete...")
     for t in download_threads:
         t.join()
-    for t in reference_threads:
-        t.join()
+    print("All download threads completed.")
+
+    # Reference processing is DISABLED
+    # # Signal reference threads to stop
+    # for _ in range(REFERENCE_THREAD_COUNT):
+    #     download_queue.put(None)
+
+    # # Wait for reference threads to complete
+    # print("Waiting for reference threads to complete...")
+    # for t in reference_threads:
+    #     t.join()
+    # print("All reference threads completed.")
 
     end_time = time.time()
-    print(f"Pipeline complete. Total time: {end_time - start_time:.2f} seconds")
+    print("\n" + "="*60)
+    print("MISSING PAPERS RECOVERY COMPLETE")
+    print("="*60)
+    print(f"Total time: {end_time - start_time:.2f} seconds")
+    print("⚠️  Note: References extraction was DISABLED")
+    print("="*60)
