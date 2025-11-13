@@ -1,0 +1,96 @@
+\input{src/figs/model}
+
+\section{Neural Constraint Satisfaction} \label{sec:method}
+In \S\ref{sec:problem} we introduced a structured problem formulation for object rearrangement and reduced it to solving the correspondence and combinatorial problems.
+We now present our method, Neural Constraint Satisfaction (\methodname) as a method for controlling an agent that plans over and acts with a state transition graph constructed from learned entity representations.
+This section is divided into two parts: modeling and control.
+The modeling part is further divided into two parts: representation learning and graph construction.
+The representation learning part addresses the correspondence problem, while the graph construction and control parts address the combinatorial problem.
+
+\subsection{Modeling}
+The modeling component of~\methodname abstracts the experience buffer into a factorized state transition graph that can be reused across different rearrangement problems.
+Below we describe how we first train an object-centric world model to infer entities that are independent, symmetric, and factorized and then construct the state transition graph by clustering entities with similar state transitions.
+These two steps comprise a two-level abstraction hierarchy over the raw sensorimotor transitions.
+
+\paragraph{Level 1: representation learning}
+The first level concerns the unsupervised learning of entity representations that factorizes into their action-invariant features (their \textbf{type}) and their action-dependent features (their \textbf{state}).
+Concretely our goal is to model a video transition $o_t, a_t \rightarrow o_{t+1}$ as a transition over entity-sets $\mathbf{h}_t, a_t \rightarrow \mathbf{h}_{t+1}$, where each entity $h^k$ is factorized as a pair $h^k = (z^k, s^k)$.
+Given our setting where an action moves only a single object in the environment at a time, successful representation learning implies three criteria: (1) the world model properly identifies the individual entity $h^k$ corresponding to the moved object, (2) only the state $s^k$ of that entity should change, while its type $z^k$ should remain unaffected, and (3) other entity representations $h^{\neq k}$ should also remain unaffected.
+Criteria (1) and (3) rule out standard approaches that represent an entire scene with a monolithic representation, so we need an object-centric world model instead of a monolithic world model.
+But criterion (2) rules out standard object-centric world models (e.g.~\citep{veerapaneni2020entity,elsayed2022savi++,singh2022simple}), which do not decompose entity representations into action-invariant and action-dependent features.
+
+Because the parameters of a mixture model are independent and symmetric by construction, we propose to construct our factorized object-centric world model as an equivariant sequential Bayesian filter with a mixture model as the latent state, where entity representations are the parameters of the mixture components.
+Recall that a filter consists of two major components, latent estimation and latent prediction.
+We implement latent estimation with the state-of-the-art slot attention (SA)~\citep{locatello2020slot}, based on the connection between mixture components and SA slots~\citep{chang2022object}.
+We implement latent prediction with the transformer decoder (TFD) architecture~\citep{vaswani2017attention} because TFD is equivariant with respect to its inputs.
+We denote the SA \texttt{slot}s as $\bm{\lambda}$ and SA \texttt{attn} masks as $\bm{\alpha}$.
+We split each \texttt{slot} $\lambda \in \mathbb{R}^n$ into two halves $\lambda^z \in \mathbb{R}^{\frac{n}{2}}$ and $\lambda^s \in \mathbb{R}^{\frac{n}{2}}$.
+Given observations $o$ and actions $a$, we embed the actions as $\tilde{a}$ with an feedforward network and implement the filter as:
+\begin{align*}
+    \hat{\bm{\lambda}}_1 &\sim \text{Gaussian} \qquad
+    &\hat{\bm{\lambda}^{s}}_{t+1} &= TFD\left(
+        \text{queries}=\bm{\lambda}^{s}_{t}, 
+        \text{keys/values}=\left[\bm{\lambda}^{s}, \tilde{a}_t\right]
+        \right) \\
+    \bm{\lambda}_{t}, \bm{\alpha}_{t} &= SA\left(\hat{\bm{\lambda}}_{t}, o_{t}\right) \qquad
+    &\hat{\bm{\lambda}}_{t+1} &= \left[\bm{\lambda}^{z}_t, \hat{\bm{\lambda}^{s}}_{t+1}\right]
+\end{align*}
+where $[ \cdot, \cdot ]$ is the concatenation operator, $\hat{\bm{\lambda}}$ is the output of the latent prediction step, and $\bm{\lambda}$ is the output of the latent estimation step.
+We embed this filter inside the SLATE backbone~\citep{singh2022illiterate} and call this implementation \textbf{dynamic SLATE} (dSLATE).
+For a background on SLATE, as well as dSLATE hyperparamters, see Appdx.~\ref{appdx:slate_background}.
+
+By constructing $\hat{\bm{\lambda}^{z}}_{t+1}$ as a copy of $\bm{\lambda}^{z}_t$, dSLATE enforces the information contained $\bm{\lambda}^{z}$ to be action-invariant, hence we treat $\bm{\lambda}^{z}$ as dSLATE's representation of the entities' types.
+As for the entities' states, either the action-dependent part of the slots $\bm{\lambda}^{s}$ or the attention masks $\alpha$ can be used.
+Using $\alpha$ may be sufficient and more intuitive to analyze if all objects looks similar and there is no occlusion, while $\bm{\lambda}^{s}$ may be more suitable in other cases, and we provide an example of each in the experiments.
+To simplify notation going forward and connect with the notation in \S\ref{sec:problem}, we use $\mathbf{h}$ to refer to $(\bm{\lambda}, \bm{\alpha})$, use $\bm{z}$ to refer to $\bm{\lambda}^{z}$, and use $\bm{s}$ to refer to $\bm{\lambda}^{s}$ or $\bm{\alpha}$.
+Thus by construction dSLATE satisfies criterion (2).
+Empirically we observe that it satisfies criterion (1) as well as SLATE does, and that TFD learns to sparsely edit $\bm{\lambda}^{s}_t$, thereby satisfying criterion (3).
+
+\paragraph{Level 2: graph construction} \label{sec:build_graph}
+Having produced from the first level a buffer of entity-set transitions ${\{\mathbf{h}_t, a_t \rightarrow \mathbf{h}_{t+1}\}_{n=1}^N}$, the goal of the second level (Fig.~\ref{fig:model}b) is to use this buffer to construct a factorized state transition graph.
+The key to solving the combinatorial problem is to construct the edges of this graph to represent not state transitions of entire entity-sets (i.e. ${\mathbf{s}_t, a_t \rightarrow \mathbf{s}_{t+1}}$) as prior work does~\citep{zhang2018composable}, but state transitions of \emph{individual entities} (i.e. ${s^k_t, a_t \rightarrow s^k_{t+1}}$).
+Constructing edges over transitions for individual entities rather than entity sets enables the same transition to be reused with different context entities present.
+Constructing edges over state transitions instead of entity transitions enables the same transition to be reused across entities with different types.
+This would enable the agent to recompose sequences of previously encountered state transitions for solving new rearrangement problems with different entities in different contexts.
+Henceforth our use of ``state'' refers specifically to the state of individual entity unless otherwise stated. 
+
+Given our bisimulation assumption that states can be partitioned into a finite number of groups, we construct our graph such that nodes represent equivalence classes among individual states and the edges represent actions that transform a state from one equivalence class to another.
+To implement this we cluster state transitions of individual entities in the buffer, which reduces to clustering the states of individual entities before and after the transition.
+We treat each cluster centroid as a node in the graph, and an edge between nodes is tagged with the single action that transforms one node's state to another's.
+The algorithm for constructing the graph is shown in Alg.~\ref{alg:build_graph} and involves three steps: (1) isolating the state transition of an individual entity from the state transition of the entity-set, (2) creating graph nodes from state clusters, and (3) tagging graph edges with actions.
+
+\input{src/figs/building_the_graph}
+
+The first step is to identify which object was moved in each transition, i.e. identifying the entity $h^k$ that dSLATE predicted was affected by $a_t$ in the transition $(\mathbf{h}_t, a_t, \mathbf{h}_{t+1})$.
+We implement a function \texttt{isolate} that achieves this by solving $k = \argmax_{k' \in \{1, ..., K\}} d(s^{k'}_t, s^{k'}_{t+1})$ to identify the index of the entity whose state has most changed during the transition, where $d(\cdot, \cdot)$ is a distance function, detailed in Table~\ref{tab:FACTS_hyperparameters} of the Appendix.
+This converts the buffer of transitions over entity-sets ${\mathbf{h}_t, a_t \rightarrow \mathbf{h}_{t+1}}$ into a buffer of transitions over individual entities ${h^k_t, a_t \rightarrow h^k_{t+1}}$.
+
+The second step is to cluster the states before and after each transition.
+We implement a function \texttt{cluster} that uses K-means to returns graph nodes as the centroids $\{s_*\}_{m=1}^M$ of these state clusters.
+
+The third step is to connect the nodes with edges that record actions that actually were taken in the buffer to transform one state to the next.
+We implement a function \texttt{bind} that, given entity $h^k$, returns the index $[i]$ of the centroid $s_*$ that is the nearest neighbor to the entity's state $s^k$.
+For each entity transition $(h_t^k, a_t, h_{t+1}^k)$ we \texttt{bind} entity $h_t^k$ and $h_{t+1}^k$ to their associated nodes $s_*^{[i]}$ and $s_*^{[j]}$ and create an edge between $s_*^{[i]}$ and $s_*^{[j]}$ tagged with action $a$, overwriting previous edges based on the assumption that with a proper clustering there should only be one action per pair of nodes.
+
+In our experiments both \texttt{cluster} and \texttt{bind} use the same distance metric (see Table~\ref{tab:dslate_hyperparameters} in the Appendix), but other clustering algorithms and distance metrics can also be used.
+Our experiments (Fig.~\ref{fig:robogym_analysis}) also show that it is also possible to have more than one action primitive per pair of nodes as long as these actions all map between states bound to the same pair of nodes.
+
+\input{src/figs/planning_and_control}
+
+\subsection{Control}
+To solve new rearrangement problems, we re-compose sequences of state transitions from the graph.
+Specifically, the agent decomposes the rearrangement problem into a set of per-entity subproblems (e.g. initial and goal positions for individual objects), searches the transition graph for a transition that transforms the current entity's state to its goal state, and executes the action tagged with this transition in the environment.
+This problem decomposition is possible because the transitions in our graph are constructed to be agnostic to type and context, enabling different rearrangement problems to share solutions to the same subproblems.
+The core challenge in deciding which transitions to compose is in determining which transitions are \emph{possible} to compose.
+That is, the agent must determine which nodes in the graph correspond to the given goal constraints and which nodes correspond to the entities in the current observation, but the current entities $\mathbf{h}_t$  and goal constraints $\mathbf{h}_g$ must themselves be inferred from the current and goal observations $o_t$ and $o_g$, requiring the agent to infer both what to do and how to do it purely from its sensorimotor interface.
+
+\input{src/figs/action_selection}
+
+Our approach takes four steps, summarized in Alg.~\ref{alg:use_graph} and Fig.~\ref{fig:planning_and_control}, with further details in Appdx.~\ref{appdx:action_selection}.
+In the first step, we use dSLATE to infer $\mathbf{h}_t$ and $\mathbf{h}_g$ from $o_t$ and $o_g$ (e.g. the positions and types of all objects in the initial and goal images).
+In the second step (Fig.~\ref{fig:planning_and_control}b), because of the permutation symmetry among entities, we find a bipartite matching that matches each entities in $h_g^j$ with a corresponding entity in $h_t^k$ that shares the same type and permute the indices $k$ of $\mathbf{h}_t$ to match those of $\mathbf{h}_g$.
+We implement a function \texttt{align} that uses the Hungarian algorithm to perform this matching over $(z^1_t, ... z^K_t)$ and $(z^1_g, ... z^K_g)$, with Euclidean distance as the matching cost.
+The third step selects which goal constraint $h^k_g$ to satisfy next (Fig.~\ref{fig:planning_and_control}c).
+W implement this \texttt{select-constraint} procedure by determining which constraint $h^k_g$ has the highest difference in state with its counterpart $h^k_t$, which reduces to solving the same argmax problem as in \texttt{isolate} with the same distance function used in \texttt{isolate}.
+The last step chooses an action given the chosen goal constraint $h^k_g$ and its counterpart  $h^k_t$, by \texttt{bind}ing $h^k_t$ and $h^k_g$ to the graph based on their state components and returning the action tagged to the edge between their respective nodes (Fig.~\ref{fig:planning_and_control}d).
+If an edge does not exist between the inferred nodes, then we simply take a random action.

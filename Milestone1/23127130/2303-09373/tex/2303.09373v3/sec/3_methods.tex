@@ -1,0 +1,100 @@
+\section{Methods}
+\label{sec:methods}
+\subsection{Preliminary}
+In this section, we introduce each component of MAPSeg (\hyperref[fig2]{Fig.2}) and how MAPSeg can serve as a unified solution to centralized, federated, and test-time UDA (\hyperref[fig:overview]{Fig.1b}). We deploy MAPSeg for domain adaptative 3D segmentation of heterogeneous medical images and it consists of three components: (1) 3D masked multi-scale autoencoding for self-supervised pre-training, (2) 3D masked pseudo-labeling for domain adaptive self-training, and (3) global-local feature collaboration to fuse global and local contexts for the final segmentation task. The hybrid cross-entropy and Dice loss (\hyperref[eq:L_seg]{Eq.1}) is often adopted for regular supervised segmentation training, and we employ it as the basic component of the objective functions for MAPSeg:
+\begin{equation}
+    \label{eq:L_seg}
+    \mathcal{L}_{seg}(\hat{y},y) = -\frac{1}{n}\sum_i\sum_jy_{i,j}\log(\hat{y}_{i,j}) -\frac{2\sum y\hat{y}+\epsilon}{\sum y+\sum \hat{y}+\epsilon}
+\end{equation}
+where $n$ denotes the number of pixels, $y_{i,j}$ and $\hat{y}_{i,j}$ represent the ground truth label and predicted probability for the $i$th pixel to belong to the $j$th class, and $\epsilon$ is used to prevent zero-division. 
+
+In the following sections, notations are defined as: $x$ and $y$ indicate the original image and label of the randomly sampled local patch; $X$ and $Y$ refer to downsampled global scan and label; the subscripts $s$ and $t$ refer to the source and target domains, respectively; the superscript $M$ indicates the image is masked (\eg, $x_t^M$ refers to a masked local patch from the target domain).
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.85\linewidth]{./figs/fig2-11.pdf}
+\caption{Components of the proposed MAPSeg framework. (a) 3D multi-scale masked autoencoding. (b) 3D masked pseudo labeling in source and target domains. (c) 3D Global-local collaboration.} 
+\label{fig2}
+\end{figure*}
+\subsection{3D Multi-Scale Masked Autoencoder (MAE)}
+In this study, we propose a 3D variant of MAE using a 3D CNN backbone (\hyperref[fig2]{Fig.2a}). The detailed configuration can be found in Appendix \cref{sec:archite}. Training is jointly performed on two image sources with identical size ($96^3$ voxels): local patches $x$ randomly sampled from the volumetric scan, and the whole scan downsampled to the same size, denoted as $X$. 
+Both $x$ and $X$ are masked before feeding into the MAE: $x$ is divided into non-overlapping 3D sub-patches with size $8^3$, of which 70\% are masked out randomly based on a uniform distribution (\hyperref[fig2]{Fig.2a}); The same procedure is applied to $X$ with patch size $4^3$ since it contains a larger field-of-view (FOV). The masked versions of $x$ and $X$ are denoted as $x^M$ and $X^M$, respectively. We train the MAE encoder and decoder to reconstruct $x/X$ based on $x^M/X^M$ using mean squared error on the masked-out regions as the objective function.
+
+\subsection{3D Masked Pseudo-Labeling (MPL)}
+MPL uses a teacher-student framework which is a standard strategy in semi-/self-supervised learning~\cite{grill2020bootstrap,NIPS2017_68053af2} to provide stable pseudo labels on an unlabeled target domain during training. 
+After MAE pre-training, we keep the MAE encoder $g$ and append a segmentation decoder $h$ to build the segmentation model $f=h\circ g$ (\hyperref[fig2]{Fig.2b-c}). Given an input image $x_s$ and label $y_s$ from the source domain and an input image $x_t$ from the target domain, the teacher model $f_\theta$ takes as input the target image $x_t$ and generates pseudo labels $f_\theta(x_t)$, with gradient detached. The student model $f_\phi$ is then optimized by minimizing the segmentation loss between the predictions of $x_t^M$/$x_s^M$ and $f_{\theta}(x_t)$/$y_s$, which can be formulated as:  
+\begin{equation}
+\label{eq:L_mpl}
+\mathcal{L}_{MPL} = \mathcal{L}_{Seg}(f_{\phi}(x_t^M),f_{\theta}(x_t))+\beta\mathcal{L}_{Seg}(f_{\phi}(x_s^M),y_s)
+\end{equation}
+where $\beta$ is the weight of source prediction and set as 0.5. 
+The teacher model's parameters $\theta$ are then updated during training via exponential moving average (EMA) based on the student model's parameters $\phi$~\cite{NIPS2017_68053af2}.
+
+\begin{equation}
+\label{eq:ema_update}
+\theta_{t+1} \gets \alpha \theta_{t} + (1-\alpha)\phi_t, 
+\end{equation}
+where $t$ and $t+1$ indicate training iterations and $\alpha$ is the EMA update weight. For model initialized from the large-scale MAE pretraining, we set $\alpha$ as 0.999 during the first 1,000 steps and 0.9999 afterwards. For model pretrained on small-scale source and target datasets (\eg, only dozens of scans), we set $\alpha$ as 0.99 during the first 1,000 steps, 0.999 during the next 2,000 steps, and 0.9999 for the remaining training. The teacher model $f_{\theta}$ is initialized with student model's parameters $\phi$ after some warm-up training (\eg, 1,000 iterations) on the source-domain data. 
+
+\subsection{3D Global-Local Collaboration (GLC)}
+Directly applying MPL for UDA segmentation with large domain shift (\eg, cross-modality/sequence) may lead to unreliable pseudo-label and disrupt the training. Therefore, we design a GLC module (\hyperref[fig2]{Fig.2c}) to improve pseudo-labeling by leveraging the spatial global-local contextual relations induced by the inherent anatomical distribution prior in medical images. With the image encoder pretrained to extract image features at both local and global levels during multi-scale MAE, we take advantage of the global-local contextual relations by concatenating local and global semantic features in the latent space and make prediction based on the fused features. We differ from previous study~\cite{Chen_2019_CVPR} by only applying GLC on the output of the encoder $g$ instead of all layers to save computation cost and employing a different regularization to prevent segmentation decoder from predicting solely based on local features. 
+
+In GLC, a binary mask $M$ is used to indicate the corresponding location of the local patch $x$ inside the downsampled global volume $X$. The encoder $g$ takes as input $x$ and $X$ and generates the local latent feature $\chi_{loc} = g(x)$ as well as cropped and resized global latent feature $\chi_{glo}=\mathit{upsample}(M \odot g(X))$, where $\odot$ indicates cropping $g(X)$ based on $M$ followed by upsampling to match the spatial size of $\chi_{loc}$. Therefore, segmenting a local patch $x$ can be rewritten as $f(x)=h(\chi_{loc}\oplus\chi_{glo})$, where $\oplus$ is the concatenation along channel dimension (\hyperref[fig2]{Fig.2c}). In addition, $f$ is also trained on downsampled global volume $X$ with $\mathcal{L}_{Seg}(f(X),Y)$), in which the global latent feature $g(X)$ is duplicated and $f(X) = h(g(X)\oplus g(X))$, to prevent model from solely relying on local semantic features and encourage the encoder to extract meaningful semantic features from both local and global levels.
+
+We also add a regularization term between the $\chi_{loc}$ and $\chi_{glo}$ to maintain their similarity following~\cite{Chen_2019_CVPR}. Instead of the $\mathcal{L}_2$ regularization used in~\cite{Chen_2019_CVPR}, we maximize the cosine similarity between the $\chi_{loc}$ and $\chi_{glo}$ as:
+\begin{equation}
+\mathcal{L}_{cos}(x, X) = 1 - \frac{\chi_{loc}\cdot\chi_{glo}}{\max(\| \chi_{loc} \|_2, \| \chi_{glo} \|_2, \epsilon)}
+\end{equation}
+where $\epsilon$ is used to prevent zero-division. The loss function for GLC calculated on the source data is formulated as: 
+\begin{align}
+\label{eq.L_gs}
+\mathcal{L}_{GLC}^{S} &= \gamma(\mathcal{L}_{Seg}(f_{\phi}(X_s),Y_s)+\mathcal{L}_{Seg}(f_{\phi}(X_s^M),Y_s))
+\nonumber\\
+&+\delta(\mathcal{L}_{cos}(x_s, X_s) + \mathcal{L}_{cos}(x_s^M, X_s^M))
+\end{align}
+where $\gamma$ and $\delta$ are the weights of the auxiliary global loss and cosine similarity, and set as $\gamma=0.05$ and $\delta= 0.025$ in our experiments. Similarly, the GLC loss is also calculated on the target data based on pseudo-label $f_{\theta}(X_t)$ and formulated as:
+\begin{align}
+\label{eq.L_gt}
+\mathcal{L}_{GLC}^{T} &= 2\gamma\mathcal{L}_{Seg}(f_{\phi}(X_t^M),f_{\theta}(X_t)) + 2\delta\mathcal{L}_{cos}(x_t^M, X_t^M)
+\end{align}
+Therefore, the overall loss function of GLC is:
+\begin{align}
+\label{eq.L_global}
+\mathcal{L}_{GLC} &= \mathcal{L}_{GLC}^{S}+\mathcal{L}_{GLC}^{T}
+\end{align}
+With the regular fully-supervised segmentation loss on source data $\mathcal{L}_{FSS} = \beta\mathcal{L}_{Seg}(f_{\phi}(x_s),y_s)$, where $\beta$ is defined as in \hyperref[eq:L_mpl]{Eq.2}, the overall objective function $\mathcal{L}$ for centralized UDA is formulated as:
+\begin{equation}
+\label{eq.L_center}
+\mathcal{L} = \mathcal{L}_{FSS}+\mathcal{L}_{MPL}+\mathcal{L}_{GLC}
+\end{equation}
+It is clear that \hyperref[eq.L_center]{Eq.8} requires centralized and synchronous access to source and target data. In the section \hyperref[sec.fuda]{3.5} and \hyperref[sec.ttuda]{3.6}, we demonstrate how MAPSeg can be adapted to federated (decentralized and synchronous access to data) and test-time (decentralized and asynchronous access to data) UDA scenarios. 
+
+\subsection{Extension to Federated UDA}
+\label{sec.fuda}
+In reality, labeled source-domain data and unlabeled target-domain data are often collected at different sites. We consider a practical scenario where a server (\eg a major hospital) hosts potentially large amount of both labeled and unlabeled scans, and distributed clients (\eg clinics or imaging sites) possess only unlabeled images. This is an under-explored scenario as FL typically assumes either fully or partially labeled data from all clients. We extend MAPSeg to solve this federated multi-target UDA problem according to the details in Algorithm 1 of Appendix \cref{sec:recipe}. Specifically, the server updates the student model $f_\phi$ by minimizing the loss for the labeled source-domain data $D_S$:
+\begin{align}
+    \mathcal{L}_s 
+    &= \beta(\mathcal{L}_{seg}(f_\phi(x_s), y_s)+\mathcal{L}_{seg}(f_\phi(x_s^M), y_s)) \nonumber\\
+    &+\gamma(\mathcal{L}_{seg}(f_\phi(X_s), Y_s)+\mathcal{L}_{seg}(f_\phi(X_s^M), Y_s)) \nonumber\\
+    &+ \delta(\mathcal{L}_{cos}(x_s, X_s) + \mathcal{L}_{cos}(x_s^M, X_s^M)) \label{eq:loss_server}
+\end{align}
+The clients update the student model $f_\phi$ by minimizing the loss for its own unlabeled target-domain data $D_T^k$:
+\begin{align}
+    \mathcal{L}_u
+    &= \beta(\mathcal{L}_{seg}(f_\phi(x_t^M), f_\theta(x_t))+\mathcal{L}_{seg}(f_\phi(x_t), f_\theta(x_t))) \nonumber\\
+    &+ \gamma(\mathcal{L}_{seg}(f_\phi(X_t^M), f_\theta(X_t))+\mathcal{L}_{seg}(f_\phi(X_t), f_\theta(X_t))) \nonumber\\
+    &+ \delta(\mathcal{L}_{cos}(x_t, X_t) + \mathcal{L}_{cos}(x_t^M, X_t^M)) \label{eq:loss_client}
+\end{align}
+Comparing to the centralized UDA loss (\hyperref[eq.L_center]{Eq.8}), we decompose it into two components: fully supervised loss for server training (\hyperref[eq:loss_server]{Eq.9}) and self-supervised loss for client updates (\hyperref[eq:loss_client]{Eq.10}), which avoids the need for centralized data. After each local update, each client sends the EMA teacher model parameters $\theta$ to the server for aggregation following typical federated averaging\cite{mcmahan2017communication}.
+
+\subsection{Extension to Test-time UDA}
+\label{sec.ttuda}
+Test-time UDA often involves two separate stages of training, including the source-only training at one center and the target-only finetuning at another site. In the federated UDA setting, \hyperref[eq:loss_server]{Eq.9} and \hyperref[eq:loss_client]{Eq.10} are jointly used to update the server model through synchronous federated averaging after each round. We can further ease the constraint of synchronous communication between source and target sites by training $f_\phi$ on the source data using \hyperref[eq:loss_server]{Eq.9} for some (\eg 1,000) warm-up steps before distributing the model parameters $\phi$ to the target site for initializing the teacher model $f_\theta$. On the target site, $f_\theta$ provides stable pseudo-labels to guide the self-supervised training with \hyperref[eq:loss_client]{Eq.10} and is updated by the EMA of $\phi$ following \hyperref[eq:ema_update]{Eq.3}. We find that in this asynchronous setting MAPSeg still performs well on the target-domain data, albeit with a minor performance tradeoff on the source-domain data (see \hyperref[tab:testtime]{Tab.3}).
+
+%-------------------------------------------------------------------------
+\subsection{Implementation Details} \label{section:2.1}
+
+\noindent\textbf{Model architecture and implementation.} We implement the encoder backbone $g$ using 3D-ResNet-like CNN. The segmentation decoder $h$ is adapted from DeepLabV3~\cite{chen2017rethinking}. The framework is implemented using PyTorch. More details of the model and the training procedure are provided in Appendix \cref{sec:archite} and \cref{sec:recipe}. 
+
+\noindent\textbf{Selecting the best model.} For choosing the best model during training, some studies choose to train for fixed iterations and use the last checkpoint. On the other hand, some of the previous UDA studies~\cite{8988158,Chen_Dou_Chen_Qin_Heng_2019} face a dilemma in selecting the best model during training by validating against a hold-out portion of target-domain labels, which is unrealistic as UDA assumes full absence of target labels. We demonstrate that MPL not only provides an efficient pathway to domain adaptative segmentation but also serves as an indicator of how well the model is being adapted to the target domain. We validate the model after each epoch and the best model is selected based on the score: 
+$\mathit{Score}=\mathit{Dice}_{Src}-0.5\times\overline{\mathcal{L}_{Seg}}(f_{\phi}(x_t^M),f_{\theta}(x_t))$, where $\mathit{Dice}_{Src}$ is the Dice score on source-domain validation set and $\overline{\mathcal{L}_{Seg}}(f_{\phi}(x_t^M),f_{\theta}(x_t))$ is the mean of $\mathcal{L}_{Seg}(f_{\phi}(x_t^M),f_{\theta}(x_t))$ during the last training epoch. From \hyperref[eq:L_seg]{Eq.1}, it is clear that $ \lim_{\hat{y}\to y} \mathcal{L}_{seg}(\hat{y},y)=-1$, therefore, $Score$ has an upper bound of $1.5$. We demonstrate in \hyperref[tab:cardiac]{Tab.4} that the difference between validation using target labels versus $Score$ is acceptable (81.2 vs. 80.3). Even without accessing target labels for validation, MAPSeg still surpasses the previous SOTA results that use target labels for validation. It is worth noting that we only use target labels for validation in \hyperref[tab:cardiac]{Tab.4} for a fair comparison with previously reported results; other results presented use $Score$ for validation by default. For federated and test-time UDA, $\mathit{Score} = -\overline{\mathcal{L}_{Seg}}(f_{\phi}(x_t^M),f_{\theta}(x_t))$.

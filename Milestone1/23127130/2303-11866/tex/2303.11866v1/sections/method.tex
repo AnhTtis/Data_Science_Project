@@ -1,0 +1,74 @@
+The basic idea of our approach is to align a vision model and a language model by updating a small percentage of their parameters by gradient descent. 
+This involves four main elements.
+First, the vision and language model must initialized from strong, pretrained vision and language models, rather than random initialization.
+Second, we lock all the parameters in each model.
+Third, we selectively unlock critical parameters.
+Fourth, we insert small trainable modules into each model to aid adaptation.
+There are multiple ways of implementing these strategies, which we cover in this section.
+% \subsection{Freezing Pretrained Encoders}
+% Both encoders are often initialized using weights \citep{simla,albef,lit} from unimodal self-supervised training tasks such as \citep{simcse,dino,beit,ibot_mim, masked_autoencoder} on large numbers of samples ($\geq1$m+).
+% LiT \citep{lit} shows that it is unnecessary to train both encoders.
+% Specifically, they find that freezing the vision encoder (preventing it from recieving a gradient update) while training the text encoder can be beneficial.
+% \citet{lit} attribute this to the pretrained image encoder being strong, and degrading during alignment training. 
+% Since contrastive losses benefit from larger batch sizes \citep{infonce} (e.g. CLIP uses a batch size of $\approx 32k$), and batch sizes are bounded by GPU memory, reducing the memory taken up by the model during training allows a larger batch size, and therefore better performance. 
+% A substantial benefit of locking parameters is a significant reduction in required memory, as the computational graph used by autodifferentiation engines in frameworks such PyTorch \citep{pytorch} does not need to store gradients for locked parameters during backpropagation.
+% By freezing both the text encoder and vision encoder, we prevent the vast majority of parameters in the model from receiving gradient updates, resulting in a massive reduction in trainable parameters.
+\subsection{Background}
+\label{sec:background}
+\input{sections/background}
+\subsection{Adding Adapters}
+\label{sec:growing-adapter}
+Aligning the representations of a language transformer and a vision transformer is typically done by updating $100$\% of the parameters in one \citep{lit} or both \citep{clip} of the transformers.
+By freezing the transformers, we exclude full-model training, and must use an alternative strategy to align the image and text representations.
+A promising approach is inserting a small (relative to each transformer), trainable module into the frozen, pretrained transformers that can learn to modify the internal representations of the transformer it is placed within, such that the representation spaces of the frozen vision and language transformers become aligned while leaving the pretrained parameters untouched. 
+We explore two such modules: layerwise adapters \citep{Houlsby2019ParameterEfficientTL,He2021TowardsAU} and "deep" adapters.
+
+
+\begin{figure}
+  \centering
+  \includegraphics{figures/adapter.pdf}
+  \caption{Growing the transformer encoder stack to add a trainable deep adapter to a locked model. The deep adapter is architecturally identical to a layer from the encoder stack.}
+  \label{fig:growing-adapter}
+\end{figure}
+
+Layerwise adapters \citep{Houlsby2019ParameterEfficientTL} have been used to adapt pretrained transformer-based language models to new tasks while only updating $2-3$\% of model parameters.
+A layerwise adapter is inserted before each layer normalization \citep{Ba2016LayerN} layer in a transformer, and consists of a weight matrix that downsamples the input, followed by an activation function (we use GELU \citep{gelu}) and a weight matrix that restores the input to the original dimensionality, and finally, a residual connection.
+We depict the architecture / placement of layerwise adapters in Fig \ref{fig:layerwise-adapter}.
+
+Another solution is to treat the frozen encoders as feature extractors, and learn trainable adapters that align the frozen image and text features.
+Transformer architectures can be seen as a stack of identically structured transformer encoder layers, so a natural solution to the problem of designing a trainable adapter atop a stack of frozen transformer encoder layers is to grow the stack, and keep the newly added layers trainable. 
+This yields a generic approach (Fig. \ref{fig:growing-adapter}) to add a trainable adapter to a frozen transformer from any of the standardized families (e.g. BERT \citep{bert}, ViT \citep{vit}) that only requires a small number of parameters to recieve gradients ($\approx7$\% for \texttt{bert-base}).
+\subsection{Unlocking Parameters}
+\label{sec:unlocked-layernorms}
+\begin{wrapfigure}{R}{0.5\textwidth}
+	\begin{minipage}{0.5\textwidth}
+			\vspace{-1em}
+			\centering
+			\includegraphics[scale=0.8]{figures/layerwise-adapter.pdf}
+            \vspace{-3mm}
+			\caption{The architecture and placement of layerwise adapters combined with a layernorm unlocking strategy. }
+			\label{fig:layerwise-adapter}
+	\end{minipage}
+\end{wrapfigure}
+We try two strategies for selectively unlocking parameters in a frozen transformer: unlocking the layer normalization \citep{Ba2016LayerN} parameters, and BitFit \citep{bitfit}. 
+Standard transformers \citep{attention_is_all_you_need} have two layer normalization \citep{Ba2016LayerN} modules for each transformer encoder layer, and these are known to play an important role (\S\ref{sec:related}).
+Each layer normalization layer has learnable scale $\gamma$ and bias parameters $\beta$ that apply an elementwise scale and shift to the input of the layer normalization layer.
+In the first strategy, we allow the layer normalization layers to remain unlocked and receive gradient updates. 
+In BitFit \citep{bitfit}, (Bias-term Finetuning), the additive bias terms of \textit{every} module in a transformer encoder layer are allowed to remain unlocked and receive gradient updates.
+Both of these strategies unlock a small percentage (0.24\% and 0.31\% of the parameters in a 12-layer \texttt{base} transformer respectively).
+% A layer normalization layer is defined as 
+% $$
+% y=\frac{x_i-\mu }{\sqrt{\sigma^2 + \epsilon}} * \gamma+\beta,
+% $$
+% where $\mu$ and $\sigma^2$ are the population mean and variance for a sample sequence $x = \{x_1, x_2, \ldots x_n \}$, and $x_i$ is an element of the sequence.
+% A layer normalization layer has a learnable scale parameter, $\gamma$ , and a learnable bias parameter $\beta$ that apply an elementwise scale and shift to $x_i$.
+% Although they make up only a minuscule proportion of the parameters in a frozen transformer, we find that keeping the $\gamma$ and $\beta$ parameters of the layer normalization layers unlocked (Fig. \ref{fig:unlocked-ln}) has a disproportionate effect on alignment.
+
+\subsection{Implementation Details}
+\label{sec:implementation-details}
+\textbf{Datasets} We draw $591,753$ image-text pairs from the training set of COCO2014\cite{coco}, following the split of \citet{karpathy_split}.  
+The weights of the vision encoders are initialized from DeiT \citet{deit}, and the text encoders are initialized from SimCSE \citep{simcse}.
+We train each model with a batch size of 512 on 4x NVIDIA A6000 GPUs for 15 epochs, using the AdamW optimizer \citep{adamw} optimizer with a weight decay of 0.02. 
+The learning rate is warned up to 1$e^{-4}$ in the first 10 epochs, and then decayed to $1e^{-5}$.
+We use random crops of resolution $256 \times 256$ with RandAugment\citep{randaugment}, with colors transformations removed following \cite{albef}.
+

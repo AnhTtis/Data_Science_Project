@@ -1,0 +1,66 @@
+
+\section{Audio-driven Group Dance Generation}
+
+
+\subsection{Problem Formulation}
+\label{sec:task}
+Given an input music audio sequence $\{m_1, m_2, ...,m_T\}$ with $t = \{1,..., T\}$ indicates the index of music segments, and the initial 3D positions of $N$ dancers $\{\tau^1_0, \tau^2_0, ..., \tau^N_0 \}$, $\tau^i_0 \in \mathds{R}^{3}$, our goal is to generate the group motion sequences $\{y^1_1,..., y^1_T; ...;y^n_1,...,y^n_T\}$ where $y^i_t$ is the generated pose of $i$-th dancer at time step $t$. Specifically, we represent the human pose as a 72-dimensional vector $y = [\tau;  \theta]$ where $\tau$, $\theta$ represent the root translation and pose parameters of the SMPL model~\cite{SMPL:2015}, respectively.
+
+Generally, the generated group dance motion should meet the two conditions: \textit{(i)} consistency between the generated dancing motion and the input music in terms of style, rhythm, and beat; \textit{(ii)} the motions and trajectories of dancers should be coherent without cross-body intersection between dancers. Figure~\ref{fig:GMG} shows an overview of our approach.
+
+\subsection{GDanceR Architecture}
+
+
+
+\textbf{Transformer Music Encoder.} From the raw audio signal of the input music, we first extract music features using the audio processing library~\cite{mcfee2015librosa}. Concretely, we extract the mel frequency cepstral coefficients (MFCC), MFCC delta, constant-Q chromagram, tempogram, onset strength and one-hot beat, which results in a 438-dimensional feature vector. We then encode the music sequence $\{m_1, m_2, ...,m_T\}$, $m_t \in \mathds{R}^{438}$ into a sequence of hidden representation $\{a_1, a_2,..., a_T\}$, $a_t \in \mathds{R}^{d_a}$. In practice, we utilize the self-attention mechanism of transformer~\cite{vaswani2017attention} to effectively encode the multi-scale information and the long-term dependency between music frames. The hidden audio at each time step is expected to contain meaningful structural information to ensure that the generated dancing motion is coherent across the whole sequence.
+
+
+
+
+\textbf{Initial Pose Generator.}
+Given the initial positions of all dancers, we generate the initial poses by combing the audio feature with the starting positions. 
+We aggregate the audio representation by taking an average over the audio sequence.
+The aggregated audio is then concatenated with the input position and fed to a multilayer perceptron (MLP) to predict the initial pose for each dancer:
+\begin{equation}
+\label{eq:initial_pose_generator}
+y^i_0 = \text{MLP}\left( \left[\frac{1}{T}\sum_{t=1}^T a_t ; \tau^i_0 \right] \right),
+\end{equation}
+where $[;]$ is the concatenation operator, $\tau^i_0$ is the initial position of the $i$-th dancer.
+
+\textbf{Group Motion Generator.}
+\label{sub_sec_group_motion_generator} 
+To generate the group dance motion, we aim to synthesize the coherent motion of each dancer such that it aligns well with the input music. Furthermore, we also need to maintain global consistency between all dancers. In practice, our Group Encoder uses Recurrent Neural Network to capture the temporal motion dynamics of each dancer~\cite{li2018_rnn_motion_prediction, mao2019_rnn_motion_prediction}, and attention mechanism to encode the spatial relationship of all dancers~\cite{vaswani2017attention}. 
+
+Specifically, at each time step, the pose of each dancer in the previous frame $y^i_{t-1}$ is sent to an LSTM unit~\cite{lstm} to encode the hidden local motion representation, i.e., ${h^i_t=\text{LSTM}(y^i_{t-1},h^i_{t-1})}$. 
+
+To ensure the motions of all dancers have global coherency without strange effects such as cross-body intersection, we introduce the Cross-entity Attention mechanism. In particular, each individual motion representation is first linearly projected into a key vector $k^i$, a query vector $q^i$ and a value vector $v^i$ as follows: 
+\begin{equation}
+    k^i = h^i W^{k}, \quad q^i = h^i W^{q}, \quad v^i = h^i W^{v},
+\end{equation}
+where $W^q, W^k \in \mathds{R}^{d_h \times d_k}$, and  $W^v \in \mathds{R}^{d_h \times d_v}$ are parameters that transform the hidden motion $h$ into a query, a key, and a value, respectively. $d_k$ is the dimension of the query and key while $d_v$ is the dimension of the value vector. To encode the relationship between dancers in the scene, our Cross-entity Attention also utilizes the Scaled Dot-Product Attention as in \cite{vaswani2017attention}.
+
+In practice, we find that people having closer positions to each other tend to have higher correlation in their movement. Therefore, we use Spacial Encoding to encode the spacial relationship between two dancers. The Spacial Encoding between two entities based on their distance in the 3D space is defined as follows:
+\begin{equation}
+\label{eq:e_ij}
+    e_{ij} = \exp\left(-\frac{\Vert \tau^i - \tau^j \Vert^2}{\sqrt{d_{\tau}}}\right),
+\end{equation}
+where $d_{\tau}$ is the dimension of the position vector $\tau$. Considering the query $q^i$, which represents the current entity information, and the key $k^j$, which represents other entity information, we inject the spatial relation information between these two entities onto their cross attention coefficient: 
+\begin{align}
+    \alpha_{ij} &= \text{softmax}\left(\frac{(q^i)^\top k^j}{\sqrt{d_k}} + e_{ij}\right).
+\end{align}
+
+
+To preserve the spatial relative information in the attentive representation, we also embed them into the hidden value vector and obtain the global-aware representation $g^i$ of the $i$-th entity as follows:
+\begin{align}
+    g^i &= \sum_{j=1}^N\alpha_{ij}(v^j +  e_{ij}\gamma),
+\end{align}
+where $\gamma \in \mathds{R}^{d_v}$ is the learnable bias and scaled by the Spacial Encoding. Intuitively, the Spacial Encoding acts as the bias in the attention weight, encouraging the interactivity and awareness to be higher between closer entities. Our attention mechanism can adaptively attend to each dancer and others temporally and spatially, thanks to the encoded motion as well as the spatial information.
+
+
+We then fuse both the local and global motion representation by adding $h^i$ and $g^i$ to obtain the final latent motion $z^i$. Our final global-local representation of each entity is expected to carry the comprehensive information of their own past motion as well as the motion of every other entity, enabling the MLP Decoder to generate coherent group dancing sequences. Finally, we generate the next movement ${y}^i_t$ based on the final motion representation $z^i_t$ as well as the hidden audio representation $a_t$, and thus can capture the fine-grained correspondence between music feature sequence and dance movement sequence:
+\begin{equation}
+\label{eq:decoder}
+y^i_t = \text{MLP}([z^i_t; a_t]).
+\end{equation}
+
+

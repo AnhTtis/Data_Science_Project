@@ -1,0 +1,364 @@
+% Template for ICIP-2019 paper; to be used with:
+%          spconf.sty  - ICASSP/ICIP LaTeX style file, and
+%          IEEEbib.bst - IEEE bibliography style file.
+% --------------------------------------------------------------------------
+\documentclass[letterpaper]{article} % DO NOT CHANGE THIS
+
+\usepackage{spconf,amsmath,graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amssymb}
+
+\newcommand\blfootnote[1]{%
+	\begingroup
+	\renewcommand\thefootnote{}\footnote{#1}%
+	\addtocounter{footnote}{-1}%
+	\endgroup
+}		% 首页脚注
+
+% \linespread{0.99}
+
+% Example definitions.
+% --------------------
+\def\x{{\mathbf x}}
+\def\L{{\cal L}}
+\newcommand*\samethanks[1][\value{footnote}]{\footnotemark[#1]}
+
+% Title.
+% ------
+\title{Real-time Semantic Scene Completion Via Feature Aggregation and Conditioned Prediction}
+%
+% Single address.
+% ---------------
+\name{Xiaokang Chen$^*$~\thanks{$^*$ Equal Contribution. 
+	$\dagger$ This work is supported by the National Key Research and Development Program of China (2017YFB1002601, 2016QY02D0304), National Natural Science Foundation of China (61375022, 61403005, 61632003), Beijing Advanced Innovation Center for Intelligent Robots and Systems (2018IRS11), and PEK-SenseTime Joint Laboratory of Machine Vision.
+ }, Yajie Xing$^*$, Gang Zeng}
+\address{Peking University}
+%
+% For example:
+% ------------
+%\address{School\\
+%	Department\\
+%	Address}
+%
+% Two addresses (uncomment and modify for two-address case).
+% ----------------------------------------------------------
+%\twoauthors
+%  {A. Author-one, B. Author-two\sthanks{Thanks to XYZ agency for funding.}}
+%	{School A-B\\
+%	Department A-B\\
+%	Address A-B}
+%  {C. Author-three, D. Author-four\sthanks{The fourth author performed the work
+%	while at ...}}
+%	{School C-D\\
+%	Department C-D\\
+%	Address C-D}
+%
+\begin{document}
+%\ninept
+%
+\maketitle
+%
+
+\begin{abstract}
+Semantic Scene Completion (SSC) aims to simultaneously predict the volumetric occupancy and semantic category of a 3D scene.
+In this paper, we propose a real-time semantic scene completion method with a feature aggregation strategy and conditioned prediction module.
+Feature aggregation fuses feature with different receptive fields and gathers context to improve scene completion performance.
+And the conditioned prediction module adopts a two-step prediction scheme that takes volumetric occupancy as a condition to enhance semantic completion prediction.
+We conduct experiments on three recognized benchmarks NYU, NYUCAD, and SUNCG.
+Our method achieves competitive performance at a speed of 110 FPS on one GTX 1080 Ti GPU.
+\end{abstract}
+%
+\begin{keywords}
+Real-time Semantic Scene Completion, 3D Scene Understanding, Convolutional Neural Networks
+\end{keywords}
+%
+\section{Introduction}
+\label{sec:intro}
+We live in a 3D world, in which empty and occupied space is determined by the physical presence of objects. To understand the environment around us, we need to grasp the geometry and semantics of the scene simultaneously~\cite{chen2022context,chen2022d,chen2022group,tang2022not,chen2022conditional,meng2021conditional,chen2021semi,chen2020bi,chen20203d,chen2020real,tang2022compressible,tang2022point,JiaxiangTang2021JointII,MinZhong2023MaskGroupHP,QiangChen2022GroupDV,XinyuZhang2022CAEVC,JiaxiangTang2022RealtimeNR,JiaxiangTang2023DelicateTM,liu2022mpii,liu2021enhance,liu2023parallel}. Often, the single-view depth image obtained by depth sensor from a single perspective is incomplete, which means there are lots of areas occluded. To understand the 3D scene, we need to complete the invisible area according to the visible part.
+
+Object shape completion has a long history in geometry processing. Some methods~\cite{nan2012search,shao2012interactive} complete the partial input of an object by matching it with 3D models from a large shape database. \cite{yuan2018pcn, stutz2018learning} propose a learning-based strategy that use a deep neural network with supervision to handle this task.
+
+Although object shape completion could obtain a satisfactory result on a single object, it is hard to generalize to the completion of a whole scene. 
+Therefore, Semantic Scene Completion (SSC) task is proposed by~\cite{song2017semantic-sscnet}. It aims to predict the volumetric occupancy and semantic category of a 3D scene simultaneously, which is proved to outperform either the completion or the semantic segmentation task. 
+
+Considering the enormous computational and memory requirements of 3D CNN, ESSCNet~\cite{zhang2018efficient-esscnet} introduces Spatial Group Convolution (SGC) to divide input volume into different groups and conduct 3D sparse convolution on them. 
+VVNet~\cite{guo2018view-vvnet} combines 2D CNN and 3D CNN with a differentiable projection layer to efficiently reduce the computational cost. 
+Although these works are dedicated to reducing the computational cost of SSC, none of them has achieved real-time inference, leaving this task still far from practical application.
+Dense prediction tasks like semantic segmentation or SSC usually need features combining both large-receptive-field semantic information and detailed local information to yield a better result.
+In semantic segmentation, there are many works~\cite{lin2017refinenet, lee2017rdfnet, yu2018bisenet} that study feature aggregation strategies.
+For semantic scene completion,
+DDRNet~\cite{li2019rgbd-ddrnet} proposes a light-weight Dimensional Decomposition Residual (DDR) block and adopts a RDFNet\cite{lee2017rdfnet}-like feature fusion scheme to construct network.
+It saves computation through DDR block and improves performance through feature aggregation, but still cannot become real-time.
+Moreover, we notice that to do semantic-free completion is easier than to simultaneously finish completion and predict semantic categories, and the former can be served as a prior condition to the latter.
+But no existing SSC methods have exploited this property.
+
+\begin{figure*}[!ht]
+  \centering
+  \includegraphics[width=1.\linewidth]{pic/arch.pdf}
+  \caption{
+  Overview of the proposed method. The convolution parameters are shown as (channel number, kernel size, stride, dilation). The Res 3D implies 3D Residual Block, and the parameters are shown as (channel number, dilation). 
+  We propose an encoder with dilated convolution to obtain a large receptive field.
+  Features extracted by the encoder are aggregated by a stage-wise aggregation strategy, where a Global Aggregation Module is also used to aggregate global context.
+  Finally, the model adopts a step-wise conditioned prediction module to yield the final prediction.
+  }
+  \label{fig:arch}
+  \vspace{-0.3cm}
+\end{figure*}
+
+In this paper, we propose a real-time semantic scene completion model, which runs at a speed of \textbf{110 FPS} with a highly competitive result.
+We adopt a ResNet~\cite{he2016deep}-motivated network as our backbone.
+To enlarge the receptive field, we utilize dilated convolution at the latter stages of the network.
+We propose Global Aggregation Module to fuse global context feature and local feature, and a multi-level feature aggregation strategy containing the module to combine both global context and feature with different receptive fields.
+Besides, we employ a two-step prediction scheme to exploit the condition relation between volumetric occupancy and semantic category. 
+We first generate the binary occupancy prediction and yield semantic prediction according to both extracted feature and occupancy prediction.
+Thus the occupancy could supply structural information for the semantic prediction, improving the performance. 
+We conduct experiments on three public benchmarks (NYU Depth V2, NYUCAD, and SUNCG) and the experimental results validate the effectiveness of the proposed method.
+
+
+
+\section{Proposed Method}
+\label{sec:method}
+Fig.~\ref{fig:arch} illustrates the overall structure of our model.
+Given a TSDF (Truncated Signed Distance Function) data transformed from depth map, our model assign each voxel a semantic label $c\in\{c_0,c_1,\cdots,c_{N}\}$, where $N$ is the number of semantic categories and $c_0$ stands for empty voxels.
+Our method consists of four key components: Dilated Convolution Encoder, Global Aggregation Module, Multi-level Feature Aggregation, and Conditioned Prediction.
+In the following subsections, we describe these components in detail.
+
+\subsection{Dilated Convolution Encoder}
+As demonstrated in dense prediction tasks~\cite{yu2015dilatednet, chen2017deeplabv3, zhao2017pspnet}, a large receptive field is crucial to provide richer information for understanding the scene.
+Considering 3D convolutions consume large memory and computation budget, we design a light-weight encoder that effectively enlarges the receptive field and extracts representative features.
+We adopt a ResNet-like design to construct the encoder, in which two plain convolutions are used to process the raw input into low-level features, and cascaded residual blocks are used to refine the features.
+The encoder downsamples the feature map and process high-dimensional features at a lower resolution to save computational cost.
+We apply dilated convolutions at the latter downsampled stages to enlarge the receptive field and gather context information.
+As shown in Fig.~\ref{fig:arch}, we adopt a ``multi-grid" dilation rate strategy similar to ~\cite{chen2017deeplabv3} in our encoder.
+The effect of different dilation rates is studied in ablation studies.
+
+\subsection{Global Aggregation Module}
+The largest receptive field is the whole scene.
+As proved in other semantic prediction tasks~\cite{chen2017deeplabv3,zhao2017pspnet}, global context that includes information in the whole scene is beneficial to enhancing local features and improving performance.
+Therefore, we propose a Global Aggregation Module (GA Module) to aggregate global context into the local feature map.
+As Fig.~\ref{fig:arch} shows, the global context is gathered through a 3D global pooling and incorporated into the local feature map with a channel-wise attention mechanism.
+
+\subsection{Multi-level Feature Aggregation}
+Although features with large receptive field and rich context have a strong capability for semantic prediction, they usually lack detailed high-frequency information, and thus degrades the dense prediction performance.
+Therefore, we need to aggregate features with both large-range context and low-level details.
+We propose a stage-wise aggregation strategy in our method.
+We first concatenate feature maps generated by the three stages after downsampling.
+Then a convolution is applied to reduce channel dimension.
+After the high-level aggregated feature is obtained, we utilize the proposed Global Aggregation Module to moreover enhance the feature map.
+Finally, we upsample the enhanced feature map back to the original resolution, concatenate it with a low-level feature map, and reduce the dimension through another convolution.
+
+\subsection{Conditioned Prediction}
+
+We propose that semantic scene completion can be divided into two steps: semantic-free scene completion and semantic-aware scene completion, where the former can serve as a prior condition to the latter.
+Following this idea, we propose a conditioned prediction module to yield semantic scene completion results.
+The model first predicts a semantic-free volumetric occupancy, which is formatted as a two-category dense labeling task.
+The label $\hat{c}\in\{\hat{c}_0, \hat{c}_1\}$ of semantic-free completion is generated by
+\begin{equation}
+\left\{  
+    \begin{gathered}
+        \hat{c} = \hat{c}_0, \text{if } c=c_0 \\
+        \hat{c} = \hat{c}_1, \text{otherwise}
+    \end{gathered}
+\right.  
+\end{equation}
+Then we concatenate the softmax-normalized prediction with the final feature map to introduce the prior condition and predict semantic scene completion results.
+For training, the total loss is the summation of semantic-free completion loss and semantic completion loss:
+\begin{equation}
+    L(p,\hat{p},y,\hat{y}) = L_{s}(p, y) + L_{c}(\hat{p}, \hat{y})
+\end{equation},
+where $p,\hat{p}$ are respectively predictions for semantic completion and semantic-free completion, $y,\hat{y}$ are the corresponding ground truth, and $L_{s},  L_{c}$ are both softmax cross entropy loss.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Datasets and Evaluation Metrics}
+\noindent \textbf{Datasets.} We evaluate the proposed method on three benchmarks: NYU Depth V2~\cite{nyudv2} (which is denoted as NYU in the following),  NYUCAD~\cite{firman2016structured} and SUNCG~\cite{song2017semantic-sscnet}. \textbf{NYU} consists of 1449 indoor scenes that are captured via a Kinect sensor. There are 795 for training and 654 for test. We follow~\cite{song2017semantic-sscnet} and use the 3D annotated labels provided by~\cite{rock2015completing} for semantic scene completion task. \textbf{NYUCAD} uses the depth maps generated from the projections of the 3D annotations to address the misalignment of some label volumes and their corresponding depth maps. \textbf{SUNCG} is a synthetic dataset made by SSCNet~\cite{song2017semantic-sscnet}, which consists of 45622 indoor scenes. Follow \cite{song2017semantic-sscnet}, we adopt the same training/test split for our network training and evaluation. More specifically, 150K depth images and the corresponding ground-truth volumes for training and 470 pairs sampled from 170 non-overlap scenes for evaluation.
+
+\noindent \textbf{Evaluation Metrics.}
+We follow SSCNet~\cite{song2017semantic-sscnet} to use precision, recall and voxel-level intersection over union (IoU) as evaluation metrics. Specifically, two tasks are considered: semantic scene completion (SSC) and scene completion (SC). For the task of SSC, we evaluate the IoU of each object class on both observed and occluded voxels in the view frustum. For the task of SC, we treat all voxels as binary predictions and evaluate the binary IoU on occluded voxels in the view frustum.
+
+\subsection{Implementation Details}
+We use PyTorch framework to implement our experiments with a single GeForce GTX 1080 Ti GPU. We adopt mini-batch SGD with momentum to train our model with batch size $16$, momentum $0.9$ and weight decay $0.0005$. The initial learning rate is set to $0.1$ for NYU and NYUCAD, $0.02$ for SUNCG. We employ a poly learning rate policy where the initial learning rate is multiplied by $(1-\frac{iter}{max\_iter})^{0.9}$. We train our network for $300, 300$ and $20$ epochs for NYU, NYUCAD and SUNCG respectively.
+
+\subsection{Ablation Studies}
+%%%%%%%%%%%%%%% Ablation study table %%%%%%%%%%%%%%%
+\begin{table}[tbp]
+\begin{center}
+\caption{Ablation studies about different modules on the NYUCAD test set.}
+\label{tab:ab-study}
+\resizebox{0.99\columnwidth}{!}{
+\begin{tabular}{cccccc}
+\noalign{\smallskip}
+\toprule
+\textbf{Dilation} & \textbf{Feature Agg} & \textbf{GA} & \textbf{Condition} &  \textbf{SSC mIoU (\%)}  & \textbf{SC IoU (\%)} \\
+\midrule
+ & & & & 40.0 & 79.7 \\
+\checkmark & & & & 42.7 & 80.8 \\
+\checkmark & \checkmark & & & 43.0 & 81.3 \\
+\checkmark & \checkmark & \checkmark & & 43.8 & 81.9 \\
+\checkmark & \checkmark & \checkmark & \checkmark & \textbf{44.5} & \textbf{82.2} \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-0.6cm}
+\end{center}
+\end{table}
+
+We conduct ablation studies on NYUCAD to verify the proposed modules. From Table \ref{tab:ab-study}, we observe that each proposed module brings reasonable performance gain. Dilated convolution enlarges the receptive field of the network while keeping the size of feature maps unchanged, and boost the baseline by $2.7\%$ SSC mIoU. With the proposed multi-level aggregation strategy and the Global Aggregation Module, our network could jointly exploit feature maps with different receptive fields. This could improve the adaptability of our network to objects with different sizes. At last, the proposed occupancy condition supplies shape prior for the semantic prediction, thus boosting both the SSC mIoU and SC IoU.
+
+%%%%%%%%%%%%%%% Ablation study table %%%%%%%%%%%%%%%
+\begin{table}[htp]
+\begin{center}
+\caption{Ablation studies about dilation rates on the NYUCAD test set.}
+\label{tab:ab-study2}
+\resizebox{0.8\columnwidth}{!}{
+\begin{tabular}{ccc}
+\noalign{\smallskip}
+\toprule
+\textbf{Dilation rate} & \textbf{SSC mIoU (\%)}  & \textbf{SC IoU (\%)} \\
+\midrule
+1,1,1,1,1,1 & 42.8 & 80.8 \\
+2,2,2,4,4,4 & 43.2 & 81.6 \\
+2,2,2,4,8,4 & \textbf{44.5} & \textbf{82.2} \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-0.5cm}
+\end{center}
+\end{table}
+
+To further verify the importance of dilated convolutions, we conduct ablation studies on different dilation rates. Results are listed in Table \ref{tab:ab-study2}. ``Dilation rate" implies $6$ dilation rates for the last $6$ 3D Residual Blocks in the encoder. From the table, we observe that with the increase of dilation rate, performance obtains a stable gain, which illustrates the importance of the large receptive field.
+
+\subsection{Comparison with State-of-the-art Methods}
+\noindent \textbf{Quantitative Results.} We compare the proposed method with other outstanding methods on three benchmarks: NYU, NYUCAD and SUNCG. Quantitative results are listed in Table \ref{tab:sota-nyu}, \ref{tab:sota-nyucad}, \ref{tab:sota-suncg} respectively. We observe that the proposed method obtains a consistently leading result on all three datasets, especially the SC IoU metric, which illustrates the effectiveness of the proposed modules.
+
+%%%%%%%%%%%%%%% NYU table %%%%%%%%%%%%%%%
+\begin{table}[!htbp]
+\begin{center}
+\caption{Comparison with state-of-the-art methods on the NYU test set.}
+\label{tab:sota-nyu}
+\resizebox{0.8\columnwidth}{!}{
+\begin{tabular}{ccc}
+\noalign{\smallskip}
+\toprule
+\textbf{Method} & \textbf{SSC mIoU (\%)}  & \textbf{SC IoU (\%)} \\
+\midrule
+SSCNet~\cite{song2017semantic-sscnet} & 24.7 & 55.1 \\
+VVNet~\cite{guo2018view-vvnet} & 32.9 & 61.1 \\
+SATNet~\cite{liu2018see-satnet} & 34.4 & 60.6 \\
+TS3D~\cite{garbade2018two-ts3d} & 30.4 & 60.4 \\
+DDRNet~\cite{li2019rgbd-ddrnet} & 30.4 & 61.0 \\
+\bottomrule
+Ours & \textbf{34.4} & \textbf{73.4} \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-0.5cm}
+\end{center}
+\end{table}
+
+%%%%%%%%%%%%%%% NYUCAD table %%%%%%%%%%%%%%%
+\begin{table}[ht]
+\begin{center}
+\caption{Comparison with state-of-the-art methods on the NYUCAD test set.}
+\label{tab:sota-nyucad}
+\resizebox{0.8\columnwidth}{!}{
+\begin{tabular}{ccc}
+\noalign{\smallskip}
+\toprule
+\textbf{Method} &  \textbf{SSC mIoU (\%)}  & \textbf{SC IoU (\%)} \\
+\midrule
+SSCNet~\cite{song2017semantic-sscnet} & 40.0 & 73.2 \\
+VVNet~\cite{guo2018view-vvnet} &  \ & 80.3 \\
+TS3D~\cite{garbade2018two-ts3d} &  42.1 & 74.2 \\
+DDRNet~\cite{li2019rgbd-ddrnet} &  42.8 & 79.4 \\
+\bottomrule
+Ours & \textbf{44.5} & \textbf{82.2} \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-0.5cm}
+\end{center}
+\end{table}
+
+%%%%%%%%%%%%%%% SUNCG table %%%%%%%%%%%%%%%
+\begin{table}[ht]
+\begin{center}
+\caption{Comparison with state-of-the-art methods on the SUNCG test set.}
+\label{tab:sota-suncg}
+\resizebox{0.8\columnwidth}{!}{
+\begin{tabular}{ccc}
+\noalign{\smallskip}
+\toprule
+\textbf{Method} &  \textbf{SSC mIoU (\%)}  & \textbf{SC IoU (\%)} \\
+\midrule
+SSCNet~\cite{song2017semantic-sscnet} &  46.4 & 73.5 \\
+VVNet~\cite{guo2018view-vvnet} & 66.7 & 84.0 \\
+ESSCNet~\cite{zhang2018efficient-esscnet} & \textbf{70.5} & 84.5 \\
+SATNet~\cite{liu2018see-satnet} & 64.3 & 78.5 \\
+\bottomrule
+Ours & 63.5 & \textbf{84.8} \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-0.5cm}
+\end{center}
+\end{table}
+
+%%%%%%%%%%%%%%% Eff table %%%%%%%%%%%%%%%
+\begin{table}[ht]
+\begin{center}
+\caption{The inference speed and GPU memory usage of the proposed method. All results are acquired on a GTX 1080 Ti GPU and evaluated on the NYU~\cite{nyudv2} test set.}
+\label{tab:efficiency}
+\resizebox{0.99\columnwidth}{!}{
+\begin{tabular}{cccccc}
+\noalign{\smallskip}
+\toprule
+\textbf{Method} & \textbf{Params (k)} & \textbf{FLOPs (G)}  & \textbf{Speed (FPS)}  & \textbf{Memory (M)} & \textbf{SSC-mIoU(\%)} \\
+\midrule
+SSCNet~\cite{song2017semantic-sscnet} & 930 & 163.8 & 0.7 & 5305 & 24.7\\
+DDRNet~\cite{li2019rgbd-ddrnet} & 195 & 27.2 & 1.5 & 1829 & 30.4\\
+Ours & \textbf{65} & \textbf{1.6} & \textbf{109.8} & \textbf{655} & \textbf{34.4} \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-0.3cm}
+\end{center}
+\end{table}
+
+\noindent \textbf{Qualitative Results.}
+Qualitative results are visualized in Figure \ref{fig:sota}. In the first row, we observe that the prediction of SSCNet lacks too many details (such as tables and chairs) because they didn't exploit low-level feature. In the second and the third rows, large areas of walls are missing in the predictions of SSCNet. As a comparison, the proposed method completes these areas well and precisely understands the semantics of them, because we combine features with different receptive fields, and the conditioned volumetric occupancy supplies the structure prior for the final prediction.
+
+\begin{figure}[!htb]
+  \centering
+  \includegraphics[width=1.\linewidth]{pic/nyucad-res.pdf}
+  \caption{
+  Comparison with SSCNet~\cite{song2017semantic-sscnet} on the NYUCAD test set. Best viewed in color.
+  }
+  \label{fig:sota}
+  \vspace{-0.3cm}
+\end{figure}
+
+\noindent \textbf{Efficiency Analysis.} We analyze the computational efficiency of the proposed method following~\cite{li2019rgbd-ddrnet}. Statistics are listed in Table \ref{tab:efficiency}. As shown in the table, the proposed method has significantly fewer parameters and FLOPs than DDRNet~\cite{li2019rgbd-ddrnet}, while achieving much faster speed (about 73x faster) with a quite large performance gain.
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+In this paper, we propose a real-time semantic scene completion model with feature aggregation and conditioned prediction.
+We propose a light-weight encoder with a large receptive field, and propose a Global Aggregation Module and a stage-wise feature aggregation strategy to fuse both high-level context-rich features and low-level detailed features.
+And we propose a conditioned prediction module to predict volumetric occupancy and semantic completion step-by-step, exploiting volumetric occupancy as a prior condition for semantic completion prediction.
+We conduct experiments on NYU, NYUCAD, and SUNCG to validate the effectiveness of our method.
+Our method achieves a highly competitive performance at the speed of 110 FPS.
+
+
+
+% References should be produced using the bibtex program from suitable
+% BiBTeX files (here: strings, refs, manuals). The IEEEbib.bst bibliography
+% style file from IEEE produces unsorted bibliography list.
+% -------------------------------------------------------------------------
+\small
+\bibliographystyle{IEEEbib}
+\bibliography{main}
+
+\end{document}

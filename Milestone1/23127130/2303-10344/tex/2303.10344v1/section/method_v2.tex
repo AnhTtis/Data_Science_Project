@@ -1,0 +1,175 @@
+\begin{figure*}[t]
+  \includegraphics[width=\textwidth]{figures/methods/V7.pdf}
+  \caption{Architecture of the proposed locale-aware indoor illumination prediction method. The key is a local-to-global panorama inpainting pipeline that recovers both physically-plausible global structures and fine local details from a FOV-limited input image.}
+  \label{fig:pipeline}
+\end{figure*}
+\section{Local-to-global Panorama Inpainting}
+\label{section:overview}
+Our goal in this paper is to estimate a full HDR environment map $\mathbf{P}_{\text{HDR}}$ at a  locale $\mathbf{R}$ of an FOV-limited LDR image $\mathbf{I}$.
+We follow the general framework of Song \emph{et al.}~\cite{song2019neural} which decomposes this ill-posed problem into three sub-tasks: depth-based image warping, LDR panorama inpainting and HDR panorama reconstruction (see Fig. \ref{fig:pipeline}). In the first task, we leverage the recent DPT~\cite{dpt2021} to estimate the depth map $\mathbf{D}$ for $\mathbf{I}$. 
+% DPT produces more fine-grained and globally coherent predictions when compared to fully-convolutional architecture. 
+Then $\mathbf{D}$ and $\mathbf{I}$ are geometrically warped and transformed to $360^{\circ}$ spherical panoramas centered at the selected locale $\mathbf{R}$, denoting as $\mathbf{\hat{D}}$ and ${\hat{\mathbf{P}}}$ respectively. 
+This warping operation is realized through a forward projection using the estimated scene geometry and camera pose. Some regions in $\mathbf{\hat{P}}$ are missing because they do not have a projected pixel in $\mathbf{I}$.
+The following task, LDR panorama inpainting, aims to infer a dense panorama from the sparse ${\hat{\mathbf{P}}}$. In this section, we introduce a local-to-global panorama inpainting pipeline that can recover a complete LDR panorama $\mathbf{P}_{G}$ from $\mathbf{\hat{P}}$. 
+In the last sub-task, we utilize the state-of-the-art network of ~\cite{LDR2HDR} to reconstruct the HDR panoramas $\mathbf{P}_{\text{HDR}}$ from $\mathbf{P}_{G}$ for inserted objects at $\mathbf{R}$. We detail our local-to-global pipeline in this paper and more details about the other off-the-shelf networks are provided in the supplemental materials.
+
+\subsection{Observation and overview}
+
+\begin{figure}[t]
+  \begin{center}
+  \renewcommand\tabcolsep{1.0pt}
+  \begin{tabular}{ccc}
+  \small{Input} &\small{Attention matrix} & \small{Attention map}  \\
+    \includegraphics[height=0.24\linewidth, clip]{figures/methods/4_6_attention/6/inpaint/_input_cube_mark.png}&
+    \includegraphics[height=0.24\linewidth, clip]{figures/methods/4_6_attention/6/inpaint/block-9_attn_mark.png}&
+    \includegraphics[height=0.24\linewidth, clip]{figures/methods/4_6_attention/6/inpaint/patch-286_attn_line.png} 
+     \\
+    
+    \includegraphics[height=0.24\linewidth, clip]{figures/methods/4_6_attention/6/noinpaint/_input_cube_mark.png}&
+    \includegraphics[height=0.24\linewidth, clip]{figures/methods/4_6_attention/6/noinpaint/block-9_attn_mark.png}&
+    \includegraphics[height=0.24\linewidth, clip]{figures/methods/4_6_attention/6/noinpaint/patch-286_attn_line.png}
+  \end{tabular}
+  \end{center}
+  \caption{From left to right: the input incomplete panoramas with red boxes specifying the selected patches, attention matrices of the 9th transformer block with red lines indicating the attention scores of the selected patches, attention maps of the selected patches.}
+  \label{fig:attention}
+\end{figure}
+
+
+For panorama inpainting, previous works \cite{song2019neural} mostly resort to fully convolutional networks. However, CNN-based models achieve suboptimal performance due to large-scale sparse missing contents in the warped panorama and some inherent limitations of convolutional layers. CNNs are good at preserving local structures and modeling rich textures but fail to complete the large hole regions. 
+Therefore, previous works can hardly acquire sufficiently broad context as well as significant high-level representations from sparse omnidirectional images. Meanwhile, the distortion in spherical panoramas will further hamper the performance on large-scale inpainting.
+    
+Compared to CNN models with limited perspective fields, transformer is designed to support long-term interaction via the self-attention module~\cite{vit}. The self-attention mechanism can directly compute the interaction between any pair of patches, naturally capturing long-range dependencies and having a global receptive field at every stage. However, we observe that transformers work poorly on the sparse input which is the case in our task. We compare the attention maps and attention score maps for the selected patch from a sparse panorama and a dense one for illustration in Fig.~\ref{fig:attention}. As we can see, the query patch contains adequate illumination information. Given a dense input, the query patch impacts some regions (e.g. the ground) with red colors in the attention map. However, transformer blocks have trouble recovering the global structure from scattered pixels, thus the lighting can not pass information to invisible patches properly, resulting in the smooth attention map.
+
+\begin{figure}[t]
+  \includegraphics[width=\linewidth]{figures/methods/warpholesV2.pdf}
+  \caption{Illustration of warping. The warping operation results in missing regions which are categorized as pixel-stretching regions and out-of-view regions.}
+  \label{fig:pixel}
+\end{figure}
+
+Unfortunately, the problem of sparsity is inevitable in our task due to the limited FOV of our input perspective images. The panorama captured at $\mathbf{R}$ should have a 360$^\circ$ FOV while some parts are out-of-view in $\mathbf{I}$. We mark the invisible regions with blue in Fig.~\ref{fig:pixel}. The missing parts are expected to be restored by a global understanding of the scene. Another factor of the sparsity stems from pixel stretching. During image warping, some regions marked in red in Fig.~\ref{fig:pixel} are actually visible in $\mathbf{I}$, but still have small holes due to pixel stretching. 
+
+Based on the above observations, our main idea is that we first fill pixel-stretching regions according to their neighboring pixels to alleviate the sparsity, and then fill other large holes based on the global understanding of the whole scene. To this end, we propose a novel local-to-global inpainting pipeline, which can be formulated as follows:
+\begin{equation}
+    \mathbf{P}_{G} = \mathbf{M} \odot \mathbf{\hat{P}}+ (1-\mathbf{M})\odot \mathcal{G}(\mathcal{L}(\mathbf{\hat{P}});\mathcal{L}(\mathbf{M})) 
+\label{equ:mask}
+\end{equation}
+where $\mathbf{M}$ is the binary mask indicating visible pixels in $\mathbf{\hat{P}}$ and $\odot$ denotes element-wise multiplication. 
+
+The key to Eq.~\ref{equ:mask} is a local-to-global panorama inpainting pipeline that applies a local inpainting module $\mathcal{L}$ and a global inpainting module $\mathcal{G}$ sequentially on the warped panorama $\mathbf{\hat{P}}$.
+Our local inpainting method aims to fill dense holes in the pixel-stretching regions, according to the depth information. The local inpainting module employs a modified bilateral filtering-based method to remove dense and small holes in the pixel-stretching regions. After that, a global inpainting module based on a novel transformer architecture is developed to extract reliable global features from visible regions and then fill large holes in the out-of-view regions. Our specially-designed transformer architecture, named PanoTransformer, takes a cubemap projection as input to resolve the problem of spatial distortion in the spherical signals.  
+
+
+\subsection{Depth-guided local inpainting}
+\begin{algorithm}[tb]
+  \caption{Depth-guided local inpainting}
+  \label{code:localinpaint}
+  \begin{algorithmic}[1]
+    \Require
+      The input image, $\mathbf{I}$;
+      The estimated depth, $\mathbf{D}$;
+      The warped image centered at selected location, $\mathbf{\hat{P}}$;
+      The warped depth centered at selected location, $\mathbf{\hat{D}}$;
+      The threshold $t$
+    \Ensure
+      The panorama inpainted locally, $\mathbf{P}_{L}$;
+    \State $\mathbf{P}_{L} = \mathbf{\hat{P}}$
+    \State $//$ Depth recovery.
+    \State $\mathbf{\hat{D}} = \text{morphologyClosing}(\mathbf{\hat{D}})$
+    \State $\mathbf{\hat{D}} = \text{bilateralFilter}(\mathbf{\hat{D}})$
+    
+    \State $//$ Depth-guided inpainting.
+    \For{each $d\in \mathbf{\hat{D}}$}
+      \State Calculate the pixel coordinate $\mathbf{c}_{p}$ of $d$ ;
+      \State $\mathbf{c}_w = \text{PixelToWorldCoordinate}(\mathbf{c}_{p})$
+      \State Project $\mathbf{c}_w$ to $\mathbf{D}$ to get its pixel coordinate $\mathbf{c}$;
+      \State $d_i = \mathbf{D}[\mathbf{c} ]$
+      \If {$\|d_i - d \| < t$}
+        \State $\mathbf{P}_{L}[\mathbf{c}_p]=\mathbf{I}[\mathbf{c} ]$
+      \EndIf
+    \EndFor
+  \end{algorithmic}
+\end{algorithm}
+
+The local inpainting module aims to alleviate the sparsity caused by pixel stretching. Our local inpainting method contains two basic steps shown in Algorithm~\ref{code:localinpaint}. First, we leverage morphology operations (Line 3) and bilateral filtering (Line 4) to fill holes in the warped depth $\mathbf{\hat{D}}$ as much as possible. The intuition of performing depth recovery is that depth values in the pixel stretching areas vary smoothly, while the warped panorama $\mathbf{\hat{P}}$ may have rich textures. 
+
+Then, we traverse all valid depth values in $\mathbf{\hat{D}}$, and fill missing regions in $\mathbf{\hat{P}}$ with re-projected pixel values from $\mathbf{I}$. Guided by the recovered depth, we only fill those pixel-stretching regions with colors in $\mathbf{I}$. Note that our local inpainting method effectively fills dense but small holes and maintains the local structures.
+
+
+\subsection{Global inpainting with PanoTransformer}
+\label{section:lt}
+For global inpainting, we design and train a transformer-based network, named PanoTransformer, to hallucinate contents in out-of-view regions. PanoTransformer can be logically separated to an encoder and a decoder, where the encoder captures long-range distortion-free representations, while the decoder gradually recovers the spatial information for generating accurate pixel-level predictions.
+
+Considering the distortion in the equirectangular projection, PanoTransformer takes the warped cubemap projection as input. To distinguish pixels needed to be regressed, a binary mask is concatenated to the RGB channels in cubemap projection. 
+We denote the input as $\mathbf{x}\in \mathbb{R}^{6\times H\times W\times 4}$ where $H$ and $W$ is the height and width of each face in the cubemap projection.
+
+In the encoder, the input cubemap projection $\mathbf{x}$ is first reshaped into a sequence of flattened 2D patches $\mathbf{x}_p\in \mathbb{R}^{N \times(p^2\times 4)}$, where $(p, p)$ is the resolution of each image patch, and $N = \frac{6\times H\times W}{p^2}$ is the resulting number of patches. 
+Each patch is then mapped to 1D tokens $z_i\in \mathbb{R}^d$ using a trainable linear projection and augmented with position embeddings to retain positional information.
+These tokens are then fed into several transformer blocks. Each transformer block comprises multiheaded self-attention (MHSA)~\cite{NIPS2017_3f5ee243}, layernorm (LN)~\cite{ba2016layer} and MLP blocks.
+In $l$-th transformer block, $\boldsymbol{z}^l$ is fed as the input, yielding $\boldsymbol{z}^{l+1}$ as follows:
+\begin{equation}
+    \boldsymbol{w}^l =\text{MHSA}(\text{LN}(\boldsymbol{z}^l)) +\boldsymbol{z}^l
+\end{equation}
+\begin{equation}
+    \boldsymbol{z}^{l+1} =\text{MLP}(\text{LN}(\boldsymbol{w}^l)) +\boldsymbol{w}^l
+\end{equation}
+
+Noted that the token-dimensionality is fixed throughout all layers. Thus the resulting $\boldsymbol{z}$ can be transformed back to a cubemap-shape representation $\boldsymbol{z}\in \mathbb{R}^{6\times H\times W\times C}$ according to the position of the initial patch. $C$ is the channel of the extracted feature. 
+These reconstructed priors $\boldsymbol{z}$ contain ample cues of global structure and coarse textures, thanks to the transformer’s strong representation ability and global receptive fields. 
+$\boldsymbol{z}$ can be regarded as six images of the cubemap projection. We feed these image-like features to six Residual blocks~\cite{resnet} to replenish texture details. 
+\begin{figure}[tb]
+  \includegraphics[width=1.0\linewidth]{figures/methods/data_make.pdf}
+  \caption{We apply masks from ~\cite{song2019neural} on high-quality panoramas from Matterport3D~\cite{Matterport3D}, SUN360~\cite{DBLP:conf/cvpr/XiaoEOT12} and Laval~\cite{gardner2017learning} to generate pairs of masked input and the ground truth for training.}
+  \label{fig:dataset}
+\end{figure}
+
+\begin{figure}[tb]
+\begin{center}
+  \renewcommand\tabcolsep{1.0pt}
+  \begin{tabular}{ccccccc}
+  \multicolumn{4}{c}{\includegraphics[width=0.52\linewidth, clip]{figures/results/ablation/train_on_neural_dataset/4686_our_mark.png}}&\includegraphics[width=0.13\linewidth,  clip]{figures/results/ablation/train_on_neural_dataset/4686_neural_data_clipcombine.png}&
+  \includegraphics[width=0.13\linewidth,  clip]{figures/results/ablation/train_on_neural_dataset/4686_our_clipcombine.png}&
+  \includegraphics[width=0.13\linewidth,  clip]{figures/results/ablation/train_on_neural_dataset/4686_gt_clipcombine.png}\\
+  \multicolumn{4}{c}{\small{Our result and the input}}&\small{With~\cite{song2019neural}}&
+  \small{Ours}&
+  \small{Reference}\\
+  \end{tabular}
+  \end{center}
+  \caption{Comparison between models trained with our dataset and the dataset of Song \emph{et al.}~\cite{song2019neural}.}
+  \label{fig:nodata}
+\end{figure}
+
+\subsection{Dataset}
+\label{section:dataset}
+Currently, the only dataset that contains paired LDR perspective images and the corresponding HDR panoramas for a diverse set of locales is proposed by Song \emph{et al.}~\cite{song2019neural} based on Matterport3D~\cite{Matterport3D}. Unfortunately, the reconstructed HDR panoramas have obvious artifacts (\emph{e.g.}, stitching seams and broken structures) as we explained in the supplemental materials. This prohibits our model from inferring complete and globally consistent structures seen at each locale.
+
+Considering the above issue, we collect a large scale dataset with high-quality and diverse panoramas from Matterport3D~\cite{Matterport3D}, SUN360~\cite{DBLP:conf/cvpr/XiaoEOT12} and Laval~\cite{gardner2017learning}.
+Apart from the panoramas, training PanoTransformer also requires masks to generate the sparse input $\mathbf{\hat{P}}$. As the invisible regions are mainly on the top of panorama, we generate masks from the dataset of Song \emph{et al.}~\cite{song2019neural} instead of generating randomly. These sparse masks are obtained by geometrically warping, fitting to the real-world data distribution. These masks are locally inpainted before feeding to PanoTransformer.
+The main difference of our dataset to Song \emph{et al.}'s~\cite{song2019neural} dataset is that our panoramas and masks are unpaired, hence we can randomly apply diversified irregular masks on one panorama to generate various input. Since we focus on the inpainting task, we do not require that the mask and the panorama are physically correlated. Our dataset (some examples are shown in Fig. \ref{fig:dataset}) ensures that the ground-truth panoramas are free from artifacts. In all, we gather 38,929 high-quality panoramas accompanied by randomly selected masks for training and 5,368 for evaluation. We ensure that the scenes used in the evaluation would not appear in the training procedure. 
+As shown in Fig. \ref{fig:nodata}, the model trained with our dataset produces much better results than that trained with Song \emph{et al.}'s~\cite{song2019neural} dataset. Note the cluttered structures generated by the latter model due to artifacts in Song \emph{et al.}'s~\cite{song2019neural} dataset. Please refer to the supplemental material for more comparisons.
+
+
+
+\subsection{Loss function and training details}
+We optimize PanoTransformer by minimizing a pixel-wise reverse Huber loss ~\cite{Laina_2016_3DV} between the predicted panoramas and corresponding ground truth. Since using a standard L1 loss function to learn a binary light mask heavily penalizes even small shifts of a light source position, the reverse Huber loss takes advantage of L1 loss and L2 loss as below:
+\begin{equation}
+L_B=\left\{
+\begin{aligned}
+ &|y-\hat{y}|, & |y-\hat{y}| \leq T \\
+&\frac{(y-\hat{y})^2+T^2}{2T},  & |y-\hat{y}| \ge T
+\end{aligned}
+\right.
+\label{eq6}
+\end{equation}
+where $y$ is the ground truth value and $\hat{y}$ is the prediction. The threshold $T$ is set to 0.2 in our experiments.
+To generate more realistic details, an extra adversarial loss is also involved in the training process. Our discriminator adopts the same architecture as Patch-GAN~\cite{patchgan}.
+
+
+We implement our PanoTransformer using the PyTorch framework~\cite{pytorch}. Adam~\cite{kingma2017adam} optimizer is used with the default parameters $\beta_1=0.9$ and $\beta_2 = 0.999$ and an initial learning rate of 0.0001.
+PanoTransformer is trained on our dataset for 100 epochs. Training are conducted on two NVIDIA RTX 3090 GPUs with a batch size of 8. 
+
+
+\begin{figure*}
+  \includegraphics[width=\textwidth]{figures/results/evaluateLight/evaluateLight.pdf}
+  \caption{Rendering comparison with Gardner \emph{et al.}~\cite{Gardner17}, Neural Illumination~\cite{song2019neural} and EMLight~\cite{zhan2020emlight}. We render two teapots with a matte silver and a mirror material below each recovered/ground-truth illumination map. }
+  \label{fig:ball_comparions}
+\end{figure*}

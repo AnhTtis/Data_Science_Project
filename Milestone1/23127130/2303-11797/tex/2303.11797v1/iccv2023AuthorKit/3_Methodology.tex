@@ -1,0 +1,69 @@
+
+\section{Methodology}
+\subsection{Motivation and Overview}\label{motivation}
+Given an image $I$ and a set of candidate class categories $\{T(1), ..., T({N_\mathcal{C}})\} \in \mathcal{C}$, where $T(n)$ denotes textual description of $n$-th category and $N_\mathcal{C}$ is the number of classes, open-vocabulary semantic segmentation aims to assign a class label to each pixel in $I$. Different from classical semantic segmentation tasks~\cite{long2015fully, he2017mask, zhou2022rethinking, he2019adaptive, jin2021mining, yu2020context, yuan2020object}, open-vocabulary segmentation is additionally challenged by varying $\mathcal{C}$ at inference, which includes classes that were not observed during training. 
+
+In this paper, we aim to transfer the open-vocabulary capabilities of CLIP~\cite{radford2021learning} to enable our model to reason about relations between image semantics and arbitrary class labels, addressing the challenges of open-vocabulary semantic segmentation. To achieve this goal, we propose to jointly aggregate the image and text embeddings of CLIP and further enhance the aggregation by fine-tuning the image encoder. While it is a common approach to transfer the knowledge within large-scale models to tackle downstream tasks through fine-tuning the parameters~\cite{he2017mask,mensink2021factors}, existing approaches in this task have failed to effectively transfer their knowledge~\cite{zhou2022extract} due to several reasons. This includes the granularity gap between image-level supervision and pixel-level prediction, and catastrophic forgetting caused by direct optimization through feature embeddings~\cite{zhou2022extract}.
+
+To address the issues, we leverage insights from the training process of CLIP~\cite{radford2021learning} which uses a cosine-similarity map, \ie cost map.
+Our pilot experiment showed that using cost volume derived from dense image embeddings and text embeddings of CLIP as an alternative is effective, as demonstrated in Fig.~\ref{fig:conceptual_qual}, and thus  we introduce cost volume to our framework.
+Subsequently, we propose an aggregation module that incorporates both spatial and class aggregation to effectively capture relational information among inputs while promoting accurate matching between text and objects in the image, thereby reducing errors and inconsistencies in the matching costs, as shown in Fig.~\ref{fig:refinement_qual}. Finally, we introduce an efficient fine-tuning approach that not only provides improved performance, but also enhances accessibility. All these combined, we present \ours, \textbf{C}ost \textbf{A}ggrega\textbf{T}ion approach for open-vocabulary semantic \textbf{Seg}mentation.
+
+\subsection{Cost Computation and Embedding}
+To obtain dense CLIP features, we follow \cite{zhou2022extract} and modify the last layer of the image encoder.
+Given the modified CLIP image encoder $\Phi^V(\cdot)$ and the frozen text encoder $\Phi^L(\cdot)$, we extract the dense image features $D^V = \Phi^V(I)$ and the text features $D^L = \Phi^L(T)$, respectively. We use the image and text features $D^V(i)$ and $D^L(n)$, where $i$ denotes 2D spatial positions of feature embedding and $n$ denotes an index for a class, to compute a cost volume $C\in\mathbb{R}^{(H\times W)\times N_\mathcal{C}}$ by cosine similarity~\cite{rocco2017convolutional}. 
+Formally, this is defined as:
+\begin{equation}
+  {C}(i,n)=
+    \frac{D^V(i)\cdot D^L(n)}{\|D^V(i)\|\|D^L(n)\|}.
+\end{equation}
+To enhance the processing of cost in high dimensional feature space, we feed the cost volume to a single convolution layer that processes each cost slice $C(:, n)\in \mathbb{R}^{(H\times W)\times 1}$ independently to obtain initial cost volume embedding $F\in \mathbb{R}^{(H\times W)\times N_\mathcal{C} \times d_F}$, where $d_F$ is the cost embedding dimension, as shown in Fig.~\ref{fig:overall}. 
+
+\subsection{Cost Aggregation}
+Based on the insights from above, we use the constructed cost volume embedding and feed it to aggregation modules. 
+As it has been shown in previous studies that learning based on a matching cost within a regularized representation, such as the cosine-similarity map, can improve generalization ability and robustness to unseen domains \cite{cai2020matching,song2021adastereo,liu2022graftnet}, we find this approach valid. 
+
+Within our cost aggregation module, as shown in Fig.~\ref{fig:overall}, two separate aggregation strategies, \ie spatial and class aggregation, are designed to model interrelations across pixels and classes. This considers the distinct characteristic of each modality, such as spatial smoothness in an image or the permutation invariance among classes. Specifically, we first perform spatial aggregation and then class aggregation takes place, and interleave both aggregations $N_B$ times. In addition, we facilitate the cost aggregation process with embedding guidance that provide contextual information from two modalities. In the following, we explain each in detail.
+% \phseo{is affinity feature correct? I'm really confused with this term.} 
+\vspace{-10pt}
+\paragraph{Spatial aggregation.} Here, we reason about the spatial relations based on pixel-wise similarities computed between image and text embeddings. 
+%For this, we adopt Transformer~\cite{vaswani2017attention,liu2021swin} over CNNs for its adaptability of attention map to the contents~\cite{dai2021coatnet}\phseo{What does adaptability of attention map to the contents mean?}
+For this, we adopt Transformer~\cite{vaswani2017attention,liu2021swin} over CNNs for its adaptability to input tokens~\cite{dai2021coatnet}, while also having global~\cite{vaswani2017attention} or semi-global~\cite{liu2021swin,hong2022cost} receptive fields, which is more favorable to our goal to learn relations among all tokens.  In practice, we employ Swin Transformer~\cite{liu2021swin} for computational efficiency. We define this process as:
+\begin{equation}
+    {F}'(:, n) = \mathcal{T}^\mathrm{sa}(F(:, n)), 
+    \label{eq:spatial-aggregation}
+\end{equation}
+where $F(:,n)\in \mathbb{R}^{(H\times W)\times d_F}$, and $\mathcal{T}^\mathrm{sa}(\cdot)$ denotes a pair of two consecutive Swin transformer block for spatial aggregation, where the first block features self-attention within a local window, followed by the second block with self-attention within shifted window. Note that we treat $d_F$ as channel dimensions for each token, and attention is computed within individual classes separately. Intuitively, we perform spatial aggregation for each class to locate the features that will guide to accurate segmentation outputs. 
+
+\vspace{-10pt}
+\paragraph{Class aggregation.}
+Subsequent to spatial aggregation, class aggregation is designed to explicitly capture relationships between different class categories. However, this task presents two challenges that need to be addressed: the variable number of categories $\mathcal{C}$ and their unordered input arrangement. To address these challenges, we employ a Transformer~\cite{vaswani2017attention} model without position embedding for aggregation.
+This approach enables the handling of sequences of arbitrary length and provides the model with permutation invariance to inputs. This process is defined as: 
+\begin{align}
+    {F}''(i, :) = \mathcal{T}^\mathrm{ca}({F}'(i, :)),
+    \label{eq:class-aggregation}
+\end{align}
+where $F'(i,:)\in \mathbb{R}^{N_{\mathcal{C}}\times d_F}$, and $\mathcal{T}^\mathrm{ca}(\cdot)$ denotes a transformer block for class aggregation. Although we can employ the same Swin Transformer~\cite{liu2021swin} as for the spatial aggregation, we instead employ a linear transformer~\cite{katharopoulos2020transformers} as we do not need to consider spatial structure of the input tokens in this aggregation. Also, it offers a linear computational complexity with respect to the number of the tokens, allowing efficient computation. 
+
+\vspace{-10pt}
+\paragraph{Embedding guidance.}
+As a means to enhance cost aggregation process, we additionally leverage feature embeddings to provide spatial structure or contextual information of the inputs. Intuitively, we aim to guide the process with feature embeddings, based on the assumption that visually or semantically similar input tokens, e.g., color or category, have similar matching costs, inspired by cost volume filtering~\cite{hosni2012fast,sun2018pwc} in stereo matching literature~\cite{scharstein2002taxonomy}.
+% \phseo{hard to understand this statement.}. 
+Specifically, the visual embeddings $E^V$ and the text embedding $E^L$ are extracted from the additional feature backbone and CLIP text encoder, respectively, followed by a linear projection and concatenation to the input sequence. When extracting $E^V$, we avoid using the CLIP image encoder because of the potential hindrance to generalization ability when directly utilized, as discussed in Fig.~\ref{fig:conceptual_qual}. Accordingly, we redefine Eq.~\ref{eq:spatial-aggregation} and Eq.~\ref{eq:class-aggregation} as:  
+\begin{equation}
+\begin{split}
+    &{F}'(:, n) = \mathcal{T}^\mathrm{sa}([F(:, n);\mathcal{P}^V(E^V)]),\\
+    &{F}''(i,:) = \mathcal{T}^\mathrm{ca}([F'(i,:);\mathcal{P}^L(E^L)]),
+\end{split}
+\end{equation}
+where $[\cdot]$ denotes concatenation, $\mathcal{P}^V$ and $\mathcal{P}^L$ denote linear projection layer, $E^V\in \mathbb{R}^{(H\times W)\times d_E}$, and $E^L\in \mathbb{R}^{N_{\mathcal{C}}\times d_E}$, where $d_E$ denotes the feature dimension. Notably, we only provide  feature embeddings to query and key as we find this is sufficient for embedding guidance. 
+
+\subsection{Upsampling Decoder}
+Given the aggregated cost volume, we aim to generate the final segmentation mask that captures fine-details via upsampling. The simplest approach would be using handcrafted upsamplers, \ie bilinear upsampling, but we propose to conduct further aggregation within the
+decoder with light-weight convolution layers. Additionally, we provide feature embeddings from the feature backbone 
+that act as an effective guide to filter out the noises in the cost volume and exploit the higher-resolution spatial structure for preserving fine-details.
+
+Specifically, we leverage the multi-level feature embeddings readily extracted in embedding guidance for cost aggregation. Following the approach presented in~\cite{hong2022cost}, we employ bilinear upsampling on the cost volume and concatenate it with the corresponding level of feature map, followed by a convolutional layer. We iterate this process $N_U$ times, generating a high-resolution output that we feed into the prediction head for final inference.
+
+\subsection{Efficient Fine-Tuning of CLIP}
+During training, we train our model in an end-to-end manner, including the CLIP image encoder. However, fine-tuning the encoder, which can scale up to hundreds of millions of parameters, can be computationally expensive and memory-intensive. Moreover, since our objective is to effectively transfer the open-vocabulary capability of CLIP, performance should not be compromised as well. To this end, we freeze the MLP layers in the encoder, also known as Feed-Forward Networks (FFNs), and only optimize the layers responsible for spatial interaction, such as the attention layers and positional embeddings~\cite{vaswani2017attention}, based on the insight that tuning these layers is sufficient for transferring image-level representations to pixel-level. With this approach, we achieve higher efficiency and improved performance over full fine-tuning.

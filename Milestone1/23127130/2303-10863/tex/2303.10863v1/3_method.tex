@@ -1,0 +1,163 @@
+\section{Method}
+
+\subsection{Problem Formulation}
+Given an image, SGG aims to not only detect the objects in the target image but also predict the predicate between them.
+In this paper, we focus on few-shot learning of SGG. 
+Given a set of object category $\Set{C}$ and a set of predicate category $\Set{R}$, the predicate categories are split into the novel set $\Set{R}^{N}$ and the base set $\Set{R}^{B}$ (\ie, $\Set{R} = \Set{R}^{B} \cup \Set{R}^{N}$). The training set only includes samples of base categories.
+During evaluation, each predicate category $r \in \Set{R}$ is provided an annotated support example set $\Set{S}_r$ with $K$ shots (\ie, $K$ support images with only 1 annotated triplet for each predicate)\footnote{In the following, we use ``a support sample" (or ``a support triplet") to denote the annotated triplet in the support image of one predicate type.\label{footnote:sample}}. 
+And for each support triplet $\left \langle s,r,o \right \rangle \in \Set{S}_r$, it is provided with category annotations of subject and object $ c_s, c_o \in \Set{C} $, as well as the bounding boxes $b_s, b_o$ of the object pairs.
+Given a query image $I$ and the support set of one category $r$, FSSGG aims to detect all the target relationship triplets belonging to the support category $r$ in the query image.
+Following the two-stage SGG pipeline, we first detect a set of proposals $ \Set{B}$ with a pretrained object detector, and for each pair of proposal $b_s,b_o \in \Set{B}$, we encode its embedding and compute similarity with each support triplet of $r$.
+To mimic the evaluation setting, the support set and query set is usually randomly sampled in one batch during training.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/pipeline2.pdf}
+    \caption{The pipeline of our method. We generate the representations for both query and support samples with a projection network and then estimate the distance between them by a metric learner.}\label{fig:pipeline}
+  \end{figure}
+
+\subsection{Pipeline Overview}
+Following previous metric-based FSL works~\cite{snell2017prototypical,zhou2022learning,fan2020few}, we aim to construct a projection network to learn effective latent representations of visual relationships, as shown in Figure~\ref{fig:pipeline}.
+Then, we measure the distance between the representations of the query and support samples with a metric learner to estimate whether they belong to the same category. 
+To model useful information from multiple cues, our projection network contains a visual encoder, a context encoder, and a proposed prototype encoder.
+
+
+\textbf{Visual Encoder.}
+Given a pair of proposals $b_s$ and $b_o$ in an image $I$, we extract the visual feature of each proposal with a visual encoder $\text{Enc}_{vis} $: 
+\begin{equation} \label{eq:visual}
+    \Mat{f}^{v}_{s} = \text{Enc}_{vis} \left (b_s \right ), \quad \Mat{f}^{v}_{o} = \text{Enc}_{vis} \left (b_o \right ), 
+\end{equation}
+
+\textbf{Context Encoder.}
+As the predicate prediction for a pair of objects is highly relevant to the scene context information (\eg, spatial positions of objects and global information about other detected objects in the image), we follow previous SGG works and exploit a context encoder to extract contextual information in the image. Given an arbitrary context encoder $\text{Enc}_{con} $ (\eg, Motifs~\cite{zellers2018neural}, VCTree~\cite{tang2019learning}), we can obtain the context feature of one object pair $s$ and $o$:
+\begin{equation}
+    \Mat{f}^{con}_{s\rightarrow o} = \text{Enc}_{con} \left ( I, b_s, b_o, \Set{B}_{/so} \right ),
+\end{equation}
+
+where $ \Set{B}_{/so} $ is the set of other detected objects in image $I$.
+
+\textbf{Prototype Representation.}
+To model multiple semantics of predicates, we devise a decomposed prototype encoder $\text{Enc}_{pro}$ to generate decomposed prototype representations for the input object pair $s$ and $o$:
+\begin{equation}
+    \Mat{f}^{pro}_{s\rightarrow o} = \text{Enc}_{pro} \left (b_s, b_o \right ),
+\end{equation}
+and more details about $\text{Enc}_{pro}$ are explained in Sec~\ref{sec:prototype}.
+
+\textbf{Feature Aggregation.}
+After obtaining these encoded features, we integrate them with an aggregator $\text{AGG}$:
+\begin{equation}\label{eq:agg}
+    \Mat{F}_{s\rightarrow o} = \text{AGG} \left ( \Mat{f}^{v}_{s}, \Mat{f}^{v}_{o}, \Mat{f}^{con}_{s\rightarrow o}, \Mat{f}^{pro}_{s\rightarrow o} \right ).
+\end{equation}
+Here, we simply exploit a two-layer MLP as our aggregator, leaving other fancy operations as future work.
+
+\textbf{Metric Learning.}
+After obtaining the representations of query sample $i$ (with object pair $\left \langle s, o \right \rangle $)\footnote{For simplicity, we omit the subscript $ \scriptsize{s \to o }$ for object pair $s,o$ in query sample $i$ here, and we omit all the pair subscripts in the following.} and support triplet\footref{footnote:sample} $j$, we compute their Euclidean distance following~\cite{snell2017prototypical}: 
+\begin{equation}
+    d_{i,j} = \left \| \Mat{F}^{Q}_i - \Mat{F}^{P}_j \right \| ^2, 
+\end{equation}
+where $\Mat{F}^{Q}_i$ and $\Mat{F}^{P}_j$ are the final representations of sample $i$ and $j$ computed by Eq.~\eqref{eq:agg}. After that, the common policy is to average the distances between the query sample $i$ and all the support samples of category $r$ to get the final scores between $i$ and the category $r$. And the distance is: 
+\begin{equation}\label{eq:metric}
+   d(i,r) =  \frac{1}{|S_r|} \sum_{j\in S_r} d_{i,j}.
+\end{equation}
+While in our method DPL, we will exploit an adaptive metric learner to compute the scores of query sample $i$ and the support category $r$. More details are in Sec~\ref{sec:prototype}.
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/prototype.pdf}
+    \caption{The overview of the construction process of our decomposed prototype representation. We first decompose the target predicate category into a set of prototype representations based on its support set. Given a query sample, we recombine the prototypes with adaptive weights by considering the subject-object pairs. The recombined feature is used to enhance the final representation of the query sample. The representation construction of support samples follows the same pipeline which is omitted in this figure. }
+\end{figure*}
+
+\subsection{Decomposed Prototype Learning}\label{sec:prototype}
+In this subsection, we will introduce the details of our proposed DRL paradigm. We first construct the decomposed semantic space for each predicate with the help of pretrained VL models. Then, we generate attended semantic prototype representations for each triplet sample to enhance its latent embedding. Lastly, we devise a metric learner to intelligently estimate the distance between query and support samples by assigning adaptive weights.
+
+\subsubsection{Prototype Generation}
+
+\textbf{Prompt Tokens.}
+Prompt tuning is an efficient way to transfer the knowledge of the large pretrained VL models into downstream tasks. In this paper, we introduce learnable prompts as indicators to help us construct the semantic space for each predicate with the power of VL models.
+As the semantics of one predicate are highly related to the subject-object context, we combine the subject and object category with the prompts to induce the semantic knowledge of predicates. To explore more compositions of subject-object context, we exploit the subjects and objects to generate prototypes separately.
+
+Specifically, we first define the contextual prompt tokens $\Mat{T}^{s}= [\Mat{t}^{s}_1, \cdots, \Mat{t}^{s}_{L} ]$ and $\Mat{T}^{o}= [\Mat{t}^{o}_1, \cdots, \Mat{t}^{o}_{L} ]$ for the subject and object separately, and $L$ is the length of prompt tokens. 
+Given a predicate category $r$ and its one support triplet $k$ with subject-object pairs $\left \langle s, o \right \rangle$, we exploit their annotated label words with our prompt tokens to construct our prompts:
+\begin{equation}
+    \Mat{p}^{s}_{k} = \left[\Mat{W}[s]; \Mat{W}[r]; \Mat{T}^{s} \right], \quad \Mat{p}^{o}_{k} = \left[\Mat{T}^{o}; \Mat{W}[r]; \Mat{W}[o] \right],
+\end{equation}
+where $\Mat{W}[s]$ and $\Mat{W}[o]$ are the category word embeddings for $s$ and $o$, respectively, and the $\Mat{W}[r]$ is the category word embeddings for predicate $r$.
+
+
+\textbf{Prototype Generation.}
+After obtaining all the composed prompts $\Set{P}$, we feed them into the text encoder of the VL model to extract the text embedding for each prompt:
+\begin{equation}
+    \Mat{h}^{s}_k = \text{Enc}_{txt} \left ( \Mat{p}^{s}_k \right ), \quad \Mat{h}^{o}_k = \text{Enc}_{txt} \left ( \Mat{p}^{o}_k \right ),
+\end{equation}
+where $\Mat{p}^{s}_k \in \Set{P}^{s}$ and $\Mat{p}^{o}_k \in \Set{P}^{o}$ are the generated prompt embeddings for the subject and object, respectively.
+The obtained text embeddings $\Mat{h}^{s}_k \in \Set{H}^{s}$ and $\Mat{h}^{o}_k \in \Set{H}^{o}$can be regarded as the extracted semantic knowledge from the VL model. 
+Then, we generate the prototypes from the text embedding $\Mat{h}_k$:
+
+\begin{equation}
+    \Mat{u}^{s}_{k} = \text{Gen}_s \left ( \Mat{h}^{s}_k \right ), \quad \Mat{u}^{o}_{k} = \text{Gen}_o \left ( \Mat{h}^{o}_k \right ),\label{eq:ProtoGen}
+\end{equation} 
+where $\text{Gen}_s$ and $\text{Gen}_o$ are two-layer MLPs for subject and object, respectively. And $\Mat{u}_{k}^{s} \in \Set{U}^{s}$ and $\Mat{u}_{k}^{o} \in \Set{U}^{o}$ are the generated prototypes.
+
+\subsubsection{Decomposed Prototype Representation}
+Each triplet sample of the predicate may have different semantics due to different subject-object pairs. Thus, we assign adaptive weights to each prototype for each sample.
+Given a query sample $i$ with subject $s$ and object $o$, we first project the encoded visual feature $\Mat{f}^{v}_s$ and $\Mat{f}^{v}_o$ (computed from Eq.~\eqref{eq:visual}) into the prototype space:
+\begin{equation}
+    \Mat{v}_s = \text{Map}_s \left ( \Mat{f}^{v}_s \right ), \quad \Mat{v}_o = \text{Map}_o \left ( \Mat{f}^{v}_o \right ),
+\end{equation}
+where $\text{Map}_s$ and $\text{Map}_o$ are both two-layer MLPs. 
+
+Then, we compute the similarity score of each text embedding of the prototype $k$ and visual embedding of query sample $i$ for both subject and object:
+\begin{equation}
+a_{k} = \text{Att} \left ( \Mat{v} \odot \Mat{h}_k \right ), 
+\end{equation}
+where $\text{Att}$ is a two-layer MLP, $\odot$ is element-wise production, and $N$ is the number of prototypes, we omit the subscripts for subject and object here. We normalize the scores $a_{*}$ with softmax to get the attention score $\tilde{a}_{*}$. 
+
+Later, we aggregate the generated prototype $\tilde{\Mat{u}} $ for subject and object with normalized attention scores $\tilde{a}$:
+\begin{equation}
+    \tilde{\Mat{u}}^{s} =  { \sum_{k=1}^{|\Set{P}|}} \tilde{a}^{s}_{k} \Mat{u}^{s}_k, \quad \tilde{\Mat{u}}^{o} =  { \sum_{k=1}^{|\Set{P}|}} \tilde{a}^{o}_{k} \Mat{u}^{o}_{k},
+\end{equation}
+where $|\Set{P}|$ is the number of prototypes. After that, we concatenate the prototype features for each sample:
+\begin{equation}
+    \Mat{f}^{pro}=[\tilde{\Mat{u}}^{s}; \tilde{\Mat{u}}^{o}],
+\end{equation} 
+and we will enhance the final representation of query sample $i$ with generated $\Mat{f}^{pro}$.
+
+
+\subsubsection{Metric Learner}
+After obtaining the distance between the query sample and each support sample, a naturally exploited approach in previous works is to average these distances. 
+However, as the visual appearance of the relationship triplets differs greatly under different subject-object pairs, the predictions computed by averaging the distance in Eq.~\eqref{eq:metric} will be disturbed by samples with large differences, resulting in wrong predictions. Therefore, given a query sample $i$, we propose to pay higher attention to the support samples with more similar subject-object pairs with $i$ when making predictions.
+Here, we model the similarity between subjects and objects with the text embeddings of pretrained VL models.
+
+We first send the predicted category of the subject and object with a pre-defined prompt\footnote{We exploit a fixed prompt ``\texttt{This is a photo of [cls]}" here and \texttt{[cls]} is the word tokens of predicted object categories.} into the text encoder of the VL model and get text features. Then, we compute the similarity of subject and object text embeddings between the query sample and each support sample. Last, we multiply the scores to get the final weights:
+\begin{equation}
+    \hat{e}_{i,j} =  e^{s}_{i,j} * e^{o}_{i,j},
+\end{equation}
+where $e^{s}_{i,j}$ and $e^{o}_{i,j}$ are the similarity scores for the subject and object between query sample $i$ and support sample $j$. And we normalize $\hat{e}_{i,*}$ with softmax to get $\tilde{e}_{i,*}$.
+
+The final distance between query sample $i$ and support samples of predicate $r$ is combined as:
+\begin{equation}
+    \tilde{d}(i,r) = \sum_{j \in \Set{S}_{r}}\tilde{e}_{i,j}d_{i,j},
+\end{equation}
+where $\Set{S}_{r}$ is the support set of predicate category $r$.
+
+
+
+\subsection{Model Training}
+During training, we randomly sample the categories $R_b$ in one batch, and for each category $r$, we randomly select a part of its positive samples as the support set, while the rest positives are regarded as query samples. 
+For each query sample $i$ in batch $\Set{D}_b$, we compute the loss by its distance with the positive $r$ and negative categories:
+\begin{equation}
+    \mathcal{L}_{rel} = - \sum_{i \in \Set{D}_b} \left ( \text{log}\frac{\text{exp}(-\tilde{d}(i,r))}{ {\textstyle \sum_{j \in \Set{R}_b}}\text{exp} (-\tilde{d}(i,j)) } \right ).
+\end{equation}
+
+To train the prototype space, we expect the predictions only with the prototype features can work as well as the final aggregated features. Therefore, we exploit Kullback Leibler (KL) divergence loss to make the output distribution of prototype features close to the final output:
+\begin{equation}
+    \mathcal{L}_{kl} = \sum_{i \in \Set{D}_b} \text{KL}(\hat{\Mat{y}}_i||\Mat{y}^{pro}_i),
+\end{equation}
+where $\Mat{y}^{pro}$ is the output distribution calculated only by prototype features $ \Mat{f}^{pro}$, and $\hat{\Mat{y}}_i$ is the output distribution with final aggregated representations $ \Mat{F}$.
+
+The total training loss of our method is as follows:
+\begin{equation}
+    \mathcal{L}=\mathcal{L}_{rel} + \mathcal{L}_{kl} + \mathcal{L}_{obj},
+\end{equation}
+where $\mathcal{L}_{obj}$ is cross entropy loss for object classification.
+

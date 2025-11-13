@@ -37,7 +37,7 @@ def check_sequence(base_dir: str, start_tail: int = 7856, end_tail: int = 9100):
     print(f"Present min: {min(tails)}, Present max: {max(tails)}")
 
     if missing:
-        print(f"Missing ({len(missing)}): {', '.join(f'{m:05d}' for m in missing[:50])}"
+        print(f"Missing ({len(missing)}): {', '.join(f'"{m:05d}"' for m in missing[:50])}"
               + (" ..." if len(missing) > 50 else ""))
     else:
         print("No missing IDs in range.")
@@ -58,4 +58,4 @@ def check_sequence(base_dir: str, start_tail: int = 7856, end_tail: int = 9100):
 
 if __name__ == "__main__":
     BASE_DIR = r"d:\Data\Learning\University\Year3\Intro to DS\Data_Science_Project\Milestone1\23127130"
-    check_sequence(BASE_DIR, start_tail=7856, end_tail=9100)
+    check_sequence(BASE_DIR, start_tail=7856, end_tail=12855)

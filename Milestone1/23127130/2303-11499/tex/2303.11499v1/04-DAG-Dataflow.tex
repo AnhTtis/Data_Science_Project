@@ -1,0 +1,130 @@
+\section{Exploiting Inter-Operation Reuse}
+\vspace{-1mm}
+\label{sec:dataflows}
+
+This section discusses the inter-operation reuse opportunities in the the dependency graph of tensor operations using a systematic methodology. It formulates a generalized set of inter-operation reuse patterns in an arbitrary dependency graph of tensor operations. 
+%We represent the application as a dependency graph, where the node represents an operation and an edge represents the tensor which is the output of the operation represented by the source node and is an input to the operation represented by the desitnation node. 
+For the purpose of this paper, the graph is directed and acyclic.
+
+\subsection{Generalizing Inter-op reuse patterns}
+\label{sec:patterns}
+We identify five major inter-operation patterns in an arbitrary tensor DAG. 
+%\TK{``There are five .. " or ``We identify five .." ? Also - point to the figure - esp as the color coding matches that, and in each pattern pls point to the figure as example}
+
+\textbf{Sequential} - The execution just takes place in an op-by-op function, although it maybe possible to reuse the data on-chip with Sequential pattern depending on the space in the buffer. There are generally no constraints on this type of pattern and this is the pattern used when none of the other patterns are possible. Also, this pattern does not give any benefit, and the output of the operation is both written and re-read from on-chip or off-chip depending on the capacity.
+
+\textbf{\textcolor{blue}{Pipelineable}} - A \textcolor{blue}{Pipelineable} reuse pattern can exist at the edge connecting two consecutive nodes of the tensor dependency graph. This is shown as a blue arrow in~\autoref{fig:inter-op-reuse}. This implies that it would be possible and efficient to reduce the memory traffic using pipelining. This is the traditional pipelining used between the two operations in prior works~\cite{flat,garg2021understanding,tangram,yan2020hygcn}. More than two operations could also be pipelined if the more than two consecutive nodes are connected by edges with {pipelineable} pattern. There are conditions to the \textcolor{blue}{pipelineable} pattern. For an example pair of Einsums ${Z_{m,n}=\sum_{k}A_{m,k}*B_{k,n}}$ and ${W_{o,n}=\sum_{j}C_{o,j}*Z_{j,n}}$, if the contracted rank in the producer ie. $K$ and the unshared rank in the consumer ie. $O$ are dominant ranks, then pipelining is not beneficial and can lead to severe under-utilization since with $K$ being dominant, the consumer waits for a meaningful data and with $O$ being dominant, the producer waits for the consumer to consume the data. We discuss 'dominance' further in~\autoref{sec:graph}. However, the {pipelineable} pattern does not guarantee pipelining unless additional conditions related to intra-operation dataflow are satisfied which we discuss in~\autoref{sec:gogeta}. If the intermediate tensor is no longer required, then pipelining gives the full benefit of having to avoid reading and writing the intermediate tensor into the memory. However, if the tensor $Z$ in the above example is required in the future, there is an additional need to perform \textcolor{BrickRed}{pipeline\_with\_writeback} or \textcolor{cyan}{pipeline\_with\_hold}. 
+
+
+\textbf{\textcolor{BrickRed}{Pipeline\_with\_writeback}} -  Traditional operation pipelining completely consumes the intermediate tensor, and replaces it by the stage tensor, if the data is no longer needed. However, the intermediate tensor can be used in a future computation, a pattern that has not been observed in previously popular applications like Attention, Graph Neural Networks etc. This is represented by the transitive edge (discussed in \autoref{sec:graph}) on the graph. Therefore this tensor needs to be stored in an on-chip SRAM buffer or DRAM depending on the capacity. This way, we need to write the tensor back to the SRAM/backing store but we still avoid having to read the tensor into the consecutive operation so it still provides half the benefit of ~\textcolor{blue}{pipelineable} pattern over the sequential pattern. \textcolor{BrickRed}{Pipeline\_with\_writeback} pattern can be seen in Conjugate Gradient as~\autoref{fig:inter-op-reuse} shows in brick red color.
+
+\textbf{\textcolor{cyan}{Pipeline\_with\_hold}} - As discussed above, we may need a pipelined tensor in the future. But there is a possibility that the complete chain until the future reuse of this tensor is pipelineable. In that case, we can bypass the requirement to write the complete tensor back into the backing store or the on-chip SRAM and we could just hold the tensor until the operation where we need to use the tensor reaches the particular stage. This essentially depends on the reuse distance between the operand nodes. This pattern provides the full benefit of pipelining but requires additional occupancy in the register file or on the on-chip SRAM depending on the granularity of pipelining. This pattern can be used in ResNet~\cite{resnet} residual block with skip connections as~\autoref{fig:inter-op-reuse} shows in cyan color.
+
+\textbf{\textcolor{LimeGreen}{Parallel Multicast}} - It is also possible to reuse the a tensor into multiple parallel tensor operations, which we call \textcolor{LimeGreen}{Parallel\_multicast}. These parallel operations are non-transitive edges from the multicasting nodes to the directly connected nodes. This can be seen in Conjugate Gradient as~\autoref{fig:inter-op-reuse} shows in green color.
+
+\subsection{Node and Edge Attributes of Dependency Graph}
+\label{sec:graph}
+\vspace{-1mm}
+In this section, we discuss the various attributes of the nodes and the edges of the dependency graph that help determine the inter-operation reuse opportunities.
+
+\textbf{node.intra\_dataflow}: Dataflow within the operation that is represented by the node. It consists of loop order, parallelism and tiling strategies.
+
+\textbf{edge.inter\_datflow}: This represents one of the inter-operation patterns described in~\autoref{sec:patterns} except \textcolor{LimeGreen}{Parallel\_multicast} which is an attribute of the multicasting node and the non-transitive edges are marked automatically if the node is multicasting.
+
+\textbf{node.dominance}: This is important in determining pipelining opportunities between the two operations since the source node is checked for contraction dominance and the destination node is checked for dominance of unshared rank. We define dominance in both relative terms and absolute terms since relative terms affect the pipelining stages and length of the stage while absolute terms affect the occupancy of the intermediate data. If a rank is greater than 1000 AND the ratio of the rank to the other ranks is more skewed than 100:1, the rank is considered as dominant. This attribute can take four values 'U' (uncontracted rank is dominant), 'C' (contracted rank is dominant), 'bal' (All ranks are not too small and none of them is dominant, minimum value of the rank is 50) and 'small' (all ranks are non-dominant and one of them is less than 50).
+
+\textbf{Critical Path/Longest path}: It is the longest path between first and the last node. Intuitively, its the path that moves forward rather than branching out. $longestpath(edge)$ represents the portion of the critical path between source and destination node of that edge.
+
+\textbf{edge.isTransitive}: This checks whether the edge is transitive or not. A transitive edge is an edge which is not on the critical path but the nodes it connects are on the critical path. For example, in the conjugate gradient iteration shown in~\autoref{fig:inter-op-reuse}, both the red edges are transitive edges, since they connect nodes on critical path but are not themselves on it. A transitive edge indicates an output of an operation that will be used later. For a \textcolor{blue}{pipelineable} pattern, transitive edge represents the additional \textcolor{BrickRed}{writeback} or \textcolor{cyan}{hold} pattern.  
+
+\textbf{node.numcast}: The number of non-transitive edges originating from the node.
+
+\insertFigure{inter-op-reuse}{Output of~\autoref{alg:inter-op} using colored edges. Letters in the node denote dominance, 'U' means uncontracted, 'C' means contracted and 'bal' means all ranks are moderately big. Note that first tensor is uncontracted dominant since we compress the K rank (CSR format).\vspace{-1mm}}
+
+\textbf{node.parallel\_multicast}: Represents that the node has parallel multicast opportunities for its output. All non-transitive edges from the node depict multicasting of the output to multiple operations and are colored green in~\autoref{fig:inter-op-reuse}.
+
+\textbf{edge.src and edge.dest}: Represent the source and the destination nodes of the edge.
+
+\textbf{edge.tensor}: The tensor represented by the edge.
+
+\textbf{node.op}: The operation of the node. Tensor\_mac denotes tensor multiplication or tensor addition/subtraction.
+
+\textbf{edge.tensor.ranks}: Ranks of the edge.tensor
+
+\textbf{edge.tensor.swizzled}: A tensor is swizzled when its read in the opposite order as it was previously written. For example, a tensor $P$ in row-major order but read in the N-major order is considered swizzled. A tensor is also said to be swizzled when the transpose is read in the same order as the tensor. For example, if the tensor $P$ with ranks M,N is written in an M-major order and $P^T$ is also read in the M-major order. Swizzling is determined from the relative order of the ranks in the loop order of the source and the destination of the edge. Swizzling of the shared ranks is unacceptable if the inter\_dataflow of the edge is \textcolor{blue}{pipelineable} or \textcolor{cyan}{pipeline\_with\_hold}. It incurs a penalty incase of \textcolor{BrickRed}{pipeline\_with\_writeback} which reduces the favorability of that dataflow due to reduction in locality. This is further discussed in~\autoref{sec:gogeta}.
+
+\subsection{Inter-operation Reuse Determination Algorithm}
+\vspace{-1mm}
+\input{algorithm/interop.tex}
+
+
+~\autoref{alg:inter-op} shows the methodology to mark the tensor dependency graph we reuse patterns. A node which has more than one non-transitive edges can multicast its output into more than one parallel operations and thus all the non-transitive edges from that node have the~\textcolor{LimeGreen}{parllel\_multicast} pattern. A non-transitive edge where the source node is uncontracted dominant and the destination is unshared dominant, that edge has a~\textcolor{blue}{pipelineable} pattern. Note that~\textcolor{blue}{pipelineable} inter-operation pattern does not guarantee pipelining since it also depends on the order of the individual operations as we discuss in \autoref{sec:gogeta}. Any edge where the source node is contracted dominant or the destination is unshared dominant, has a sequential inter-operation pattern. A transitive edge with uncontracted dominant source node could have~\textcolor{cyan}{Pipeline\_with\_hold} pattern, if all the edges on the corresponding critical path are pipelienable, otherwise it has the~\textcolor{BrickRed}{Pipeline\_with\_writeback} pattern.
+
+Next, we focus on~\DataflowName mapping strategies for an arbitrary DAG of tensors. %Note, while this graph level formulation in this section is generalizable over all kind of tensor operations of any arithmetic intensity, the next section focusses more on arbitrary DAG of low intensity GEMMs and some of the design decisions are made considering the low intensity of individual GEMMs.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\begin{comment}
+%\vspace{-1mm}
+\section{Insights and Solution}
+\label{sec:solution}
+%\vspace{-2mm}
+\insertWideFigure{results}{Maximum possible Arithemtic Intensity assuming 100\% reuse (Unit is Number of Multiplications/Element Access) for a) SpMM individual operation b) DenseGEMM individual operation c) 1 iteration of CG loop for varying RHS\vspace{-2mm}}
+
+\subsection{Dataflow Considerations}
+
+We explore the various reuse opportunities that CG algorithm offers which would determine the data orchestration.
+
+\subsubsection{Intra-operation Reuse Opportunities}
+We saw that reuse opportunities within a operation are less compared to traditional DNNs due to the low arithmetic intensity. Similar to the traditional DNNs, some reuse in the GEMMs can be achieved by using temporally local register files in the PEs or spatially, through multicasting or peer-peer forwarding. Prior works like Alrescha~\cite{asgari2020alrescha} have proposed techniques to extract locality from dense regions of the sparse matrices.
+
+\subsubsection{Inter-operation Reuse Opportunities Within the CG Loop}
+Inter-operation reuse can be achieved by reusing the portion of the output of the first operation immediately into the next operation. The design-space of even two of these \textit{pipelined} operations is non-trivial owing to the inter-dependence of the intra-operation dataflows~\cite{garg2021understanding}. However, Conjugate Gradient offers immense pipelining opportunities within one loop iteration of CG Algorithm in ~\autoref{alg:cg_einsum}. Matrix $A$ is the input for every iteration and has to be read once. Every CG loop iteration has dynamically generated matrices $R^{k-1}, P^{k-1}, (R^{k-1})^T, (P^{k-1})^T$ and $X^{k-1}$ as the inputs and $R^k, P^k, (R^k)^T, (P^k)^T$ and $X^k$ as the outputs for the loop. Rest of the intermediate variables (or variable product expressions) are consumed within the single loop iteration. Since, the memory footprint of inputs and outputs to the loop is low, theoretically, the reuse benefit of inter-operation pipelining is high.
+
+\subsubsection{Reuse opportunities between Multiple Iterations of the CG loop}
+At an even further granularity, the theoretical reuse across iterations scales. On unrolling the CG for loop $iter$ times, the inputs to a big loop iteration are $A, R^{k-iter}, P^{k-iter}, (R^{k-iter})^T, (P^{k-iter})^T$ and $ X^{k-iter}$ while the outputs are $R^k, P^k, (R^k)^T, (P^k)^T$ and $X^k$. Since all of the input/output variables to the CG loop are dynamically generated and since the only input from the application side $A$ is same across all iterations, the memory accesses in an ideal case are the same regardless of $iter$. Thus maximum achievable arithmetic intensity scales. This kind of a reuse is useful for CG algorithm with RHS=1 and it is achievable due to less memory footprint of that CG algorithm.
+
+%\vspace{-0.5mm}
+
+\subsection{Microarchitectural Considerations}
+
+%vspace{-0.5mm}
+
+
+There are multiple possible hardware implementations for the dataflows we explore. However, CPUs and GPUs owing to their implicit data orchestration are inefficient since the locality in the HPCG workloads is poor. Moreover, the inter-operation data communication would happen through the memory hierarchy which is expensive.
+
+Spatially programmed accelerators (or Dataflow Accelerators) on the other hand enable efficient pipelining since they convert these cache accesses into direct communication. However, within, spatial accelerators, large fixed dataflow DNN acceelrators like Google TPU~\cite{tpu-isca} and NVDLA~\cite{nvdla} are optimized for intra-operation reuse which is low in the HPCG workloads. We aim to propose a substrate with small reconfigurable GEMM engines for individual operation execution and focus on the buffer hierarchy and interconnect that optimizes inter-operation communication.
+
+Using programmable scratchpads would allow us to have flexible partitions for various variables and would also allow a more explicit control over the data orchestration~\cite{buffets}. Moreover, support for ping-pong buffering at various granularities would enable us coarse-grained pipelining in addition to the fine-grain pipelining and would also allow access of certain variables used in multiple iterations, for example, $R^{k-1}$ which are required even after $R^k$ is generated.
+
+%\vspace{-1mm}
+
+\subsection{Conjugate Gradient Algorithm Variants}
+We also plan to support variants of conjugate gradient algorithm, for example Pre-conditioned conjugate gradient algorithm an  (PCG)~\cite{bramble1988preconditioning} which uses pre-conditioning to achieve faster convergence and BiCGStab~\cite{van1992bi} which extends conjugate gradient to non self-adjoint $A$ matrices.
+
+\end{comment}

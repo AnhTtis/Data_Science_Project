@@ -1,0 +1,118 @@
+\section{Technical Approach}
+
+In the following sections, we first describe the network architecture along with the pretraining procedure on a source domain. Then, we introduce \net and provide detailed explanations of all contributions.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Network Architecture and Pretraining}
+\label{ssec:ta-network-pretraining}
+
+In this section, we detail the network architecture of our proposed \net and the loss functions that we employ during the initial training phase.
+
+{\parskip=3pt
+\noindent\textit{Network Architecture:}
+We build our network following the common scheme of unsupervised monocular depth estimation leveraging two separate networks that we refer to as DepthNet and PoseNet as depicted in \cref{fig:overview}. Similar to \mbox{CL-SLAM}~\cite{voedisch2023continual}, for an image triplet $\{ \mathbf{I}_{t-2}, \mathbf{I}_{t-1}, \mathbf{I}_t \}$ we use Monodepth2~\cite{godard2019digging} to jointly predict a dense depth map $\mathbf{D}_{t-1}$ of the center image and the camera motion with respect to both neighboring frames, \ie, $\mathbf{O}_{t-2 \shortto t-1}$ and $\mathbf{O}_{t-1 \shortto t}$. In \net, we then output the latter as the VO estimate. In particular, we use an implementation comprising two separate ResNet-18~\cite{he2016deep} encoders for the DepthNet and the PoseNet.
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+{\parskip=3pt
+\noindent\textit{Source Domain Pretraining:}
+To initialize \net, we perform unsupervised training on a source domain $\mathcal{S}$ in an offline manner. In detail, we exploit the photometric reprojection loss $\mathcal{L}_\mathit{pr}$ and the image smoothness loss $\mathcal{L}_\mathit{sm}$ to train the DepthNet and the PoseNet~\cite{godard2019digging}. We additionally supervise the PoseNet with scalar velocity readings from the vehicle's IMU~\cite{guizilini20203d}. The applied velocity supervision term $\mathcal{L}_\mathit{vel}$ enforces metric scale-aware odometry estimates. Thus, our total loss is composed of three terms:
+\begin{equation}
+    \label{eqn:total_loss}
+    \mathcal{L} = \mathcal{L}_{pr} + \gamma \mathcal{L}_{sm} + \lambda \mathcal{L}_{vel},
+\end{equation}
+with weighting factors $\gamma$ and $\lambda$.
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Online Continual Learning}
+\label{ssec:ta-continual-learning}
+
+After pretraining on a source domain $\mathcal{S}$, we use \net to perform online continual learning on an unseen target domain $\mathcal{T}$. As illustrated in \cref{fig:overview}, each new RGB image triggers the following steps:
+\begin{enumerate}[label={(\arabic*)}, topsep=0pt, noitemsep]
+    \item Create a data triplet comprising the new frame $\mathbf{I}_t$ and the two previous frames $\mathbf{I}_{t-1}$ and $\mathbf{I}_{t-2}$ along with the corresponding IMU readings.
+    \item Check whether this triplet should be added to the replay buffer using the proposed diversity-based update mechanism.
+    \item Sample from the replay buffer and combine the samples with the previously generated data triplet.
+    \item Estimate the depth map $\mathbf{D}_{t-1}$ and the camera motions $\mathbf{O}_{t-2 \shortto t-1}$ and $\mathbf{O}_{t-1 \shortto t}$.
+    \item Compute the loss defined in \cref{eqn:total_loss} and update the network weights via backpropagation.
+    \item Repeat steps (4) and (5) for $c$ iterations.
+    \item Output $\mathbf{O}_{t-1 \shortto t}$ as the odometry estimate.
+\end{enumerate}
+
+{\parskip=3pt
+\noindent
+In the following, we provide more details on the proposed replay buffer and the online continual learning strategy of \net. Finally, we propose an asynchronous version of \net that separates the motion estimation from the network update step allowing continuous inference.
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% {\parskip=3pt
+% \noindent\textit{Replay Buffer:}
+\subsubsection{Replay Buffer}
+As outlined in \cref{sec:introduction}, previous works~\cite{kuznietsov2021comoda, voedisch2023continual} typically assumed an infinitely sized replay buffer without considering the limited storage capacity on robotic platforms or mobile devices. To address this issue, we use a replay buffer with a fixed maximum size and propose an image diversity-based update mechanism that is comprised of two steps shown in \cref{fig:replay-buffer}. First, determine whether to add the current online data into the replay buffer and, second, if adding the data results in exceeding the predefined buffer size, select a sample that will be removed from the buffer.
+
+Inspired by the loop closure detection in visual SLAM~\cite{li2021deepslam, voedisch2023continual}, we interpret the cosine similarity between image feature maps as a distance measure between two frames $\mathbf{I}_1$ and $\mathbf{I}_2$:
+\begin{equation}
+    \text{sim}_{\cos} = \cos \left( \text{feat}(\mathbf{I}_1), \text{feat}(\mathbf{I}_2) \right),
+\end{equation}
+where $\text{feat}(\cdot)$ denotes the respective image features.
+In order to determine whether adding a new sample would increase the diversity of the replay buffer, we compute its cosine similarity with respect to all samples that are already in the buffer and take the maximum value.
+\begin{equation}
+    \text{sim}_\mathbf{B}(\mathbf{I}_t) = \max_{\mathbf{I}_i \in \mathbf{B}} \cos \left( \text{feat}(\mathbf{I}_t), \text{feat}(\mathbf{I}_i) \right),
+\end{equation}
+where $\mathbf{I}_i \in \mathbf{B}$ refers to the current content of the buffer. If $\text{sim}_\mathbf{B}(\mathbf{I}_t) < \theta_\mathit{th}$, the data triplet associated with $\mathbf{I}_t$ is added to the replay buffer.
+In case this results in a buffer size larger than the allowed size, we have to remove a sample from the buffer. Instead of using random sampling, we remove the sample that yields maximal diversity within the remaining samples. Formally, we remove the following sample:
+\begin{equation}
+    \argmax_{\mathbf{I}_i \in \mathbf{B}} \sum_{\mathbf{I}_j \in \mathbf{B}} \cos \left( \text{feat}(\mathbf{I}_i), \text{feat}(\mathbf{I}_j) \right)
+\end{equation}
+
+As described in the next section, we do not update the encoder weights of \net. Therefore, to avoid the overhead of a separate network, we use the encoder of the DepthNet to generate image features.
+% }
+
+\begin{figure}
+    \centering
+    \captionsetup[subfigure]{justification=justified, font=small, width=1.25\linewidth}
+    \subfloat[An image is added to the replay buffer if the cosine similarity to the most similar image in the buffer is below a threshold, \eg, $\theta_\mathit{th} = 0.95$. Here, the image will be added since $0.92 < \theta_\mathit{th}$.]{%
+        \includegraphics[width=.8\linewidth]{figures/replay_buffer_add.pdf}}
+    \hfill
+    \subfloat[If adding a new image results in exceeding the allowed size of the replay buffer, the image that is the most similar with respect to all other images is removed. The table shows the cosine distance between two frames.]{%
+        \includegraphics[width=.8\linewidth]{figures/replay_buffer_remove.pdf}}
+    % \vspace*{-.5cm}
+    \caption{Diversity-based update mechanism of the replay buffer, separated in (a) adding and (b) removing a sample.}
+    \label{fig:replay-buffer}
+    % \vspace*{-.3cm}
+\end{figure}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% {\parskip=3pt
+% \noindent\textit{Adaptive Visual-Inertial Odometry:}
+\subsubsection{Adaptive Visual-Inertial Odometry}
+After the replay buffer has been updated, we construct a batch $\mathbf{b}_t$ consisting of the data triplet of the current image $\mathbf{I}_t$ and $N$ samples from the replay buffer.
+\begin{equation}
+    \mathbf{b}_t = \{ \mathbf{I}_t, \mathbf{I}_1, \mathbf{I}_2, \dots, \mathbf{I}_N \}
+\end{equation}
+To query the samples from the buffer, we use a uniform probability distribution across all samples and avoid selecting the same sample multiple times if the current size of the buffer is greater than the requested number of samples. To further increase diversity, we augment the replay images in terms of brightness, contrast, saturation, and hue value.
+Next, the batch $\mathbf{b}_t$, comprising RGB images and velocity measurements, is fed to the DepthNet to estimate a dense depth map of the center images and to the PoseNet to estimate the camera motion with respect to both neighboring frames. Following the same procedure as during pretraining (see \cref{ssec:ta-network-pretraining}), we then compute the loss $\mathcal{L}$ defined in \cref{eqn:total_loss} and perform backpropagation to update the network weights. Following McCraith~\etal~\cite{mccraith2020monocular}, we do not update the weights of the encoders but only of the decoders.
+% }
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% {\parskip=3pt
+% \noindent\textit{Asynchronous \net:}
+\subsubsection{Asynchronous \net}
+Finally, we propose an asynchronous variant of \net to address true continuous inference on robotic platforms in a real-time capable setting. Since multiple update iterations $c$ can result in a situation, in which the network update takes longer than the frame rate of the input camera stream, we also design a version that decouples the VO estimation from the CL updates. As illustrated in \cref{fig:asynchronous-version}, the \textit{predictor} continuously generates VO estimates for each incoming image. The \textit{learner} contains a copy of the network that is updated using the previously introduced online CL strategy but disregards images if the update step takes longer than the time until the next frame is available. Compared to caching frames, this strategy ensures that always the latest information is used to update the network. Then, after a given number of update cycles, the network weights are transferred from the \textit{learner} to the \textit{predictor}.
+We include implementations in both ROS and ROS2 in our published code base.
+% }
+
+\begin{figure}
+    \centering
+    \includegraphics[width=.85\linewidth]{figures/asynchronous_version.pdf}
+    % \vspace*{-.5cm}
+    \caption{Illustration of the asynchronous variant of \net. While the predictor generates visual odometry estimates in real time, the learner updates the network weights via backpropagation. After a given number of update cycles, the network weights are transferred from the learner to the predictor.}
+    \label{fig:asynchronous-version}
+    \vspace*{-.3cm}
+\end{figure}

@@ -1,0 +1,88 @@
+\documentclass[../main.tex]{subfiles}
+
+\begin{document}
+%Our proposed \MODEL introduces two novel characteristics to the well-known GPT-3 model. These two new characteristics are related to the model architecture and data processor respectively. For the first characteristic, we design a query layer on top of the Transformer architecture. For the second characteristic, we add end-of-document (EOD) symbols between documents to avoid topical contamination. 
+
+\subsection{Design Principles}
+
+\MODEL\ aims to achieve the following goals.
+\begin{itemize}
+  \item \textbf{Performance}: state-of-the-art NLP performance across multiple domains and tasks.
+  \item \textbf{Efficiency}: training trillion parameters model with maximum system performance on a modest cluster.
+  \item \textbf{Usability}: extendable to various domains or tasks, without need of retraining the model from scratch.
+  \item \textbf{Deployment}: easily customizable and deployable in various real-world settings.
+\end{itemize}
+
+Achieving all the above goals at the same time is very challenging. Considering the first goal, a language model that can generalize and perform well across domains should have a very large number of parameters and be trained on large amount of data according to the scaling law~\cite{2020Scaling,2022Training,clark2022unified}. However, training such a large model also means that a high-end cluster is mandatory, which somehow contradicts with the second goal. And the larger scale of the model also leads to increasing cost in deploying the trained model, which is related to the fourth goal.
+
+Considering the high computational cost incurring during the training phase, we want the resulted model to be practically usable and efficient in many real applications. With this goal in mind, we propose to train the model in multiple domains and make it further extendable to any number of domains in a continuous learning paradigm, subject to the computation resource.
+
+During training phase, the trillion parameters \MODEL\ model is fed with data from multiple domains. However, in the deployment phase, it is often unnecessary or even impossible to host the trillion parameters model for every application. Therefore, a model that allows for the grouping and separation of its parameters based on various training and deployment setups offers significant advantages.
+
+\subsection{PanGu-$\Sigma$ Architecture}
+
+\subsubsection{Overview}
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=0.75\textwidth]{sections/fig/zhoupingyi/pangu-sigma-arch.pdf}
+    \caption{PanGu-$\Sigma$ architecture. The architecture is mixed by dense transformer layers and sparse transformer layers. The lower M layers are dense layers shared across different domains. The upper N transformer layers' feed-forward part are sparsely activated via Random Routed Experts (RRE). Tokens from different domains have different embeddings. }
+    \label{fig:alpha_to_sigma}
+\end{figure*}
+
+\MODEL\ adopts an auto-regressive language modeling with stacked transformer decoder layers and a query layer on the top. The \MODEL\  architecture offers a flexible design. The bottom M layers are globally shared across all the domains, and the top N layers (including the query layer) are sparsely activated according to the domains of the input data. In each RRE layers, there are K experts in G groups in total, the number of experts in each group can be different. 
+This flexible design offers three mode.
+
+\begin{itemize}
+  \item \textbf{Mixed mode}: when $M > 0$, $N > 0$ and $K > 0$, model contains both sparse RRE layers and dense layers. 
+  \item \textbf{Dense mode}: when $N = 0$ or $K = 1$, the architecture will reduce to a dense PanGu-$\alpha$ model.
+  \item \textbf{Sparse mode}: when $M=0$ and $K > 1$, the architecture will be a sparse model.
+\end{itemize}
+ 
+ In this trillion-parameters modeling practice, We use the mixed configuration by placing the shared parameters close to the input layer (bottom) and all the sparsely activated expert parameters close to the output layer (top). In the model designing stage, we benchmark various experts placement strategies on smaller scale models and the selected strategy obtains the lowest language modeling perplexity. Our hypothesis is that bottom layers tends to learn general knowledge, while the specific knowledge is in a higher level of abstraction and is more appropriate to be learned by the top layers. In the token embedding layer, we choose to use different embedding matrices for different domains.
+
+\subsubsection{Random Routed Experts}
+
+In the top N layers, we replace each feed-forward sub-layer with multiple conditionally activated feed-forward sub-layers (experts), following the Mixture of Experts (MoE) paradigm.
+
+A key question in designing MoE architecture is how to route tokens to experts. For \MODEL\ , we propose a Random Routed Experts (RRE) mechanism, which is inspired by Hash Layers proposed in~\cite{2021Hash}.
+Specifically, RRE routes the tokens by IDs in a two-level manner. In the first level, the token is mapped to a group of candidate experts by domain, and then in the second level, one expert in this group is chosen according to a token-expert routing map to process the token. The routing map is randomly initialized and each layer has a independently initialized mapping for balancing the computation.
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=0.7\textwidth]{sections/fig/zhoupingyi/pangu-sigma-rre.pdf}
+    \caption{Random Routed Experts (RRE) in \MODEL\ . The token is first routed to a group of experts by domain, and then randomly routed to one of the experts in that domain. There is no learnable routers in the model.}
+    \label{fig:alpha_to_sigma}
+\end{figure*}
+
+RRE has several advantages over the commonly-used learnable routers.
+
+\begin{itemize}
+    \item During training, \MODEL\ allows for the addition, modification, or removal of domain-specific experts without any impact on the other experts. This attribute makes \MODEL\ highly flexible for alleviating the commonly encountered problem of catastrophic forgetting, which is crucial for life-long or continual learning.
+    \item In most real-world deployment setting, it is unnecessary or impractical to deploy a trillion-parameter model. \MODEL\ allows one to extract a sub-model for specific domains according to practical requirements and only deploy the sub-model. The sub-model may contain tens of billion parameters but still keep the predictive power of the original model on the target domains. Using this extract-and-deploy operation, we can easily deploy models for multiple industrial applications.
+    \item All the conventional MoE models rely on all-to-all communication collective operation to move data between experts residing on different devices. With our proposed two-level routing, experts from different domains don't exchange tokens, and all-to-all communication is constrained \emph{within} each domain. As a result, the expensive global all-to-all operation is reduced to grouped all-to-all, saving much communication volume and reducing the end-to-end training latency.
+    \item Learnable router needs more computation, and can suffer from problem of unbalanced loads across the experts, which typically makes the training process less stable. RRE avoids all the above pitfalls since no additional parameters are introduced and randomly initialized routing table helps to balance the loads on experts.
+\end{itemize}
+
+RRE requires a routing map which is initialized before pretraining, Algorithm 1 describes how we construct the routing table. 
+
+\begin{algorithm}[H]
+\caption{Routing table construction procedure in Random Routed Experts (RRE) mechanism.}
+ \SetKwInOut{Input}{input}\SetKwInOut{Output}{output}
+ \Input{number of domain $d$, number of layers $l$, number of experts per domain per layer $e$, size of vocabulary $V$.}
+ \Output{$T$, a tensor of shape $(d, l, V)$ acting as the RRE routing table.}
+ set random seed to 0 \;
+ initialize $T$ \;
+ initialize $\vec{u}$, a vector $[0, ..., V-1]$ of size $V$ \;
+ $\tilde{V} = \lfloor V / e \rfloor \cdot e$ \;
+ $\vec{u}[0: \tilde{V}-1] = \lfloor\vec{u}[0: \tilde{V}-1] / e  \rfloor$ \;
+ $\vec{u}[\tilde{V}: V-1] = [0, ..., V -\tilde{V} -1 ] $ \;
+  
+ \For{$j \leftarrow 0 $ \KwTo $l - 1$}{
+ \For{$i \leftarrow 0 $ \KwTo $d - 1 $}{
+    shuffle $\vec{v}$, a vector $[0, ..., V-1]$ of size $V$ \;
+    $T[i][j][\vec{v}] = \vec{u} + i * e $ \;
+  }
+ }
+\end{algorithm}
+\end{document}

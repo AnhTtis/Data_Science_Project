@@ -1,0 +1,364 @@
+We now provide a framework based on \emph{variational autoencoders} \citep{DBLP:journals/corr/KingmaW13} that allows us to learn a discrete latent space model of $\mdp$ through the interaction of the agent executing a pre-learned RL policy $\policy \in \mpolicies{\mdp}$ with the environment.
+Concretely, we seek a discrete latent space model $\tuple{\latentmdp_{\decoderparameter}, \embed_{\encoderparameter}, \embeda_{\encoderparameter, \decoderparameter}}$ such that $ \latentmdp_{\decoderparameter} = \tuple{\latentstates, \latentactions, \latentprobtransitions_{\decoderparameter}, \latentrewards_{\decoderparameter}, \latentlabels_{\decoderparameter}, \atomicprops, \zinit}$.
+We propose to learn the parameters $\tuple{\encoderparameter, \decoderparameter}$ of an \emph{encoder} $\encoder$ and a \emph{behavioral model} $\decoder$ from which we can retrieve
+(i) the embedding functions
+$\embed_{\encoderparameter}$ and $\embeda_{\encoderparameter, \decoderparameter}$,
+(ii) the latent MDP components $\latentprobtransitions_{\decoderparameter}$, $\latentrewards_{\decoderparameter}$, and $\latentlabels_{\decoderparameter}$,
+and (iii) a latent policy $\latentpolicy_\decoderparameter \in \latentmpolicies$, via
+$
+    \min_{\decoderparameter} \divergence{\mdp_\policy}{\decoder},
+$
+where $\divergencesymbol$ is a discrepancy measure.
+Intuitively, the end goal is to learn
+(i) a discrete representation of $\states$ and $\actions$
+(ii) to mimic the behaviors of the original MDP over the induced latent spaces, thus yielding a latent MDP with a bisimulation distance close to $\mdp$, and
+(iii) to \emph{distill} $\policy$ into $\latentpolicy_{\decoderparameter}$. %\todo{Removed the sentence about compressing, it gives the wrong intuition I feel (it is actually an abstraction)}
+%, i.e., to \emph{compress} $\policy$ over these latent spaces.
+In the following, we distinguish the case where we only learn $\latentstates$, with $\latentactions = \actions$ (in that case, $\actions$ is assumed to be discrete), and the one where we additionally need to discretize the set of actions and learn $\latentactions$.
+
+\subsection{Evidence Lower Bound}
+In this work, we focus on the case where $\dklsymbol$ is used as discrepancy measure: the goal is optimizing $\min_{\decoderparameter}
+\dklsymbol(\mdp_{\policy} \parallel \decoder)$ or equivalently maximizing the marginal
+% \emph{log-likelihood of traces} of the original MDP, given by 
+% $\expected{\trace \sim \mdp_\policy}{\log \decoder\fun{\trace}}$ such that:
+\emph{log-likelihood of traces} of $\mdp$, i.e.,
+$\expected{\trace \sim \mdp_\policy}{\log \decoder\fun{\trace}}$, where
+% \begin{equation}
+%     \expected{\trace \sim \mdp_\policy}{\log \decoder\fun{\trace}} 
+%     \text{ s.t. }
+%     \decoder\fun{\trace} =
+%         \begin{cases}
+%             \int_{\inftrajectories{\latentmdp_{\decoderparameter}}} \decoder\fun{\trace \mid \seq{\latentstate}{T}} \, d\latentprobtransitions_{\latentpolicy_{ \decoderparameter}}\fun{\seq{\latentstate}{T}} & \text{if } \latentactions = \actions, \\ 
+%             \int_{\inftrajectories{\latentmdp_{\decoderparameter}}} \decoder\fun{\trace \mid \seq{\latentstate}{T}, \seq{\latentaction}{T - 1}} \, d\latentprobtransitions_{\latentpolicy_{ \decoderparameter}}\fun{\seq{\latentstate}{T}, \seq{\latentaction}{T - 1}} & \text{else.} 
+%         \end{cases} \label{eq:maximum-likelihood}
+% \end{equation}
+\begin{equation}
+    \decoder\fun{\trace} =
+            \int_{\inftrajectories{\latentmdp_{{\decoderparameter}}}} \decoder\fun{\trace \mid \seq{\latentvariable}{T}} \, d\latentprobtransitions_{\latentpolicy_{ \decoderparameter}}\fun{\seq{\latentvariable}{T}}, \label{eq:maximum-likelihood}
+\end{equation}
+%such that
+%$\trace = \defaulttrace$,
+$\trace = \langle \seq{\state}{T}, \seq{\action}{T - 1}, \seq{\reward}{T - 1}, \seq{\labeling}{T} \rangle$,
+$\latentvariable \in \latentvariables$ with $\latentvariables = \latentstates$ if $\latentactions = \actions$ and $\latentvariables = \latentstates \times \latentactions$ otherwise,
+$\latentprobtransitions_{\latentpolicy_{\decoderparameter}}(\seq{\latentstate}{T}) = \prod_{t = 0}^{T - 1} \latentprobtransitions_{\latentpolicy_{\decoderparameter}}(\latentstate_{t + 1} \mid \latentstate_t)$, and $\latentprobtransitions_{\latentpolicy_{ \decoderparameter}}(\seq{\latentstate}{T}, \seq{\latentaction}{T-1}) = \prod_{t = 0}^{T - 1} {\latentpolicy_{\decoderparameter}}(\latentaction_t \mid \latentstate_t) \cdot \latentprobtransitions_{\decoderparameter}(\latentstate_{t + 1} \mid \latentstate_t, \latentaction_t)$.
+%Note that
+The dependency of $\trace$ on $\latentvariables$ in Eq.~\ref{eq:maximum-likelihood}
+is made explicit by the law of total probability.
+
+Optimizing $\expected{\trace \sim \mdp_\policy}{\log \decoder\fun{\trace}}$ through Eq.~\ref{eq:maximum-likelihood} is typically intractable \citep{DBLP:journals/corr/KingmaW13}.
+To overcome this, we use an encoder $\encoder\fun{\seq{\latentvariable}{T} \mid \trace}$ to set up
+a \emph{lower bound} on the log-likelihood of produced traces,
+%on the $\log$-values of Eq.~\ref{eq:maximum-likelihood}
+often referred to as \emph{evidence lower bound} (ELBO, \citealp{DBLP:journals/jmlr/HoffmanBWP13}):
+\begin{align*}
+    &\log \decoder\fun{\trace} - \dkl{\encoder\fun{\sampledot \mid \trace}}{{\decoder\fun{\sampledot \mid \trace}}} \notag \\
+    % = & \expectedsymbol{\seq{\latentvariable}{T} \sim \encoder\fun{\sampledot \mid \trace}} \log \fun{\nicefrac{\decoder\fun{\trace \mid \seq{\latentvariable}{T}} \cdot \latentprobtransitions_{\latentpolicy_{ \decoderparameter}}\fun{\seq{\latentvariable}{T}}}{\encoder\fun{\seq{\latentvariable}{T} \mid \trace}}}
+    = & \expected{\seq{\latentvariable}{T} \sim \encoder\fun{\sampledot \mid \trace}}{\log \decoder\fun{\trace \mid \seq{\latentvariable}{T}}}  - \dkl{\encoder\fun{\sampledot \mid \trace}}{\latentprobtransitions_{\latentpolicy_{ \decoderparameter}}}
+\end{align*}
+The purpose of optimizing the ELBO is twofold.
+First, this allows us learning $\embed_{\encoderparameter}$ via (i) $\encoder(\seq{\latentstate}{T} \mid \trace) = \prod_{t = 0}^{T} \embed_{\encoderparameter}(\latentstate_{t} \mid \state_t)$ or (ii) $\encoder(\seq{\latentstate}{T}, \seq{\latentaction}{T - 1} \mid \trace) = \encoder(\seq{\latentaction}{T-1} \mid \seq{\latentstate}{T}, \trace) \cdot \encoder(\seq{\latentstate}{T} \mid \trace)$, where $\encoder\fun{\seq{\latentaction}{T-1} \mid \seq{\latentstate}{T}, \trace} = \prod_{t = 0}^{T - 1} \latentembeda_{\encoderparameter}(\latentaction_t \mid \latentstate_t, \action_t)$, $\latentembeda_\encoderparameter$
+%playing the role of an %stochastic
+being an
+action encoder.
+We assume here that
+%the encoding of states and actions to latent spaces is independent of rewards.
+encoding states and actions to latent spaces is independent of rewards.
+We additionally make them independent of $\seq{\labeling}{T}$ by assuming that
+%the labeling function $\labels$ is known.
+$\labels$ is known.
+This allows $\embed_\encoderparameter$ to encode states and their labels directly into the latent space (cf. Sect.~\ref{subsec:discrete-latent-distr}).
+
+% Second, we assume that the behavioral model $\decoder$ can be decomposed into reward and label models of $\latentmdp_{\decoderparameter}$, as well as a \emph{generative model} $\decoder^{\generative}$, enabling the reconstruction of states and actions.
+%Therefore, states, actions, rewards, and labels can be made independent given the latent sequence:
+Second, we assume the existence of latent reward and label models, i.e., $\decoder^{\rewards}$ and $\decoder^{\labels}$, allowing to recover respectively $\latentrewards_{\decoderparameter}$ and $\latentlabels_{\decoderparameter}$, as well as a \emph{generative model} $\decoder^{\generative}$, enabling the reconstruction of states and actions.
+This allows decomposing the behavioral model $\decoder$ into:
+%\todo{Can you triple check this? I feel like some intuition might help the reader be convinced without checking the equations --- and if we can let's use display equations}
+% We thus argue that
+% We thus argue that sequences (i) $\seq{\state}{T}$, $\seq{\action}{T}$ $\seq{\reward}{T - 1}$, and $\seq{\labeling}{T}$ can be made independent given $\tuple{\seq{\latentstate}{T}, \seq{\action}{T - 1}}$, while .
+\begin{multline*}
+\quad \quad \begin{aligned}
+    &\decoder\fun{\seq{\state}{T}, \seq{\action}{T - 1}, \seq{\reward}{T - 1}, \seq{\labeling}{T} \mid \seq{\latentvariable}{T}} \\
+    =& \decoder^{\generative}(\seq{\state}{T} \mid \seq{\latentstate}{T}) 
+    \cdot \decoder^{\generative}(\seq{\action}{T - 1} \mid \seq{\latentvariable}{T}) \\
+    & \cdot \decoder^{\rewards}(\seq{\reward}{T - 1} \mid \seq{\latentstate}{T}, \seq{\latentaction}{T - 1}) \cdot \decoder^{\labels}(\seq{\labeling}{T} \mid \seq{\latentstate}{T}),
+\end{aligned}\\
+% where (i)
+% $\decoder^{\generative}(\seq{\state}{T} \mid \seq{\latentstate}{T}) = \prod_{t = 0}^{T} \decoder^{\generative}(\state_t \mid \latentstate_t)$,
+% (ii) $\decoder^{\generative}(\seq{\action}{T - 1} \mid \seq{\latentstate}{T - 1}, \seq{\latentaction}{T - 1})$ is $\prod_{t = 0}^{T - 1} \latentpolicy_{\decoderparameter}(\latentaction_t \mid \latentstate_t)$ if $\latentactions = \actions$ and $\prod_{t = 0}^{T - 1} \embeda_{\decoderparameter}(\action_t \mid \latentstate_t, \latentaction_t)$ otherwise,
+% (iii) $\decoder^{\rewards}(\seq{\reward}{T - 1} \mid \seq{\latentstate}{T}, \seq{\latentaction}{T - 1}) = \prod_{t = 0}^{T - 1} \decoder^{\rewards}(\reward_{t} \mid \latentstate_t, \latentaction_t)$,
+% (iv) $\decoder^{\labels}(\seq{\labeling}{T} \mid \seq{\latentstate}{T}) = \prod_{t = 0}^{T}\decoder^{\labels}(\labeling_t \mid {\latentstate}_{t})$.
+%The generative model (ii)
+\begin{aligned}
+    \text{where }\decoder^{\generative}(\seq{\state}{T} \mid \seq{\latentstate}{T}) &= \textstyle{\prod_{t = 0}^{T}} \, \decoder^{\generative}(\state_t \mid \latentstate_t), \\
+    \decoder^{\generative}(\seq{\action}{T - 1} \mid \seq{\latentvariable}{T - 1}) &=
+    \begin{cases}
+        \textstyle{\prod_{t = 0}^{T - 1}}\, \latentpolicy_{\decoderparameter}(\action_t \mid \latentstate_t) \text{ if } \latentactions = \actions \\
+        \prod_{t = 0}^{T - 1}\, \embeda_{\decoderparameter}(\action_t \mid \latentstate_t, \latentaction_t) \text{ else,}
+    \end{cases} \\
+    \decoder^{\rewards}(\seq{\reward}{T - 1} \mid \seq{\latentstate}{T}, \seq{\latentaction}{T - 1}) &= \textstyle{\prod_{t = 0}^{T - 1}} \, \decoder^{\rewards}(\reward_{t} \mid \latentstate_t, \latentaction_t), \text{and} \\
+    \decoder^{\labels}(\seq{\labeling}{T} \mid \seq{\latentstate}{T}) &= \textstyle{\prod_{t = 0}^{T}} \, \decoder^{\labels}(\labeling_t \mid {\latentstate}_{t}).
+\end{aligned}
+\end{multline*}
+Model $\embeda_{\decoderparameter}$
+allows learning the action embedding function via $\embeda_{\encoderparameter, \decoderparameter}\fun{\action \mid \state, \latentaction} = \expectedsymbol{\latentstate \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state}}\embeda_{\decoderparameter}\fun{\action \mid \latentstate, \latentaction}$ for all $\state \in \states, \action \in \actions, \latentaction \in \latentactions$.
+We also argue that a \emph{perfect reconstruction} of labels is possible, i.e., $\decoder^{\labels}\fun{\seq{\labeling}{T} \mid \seq{\latentstate}{T}} = 1$, due to the labels being encoded into the latent space.
+%Intuitively, this can be done by encoding labels directly into the latent space. Details are given below.
+From now on, we thus omit the label term.
+
+% Deterministic embedding functions
+% %$\embed_{\encoderparameter}\colon \states \! \to \latentstates$, $\embeda_{\encoderparameter, \decoderparameter} \colon \states \times \latentactions \to \actions$ and and reward function 
+% $\latentrewards_{\decoderparameter} \colon \latentstates \times \latentactions \to \R$
+%$\embed_{\encoderparameter}\fun{\state} = \mode{\embed_{\encoderparameter}\fun{\sampledot \mid \state}}$, $\embeda_{\encoderparameter, \decoderparameter}\fun{\state, \latentaction} = \mode{\embeda_{\decoderparameter}\fun{\sampledot \mid \embed_{\encoderparameter}\fun{\state}, \latentaction}}$, and $\latentrewards_{\decoderparameter}\fun{\latentstate, \latentaction} = \expectedsymbol{\reward \sim \decoder^{\rewards}\fun{\sampledot \mid \latentstate, \latentaction}} \reward$ for $\state \in \states, \latentaction \in \latentactions$.
+
+Deterministic embedding functions $\embed_{\encoderparameter}$, $\embeda_{\encoderparameter, \decoderparameter}$
+and $\latentrewards_{\decoderparameter}$
+can finally be obtained by
+taking the mode of their distribution.%
+
+\smallparagraph{Back to the local setting.}~Taking Assumption~\ref{assumption:ergodicity} into account, drawing multiple finite traces $\trace \sim \mdp_{\policy}$ can be seen as a continuous interaction with $\mdp$ along an infinite trace \citep{DBLP:conf/nips/Huang20}.
+This observation allows us to formulate the ELBO in the local setting\footnote{The expert reader might note this is not the standard definition of ELBO, we prove in Appendix (Corollary~\ref{cor:elbo-local}) that this reformulation is valid because of developments in Sect.~\ref{section:deepmdp}.}
+and connect to local losses:
+%and connect to local losses introduced in Sect.~\ref{section:deepmdp}:
+%
+% \begin{Lemma}\label{lem:elbo-local}
+% Let  $\stationary{\policy}$ be the stationary distribution of $\mdp_\policy$, $f \colon \states \times \actions \times \images{\rewards} \times \states \to \R$ be a continuous function, and $\embed\fun{\latentstate, \latentstate' \mid \state, \state'} = \embed\fun{\latentstate \mid \state} \embed\fun{\latentstate' \mid \state'}$.
+% Assume $\states, \actions$ are compact, then
+% \begin{align*}
+%     & \lim_{T \to \infty} \frac{1}{T} \expectedsymbol{}_{\substack{\trace \sim \mdp_{\policy}[T] \\ \seq{\latentvariable}{T} \sim \encoder\fun{\sampledot \mid \trace}}}
+%     \begin{aligned}[t]
+%     [&\log \decoder\fun{\trace \mid \seq{\latentvariable}{T}} \\ & \quad \quad  - \dkl{\encoder\fun{\sampledot \mid \trace}}{{\decoder\fun{ \sampledot \mid \trace}}} ] \end{aligned}\\
+%     =&
+%     \left\lbrace\begin{array}{@{}r@{\quad}l@{}}
+%     \displaystyle \expectedsymbol{}_{\substack{\state, \action, \reward, \state' \sim \stationary{\policy}\\ \latentstate, \latentstate' \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state, \state'}}} \big[
+%     \begin{aligned}[t]
+%         & \log \decoder^{\generative}\fun{\state' \mid \latentstate'} + \log \latentpolicy_{\decoderparameter}\fun{\action \mid \latentstate} + \\
+%         & \log \decoder^{\rewards}\fun{\reward \mid \latentstate, \action} - \\
+%         & \dkl{\embed_{\encoderparameter}\fun{\sampledot \mid \state'}}{\latentprobtransitions_{\latentpolicy_{\decoderparameter}}\fun{\sampledot\mid \latentstate}} \big] \text{ if } \latentactions = \actions \hfill \\
+%     \end{aligned} \hfill \\[30pt]
+%     \displaystyle \expectedsymbol{}_{\substack{\state, \action, \reward, \state' \sim \stationary{\policy}\\ \latentstate, \latentstate' \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state, \state'} \\ \latentaction \sim \latentembeda_{\encoderparameter}\fun{\sampledot \mid \latentstate, \action}}}\big[
+%     \begin{aligned}[t]
+%         & \log \decoder^{\generative}\fun{\state' \mid \latentstate'} + \log\embeda_{\decoderparameter}\fun{\action \mid \latentstate, \latentaction} + \\
+%         & \log \decoder^{\rewards}\fun{\reward \mid \latentstate, \latentaction} - \\
+%         & \dkl{\embed_{\encoderparameter}\fun{\sampledot \mid \state'}}{\latentprobtransitions_{\decoderparameter}\fun{\sampledot\mid \latentstate}} - \\
+%         & \dkl{\latentembeda_{\encoderparameter}\fun{\sampledot\mid\latentstate, \action}}{\latentpolicy_{\decoderparameter}\fun{\sampledot \mid \latentstate}} \big]
+%         \text{ else},
+%     \end{aligned}\hfill
+%     \end{array}
+%     \right.
+% \end{align*}
+% %where $\trace = \defaulttrace$, $\seq{\latentvariable}{T} = \seq{\latentstate}{T}$ if $\latentactions = \actions$ and $\seq{\latentvariable}{T} = \tuple{\seq{\latentstate}{T}, \seq{\latentaction}{T - 1}}$ otherwise.
+% where $\mdp_{\policy}[T]$ denotes the distribution over $\traces{\mdp_\policy}$ of size $T$ and $ \stationary{\policy}(\state, \action, \reward, \state') = \stationary{\policy}(\state, \action, \state') \cdot \condition{=}(\reward,  \rewards\fun{\state, \action, \state'})$.
+% \end{Lem.}
+%
+%We formulate the maximization of the \emph{local} ELBO\footnote{The expert reader might note this is not the standard definition of ELBO, we prove in Appendix that this reformulation is valid because of developments in Section~\ref{section:deepmdp}.} as
+\[
+%\begin{align*}
+    \max_{\encoderparameter, \decoderparameter}\; \elbo\fun{\latentmdp_{\decoderparameter}, \embed_{\encoderparameter}, \embeda_{\encoderparameter, \decoderparameter}} = - \min_{\encoderparameter, \decoderparameter} \left\{\distortion_{\encoderparameter, \decoderparameter} + \rate_{\encoderparameter, \decoderparameter} \right\},
+%\end{align*}
+\]
+where $\distortion$ and $\rate$ denote respectively the \emph{distortion} and \emph{rate} of the variational model  \citep{DBLP:conf/icml/AlemiPFDS018}, given by
+\begin{equation*}
+    \distortion_{\encoderparameter, \decoderparameter} = -
+    \left\lbrace\begin{array}{@{}r@{\quad}l@{}}
+        \displaystyle \expectedsymbol{}_{\substack{\state, \action, \reward, \state' \sim \stationary{\policy} \\ \latentstate, \latentstate' \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state, \state'}}} \big[
+        \begin{aligned}[t]
+        & \log \decoder^{\generative}(\state' \mid \latentstate') + \log \latentpolicy_{\decoderparameter}(\action \mid \latentstate) +
+        \\
+        & \log \decoder^{\rewards}\fun{\reward \mid \latentstate, \action}\big]
+        \text{ if } \latentactions = \actions,
+        \end{aligned} \hfill \\
+        \displaystyle \expectedsymbol{}_{\substack{\state, \action, \reward, \state' \sim \stationary{\policy} \\ \latentstate, \latentstate' \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state, \state'} \\ \latentaction \sim \latentembeda_{\encoderparameter}\fun{\sampledot \mid \latentstate, \action}}}
+        \big[
+        \begin{aligned}[t]
+        & \log \decoder^{\generative}\fun{\state' \mid \latentstate'} + \\
+        & \log \embeda_{\decoderparameter}\fun{\action \mid \latentstate, \latentaction} + \\
+        & \log \decoder^{\rewards}\fun{\reward \mid \latentstate, \latentaction}\big] \text{ else, and}
+        \end{aligned} \hfill
+        \end{array}
+    \right.
+\end{equation*}
+\begin{equation*}
+    \rate_{\encoderparameter, \decoderparameter} =
+    \left\lbrace\begin{array}{@{}r@{\quad}l@{}}
+        \displaystyle \expectedsymbol{}_{\substack{\state, \action, \state' \sim \stationary{\policy} \\ \latentstate \sim \embed_{\encoderparameter}(\sampledot \mid \state)}}  \dkl{\embed_{\encoderparameter}\fun{\sampledot \mid \state'}}{\latentprobtransitions_{\latentpolicy_{\decoderparameter}}(\sampledot \mid \latentstate)} \text{ if } \latentactions = \actions, \hfill \\
+        \displaystyle \expectedsymbol{}_{\substack{\state, \action, \state' \sim \stationary{\policy} \\ \latentstate \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state} \\ \latentaction \sim \latentembeda_{\encoderparameter}\fun{\sampledot \mid \latentstate, \action} }}
+        \big[
+        \begin{aligned}[t]
+        & \dkl{\embed_{\encoderparameter}\fun{\sampledot \mid \state'}}{\latentprobtransitions_{\decoderparameter}\fun{\sampledot \mid \latentstate, \latentaction}} + \\
+        & \dkl{\latentembeda_{\encoderparameter}\fun{\sampledot\mid\latentstate, \action}}{\latentpolicy_{\decoderparameter}\fun{\sampledot \mid \latentstate}} \big] \text{ else.}
+        \end{aligned} \hfill
+    \end{array}
+    \right.
+\end{equation*}
+%
+We omit the subscripts when the context is clear.
+The optimization of $\elbo\fun{\latentmdp_{\decoderparameter}, \embed_{\encoderparameter}, \embeda_{\encoderparameter, \decoderparameter}}$ allows for an indirect optimization of the local losses through their variational versions:
+(i) $\localrewardloss{\stationary{\latentpolicy}}$ via the log-likelihood of rewards produced, and % by taking $\latentrewards_{\decoderparameter}\fun{\latentstate, \latentaction} = \expectedsymbol{\reward \sim \decoder^{\rewards}\fun{\sampledot \mid \latentstate, \latentaction}} \reward$, and
+(ii) $\localtransitionlossupper{\stationary{\latentpolicy}}$ where we change the Wasserstein term to the KL divergence.
+Note that this last change means we do not necessarily obtain the theoretical guarantees on the quality of the abstraction via its optimization. Nevertheless, our experiments indicate KL divergence is a good proxy of the Wasserstein term in practice.
+%it \todo{odd way to end the section, why is this loss of guarantees not a problem?} (cf.\todo{The right way to write it is cf. not c.f., check the whole doc.} Eq.~\ref{eq:bidistance-abstraction-quality} and Eq.~\ref{eq:value-diff-abstraction-quality}).
+
+\subsection{VAE Distributions}\label{subsec:discrete-latent-distr}
+\smallparagraph{Discrete distributions.}~We aim at learning \emph{discrete} latent spaces $\latentstates$ and $\latentactions$, the distributions $\embed_{\encoderparameter}$, $\encoder^{\actions}$, $\latentprobtransitions_{\decoderparameter}$, and $\latentpolicy_{\decoderparameter}$ are thus supposed to be discrete.
+Two main challenges arise:
+%by learning the parameters of discrete distributions via
+% stochastic computation graphs through %optimization techniques such as
+%\emph{gradient descent} and \emph{Monte-Carlo sampling} methods:
+%\todo{F: cut here}
+(i) gradient descent is not applicable to learn $\encoderparameter$ and $\decoderparameter$ due to the discontinuity of $\latentstates$ and $\latentactions$, and (ii) sampling from these distributions must be a \emph{derivable operation}.
+We overcome these by using \emph{continuous relaxation of Bernoulli distributions} to learn a binary representation of the latent states, and the \emph{Gumbel softmax trick} for the latent action space \citep{DBLP:conf/iclr/JangGP17,DBLP:conf/iclr/MaddisonMT17}.
+% Intuitively, they rely on a temperature parameter $\temperature$ that makes the continuous distributions converging to their discrete variant when $\temperature$ converges to $0$.
+
+\smallparagraph{Labels.}~To enable $\log \decoder^\labels\fun{\seq{\labeling}{T} \mid \seq{\latentstate}{T}} = 0$, we encode $\labels\fun{\state_t} = \labeling_t$ into each $\latentstate_t$ via $\embed_{\encoderparameter}$.
+Recall each label is given in binary. We thus allocate $|\atomicprops|$ bits in $\latentstates$ for the labels.
+Then, $\embed_{\encoderparameter}\fun{\latentstate \mid \state} > 0$ implies $\labels\fun{\state} = \latentlabels_\decoderparameter\fun{\latentstate}$, for all $\state \in \states, \latentstate \in \latentstates$,
+\iffalse
+This enforces the following property of $\embed_{\encoderparameter}$:
+\[
+\forall \state \in \states, \, \forall \latentstate \in \latentstates,\, \embed_{\encoderparameter}\fun{\latentstate \mid \state} > 0 \implies \labels\fun{\state} = \latentlabels_\decoderparameter\fun{\latentstate},
+\]
+\fi
+satisfying Assumption~\ref{assumption:labeling} if $\embed_{\encoderparameter}$ is deterministic.
+
+\smallparagraph{Decoders.}~For $\decoder^{\generative}$, $\embeda_{\decoderparameter}$, and $\decoder^{\rewards}$, we learn the parameters of multivariate normal distributions.
+%Models $\decoder^{\generative}$, $\embeda_{\encoderparameter, \decoderparameter}$ thus allow generating grounded states or actions %from the environment
+%based on their latent embedding.
+%While our approach allows learning a meaningful representation of the input model and policy through latent state and action spaces,
+This further allows linking all $\latentstate \in \latentstates$ to the parameters of $\decoder^{\generative}(\sampledot \mid \latentstate)$ for explainability.
+%This allows each $\latentstate \in \latentstates$ to be linked to the normal parameters of $\decoder^{\generative}(\sampledot \mid \latentstate)$ for explainability purposes.
+
+% \smallparagraph{Deterministic functions.}~%
+% % Deterministic embedding functions
+% $\embed_{\encoderparameter}$, $\embeda_{\encoderparameter, \decoderparameter}$ and and
+% %reward function 
+% $\latentrewards_{\decoderparameter}$
+% %$\latentrewards_{\decoderparameter}$
+% can be obtained by
+% taking the mode of their learned distribution.%
+
+\subsection{Posterior Collapse}\label{sec:posterior-collapse}
+A common issue encountered while optimizing variational models via the ELBO is %so called
+\emph{posterior collapse}.
+Intuitively, this results in a degenerate local optimum where the model learns to ignore the latent space.
+%while the generative model alone is used to optimize the ELBO.
+With a discrete encoder, this translates into a deterministic mapping to a single latent state, regardless of the input.
+%From a formal-abstraction point of view,
+%From a model-checking standpoint, this means 
+%the VAE derives this coarse abstraction by ``learning a BSCC decomposition of $\mdp$'', consisting in a unique absorbing state since $\mdp$ is ergodic.
+%
+%
+From an information-theoretic point of view, optimizing the ELBO gives way to a trade-off between the minimization of
+%the rate and the distortion
+$\rate$ and $\distortion$, where the feasible region is a convex set \citep{DBLP:conf/icml/AlemiPFDS018}.
+%Posterior collapse happens when the rate is close to zero
+Posterior collapse occurs when $\rate \approx 0$
+%(referred to as the \emph{auto-decoding limit} of the variational model).
+(\emph{auto-decoding limit}).
+%, which can be achieved by the optimizer by merging all states to the same embedding.
+%$\expected{\trace \sim \mdp_\policy}{\sum_{t=0}^{T - 1}\dkl{\encoder^\transitions\fun{\latentstate_{t + 1} \mid \state_t, \action_t}}{\latentprobtransitions_{\decoderparameter}\fun{\latentstate_{t + 1} \mid \latentstate_t, \action_t}}} \approx 0$, meaning
+% $\encoder^\transitions\fun{\seq{\latentstate}{T} \mid \seq{\state}{T}, \seq{\action}{T - 1}} \approx \latentprobtransitions_{\decoderparameter}\fun{\seq{\latentstate}{T} \mid \seq{\action}{T - 1}}$.
+%$\log \embed_{\encoderparameter}\fun{\latentstate' \mid \state'} \approx \expected{\latentstate \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state}}{\log \latentprobtransitions_{\decoderparameter}\fun{{\latentstate}' \mid \latentstate, {\action}}}$ for any $\latentstate' \in \latentstates$ by definition of the KL divergence.
+%This means (i) the embedding distribution is nearly independent of ${\state' \in \states}$, and (ii) the latent  transition distribution tends to ignore $\action \in \actions$.
+% The latent representation is thus not encoding information about input transitions, meaning that it fails to create a useful representation.
+%On the other hand, one can achieve a distortion close to zero
+On the other hand, one can achieve $\distortion \approx 0$
+%(referred to as the \emph{auto-encoding limit})
+(\emph{auto-encoding limit})
+at the price of a higher rate.
+
+% As already mentioned, posterior collapse is a consequence of the KL divergence here replacing the Wasserstein in the rate minimization: when the latter is used, Lem.~\ref{Lem.:local-loss-upper-bounds} and Lem.~\ref{Lem.:bidistance-abstraction-quality} ensure that a value close to zero implies a bisimilarity between states embedded to the same representation.
+
+% \smallparagraph{Regularization terms.}
+% Various solutions have been proposed in the litterature to prevent posterior collapse.
+% They include \emph{KL-scaling} % and \emph{KL-annealing}
+% consisting in changing $\elbo$ to $\beta\text{-}\elbo = -(\distortion + \beta \cdot \rate)$, with $\beta \in \mathopen[0, 1\mathclose]$.
+% This allows to interpolate between auto-encoding and auto-decoding behavior, which is not possible with the standard ELBO objective.
+
+% Another method consists in adding an \emph{entropy regularizer} $\alpha \in \mathopen[0, \infty\mathclose[$ to $\elbo$, i.e.,
+% $
+%     \alpha\text{-}\elbo = \elbo + \alpha \cdot \entropy{\encoder},
+% $
+% and anneal $\alpha$ to 0 during training \citep{DBLP:conf/icml/HaarnojaZAL18,DBLP:conf/corl/BurkeHR19}, where 
+% $\entropy{\encoder}$ denotes the entropy of an encoding distribution.
+% We choose to measure the entropy of the \emph{marginal} encoder, given by $\encoder\fun{\latentstate} = \expectedsymbol{\state \sim \stationary{\policy}} \embed_{\encoderparameter}\fun{\latentstate \mid \state}$. 
+% Intuitively, this encourages the encoder to learn to make plenty use of the latent space. % to represent the input data.
+
+% A drawback of these methods is that we are no longer optimizing a lower bound on the log-likelihood of the input while optimizing
+% % $\tuple{\alpha, \beta}\text{-}\elbo(\latentmdp_{\decoderparameter}, \embed_{\encoderparameter}, \embeda_{\encoderparameter, \decoderparameter}) = - (\distortion_{\encoderparameter, \decoderparameter} + \beta \cdot \rate_{\encoderparameter, \decoderparameter}) + \alpha \cdot \entropy{\embed_{\encoderparameter}}$.
+% $\tuple{\alpha, \beta}\text{-}\elbo = - (\distortion + \beta \cdot \rate) + \alpha \cdot \entropy{\encoder}$.
+% In practice, setting up annealing schemes for $\alpha$ and $\beta$ allows to eventually recover $\elbo$ and avoid posterior collapse ($\alpha=0$ and $\beta=1$ matches $\elbo$).
+\smallparagraph{Regularization terms.}~%
+Various solutions have been proposed in the literature to prevent posterior collapse.
+They include \emph{entropy regularization} (via $\alpha \in \mathopen[ 0, \infty \mathclose[$, \citealt{DBLP:conf/icml/HaarnojaZAL18,DBLP:conf/corl/BurkeHR19}) and
+\emph{KL-scaling} (via $\beta \in \mathopen[0, 1\mathclose]$, e.g., \citealt{DBLP:conf/icml/AlemiPFDS018}),
+consisting in changing $\elbo$ to
+$\tuple{\alpha, \beta}\text{-}\elbo = - (\distortion + \beta \cdot \rate) + \alpha \cdot \entropy{\encoder}$, where 
+$\entropy{\encoder}$ denotes the entropy of an encoding distribution.
+We choose to measure the entropy of the \emph{marginal} encoder, given by $\encoder\fun{\latentstate} = \expectedsymbol{\state \sim \stationary{\policy}} \embed_{\encoderparameter}\fun{\latentstate \mid \state}$. 
+Intuitively, this encourages the encoder to learn to make plenty use of the latent space. % to represent the input data.
+The parameter $\beta$ allows to interpolate between auto-encoding and auto-decoding behavior, which is not possible with the standard ELBO objective.
+
+A drawback of these methods is that we no longer optimize a lower bound on the log-likelihood of the input while optimizing
+% $\tuple{\alpha, \beta}\text{-}\elbo(\latentmdp_{\decoderparameter}, \embed_{\encoderparameter}, \embeda_{\encoderparameter, \decoderparameter}) = - (\distortion_{\encoderparameter, \decoderparameter} + \beta \cdot \rate_{\encoderparameter, \decoderparameter}) + \alpha \cdot \entropy{\embed_{\encoderparameter}}$.
+$\tuple{\alpha, \beta}\text{-}\elbo$.
+In practice, setting up annealing schemes for $\alpha$ and $\beta$ allows to eventually recover $\elbo$ and avoid posterior collapse ($\alpha=0$ and $\beta=1$ matches $\elbo$).
+
+% \cite{DBLP:conf/iclr/HeSNB19} introduced a method only based on the training process of the variational model, which allows to overcome this problem.
+% It consists in an aggressive training schedule which iterates between multiple updates of $\encoderparameter$ and one update of $\decoderparameter$, based on the observation that the inference model often lags behind the reconstruction model during training when posterior collapse occurs.
+% In our experiments, we also noticed that posterior collapse is even more difficult to handle when the entropy of the produced traces is low, in particular when rewards and states produced by executing $\policy$ have low variance.
+%This can be explained by an auto-encoding behavior: \cite{DBLP:conf/icml/AlemiPFDS018} showed that $\dataentropy - \rate$ is an upper bound on the distortion $\distortion$ that can be achieved, with $\dataentropy$ being the entropy of the input distribution (in our case $\dataentropy = \entropy{\stationary{\policy}}$).
+% When $\entropy{\stationary{\policy}}$ is low, the optimizer may tend to minimize the distortion by pushing the rate close to zero and achieve this way the low entropy of the input distribution.
+% \begin{figure*}[t]
+%     \begin{subfigure}{0.495\textwidth}
+%         \centering
+%         \includegraphics[width=\textwidth]{ressources/cartpole_histogram.pdf} \\
+%         \caption{CartPole}
+%     \end{subfigure}
+%     \begin{subfigure}{0.495\textwidth}
+%         \centering
+%         \includegraphics[width=\textwidth]{ressources/mountain_car_histogram.pdf} \\
+%         \caption{MountainCar}
+%     \end{subfigure}
+%     \caption{Latent space distribution along training steps. The intensity of the blue hue corresponds to the frequency of latent states produced by $\embed$ during training. We compare a bucket-based prioritized against a simple uniform experience replay. The latent space learned with transitions sampled from the uniform replay buffer collapses to (a) two and (b) a single latent state(s).}
+%     \label{fig:prioritized-replay}
+% \end{figure*}
+%
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{ressources/cartpole_histogram.pdf}
+    \caption{Latent space distribution along training steps for the CartPole environment. The intensity of the blue hue corresponds to the frequency of latent states produced by $\embed_{\encoderparameter}$ during training. We compare a bucket-based prioritized against a simple uniform experience replay.
+    % The latent space learned with transitions sampled from the uniform replay buffer collapses to two latent states.}
+    The latent space learned via the uniform buffer collapses to two latent states.}
+    \label{fig:prioritized-replay}
+\end{figure}
+\smallparagraph{Prioritized replay buffers.}~%
+To enable meaningful use of latent space to represent input state-actions pairs,
+%states that are reached under $\policy$ but not seen often should not be ignored during the learning process.
+$\encoder$ should learn to (i) exploit the entire latent space, and (ii) encode wisely states and actions of transitions yielding poor ELBO, being generally sensitive to bad representation embedding.
+%This motivates us to use a \emph{prioritized replay buffer} \citep{DBLP:journals/corr/SchaulQAS15} to store and sample environment transitions.
+This motivates us to use a \emph{prioritized replay buffer} \citep{DBLP:journals/corr/SchaulQAS15} to store transitions and sample them when optimizing $\elbo$.
+Draw $\tuple{\state, \action, \reward, \state'} \sim \stationary{\policy}$ and let $p_{\tuple{\state, \action, \reward, \state'}}$ be its priority, we introduce the following priority functions.
+
+\begin{itemize}
+    % \item \emph{Bucket-based priority:}~the replay buffer is partitioned in $|\latentstates|$ \emph{buckets}.
+    % Each bucket $b \colon \latentstates \to \N$ is a latent state counter that is incremented each time a latent state is drawn from $\embed_{\encoderparameter}$.
+    % We also maintain a training step counter $N$.
+    % At each step, let $\latentstate \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state}$, we assign $p_{\tuple{\state, \action, \reward, \state'}}$ to $\nicefrac{N}{b\fun{\latentstate}}$, then increment $N$ and $b\fun{\latentstate}$ of $1$.
+    % This allows the encoder to learn from transitions for which the embedding of their incident state is not seen often under $\policy$ and fairly distribute the latent space.
+    \item \emph{Bucket-based priority:}~we partition the buffer in $|\latentstates|$ \emph{buckets}.
+    Let $N \in \N$ and $b \colon \latentstates \to \N$ be respectively step and latent state counters.
+    At each step, let $\latentstate \sim \embed_{\encoderparameter}\fun{\sampledot \mid \state}$, we assign $p_{\tuple{\state, \action, \reward, \state'}}$ to $\nicefrac{N}{b\fun{\latentstate}}$, then increment $N$ and $b\fun{\latentstate}$ of one.
+    This allows $\embed_\encoderparameter$ to process states being infrequently visited under $\policy$ and learn to fairly distribute $\latentstates$.
+    % This allows $\embed_\encoderparameter$ to consider transitions for which the embedding of their incident state is infrequently visited under $\policy$, and learn to fairly distribute $\latentstates$.
+    % and learn to make plenty use of the latent space.
+    \item \emph{Loss-based priority:}~we set $p_{\tuple{\state, \action, \reward, \state'}}$ to its individual transition loss,
+    %$- \loss_{\elbo}$, i.e., for $\latentstate, \latentstate' \sim \embed\fun{\sampledot \mid \state, \state'}$ and $\latentaction \sim \encoder^\actions\fun{\sampledot \mid \latentstate, \action}$ if $\latentactions \neq \actions$ and $\latentaction = \action$ else,
+    % \begin{align*}
+    %     & \loss_{\elbo}\fun{\tuple{\state, \action, \reward, \state'}, \tuple{\latentstate, \latentaction, \latentstate'}} \\
+    %     =&  - \log \decoder^\generative\fun{\state' \mid \latentstate'} - \log \decoder^{\rewards}\fun{\reward \mid \latentstate, \latentaction} - \log \latentpolicy_{\decoderparameter}\fun{\latentaction \mid \latentstate} + \log \embed_{\encoderparameter}\fun{\latentstate' \mid \state'} \\
+    %     & - \condition{=}\fun{\latentactions, \actions} \cdot \log \latentprobtransitions_{\latentpolicy_{\decoderparameter}}\fun{\latentstate' \mid \latentstate} \\
+    %     & - \condition{\neq}\fun{\latentactions, \actions} \cdot \fun{\log \embeda_{\decoderparameter}\fun{\action \mid \latentstate, \latentaction} + \log \latentprobtransitions_{\decoderparameter}\fun{\latentstate' \mid \latentstate, \latentaction} - \log \encoder^{\actions}\fun{\latentaction \mid \latentstate, \action}}.
+    % \end{align*}
+    which enables to learn improving the representation of states and actions that yield poor ELBO.
+\end{itemize}
+%

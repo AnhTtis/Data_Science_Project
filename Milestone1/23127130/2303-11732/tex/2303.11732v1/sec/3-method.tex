@@ -1,0 +1,214 @@
+%---------------------------------------------------------------
+%---------------------------------------------------------------
+\begin{figure*}[t]
+\begin{center}
+\includegraphics[width=\textwidth] {./fig/frame.pdf}
+\end{center}
+\vspace{-0.25cm}
+\caption{\textbf{Framework Overview.} Given one input video, we first encode RGB and Flow for appearance and motion embeddings, then localize category-agnostic action proposals (detect actionness and regress boundary). For open-vocabulary classification, we design (A) text-based classifiers using attribute descriptions from Large Language Models, and (B) vision-based classifiers using (RGB \& Flow)-conditional prompt tuning. Finally, the RGB-Flow-Text modalities are aligned for low-shot TAL.}
+\vspace{0.15cm}
+\label{fig:framework}
+\end{figure*}
+%-------------------------------------------------------------
+%-------------------------------------------------------------
+
+
+
+
+\section{Method}
+\label{sec:method}
+In this paper, our goal is to tackle open-vocabulary temporal action localization, by aligning multi-modal video representations, extracted from RGB, Flows, and texts. 
+In Sec.~\ref{subsec:formulation}, we start by introducing problem scenarios. 
+In Sec.~\ref{subsec:arch}, we describe the proposed architecture, consisting of two vital modules, namely, category-agnostic action proposal and open-vocabulary action classification via descriptions or visual instance prompts. 
+Lastly, we detail the training and inference procedure in Sec.~\ref{subsec:training}.
+
+
+
+\vspace{-0.2cm}
+\subsection{Problem Scenario}  
+\label{subsec:formulation}
+\vspace{-0.1cm}
+Assuming we are provided one untrimmed video dataset for training, {\em e.g.}, $\mathcal{D}_{\text{train}} = \{(\mathbf{V}_1, \mathbf{Y}_1), \dots, (\mathbf{V}_N, \mathbf{Y}_N)\}$, where $\mathbf{V}_i \in \mathbb{R}^{T_i \times H \times W \times 3}$ denotes one video sequence with $T_i$ frames, $\mathbf{Y}_i \in \mathbb{R}^{T_i \times \mathcal{C}_{\text{train}}}$ refers to the frame-wise annotation for action categories, that fall into one pre-defined vocabulary. 
+Our goal is to train an open-vocabulary temporal action localization model, that can process testing videos from unseen categories, {\em i.e.}, to detect and classify actions beyond the seen ones at training time:
+\begin{align}
+    \mathbf{Y}_j = \Phi_{\text{open-TAL}}(\mathbf{V}_j) \in \mathbb{R}^{T_j \times \mathcal{C}_{\text{test}}}, 
+    \quad 
+    \mathbf{V}_j \sim \mathcal{D}_{\text{test}},
+\end{align}
+where $\mathbf{V}_j$ refers to a video sampled from the testing set. Under zero-shot settings, action categories for training (base) and evaluation (novel) are disjoint, {\em i.e.},~$\mathcal{C}_{\text{train}} \cap \mathcal{C}_{\text{test}} = \emptyset$. Under few-shot settings, training categories are included in the testing categories, {\em i.e.},~$\mathcal{C}_{\text{test}} \supset \mathcal{C}_{\text{train}}$.
+As a comparison, in closed-set scenarios, categories for training and testing are identical, {\em i.e.},~$\mathcal{C}_{\text{test}} = \mathcal{C}_{\text{train}}$.
+
+
+\vspace{-0.2cm}
+\subsection{Architecture}
+\label{subsec:arch}
+\vspace{-0.1cm}
+We propose a multi-modal low-shot action localization framework, containing two modules: category-agnostic proposal (in Sec.~\ref{sec:temp}), and open-vocabulary classification by descriptions or visual prompts~(in Sec.~\ref{sec:classifier}). \textbf{Note that}, both visual and textual encoders are pre-trained and kept frozen, thus resembling the downstream adaptations of foundation models~\cite{Radford21,Jia21,yao2021filip} effectively. 
+
+
+
+\subsubsection{Category-agnostic Action Proposal} 
+\label{sec:temp}
+As for the visual encoding, we here consider two widely-used modalities for video understanding, namely, RGB appearance and optical flow.
+
+
+\vspace{0.2cm}
+\noindent \textbf{RGB Frame Encoder.}
+\hspace{1pt} Given one untrimmed video with $T$ frames, $\mathbf{V} = \{I_1, \dots, I_T\}$, we employ two types of RGB pre-trained encoders to obtain frame-wise features, {\em i.e.}, CLIP image~\cite{Radford21} and I3D RGB~\cite{carreira2017quo}. 
+\begin{align}
+    \mathbf{F}^{\mathrm{rgb}} = \Phi_{\text{CLIP-r}}(\mathbf{V}) \ \  \mathrm{or} \ \  \mathbf{F}^{\mathrm{rgb}} = \Phi_{\text{I3D-r}}(\mathbf{V}),
+\end{align}
+where $\Phi_{\text{CLIP-r}}(\cdot)$ is pre-trained on 400M image-text pairs, 
+with rich description of visual appearances; 
+$\Phi_{\text{I3D-r}}(\cdot)$ is pre-trained on Kinetics-400 for action recognition, with good representations of the temporal continuity. 
+For simplicity, we denote the above features as $\mathbf{F}^{\mathrm{rgb}} \in \mathbb{R}^{T \times D_{\mathrm{rgb}}}$, $D_{\mathrm{rgb}}$ denotes the dimension of RGB features.
+
+
+\vspace{0.2cm}
+\noindent \textbf{Flow Encoder.} 
+\hspace{1pt} We first use the TV-L1 algorithm~\cite{wedel2009improved} to compute optical flows from the RGB frame sequence, and then, feed them into the pre-trained I3D Flow encoder~\cite{carreira2017quo} to compute frame-wise motion features: 
+\begin{align}
+    \mathbf{F}^{\mathrm{flow}} =  \Phi_{\text{I3D-f}}(\mathbf{V}) \in \mathbb{R}^{T \times D_{\mathrm{flow}}},
+\end{align}
+where $\Phi_{\text{I3D-f}}(\cdot)$ is pre-trained on Kinetics-400, thus containing rich motion details, $D_{\mathrm{flow}}$ denotes the dimension of the Flow features. 
+
+
+\vspace{0.2cm}
+\noindent \textbf{Temporal Aggregation.}
+\hspace{1pt} Given visual features ($\mathbf{F}^{\mathrm{rgb}}$ \& $\mathbf{F}^{\mathrm{flow}}$) from the frozen encoders, we pass them through one temporal aggregation module $\Phi_{\text{temp}}(\cdot)$, consisting of standard Transformer encoder layers, for better action modeling. As the action duration varies frequently, following recent methods~\cite{dai2022ms,zhang2022actionformer}, we construct a multi-scale pyramid structure for $\Phi_{\text{temp}}$, formulated as: 
+\begin{align}
+    \mathbf{F}^{*} = \{\mathbf{F}_1^{*}, ...,  \mathbf{F}_L^{*} \} =  \Phi_{\text{temp}}(\mathbf{F}^{*})
+    \in \mathbb{R}^{T' \times D_{*}},
+\end{align}
+where $*$ refers to the RGB or Flow modality. The Transformer pyramid covers $L$ layers, and each layer consists of Multi-head Self-attention, Layer Norm, and MLPs. We perform ``$2\times$'' down-sampling between adjacent layers, to ensure that deeper layers focus on long actions, while shallow layers handle short actions. As a result, we obtain $\mathbf{F}_i^{*} \in \mathbb{R}^{T/{2^{i}} \times D_{*}}$ for the $i$-th layer features. 
+
+
+
+\vspace{0.2cm}
+\noindent \textbf{Category-agnostic Proposals.} 
+\hspace{1pt} Here, we design one temporal action localizer, containing one detector $\Phi_{\mathrm{det}}(\cdot)$ and one regressor $\Phi_{\mathrm{reg}}(\cdot)$ in parallel, to produce category-agnostic action proposals. Concretely, when taking multi-scale pyramid features $\mathbf{F}^{*}$ as input, $\Phi_{\mathrm{det}}(\cdot)$ predicts the frame-level action probability, {\em i.e.}, performing the binary classification for action and background; while $\Phi_{\mathrm{reg}}(\cdot)$ regresses the left offset and right offset to the nearest action instance for each frame, thus refining the boundary. 
+\begin{equation}   \label{eq:detector}
+{
+\widehat{\mathbf{p}}_{\mathrm{det}}^{*} = \Phi_{\mathrm{det}}(\mathbf{F}^{*}) \in \mathbb{R}^{T'},
+\ \
+\widehat{\mathbf{P}}_{\mathrm{reg}}^{*} = \Phi_{\mathrm{reg}}(\mathbf{F}^{*}) \in \mathbb{R}^{T' \times 2}.
+}
+\end{equation}
+
+
+
+Structurally, both the detector and the regressor are composed of 1D convolutional networks. Hereafter, by further post-processing $\widehat{\mathbf{p}}_{\mathrm{det}}$ and $\widehat{\mathbf{P}}_{\mathrm{reg}}$, we could obtain $B$ action proposals $\{{b_i}\}_{i=1}^B$. And then, we compute visual embeddings for these category-agnostic proposals by taking the mean pooling of RGB or Flow features within the proposal intervals.
+\begin{align}
+    \mathbf{f}^{*}_i = \Phi_{\text{pool}}(\mathbf{F}^{*}[b_i]) \in \mathbb{R}^{D_{*}}.
+\end{align}
+
+\textbf{Note that}, we do not claim novelty or contribution on category-agnostic action detection~\cite{Lin18,zhao2020bottom,tan2021relaxed,zhang2022actionformer,lin2021learning}, which has been widely-studied in the community. And our method is flexible to these off-the-shelf detectors.
+
+
+
+\subsubsection{Open-vocabulary Action Classification}
+\label{sec:classifier}
+In this section, we introduce the procedure for classifying action proposals towards both base and novel categories~(only requested by user at inference time). To produce such open-vocabulary classifiers, the key is to use a pre-trained text encoder of vision-language foundation models. Specifically, one vanilla solution~\cite{Radford21} is to combine category names with handcrafted prompts, {\em e.g.}, ``one video of \{category\}'', then feed into the CLIP text encoder to generate action classifier. 
+However, such a paradigm suffers from lexical ambiguities, for example, “fencing” can either refer to “the game of stabbing with slender steel swords in protective clothing” or “enclose or separate something with paling or hedgerow”, directly encoding vanilla category names is unable to distinguish these concepts. Here, we present two novel strategies to enhance the discriminative power of generated classifiers with: detailed language descriptions or vision-conditioned prompting.
+
+
+
+
+\vspace{0.2cm}
+\noindent \textbf{Classifier construction by language descriptions. } 
+Here, we consider to decompose actions into ``attribute'' that specifies one category from various aspects, hence enriching the discriminative power of constructed classifiers. As shown in Figure~\ref{fig:framework} (A), for $C$ action category names (denoting as $\mathcal{C}_{\mathrm{name}}$), we prompt one large-scale language model~(LLMs), for example, GPT-3~\cite{Brown20} or OPT~\cite{zhang2022opt}, with three attribute templates, to obtain detailed descriptions of salient objects, event fields, and motion interactions for query actions:
+\begin{align}
+\mathbf{M}_{\mathrm{desc}} &= \Phi_{\text{LLM}}(\Phi_\mathrm{attr}[\mathcal{C}_{\mathrm{name}}]),
+\end{align}
+where three attribute templates $\Phi_\mathrm{attr}$ are ``what tools are needed for [action]?'', ``where [action] usually takes place?'', and ``how to decompose steps for [action]?'', respectively. Note that, here we only use some straight-forward prompt templates, while other templates may also bring similar attribute descriptions.
+
+
+With the attribute descriptions $\mathbf{M}_{\mathrm{desc}}$, the classifier embeddings for $C$ action categories can thus be generated using the CLIP text encoder:
+\begin{align}  \label{description}
+\mathbf{F}^{\mathrm{text}} = \Phi_{\text{CLIP-t}}( \Phi_\textsc{tokenise}(\mathbf{M}_{\mathrm{desc}})) \in \mathbb{R}^{C \times D_{\mathrm{text}}},
+\end{align}
+where $\Phi_\textsc{tokenise}(\cdot)$ refers to the language tokenizer that converts words into vectors, and $D_{\mathrm{text}}$ refers to the dimension of the textual features. 
+
+
+
+\vspace{0.2cm}
+\noindent \textbf{Classifier construction by conditioning on video instance.} 
+\hspace{1pt} For the cases where comprehensive text descriptions are challenging to acquire, for instance, a good description for gymnastics with intricate pose patterns is prohibitively long, we consider one alternative way for lexical disambiguation. In particular, we design a vision-conditional prompt module $\Phi_{\mathrm{prmp}}(\cdot)$, as shown in Figure~\ref{fig:framework} (B). For any given video, $\Phi_{\mathrm{prmp}}(\cdot)$ takes its RGB and Flow features, {\em i.e.}, $\mathbf{F}^{\mathrm{rgb}}$ and $\mathbf{F}^{\mathrm{flow}}$, as inputs, and outputs $K$ concrete prompt vectors $\mathbf{M}_{\mathrm{cond}}$. 
+\begin{align}
+    \mathbf{M}^{*}_{\mathrm{cond}} = \Phi_{\text{prmp}}(\mathbf{F}^{*}) \in \mathbb{R}^{K \times D_{\mathrm{text}}}.
+\end{align}
+where $\Phi_{\mathrm{prmp}}(\cdot)$ refers to a trainable module~(can be either MLPs or Transformer encoder), and $\mathbf{M}^*_{\mathrm{cond}}$ denotes the instance-specific prompt vectors, containing rich visual details from the RGB or Flow stream.
+
+
+Hereafter, we can generate the classifier embeddings for ${C}$ actions, {\em i.e.}, prepending\,/\,appending $\mathbf{M}^{*}_{\mathrm{cond}}$ with category name tokens, then inputting all these tokens into the CLIP text encoder. 
+\begin{align}  \label{conditional}
+\mathbf{F}^{\mathrm{text}} = \Phi_{\text{CLIP-t}}(\mathbf{M}^{*}_{\mathrm{cond}},\, \Phi_\textsc{toke}(\mathcal{C}_{\mathrm{name}}),\, \mathbf{M}^{*}_{\mathrm{cond}}),
+\end{align}
+where $\mathbf{F}^{\mathrm{text}} \in \mathbb{R}^{C \times D_{\mathrm{text}}}$ refers to the classifier embeddings. At training time, the gradients can flow through the frozen encoder $\Phi_{\text{CLIP-t}}(\cdot)$ to only optimize the conditional prompt module $\Phi_{\mathrm{prmp}}(\cdot)$. 
+
+
+In zero-shot scenarios, $\Phi_{\mathrm{prmp}}(\cdot)$ is trained on seen (base) categories, then directly applied to test videos of novel categories, outputting vision-conditional, task-specific prompt vectors $\mathbf{M}_{\mathrm{cond}}$; while in the few-shot scenarios, $\mathbf{M}_{\mathrm{cond}}$ can be category-specific to learn from the support video exemplars of novel categories. Intuitively, $\Phi_{\mathrm{prmp}}(\cdot)$ can be seen as implicitly decomposing actions into ``visual attributes'', enriching the classifier obtained from only encoding category names. 
+
+
+
+\vspace{0.2cm}
+\noindent \textbf{Cross-modal alignment.}
+For one video, the textual stream ends up with the category-wise features $\mathbf{F}^{\mathrm{text}} = \{\mathbf{f}_1^{\mathrm{text}}, \dots, \mathbf{f}_{C}^{\mathrm{text}} \} \in \mathbb{R}^{C \times D_{\mathrm{text}}}$; while the visual stream ends up with RGB features $\mathbf{f}^{\mathrm{rgb}}\in \mathbb{R}^{D_{\mathrm{rgb}}}$ and Flow features $\mathbf{f}^{\mathrm{flow}} \in \mathbb{R}^{D_{\mathrm{flow}}}$ for action proposals. 
+
+
+To alignment between language with appearance or motion, we adopt a lightweight module~($\Phi_{\mathrm{align}}(\cdot)$) to map RGB-Flow-Text embeddings into one shared space.
+\begin{equation}   \label{eq:aligner}
+{
+\mathbf{h}^{\circ} = \Phi_{\mathrm{align}}(\mathbf{f}^{\circ}) \in \mathbb{R}^{D_{\mathrm{align}}},
+}
+\end{equation}
+where $\circ$ refers to any of the three modalities, and $D_{\mathrm{align}}$ refers to the aligned dimension of the embedding space. Architecture-wise, $\Phi_{\mathrm{align}}(\cdot)$ is flexible to off-the-shelf networks, such as MLPs or Transformer encoder. 
+
+
+
+\vspace{-0.2cm}
+\subsection{Training and Inference}
+\label{subsec:training}
+\vspace{-0.1cm}
+Given one batch of (RGB, Flow, Text) training pairs, the visual stream ends up with RGB and Flow embeddings for action proposals, namely, $\mathbf{h}^{\mathrm{rgb}}$ and $\mathbf{h}^{\mathrm{flow}}$; while the textual stream ends up with classifier embeddings $\{\mathbf{h}_1^{\mathrm{text}}, \dots, \mathbf{h}_{C}^{\mathrm{text}} \}$. In the following, we describe the optimization details for detection and classification.
+
+
+
+\vspace{0.2cm}
+\noindent \textbf{Category-agnostic Proposal.} 
+\hspace{1pt} Following previous methods~\cite{Lin18,tan2021relaxed}, to supervise the generation of action proposals, we adopt the weighted cross-entropy loss for action proposal~\cite{lin2019bmn,lin2018bsn} and use the DIoU loss $\mathcal{L}_{\mathrm{reg}}$ for distance regression~\cite{zheng2020distance}. Formally, 
+\begin{equation}
+{
+\mathcal{L}_{\mathrm{det}} = \sum _{t\in \Omega^{+}} \mathcal{H}({p}_t^{*}, {\widehat{p}}_t^{*}) +  \gamma \sum _{t\in \Omega^{-}} \mathcal{H}({p}_t^{*}, {\widehat{p}}_t^{*}),
+}
+\end{equation}
+where ${{p}_t} \in \{0,1\}$ and ${{\widehat{p}}_t} \in [0,1]$ are the label and probability for category-agnostic actions at $t$-th timestamp; $\mathcal{H}$ and $\gamma$ are the cross-entropy and the balancing weight; $\Omega^{+}$ and $\Omega^{-}$ are positive sets and negative sets. 
+\begin{equation}
+{\mathcal{L}_{\mathrm{reg}} = 1 - \mathrm{IoU} + \mathcal{D}(\widehat{\mathbf{P}}_{\mathrm{reg}}^{*}, \mathbf{P}_{\mathrm{reg}}^{*}),
+}
+\end{equation}
+where $\mathrm{IoU}$ is the intersection over union between predicted proposals and ground-truth actions. $\mathbf{P}_{\mathrm{reg}}$ refers to the regression ground-truth, and $\mathcal{D}$ refers to the normalized euclidean distance.
+
+
+\vspace{0.2cm}
+\noindent \textbf{Open-vocabulary Classification.}
+\hspace{1pt} After calculating action proposals, we aim to encourage the paired (RGB, Flow, Text) embeddings to emit the highest similarity score among others, we use the infoNCE loss to supervise tri-modal alignment in the shared space, which can be written as follows:
+\begin{align}
+\mathcal{L}_{\mathrm{cls}} = &- \sum_i \big( \log \frac{\exp( \mathcal{S}(\mathbf{h}_{i}^{\mathrm{*}}, \mathbf{h}_{i}^{\mathrm{text}}) / \tau)}{\sum\limits_{j} \exp(\mathcal{S}(\mathbf{h}_{i}^{\mathrm{*}}, \mathbf{h}_{j}^{\mathrm{text}}) / \tau)} \big),
+\end{align}
+where $\mathcal{S}$ refers to the cosine similarity, and $\tau$ is one temperature parameter. Using the well-aligned multi-modal features, we can naturally achieve open-vocabulary classification, through evaluating the cosine similarity between the textual and visual modalities.
+
+
+\vspace{0.2cm}
+\noindent \textbf{Total Loss.}
+\hspace{1pt} During training, we freeze encoders for RGB-Flow-Text, 
+and jointly optimize the detector, regressor, vision-conditional prompt module, and corss-modal aligner. Using two balancing ratios ($\lambda_1$ and $\lambda_2$), the total optimization loss $\mathcal{L}_{\mathrm{all}}$ can be formulated: 
+\begin{align}
+  \mathcal{L}_{\mathrm{all}} = \mathcal{L}_{\mathrm{det}} + \lambda_1\mathcal{L}_{\mathrm{reg}} + \lambda_2\mathcal{L}_{\mathrm{cls}}.
+\end{align}
+
+
+
+\vspace{0.1cm}
+\noindent \textbf{Inference.}
+\hspace{1pt} At testing time, for one given video, we could compute the frame-level action probability $\widehat{\mathbf{p}}_{\mathrm{det}}^{*}$ from the binary classifier, and the frame-level boundary offset $\widehat{\mathbf{P}}_{\mathrm{reg}}^{*}$ from the boundary regressor. For category-agnostic proposal, we threshold $\widehat{\mathbf{p}}_{\mathrm{det}}^{*}$ through $\theta_{loc}$, concatenate consecutive snippets as action proposals, utilize $\widehat{\mathbf{P}}_{\mathrm{reg}}^{*}$ for boundary refinement, and eliminate proposal redundancy with soft non-maximum suppression (NMS). For low-shot classification, we calculate cosine similarity between category textual embeddings and proposal visual embeddings, then only retain the category with probabilities greater than threshold $\theta_{cls}$. 

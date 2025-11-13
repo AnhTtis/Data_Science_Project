@@ -1,0 +1,93 @@
+\subsection{Neighbor Search}
+In Section~\ref{sec:dbscan}, we introduced an algorithm that performed density-based clustering. Algorithm~\ref{alg:dbscan} includes two references to a {\em FindNeighbors()} function that identifies all points within $\varepsilon$ distance of a point. We generalize the query as follows:
+
+\begin{definition} $\mathit{findNeighborhood}(p, S, \varepsilon)$: 
+Given a dataset $S$, point {\em p} and distance $\varepsilon$, find all points $\{x \in S ~|~ \mathit{distance}(p,x) \le \varepsilon\}$
+\end{definition}
+
+The $\mathit{distance(x,y)}$ function calculates the Euclidean distance between points $x$ and $y$. The answer to this question is used to establish the $\varepsilon$-neighborhood to detect core points in DBSCAN. In Section~\ref{sec:rtx}, we discussed how RT cores are used to determine the color of a pixel by answering the ray-object intersection query:
+
+\begin{definition} $\mathit{intersect}(\vec{r}, S)$
+Given a set of objects $S$ in a scene and ray, $\vec{r}$, find all %objects $\{o \in S ~|~ \vec{r} \mbox{intersects} o\}$
+objects $\{o \in S ~|~ \vec{r}$ $\mbox{intersects}$ $o\}$
+\end{definition} 
+
+The key question, then, is to find a way to implement $\mathit{findNeighborhood}$ in terms of $\mathit{intersect}$. If we can do this, then algorithms such as DBSCAN can be readily written in terms of $\mathit{intersect}$ and can use the RT cores to accelerate their execution. We describe this process next, adapting a reduction proposed by prior work~\cite{Evangelou2021RadiusSearch,forcegraph}.
+
+\subsection{Input Transformation}\label{sec:input_trans}
+ The key insight to the transformation is that points within a distance $\varepsilon$ of a query point {\em p} (within {\em p}'s $\varepsilon$-neighborhood) are the {\em same} points that would be contained inside a sphere with origin {\em p} and radius $\varepsilon$. This intuitively makes sense for 3D datasets, since expanding a sphere over the query point would span across the three dimensions and accumulate {\em all} points within a particular query radius. However, Zellmann~\etal \cite{forcegraph} propose an alternate approach where, instead of expanding a sphere only around the query point {\em p}, they expand spheres of radius $\varepsilon$ around {\em all} points in the dataset. Fig~\ref{fig:sphere_expand} shows how spheres $C_p$, $C_q$ and $C_r$ are expanded over points {\em p}, {\em q} and {\em r}. We notice that the spheres overlap if their centers are in each other's $\varepsilon$ neighborhood. 
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.7\linewidth]{figures/sphere_expand.png}
+    \caption{We expand spheres of radius ($\varepsilon$) around all points. We launch an infinitesimally small ray originating at query point {\em q} and see that it intersects $C_p$, $C_q$ and $C_r$, since the origin is contained within all 3 spheres. Hence, {\em p, q} and {\em r} are {\em q}'s neighbors}
+    \label{fig:sphere_expand}
+    \vspace{-1.5em}
+\end{figure}
+
+\subsection{Putting it all together: RT-accelerated $\mathit{findNeighborhood}$}\label{sec:rt-findNeigh}
+Now that we have a way of representing our points as spheres in a scene, we need to formulate our ray tracing query such that we can identify all neighbors of a point. 
+Algorithm~\ref{alg:rt-neigh} presents a high-level overview of the process. 
+
+The algorithm takes a query point {\em q}, query radius $\varepsilon$ and the dataset {\em D} as inputs. In lines 1-3, for each point $p_i$, we add a sphere primitive with origin $p_i$ and radius $\varepsilon$ to the scene. This is the input transformation process described in Section~\ref{sec:input_trans} and shown in Fig~\ref{fig:sphere_expand}. 
+
+Using the user-specified axis-aligned bounding box program, a Bounding Volume Hierarchy is constructed in hardware to create the scene. In Line 4, we launch an infinitesimally small ray $\vec{r}$ with origin $\vec{q}$, direction $\vec{d}$ and $[t_{min}, t_{max}]$ as $[0, 1e^{-16}]$ to find all the spheres that are intersected by the ray. For example, from Fig~\ref{fig:sphere_expand}, we see that such a ray launched from origin  $\vec{q}$ intersects $C_p, C_q$ and $C_r$. Recall that these are solid 3D spheres and a ray of infinitesimal length is sufficient to find intersections with overlapping spheres. The overlap of spheres in Fig~\ref{fig:sphere_expand} indicates that the centers of the spheres $C_p$ and $C_r$ are within $\varepsilon$ distance of $\vec{q}$. 
+
+%\mk{The filtration step needs to be described in more detail. See comments below}
+In Lines 5-9, we record all the spheres intersected by the ray and pass it through a filter to remove self-intersections ($C_q$ in this case). When the ray traverses the BVH in hardware, it returns all the intersected {\em bounding volumes} in the BVH tree. 
+%These bounding volumes are the leaf nodes of the BVH and enclose a single object. 
+As the hardware tests for intersection with {\em bounding volumes} and not {\em objects}, it is possible that the intersection test results are incorrect. Though bounding volumes completely enclose objects, they are not an {\em exact} fit. It is possible for the ray to intersect the bounding volume but completely miss the object contained in it. In Line 6, we perform an additional check to confirm that we intersect the {\em object}. Since it is also possible for bounding volumes to overlap if the dataset is dense, this filter removes any erroneous bounding volume intersections. The filtered list of intersected spheres ({\em NeighborList}) contains the nearest neighbors of point {\em q}.
+%In Section~\ref{sec:input_trans}, we saw that the bounding volumes can overlap if the dataset is dense. In this case, it is necessary to test the individual objects for intersection. We see that this test corresponds to checking if the query point {\em q} is within  distance $\varepsilon$ from point {\em s}. In this way, we filter out any erroneous bounding volume intersections which could occur when the dataset is dense. The filtered list of intersected spheres corresponds to the nearest neighbors of point {\em q}.
+%\mk{I think a point that needs to be made in the background section and then re-iterated here is that if you use the generic intersection routine, what the RT cores actually do is invoke intersection if the ray intersects the {\em bounding box} the object is in, which means that you will have to do additional object-specific filtering to figure out if you intersected the actual object. In this section, we should point out that the object-specific filtering is easy since we're using spheres}  
+%\mk{This is a point that should be made in the input transformation section and then referenced here: if you have dense data sets, the bounding volume for a given object may contain other objects too. So here you should point out that you also need to filter out other objects that you've intersected with} 
+
+
+% For a given neighborhood problem, with search radius $\varepsilon$, the translation routine consists of the following steps:
+% \begin{enumerate}
+%     \item For each point $p_i$, add a sphere primitive with origin $p_i$ and radius $\varepsilon$ to the scene
+%     \item To find the nearest neighbors of point $p_k$, launch an infinitesimally small ray $\vec{r}$ at origin $p_k$
+%     \item Record all primitives \{$s_i$\} that intersect ray $\vec{r}$
+%     \item Use a filtering routine to remove self-intersection and other erroneous intersections
+%     \item Return the list \{$s_i$\} as nearest neighbors of point $p_k$
+% \end{enumerate}
+
+\begin{algorithm2e}
+\caption{RT-FindNeighborhood}\label{alg:rt-neigh}
+\SetKwInOut{Input}{Input}
+\SetKwInOut{Output}{Output}
+\Input{Query point q, Query radius $\varepsilon$, Dataset D}
+\Output{NeighborList}
+\For{$p \in D$} {$S \gets S \bigcup createSphere(p, \varepsilon)$\\  %\Comment{createSphere(origin, radius)}
+} 
+traceRay($\vec{q}, \vec{d}, [t_{min}, t_{max}]$)\\
+%\Comment{{\tt RAYGEN:} traceRay(origin, direction)} \\
+\If{Intersect(q, $s \in S$)}{
+%{$Neighbors \gets Neighbors \bigcup s$ \\
+\If{$(dist(q, s) \le \varepsilon) \wedge (q \ne s)$}{$NeighborList \gets NeighborList \bigcup s$}}
+\end{algorithm2e}
+\vspace{-1.0em}
+%parallel DBSCAN
+\begin{algorithm2e}
+\caption{RT-DBSCAN}\label{alg:parallel_dbscan}
+\For{point p} {$neighborCount \gets RT$-$FindNeighbors(p).length$ \\
+    \If{neighborCount $\ge$ {\em minPts}}
+    {
+        $p \gets CORE\_POINT$ \\
+    }
+}
+\For{point p} {
+   % \For{n: $dist(p,n) \le \varepsilon$} {
+   \For{n: RT-FindNeighbors(p)} {
+        \eIf{n == CORE\_POINT}{{\tt Union}(p,n)}
+        {\If{n == UNCLASSIFIED}{critical section:\\ {\tt UNION}(p,n)}}
+    
+    }
+}
+\end{algorithm2e}
+%\vspace{-0.5em}
+
+\subsection{RT-DBSCAN} \label{sec:rt-dbscan}
+We base our {\tt RT-DBSCAN} algorithm on the parallel Union-Find FDBSCAN algorithm proposed by Prokopenko~\etal \cite{DBLP:journals/corr/abs-2103-05162}. Algorithm~\ref{alg:parallel_dbscan} has two stages: (1) identifying Core points, and (2) updating cluster information using {\tt union-find}. For the first stage, we use Algorithm~\ref{alg:rt-neigh} to identify each point's {\em neighbors}. For each point in the dataset, we launch a ray tracing query to check if the ray intersects more than {\em minPts} spheres. If the ray {\em does} intersect more than {\em minPts} spheres, the query point is marked as a Core point as shown in Lines 3-5.
+
+In the second stage, we begin to form the clusters. As we did not save information about the neighbors of each point, we re-compute the Euclidean distance between points in the dataset using Algorithm~\ref{alg:rt-neigh}. Though this computation is redundant and may seem inefficient, the hardware-accelerated BVH traversal prevents performance degradation. In fact, Prokopenko~\etal show that performance does not suffer even without hardware acceleration\cite{DBLP:journals/corr/abs-2103-05162}. Additionally, this approach scales well to larger datasets as we do not run out of memory.
+
+In Lines 7-9, we check whether the point and its neighbor are core points. If both are core points, they can be merged to form a larger cluster using the {\tt UNION} operation. If the neighbor is not a core point, it must be a border point and we merge the border point into the core point's cluster. It is necessary to perform Line 14 atomically as border points can belong to more than one cluster. If not, the border point could be incorrectly assigned to two clusters, causing the erroneous merging of two different clusters. We use a DisjointSet \cite{Hopcroft1973SetMA} structure to store the rank and parent of the point. At the end of the second stage, all points that share the same parent are a part of the same cluster and all other points are noise.

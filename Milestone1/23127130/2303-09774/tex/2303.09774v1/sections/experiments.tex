@@ -1,0 +1,332 @@
+\section{Experiments}
+\label{sec:experiments}
+
+% Claim 1: By keeping some data in memory, we can significantly reduce the end-to-end time for updating all the tables. -> Figure 4. 
+% Claim 1.5: By showing runtime breakdown, we confirm that the part we save is indeed the data load/store time.
+% Claim 1.6: The more memory, the faster the runtime. However, it kinda converges after a while.
+% Claim 2: Our optimization algorithm achieves good performance compared to other alternatives.
+% Claim 3: Our algorithm is scalable
+% Claim 4: Our system is as good as other existing systems
+
+% Claim 1 figure: Current Figure 8: Compare PostgreSQL, Presto+CSV, Presto+Parquet, \system (0GB), \system (32GB)
+% Claim 1.5 figure: line chart on the top showing execution breakdown, 2 current charts without color on bottom. There could be some concurrent operations.
+% Claim 2 figure: Gray bar (base table + execution), Green bar (save nodes + load nodes). Plot y-bar chart. X-axis are different optimization methods. Y-axis are runtime. 
+% Claim 3: Keep current Figure 7 (maybe remove some algorithms)
+
+In this section, we empirically study the effectiveness of \system. 
+% by investigating the end-to-end runtime reduction \system achieves on MV refresh workloads. 
+% \system achieves on MV refresh workloads 
+% on real-world datasets. 
+We make the following claims: 
+% according to our experiment results:
+\begin{enumerate}
+\item \textbf{Faster end-to-end MV refresh:} \system is capable of speeding up \emph{end-to-end MV refresh time} by 1.04$\times$--5.08$\times$ compared to an unoptimized raw Presto DBMS, which is up to an additional 2.22$\times$ compared to other existing off-the-shelf methods. (\Cref{sec:exp_overall}) 
+\item \textbf{Consistent execution time savings:} \system's optimization results in consistent savings across different dataset sizes ranging from 10GB up to 1TB. (\Cref{sec:exp_size})
+\item \textbf{Effective utilization of memory: } \system effectively utilizes varying \memory sizes. \system's \memory can be allocated from spare memory in the system or from query memory with minimal loss of speedup. (\Cref{sec:exp_memory})
+\item \textbf{Table read time reduction:} \system's storage of intermediate tables in memory results in a $1.42\times-1.51\times$ reduction in the table read latency. (\Cref{sec:exp_io})
+\item \textbf{Effectiveness of solution to \optimizationproblem:} Solving \optimizationproblem with our solution (\solutionnodes + \solutionorder) results in a 1.06$\times$--1.23$\times$ total time reduction compared to ablated methods. (\Cref{sec:exp_algm})
+\item \textbf{Scalability of \system on distributed setups}: \system is capable of achieving consistent speedup on multi-node DB clusters regardless of the number of nodes. (\Cref{sec:exp_distributed})
+\item \textbf{Scalability of \system on complex workloads}: Our solution to \optimizationproblem has a negligible $<0.02s$ optimization time on complex DAGs with up to 100 nodes. (\Cref{sec:exp_complexity})
+\end{enumerate}
+
+
+\subsection{Experiment Setup}
+\label{sec:exp:setup}
+\subfile{plots/vs_established_methods}
+\mypara{Dataset} 
+
+We use the table generator and queries included in the \textit{TPC-DS}~\cite{tpcds} decision support benchmark in our experiments.
+We generate TPC-DS datasets from 5 distinct scale factors (10, 25, 50, 100, 1000); the scale factor determines the total size in GB of the tables in the generated dataset.
+
+We create two copies of each dataset for each scale. 
+One is a normal dataset generated as is (i.e., \tpcds). 
+The other is a \textit{date-partitioned} dataset wherein
+the three largest tables (\texttt{store\_sales, catalog\_sales, web\_sales}) are partitioned by year based on a join with the \texttt{date\_dim} table (i.e., \tpcdsdate).
+
+\mypara{Methods} 
+
+We evaluate the effectiveness of the \optimizationproblem framework by comparing it to both off-the-shelf algorithms and previously proposed algorithms:
+\begin{itemize}
+    \item \greedy: Iterate through nodes in execution order and flag nodes if doing so doesn't violate the memory constraint.
+    \item \random: Iterate through nodes in random order and flag nodes if doing so doesn't violate the memory constraint.
+    \item \ratio~\cite{xin2021enhancing}: Heuristic method prioritizing flagging nodes with high speedup score/node size ratio.
+    \item The LRU cache in the DBMS caches query results. We increase the size of the LRU cache by an amount equal to the size of \memory.
+\end{itemize}
+
+\subfile{plots/workload_table}
+
+We additionally perform an ablation analysis to evaluate the effectiveness of our solution to \system. 
+Specifically, we evaluate our individual solutions to the subproblems \subproblemnodes and \subproblemorder by swapping out one subproblem solution for a baseline method during alternating optimization.
+
+We compare our \solutionnodes solution to \subproblemnodes to the \greedy and \random methods.
+We compare our \solutionorder solution to \subproblemorder to two baseline methods:
+\begin{itemize}
+    \item Simulated annealing (\simulatedannealing)~\cite{seitz2010contributions}:
+    A hill-climbing algorithm that iteratively improves an execution order. In each iteration, two swappable nodes (i.e. doing so doesn't violate dependencies) are randomly selected; A swap is performed if doing so decreases the average memory usage. The swap is still performed with a certain probability to escape possible local minima. We set the iteration count to 10,000. 
+    % in our experiments.
+    \item \separator~\cite{ravi1991ordering, rao2005new}:
+    A divide-and-conquer algorithm that recursively finds separators/cuts in the DAG to partition nodes. In each iteration, a subgraph is partitioned into two via a cut; the algorithm stops when the original DAG has been partitioned into a series of singleton nodes by the cuts. These cuts define the execution order.
+    This algorithm notably offers a lower bound of $O(n \log(n))$.
+    % This algorithm notably comes with a lower bound of $O(nlog(n))$ on the solution quality.
+\end{itemize}
+
+% We use mix-and-match to create alternative solutions to \optimizationproblem, using our proposed solution for one subproblem while using an different solution for the other subproblem in alternating optimization (i.e. \solutionnodes (Ours) for \subproblemnodes and \simulatedannealing for \subproblemorder).
+
+\mypara{Real Workload} We construct MV refresh workloads
+% for the experiment 
+from TPC-DS queries. 
+% provided in the $query\_templates$ directory. 
+We create one node/MV for each \textit{select-project-join} (SPJ) unit in the query and merge graphs of TPC-DS queries that share similar intermediate nodes and topics (i.e. profit report, sales analysis) into one larger graph.
+Each graph represents a set of MVs to refresh together in a workload.
+As a result, we obtain five workloads with dependency graphs, each consisting of 16--26 nodes (\Cref{tbl:workload}).
+
+\mypara{Generated Workload} To investigate the scalability of our solution on more complex workloads, we create a workload generator for systematically creating realistic dependency graphs with a larger number of nodes (25--100).
+
+Our workload generator consists of two components:\begin{itemize}
+    \item A DAG generator for determining dependency between individual jobs in the workload~\cite{6471969}. We set generation parameters based on empirical analysis of real-world query structures (TPC-DS and Spider~\cite{yu-etal-2018-spider}).
+    \item A Markov chain---trained on the same query set---for determining node operations (i.e. JOIN, AGG).
+    % associated with each node. 
+    Operations are used to derive the sizes and speedup scores of nodes from their inputs.
+    % the node given 
+    % its input nodes. 
+    The sizes of nodes with no parents (i.e. reading directly from base tables) are randomly sampled from table sizes in the 100GB \tpcds dataset.
+\end{itemize}
+
+
+
+\mypara{Environment} 
+
+All experiments are performed on an Ubuntu server with an AMD EPYC 7552 48-Core Processor and 1TB RAM. The disk read and write speeds are 519.8 MB/s and 358.9 MB/s, respectively,
+with a read latency of 175 $\mu s$. For most of our experiments, the Presto cluster consists of 1 worker node with 50GB/300GB query memory for the $<$100GB/1TB datasets respectively; however, we also study with distributed setups in \cref{sec:exp_distributed}. \system's \memory is independent of query memory unless otherwise stated.
+% The read latency is 175 microseconds.
+% each measured over an average of 10 runs. 
+%
+\mypara{Implementation} We implement \system as a Python front-end over a Presto DBMS. The front-end performs optimization and sends queries to the DBMS via the Presto python connector~\cite{prestopython}; the Presto DBMS is created on top of a Hive Metastore~\cite{hive}, which stores created tables in an NFS.
+
+We control data placement in the DBMS by creating tables either (i) in the Hive catalog~\cite{prestohive} to materialize or (ii) in the memory catalog ~\cite{prestomemory} to keep in memory. Base TPC-DS tables are stored in the ORC format~\cite{orc} native to Apache Hive. We create MVs/intermediate tables in the Apache Parquet format.
+
+% We build a single-process Python prototype system for experimentation. Dataframe operations are performed with the Polars dataframe library, while materialized MVs/tables are stored on disk using the Apache Parquet format.
+\mypara{Time Measurement} We measure the end-to-end time as the time from starting the MV refresh workload to having all MVs in the workload materialized on our NFS. 
+For each setting, we measure the average end-to-end runtime over 5 runs
+to reduce variance and report the median. 
+% For analysis, we break down 
+% the end-to-end time into 3 categories: 
+% the \textit{compute} time for executing SQL statements, the \textit{read} time for reading TPC-DS base tables and MVs from external storage,
+% % for MV updates, 
+% and the \textit{write} time for the time our system spends on data materialization while no other operations (e.g., compute) are performed.
+
+The solution runtime for solving \optimizationproblem is not included in the end-to-end time as (i) optimization can be performed prior to data ingestion and (ii) solution runtimes are negligibly short compared to end-to-end MV refresh times. 
+% for result stability.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Faster End-to-End MV Refresh}
+\label{sec:exp_overall}
+
+In this section, we study the impact of \system's optimization on
+end-to-end MV refresh times.
+For this,
+% investigate the reduction achieved by \system's intermediate data storage on end-to-end runtimes of MV refresh workloads: 
+we compare the average runtimes of our constructed TPC-DS workloads using Presto DBMS with \system, without \system, and with other algorithms on the 100GB TPC-DS dataset.
+
+We report the results in \cref{fig:vs_established_methods}. The design goal of \system is to reduce the overhead of intermediate table read/write times, which is successfully reflected in our speedups achieved on the I/O heavy workloads, as follows. 
+Compared to executing the workloads in serial fashion without keeping any data in memory, \system is able to speed up end-to-end workload execution time by 1.05$\times$--2.72$\times$ using 1.6GB \memory.
+The savings increase to up to 1.20$\times$--5.08$\times$ on datasets with smaller intermediate table sizes (100GB date-partitioned TPC-DS datasets), which \system takes full advantage of to keep more data in memory throughout workload executions.
+
+Compared to other algorithms, \system achieves up to 2.22$\times$ speedup in end-to-end workload execution time. Specifically, the performance of \system over other methods can be attributed to (i) \system additionally optimizing the execution order of the workload and (ii) greedy/heuristic selection can perform arbitrarily badly on workloads.
+\subfile{plots/scale_vs_speedup}
+\subfile{plots/memory_vs_speedup}
+\subsection{\system Handles Large Workloads}
+\label{sec:exp_size}
+
+In this section, we evaluate the performance gain from \system across varying dataset 
+sizes. We measure the speedup achieved by \system on the total execution time of the 5 workloads on regular and date-partitioned TPC-DS datasets of different sizes (10GB--1TB), with \memory 1.6$\%$ of the dataset size.
+
+\Cref{fig:scale_sweep} report the end-to-end execution time reduction achieved by \system across different TPC-DS dataset scales. Given an appropriately sized \memory relative to dataset size, \system's optimization results in consistent execution time reductions across different dataset scales - 1.58$\times$--1.71$\times$ on the regular TPC-DS datasets, and 2.31$\times$--4.26$\times$ on the date-partitioned TPC-DS datasets.
+
+\subsection{Efficient Usage of \memory}
+\label{sec:exp_memory}
+
+In this section, we study \system's usage of \memory by evaluating its performance gain with varying \memory sizes.
+We measure speedup on both the total table read latency and total execution time of the 5 workloads on the 100GB \tpcdsdate dataset, performing a parameter sweep on \memory size from 0.4$\%$ to 6.4$\%$ of data size.
+Additionally, we compare the achieved speedup between using spare memory in the system and reallocating query memory from the DBMS as \memory for \system. This is reported in \Cref{fig:memory_sweep}.
+
+
+Storage of intermediate data in memory results in a notable speedup of 1.50$\times$ even with \memory 0.4$\%$ of data size.
+Further increasing the \memory size results in a speedup of up to 4.26$\times$ with 6.4$\%$ of data size.
+ % However, for the \tpcdsdate dataset shown in \Cref{fig:memory_sweep_b}, the end-to-end runtime speedups converge for $>3.2\%$ as the amount of extra memory becomes sufficient for all intermediate tables to be kept in memory.
+ 
+In the case where no spare memory is available in the system to act as \memory for \system, the \memory can also be reallocated from the query memory of the DBMS with minimal impact on achieved speedup. 
+The reduction in speedup when using reassigned memory compared to spare memory is negligible - only up to $0.25\times$.
+ % Compared to end-to-end runtime speedup, the file read latency speedups are less significant, only reaching 1.51$\times$ and 1.42$\times$ respectively with 6.4$\%$ extra memory. This suggests that \system's optimization is achieved not only by the reduction of intermediate table read times; the parallelism between in-memory table materialization and subsequent MV refreshes plays an equally important role.
+
+\subsection{\system Reduces Table Read Times}
+\label{sec:exp_io}
+In this section, we investigate \system's query-level benefits. We run the 5 workloads on 100GB datasets with varying \memory sizes and present CPU metrics reported by Presto.
+
+We provide the breakdown of savings by \memory size in \cref{tbl:hardware}. The reduction of table read latency is a major source of \system's speedup, reaching 1.51$\times$ and 1.42$\times$ respectively with 6.4$\%$ of data size. \system's optimization has a negligible effect on compute latency, which is expected as it is not the target of \system's optimization.
+ 
+ \subfile{plots/savings_breakdown}
+
+\subsection{Our Optimization
+Finds Higher-Quality Solutions}
+\label{sec:exp_algm}
+
+In this section, we examine the effectiveness of our proposed solution (\solutionnodes + \solutionorder) to \optimizationproblem. We compare the time savings achieved by solving \optimizationproblem with \solutionnodes + \solutionorder to that of ablated methods---one of \solutionnodes or \solutionorder paired with an alternative method---under the same \memory size on the total execution time of the 5 workloads on the 100GB TPC-DS dataset.
+
+\Cref{fig:algorithm} showcases this comparison on a variety of datasets. 
+Our solutions to both subproblems---\solutionnodes for \subproblemnodes and \solutionorder for \subproblemorder---both outperform their respective alternative methods.
+\solutionnodes paired with \solutionorder achieves up to 1.09$\times$ speedup compared to either \greedy, \random or \ratio paired with \solutionorder; similarly, \solutionorder paired with \solutionnodes achieves up to 1.21$\times$ speedup compared to either \simulatedannealing or \separator paired with \solutionnodes.
+
+Notably, our individual solutions overcome pitfalls that affect the alternative methods:\begin{itemize}
+    \item \greedy, \ratioshort, and \random flag nodes without considering the duration the node will be kept in memory.
+    \item \simulatedannealing and \separator have poor compatibility with the \memory size constraint, which (i) limits the number of valid node swaps \simulatedannealing can perform and (ii) cannot be integrated into \separator commonly resulting in it unfeasible execution orders, ending alternating optimization early.
+\end{itemize}
+% Our complete solution achieves the largest performance increase over ablated methods in complex problem settings (\Cref{fig:memory_container_size_a}, \Cref{fig:algorithm_a}) where the intermediate tables are large relative to the amount of extra memory, necessitating smart selection of tables to keep in memory and execution order. 
+% In simpler problem settings (\Cref{fig:memory_container_size_b}, \Cref{fig:algorithm_b}) where there is enough extra memory to keep a majority of the intermediate tables in memory, the performance increase is less significant.
+
+\subsection{\system Scales in Cluster-Based Environments}
+\subfile{plots/algorithm_comparison}
+\label{sec:exp_distributed}
+In this section, we showcase \system's ability to achieve speedup in a distributed setting.
+We vary the worker node count (50GB query memory each) in our Presto cluster and investigate the relationship between node count and total end-to-end time speedup of the 5 workloads on the 100GB \tpcds dataset.
+
+We present the results in \cref{tbl:distributed}. While the total end-to-end job execution time significantly decreases with each additional node in the distributed DB cluster, the additional savings achieved by \system's optimization remains largely consistent irrespective of the number of nodes.
+
+% We notice that the relative savings slightly decrease with additional nodes on the \tpcdsdate dataset: this is a result of Presto DB's implementation always using all nodes for a query whenever possible. As MVs in \tpcdsdate are significantly smaller compared to those in \tpcds, the increase in inter-node communication ($2.2\times$ increase from 1 to 5 worker nodes) on higher node counts is more observable in \system's MV refresh plan.
+% \subsection{Our Solution Can Handle Complex Workloads}
+% \label{sec:exp_scalabilty}
+
+
+% \textcolor{red}{In this section, we showcase the ability of our solution to solve \optimizationproblem for workloads with complex dependencies.
+% More specifically, we generate dependency graphs / workloads of up to 100 nodes and compare the optimization time of \solutionnodes + \solutionorder to ablated methods on the same workloads.}
+
+% \Cref{fig:scalability_a} shows the average optimization time of the methods over randomly generated workloads of with a varying number of nodes; the intermediate table sizes are sampled from those in the 100GB TPC-DS dataset, while the amount of extra memory is fixed at 32GB.
+% The optimization time of our proposed solution, \solutionnodes + \solutionorder, scales approximately linearly with the number of nodes in the dependency graph, with a negligible runtime of 0.02 seconds on the dependency graphs with 100 nodes. 
+% While \greedy + \solutionorder, \random + \solutionorder and \ratio + \solutionorder have faster optimization times, the advantage (0.001s/0.022s/0.008s vs 0.024s on 100-node graphs) is negligible compared to the additional end-to-end workload execution time reduction brought by \solutionnodes + \solutionorder (\Cref{sec:exp_algm}).
+% Both \solutionnodes + \simulatedannealing and \solutionnodes + \separator are significantly slower compared to the \solutionnodes + \solutionorder in terms of optimization time, especially \solutionnodes + \simulatedannealing, which is $49\times$ slower on 100-node graphs due to \simulatedannealing having to check for the peak memory constraint in each of its iterations. \solutionnodes + \solutionorder outperforms both methods in terms of both optimization time and end-to-end workload execution time reduction.
+
+% We additionally present \Cref{fig:scalability_b} as an investigation of the effect of problem complexity on optimization time induced by differing amounts of extra memory. 
+% While sufficiently small and large extra memory sizes trivialize the optimization problem and result in faster convergence of alternating optimization, the observed difference in optimization time caused by the size of extra memory peaks at $22\%$ across all methods.
+\subsection{\system's Handling of Complex Workload Structures}
+\label{sec:exp_complexity}
+
+In this section, we study the effect of workload dependency structure on the optimization time and achievable speedup of \system. We use our workload generator to create DAGs/workloads of up to 100 nodes and (1) compare \system's optimization time with baseline methods and (2) perform sweeps to investigate the relationship between generation parameters and estimated savings from \system. We generate 1000 DAGs for each setting.
+
+\mypara{Optimization Time} \Cref{fig:scalability} shows the average optimization time of the methods DAGs with up to 100 nodes.
+The optimization time of our proposed solution, \solutionnodes + \solutionorder, scales linearly with the number of nodes in the DAG, with a negligible runtime of 0.02 seconds on DAGs with 100 nodes. 
+While \greedy + \solutionorder, \random + \solutionorder, and \ratio + \solutionorder have faster optimization times, the advantage (0.001s/0.022s/0.008s vs 0.024s on 100-node graphs) is negligible compared to the additional end-to-end workload execution time reduction brought by \solutionnodes + \solutionorder (\Cref{sec:exp_algm}).
+Both \solutionnodes + \simulatedannealing and \solutionnodes + \separator are significantly slower compared to the \solutionnodes + \solutionorder in terms of optimization time while also providing less benefit in terms of workload execution time reduction.
+\subfile{plots/distributed_speedup}
+\subfile{plots/scalability_breakdown}
+\subfile{plots/complexity_exp}
+\mypara{Parameter Sweep}
+\Cref{fig:complexity} reports the results of \system's optimization vs. various generation parameters. 
+Time savings are normalized w.r.t. parameters in \cref{fig:scalability} marked in black.
+\begin{itemize}
+    \item \textbf{DAG size:} The normalized savings achieved by \system is highly correlated with DAG size. The relationship is not proportional; however, this is expected as deeply nested MVs tend to be smaller from repeated filters/projections.
+    \item \textbf{DAG height/width:} The workload generator creates DAGs following the structure of Spark workloads:
+    The height and width correspond to the number of stages in the workload and the number of nodes per stage, respectively.
+    \system achieves more savings on 'thinner' DAGs with higher height/width ratio due to fewer inter-stage dependencies, allowing nodes kept in \memory to be freed sooner with an efficient execution order.
+    \item \textbf{Node max. outdegree:} This parameter controls the number of outgoing edges generated for each node in the DAG, uniformly sampled from [0, max. outdegree].
+    A higher value results in more savings, a result of individual nodes having higher speedup scores as its flagging reduces the file read latency of more downstream nodes.
+    \item \textbf{Stage node count standard deviation (StDev):} This parameter introduces variance into the number of nodes per stage in the DAG. While the DAG structure becomes increasingly irregular with higher variance, the irregularity's effect on speedup is negligible.
+\end{itemize}
+
+% \mypara{DAG size} 
+
+% \mypara{DAG height/width} 
+
+% \mypara{Node max. outdegree} 
+
+% \mypara{Stage node count StDev} 
+
+% \ignore{
+
+% \ignore{
+% \begin{figure}[htbp]
+% \centerline{\includegraphics[width=0.8\linewidth]{figures/job3_example.png}}
+% \caption{Select nodes from job 3. \texttt{year\_total} itself is a large intermediate table while each filtered table is also of significant size. Both reading \texttt{year\_total} multiple times and writing each filtered table to disk are significant sources of inefficiencies which our system effectively addresses.}
+% \end{figure}
+% }
+
+% \ignore{
+% \begin{figure}[htbp]
+% \centerline{\includegraphics[width=0.8\linewidth]{figures/job4_example.png}}
+% \caption{Sample node from job 4. Job 4 consists of computation-heavy intermediate nodes with small result sizes. Our system is less effective on speeding up job 4 as the save/load times of intermediate tables takes up a comparably smaller proportion of total job runtime.}
+% \end{figure}
+% }
+
+% \subsection{Solution Scalability}
+% \label{sec:exp2}
+
+% \cref{fig:exp:scalea} reports the average runtime of each optimization algorithm over 1,000 graphs for each selected generated graph size with a fixed memory container size of 32GB.
+% The runtime of our algorithm scales approximately linearly with the number of nodes in the dependency graph, with an negligable runtime of 0.02 seconds on the largest dependency graphs with 100 nodes. 
+% While the \greedy and Random-based optimization algorithms have predictably faster in runtimes, their little runtime advantage is not comparable with the potential gain in speedup brought by using the MKP.
+% Both execution order optimization algorithms with the average memory usage as metric are significantly slower compared to DFS in addition to their worse performance in terms of speedup.
+
+% \paragraph{Problem Complexity} \cref{fig:exp:scaleb} reports the average runtime of each optimization algorithm over 1,000 graphs over various memory container sizes on 100-node dependency graphs.
+% Notably, the memory container size affects the complexity of the problem when using the MKP: both small and large sizes allow us to simplify the problem with the former allowing us to prune nodes and the latter allowing us to prune constraint sets. 
+% Differences in memory container size can cause up to a $\sim 25\%$ runtime difference for the MKP-based optimization algorithms.
+
+% \subsection{System Effectiveness}
+% \label{sec:exp3}
+% In this subsection, we demonstrate the effectiveness of storing in-memory tables using our system on rumtime reduction of our constructed TPC-DS Jobs.
+
+% \cref{fig:exp:vs_presto_postgres} reports runtimes of the jobs using our system with and without a 32GB memory container, Presto with both row and Parquet table formats, and PostgreSQL on the 100GB TPC-DS dataset.
+% Notably, our system surpasses PostgreSQL on all 5 jobs without a memory container.
+% On all jobs except job 4, our system performs on par with Presto without the memory container, and outperforms Presto when with it; the performance difference of our system compared to Presto on the computation-heavy job 4 can be attributed to Presto being much more suited for handling analytical workloads compared to the Polars framework.
+% % Please add the following required packages to your document preamble:
+% % \usepackage{multirow}
+
+
+
+
+
+
+
+% \subsubsection{TPC-DS analytical jobs}
+% We constructed the following jobs from TPC-DS queries:\begin{enumerate}
+%     \item Job 1 (Queries 5, 77, 80): Report sales-related metrics such as profit and returns for the store, catalog, and web channels in a 30-day window.
+%     \item Job 2 (Queries 33, 56, 60, 61): Report sales-related metrics for items in specific categories in a specific timezone, month and year produced by different manufacturers.
+%     \item Job 3 (Queries 2, 59, 74, 75): Yearly report of item sales, increase in weekly store sales, and customers with a high increase in web sales.
+%     \item Job 4 (Queries 44, 49): List the best and worst performing products in terms of net profit, and the products with the worst return ratios.
+%     \item Job 5 (Queries 14, 23): Find (i) popular items and good customers the top 40th percentile of sales for a given month.
+% \end{enumerate}
+% We manually translate the SQL statements into equivalent Python Polars codes to experiment with our research prototype, while the statements are executed as is for our experiments on PostgreSQL and Presto. 
+% For SQL operators such as rollup which do not have corresponding functionality in Python Polars, we remove them from the SQL statements to ensure the equivalency between our Polars and SQL jobs and experiment fairness.
+
+
+% \subsubsection{Job generator}
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=0.9\columnwidth]{figures/sql_matrix.jpg}
+%     \caption{SQL transition matrix used in our query generator; statistics gathered from queries from TPC-DS and the Yale Spider dataset. \texttt{START} and \texttt{END} are non-functional position marks.}
+%     \label{fig:sql_mat}
+% \end{figure}
+
+% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% % Claim correspondence & Overview
+% Our SQL job generator consists of two components: a DAG generator for creating a random dependency graph for the job, and an operation chain generator for generating SQL operation chains for each node in the dependency graph.
+% The operations in each node are then used to compute the other required parameters of node sizes and speedup scores.
+
+% \paragraph{Operation Chain Generator} We distinguish between two types of operation chains in our generated dependency graphs:\begin{itemize}
+%     \item \textit{1-to-1 chains:} Given a single input table, create one intermediate table with an operation chain consisting of \{\texttt{SELECT}, \texttt{WHERE}, \texttt{GROUP BY}, \texttt{ORDER BY}\} based on a subset of columns.
+%     \item \textit{many-to-1 chains:} Merge multiple input tables into 1 intermediate table through an operation chain consisting of \{ \texttt{JOIN}, \texttt{UNION}, \texttt{INTERSECT}, \texttt{EXCEPT}\} in addition to operations present in 1-to-1 nodes. 
+% \end{itemize}
+% We build a nested SQL parser and compute the SQL operation Markov transition matrix in Figure~\ref{fig:sql_mat} based on human-composed SQL queries from Spider ~\citep{yu-etal-2018-spider} and TPC-DS. 
+% The SQL transition matrix is used to generate realistic chains such as the following: \begin{itemize}
+%     \item \texttt{START, SELECT, WHERE, END}
+%     \item \texttt{START, SELECT, JOIN, WHERE, GROUPBY, END}
+%     \item \texttt{START, SELECT, UNION, SELECT, WHERE, END}
+% \end{itemize}
+
+% \paragraph{DAG Generator} Our dependency graph is generated using a process adapted from ~\cite{6471969}, with graph property parameters including shape and regularity similarly determined by empirical analysis of SQL queries from Spider and TPC-DS. 
+% We assign operation chains to the nodes in the generated graph through rejection sampling from our operation chain generator, assigning the correct chain type to nodes based on its number of parents: for example, a node with 3 parents can be assigned a many-to-1 chain with 2 \texttt{JOIN}s.
+% These operation chains are used to determine with some randomness the size of a node based on its parents; example computations are shown below: \begin{itemize}
+%     \item \texttt{SELECT}: $size\_out = size\_in * exponential(\lambda = 3)$
+%     \item \texttt{GROUPBY}: $size\_out = size\_in * uniform(0.05, 0.2)$
+%     \item \texttt{UNION}: $size\_out\! =\! (size\_in1 + size\_in2) * exponential(\lambda = 3)$
+% \end{itemize}
+% Source nodes with no parents are randomly assigned sizes of tables from the TPC-DS 100G dataset to initialize the node size computation process.
+% Using the assigned sizes, the save and load times are computed using a randomly assigned save/load speed from 95-105MB per second for each node.}

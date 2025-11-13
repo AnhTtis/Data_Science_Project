@@ -1,0 +1,229 @@
+\section{Camera-Calibrated Model}\label{sec:learnable-model}
+
+
+
+
+%
+
+
+We've demonstrated that our algorithm can generate simultaneous color holograms in simulation. However, experimental holograms frequently do not match the quality of simulations due to mismatch between the physical system and the model used in optimization (Eqs. \ref{eq:SLM_to_field}, \ref{eq:field_to_intensity}). Therefore, to demonstrate simultaneous color experimentally, we need to calibrate the model to the experimental system. 
+
+To do this, we design a model based on our understanding of the system's physics, but we include several learnable parameters representing unknown elements. To fit the parameters, we capture a dataset of SLM patterns and camera captures and use gradient descent to estimate the learnable parameters based on the dataset. Next we explain the model which is summarized in Fig. \ref{fig:ForwardModel}.
+
+%\subsection{Learnable Parameters for Offline Calibration} 
+
+\paragraph{Lookup Table} 
+A key element in our optimization is $\phi_\lambda$ which converts the digital SLM input into the phase coming off the SLM. It's important this function accurately matches the behavior of the real SLM. Many commercial SLMs ship with a lookup-table (LUT) describing $\phi_\lambda$; however, this LUT is generally only calibrated at a few discrete wavelengths.  Consequently, we learn a LUT for each color channel's wavelength as part of the model. Based on a pre-calibration of the LUT using the approach of \citet{yang2015nonlinear}, we observe the LUT is close to linear; we therefore parameterize the LUT with a linear model to encourage physically realistic solutions.
+% \begin{align}
+%     \phi_lambda(s) = a_1 \cdot s + a_2
+% \end{align}
+% where $a_1, a_2$ are learned parameters that are different for each color channel. We initialize $a_1, a_2$ with the values approximated from our pre-calibration \gk{is this true?}.
+
+\paragraph{SLM Crosstalk}
+SLMs are usually modeled as having a constant phase over each pixel with sharp transitions at boundaries. However, in LCoS SLMs, 
+elastic forces in the LC layer prevent sudden spatial variations, and the electric field that drives the pixels changes gradually over space. As a result, LCoS SLMs suffer from crosstalk, also called field fringing, in which the phase is blurred \cite{apter2004fringing, moser2019model, persson2012reducing}. We model crosstalk with a convolution on the SLM phase. Combined with our linear LUT described above, we can describe the phase off the SLM as
+\begin{align} \label{eq:learned-model-01-LUT}
+    \phi_\lambda(s) = k_{\text{xt}} * (a_1 \cdot s + a_2)
+\end{align}
+where $a_1, a_2$ are the learn parameters of the LUT, and $k_{\text{xt}}$ is a learned $5 \times 5$ convolution kernel representing crosstalk. Separate values of these parameters are learned for each color channel.
+
+\paragraph{Propagation with Higher Diffraction Orders}
+The discrete pixel structure of the SLM creates higher diffraction orders that are not modeled by ASM or Fresnel propagation. With the use of a 4$f$ system, a physical aperture at the Fourier plane of the SLM can be used to block higher orders. However, this adds significant size to the optical system, reducing the practicality for head-mounted displays. Therefore, we chose to avoid additional lenses after the SLM and instead account for higher orders in the propagation model.
+
+% 
+We adapt the higher-order angular spectrum model (HOASM) of \citet{Gopakumar2021UnfilteredDisplays}. 
+% Defining $\mathcal{F}\{g\} = G(f_x, f_y)$, where $g$ is the electric field off the SLM from Eq. \ref{eq:SLM_to_field}, we calculate the Fourier transform of the first diffraction orders as
+% \begin{equation} \label{eq:learned-model-02-HOASM}
+% \begin{split}
+%     G_{\text{1st order}}(f_x, f_y) = &\left(- G(f_x, f_y) + \sum_{i,j = -1}^1 G \left(f_x + \tfrac{i}{p}, f_y + \tfrac{j}{p} \right)  \right)  \\ & \times \text{Sinc}(\pi f_x p) \cdot \text{Sinc}(\pi f_y p)
+% \end{split}
+% \end{equation}
+% where $p$ is the pixel pitch of the SLM. 
+The zero order diffraction, $G_0(f_x, f_y)$, and first order diffraction, $G_1$, patterns are propagated with ASM to the plane of interest independently. Then the propagated fields are stacked and passed into a U-net, which combines the zero and first orders and returns the image intensity:
+\begin{align} 
+f_{\text{ASM}}(G, z) &= \mathcal{F}^{-1}\left\{ G \cdot H_{\text{ASM}}(z)\right\} \label{eq:learned-model-03-propagation} \\ 
+I_z &= \text{Unet}\left(f_\text{ASM}(G_0, z), \: f_\text{ASM}(G_1, z)\right), \label{eq:learned-model-04-unet}
+\end{align}
+where $H_{\text{ASM}}(z)$ is the ASM kernel. The U-Net architecture is detailed in the supplement; a separate U-net for each color is learned from the data. The U-Net helps to address any unmodeled aspects of the system that may affect the final hologram quality such as source polarization, SLM curvature, and beam profiles, and the U-net better models superposition of higher orders, allowing for more accurate compensation in SLM pattern optimization.  
+
+\section{Implementation}
+
+\paragraph{Experimental Setup}
+Our system starts with a fiber-coupled RGB source ($\lambda_r = \SI{636}{\nano\metre}, \lambda_g = \SI{512}{\nano\metre}, \lambda_b = \SI{453}{\nano\metre})$, collimated with a $\SI{400}{\milli\metre}$ lens. The beam is aligned using two mirrors, passes through a linear polarizer and beamsplitter, reflects off the SLM (Holoeye-2.1-Vis-016), and passes through the beamsplitter a second time before directly hitting the color camera sensor with Bayer filter (FLIR GS3-U3-123S6C). As seen in Fig.~\ref{fig:Setup}, there's no 4$f$ system between the SLM and camera, which allows the setup to be compact, but requires modeling of higher diffraction orders. The camera sensor is on a linear motion stage, enabling a range of propagation distances from $z = \SI{80}{\milli\metre}$ to $z = \SI{130}{\milli\metre}$.
+
+For our source, we use a superluminescent light emitting diode (SLED, Exalos EXC250011-00) rather than a laser due to its lower coherence, which has been demonstrated to reduce speckle in holographic displays \cite{Deng2017CoherenceDisplays}. \revised{Although previous work showed state-of-the-art image quality by modeling the larger bandwidth of the SLED as a summation of coherent sources \cite{Peng2021Speckle-freeCalibration}, we found the computational cost to be prohibitively high for our application due to GPU memory constraints. We achieved sufficient image quality while assuming a fully coherent model, potentially due to the U-net which is capable of simulating the additional blur we expect from a partially coherent source.}
+
+\revised{Our experimental system directly forms the hologram on a bare sensor, but for a human-viewable system, an eyepiece is necessary between the image plane and the user's eye. See Supplement for details on how the eyepiece effects the depth replicas.}
+
+\paragraph{Calibration Procedure}
+We learn parameters in our model (Eqs. \ref{eq:learned-model-01-LUT} - \ref{eq:learned-model-04-unet}) using a dataset captured on the experimental system. We pre-calculate 882 SLM patterns from a personally collected dataset of images using the ASM propagation model. Each SLM pattern is captured in $\SI{10}{\milli\metre}$ increments from $z = \SI{90}{\milli\metre}$ to $\SI{120}{\milli\metre}$%, resulting in a total of 6174 paired entries. 
+The camera data is debayered and an affine transform is applied to align the image with the SLM (see Supplement for details). Model fitting is implemented in PyTorch using an L1 loss function between the model output and camera capture. To account for the camera color balance, we additionally learn a $3 \times 3$ color calibration matrix. % from the RGB simulated intensities to the captured color image.
+We train until convergence, which is typically reached in 2-3 days on Nvidia A6000 GPU.
+
+\paragraph{Hologram Generation}
+After training, we can generate holograms by solving Eq. \ref{eq:loss_func_opponent} using the trained model for $I_{z,\lambda}$, implemented with PyTorch's native autodifferentiation. The SLM pattern, $s$, is constrained to the range where the LUT is valid (for example, 0 - 255); the values outside that range are wrapped after every optimization step.  On the Nvidia A6000 GPU, it takes about two minutes to optimize a 2D hologram.  Computation time for the optimization of a 3D hologram scales proportionally to the number of depth planes.
+
+% %
+% \subsection{Optical Setup}
+% \label{OpticalSetup}
+% As the goal is to create a feasible color holography system for AR and VR, we opt for an unfiltered holography setup in order to achieve the necessary form factor to achieve this goal.
+% %
+% The setup is simple and compact.
+% %
+% A fiber-coupled super light emitting diode (SLED) serves as the light source. 
+% %
+% \ericm{Exalos SLED, get info on exact model from Grace}
+% %
+% The SLED is collimated by a 400 mm focal length lens. 
+% %
+% The collimated beam passes through a figure-four mirror configuration for alignment.
+% %
+% From here the beam passes through a linear polarizer and a beam splitter reflecting onto the SLM.  Unfortunately, each color channel has a different polarization.  The linear polarizer is set to an angle the produces roughly equal intensity of each color channel on the sensor after reflecting off the SLM.
+% %
+% From the SLM the modified wavefront propagates back through the beam splitter to a color camera \ericm{FLIR, get specifics} mounted on a linear stage.
+% %
+% The experimental setup described above is depicted in Figure 1.
+
+% \subsection{SLED Model}
+% \label{SLED}
+
+% A SLED is used as the light source to help minimize speckle in the observed wavefront due to the larger line width \cite{Deng2017CoherenceDisplays, Peng2021Speckle-freeCalibration}.
+% %
+% Although previous work has shown that modeling each channel as a summation of coherent sources produces state of the art hologram quality, this was not an option for us due to GPU memory constraints.
+% %
+% Consequently, we simply model the SLED as three coherent plane waves with a wavelengths equal to the center of each of the three SLED channels.
+% %
+% This approach in conjunction with a neural network after the wavefront propagator has produced adequate results in experiment, hence we have opted to retain this simpler model. 
+% %
+% We hypothesize \fs{hypothesize without backing up is not good. Would change the wording here} that our downstream neural network helps to account for our physics simplifications in the modeling of the SLED.
+
+% \subsection{SLM Model}
+% \label{SLM}
+
+% The phase range of a SLM is wavelength dependent, consequently our RGB wavefront experiences different phase delays making simultaneous color holography possible.
+% %
+% In theory a perfect SLM pattern can be chosen if an SLM with an unlimited phase range in one color channel is considered. \ericm{(Do we need a proof here?)}
+% %
+% \fs{I think you might need a proof here.}
+% %
+% Unfortunately, infinite phase range SLMs do not exist and the phase range of SLMs that do exist is typically quantized to 8-bits.
+% %
+% This leads to the question of what is the ideal phase range when accounting for this 8-bit quantization.
+% %
+% We first compare the SNR of monochromatic holograms of various bit depths to understand the effect of quantization on hologram quality.
+% %
+% SNR and SSIM begin to falloff between 6 and 5 bits as depicted in  Figure ~\ref{fig:ExtendedPhaseStudy}a suggesting each 2$\pi$ phase interval should have at least 5-bits of granularity.  
+% %
+% For an 8-bit SLM, we hypothesize a phase range between 8$\pi$ and 16$\pi$ to be ideal as the effective quantization for each 2$\pi$ interval would be between 5 and 6 bits. 
+% %
+
+% To test this we optimize 2 color channel holograms in simulation.  One channel is fixed phase range of 2$\pi$ and the second color channel is varied from $2\pi$ to $16\pi$.
+% %
+% This phase range allows the exploration effective bit depths from 8 to 5 bits for an 8-bit SLM.  Simulated SLMs of lesser bit depth are also explored in this experiment
+% %
+% The previously mentioned experiment is conducted for both natural and an unnatural images.  The results for unnatural images are depicted in Figure ~\ref{fig:ExtendedPhaseStudy}b.  The results for natural images are largely the same an can be found in the supplement.  Both natural and unnatural images are used as our method does not perform equally for both types.  
+% %
+% This discrepancy is further discussed in the future work section. 
+% %
+% A steady increase in SSIM is observed as the effective bit depth decreases from 8 to 6 bits for the 8-bit SLM.  The SSIM then plateaus when decreasing from an effective bit depth of 6 to 5 in rough agreement with our results observed in the monochromatic quantization experiment.  
+% %
+% This suggests that an 8-bit SLM with a phase range between $8\pi$ and $16\pi$ should be used in the experimental set up. 
+% %
+
+%  An SLM with such phase range could not be commercially found for the visible light spectrum at the time of publication.  Instead, a Holoeye PLUTO-2.1-VIS-016 SLM was chosen for this work due to its extended phase range of 6.9$\pi$ at 530 nm.  This was the closest match to the previously mentioned results.  
+% %
+% \begin{figure}
+%     \centering
+%     \includegraphics[scale=.35]{figures/ExtendedPhase.png}
+%     \caption{A) Study on how quantization affects hologram quality in simulation.  We find a decrease in hologram quality begins at a bit depth of five. B) SSIM of two channel simultaneous color holograms in simulation.  The first channel is fixed to be a phase range of 2$\pi$ while the second channel's phase range varies from 2$\pi$ to 16$\pi$.  The SSIM of the produced hologram begins plateua and then fall off when the effective bit depth across a 2$pi$ section of the extended phase range reaches 5 bits.}
+%     \label{fig:ExtendedPhaseStudy}
+% \end{figure}
+% %
+
+% The chosen SLM is then modeled with a fully parameterized model.
+% %
+% The parameters of the computational model include a 5x5 pixel cross talk kernel, phase range, and phase bias for each of the three SLED color channels.
+% %
+% These parameters are all learned through a calibration process discussed in ~\ref{Cal}. 
+% %
+% The cross talk kernels are initialized as a Gaussian with a standard deviation of 1.5 pixels \ericm{check this}. 
+% %
+% The phase range is initialized from the closest wavelengths on the SLM spec sheet. 
+% %
+% The phase bias is initialized as zero.
+% %
+% The SLM phase delay is assumed to be strictly linear.  
+
+% \subsection{Wavefront Propagation Model}
+% \label{Propagation}
+
+% After calculating the phase imparted on the SLED wavefront from the SLM, the wavefront is propagation using a modified version of the higher order angular spectrum method (HOASM) laid out in \cite{Gopakumar2021UnfilteredDisplays} in order to better account for model mismatch.
+
+% The traditional angular spectrum method cannot be used due to the experimental set up being unfiltered.  The SLM is a discrete grid of 8 $\mu$m pixels.  This acts as a diffraction grating producing high order copies of the propagated wavefront.  Due to the short propagation distance of the system, these replicates overlap at the image plane of the system. Figure  ~\ref{fig:HOASM} depicts the need to use HOASM instead of traditional ASM.  The HOASM reduces artifacts from higher diffraction orders in experiment but does not match the simulated result. This suggests that while using HOASM is better than using ASM, model mismatch still persists.  In order to decrease model mismatch we modify the HOASM laid out in \cite{Gopakumar2021UnfilteredDisplays}.  The modified HOASM method is laid out in Fig. ~\ref{fig:ForwardModel} 
+
+
+% The first modification made to the HOASM method is that zeroth and first diffraction orders are calculated separately.
+% %
+% The first diffraction order is calculated by taking the FT \fs{did you introduce FT before} of the wavefront to be propagated and patterning the result in a grid just as done in the original HOASM.
+% %
+% Next the center FT is zeroed out before the sinc weighting function is applied and the wavefront is propagated.  This results in only the first order being modeled.
+% %
+% The zeroth order is calculated simply by propagating the field using traditional the angular spectrum method and no weighting function.
+% %
+% The two complex fields are then stacked and fed into a U-Net.  
+% %
+% We hypothesize the U-Net helps to reduce three sources of model mismatch.
+% %
+% The first source is the sinc weighting function not matching the true weighting function.
+% %
+% The presence of higher-order artifacts in the experimentally captured hologram that was optimized using HOASM as the forward model suggests the zeros of the weighting function in simulation do not match the locations of the zeros in the experiment.
+
+% The second source of model mismatch results from only including the zeroth and first diffraction orders.
+% %
+% In reality, due to the short propagation distance needed for a compact display, the second diffraction order also intersects the zeroth order at the image plane.
+% %
+% The energy contained in the second diffraction order is minimal and can largely be ignored.
+
+% The final source of model mismatch is model mismatch resulting from assumptions made in the ASM. \ericm{talk more about these assumption}
+% %
+% The architecture of the U-Net is the same for each color channel, but the weights of each channel's U-Net are unique.  
+% %
+% The wavefronts of each color channel are fed into a corresponding U-Net which outputs the combined, adjusted intensity wavefront of the two modeled diffraction orders. \ericm{Define UNet archeticture here}.
+% %
+% The three output wavefronts are then used to form each of the RBG channels captured on the camera.
+% %
+% The weighting of each combination is learned because the camera filters are not perfectly aligned with the SLED channels.
+
+% \section{Calibration}
+% \label{Cal}
+% Due to the extensive number of learned parameters in our SLM and propagation models, a rigorous calibration process must be performed.
+% %
+% To perform this process N SLM patterns were precalculated using an internal dataset.
+% %
+% The patterns are calculated using a naive ASM forward model for propagation distances from 80 to 110 mm in increments of 5 mm.
+% %
+% Each SLM pattern was simultaneously illuminated with the RGB channels of the SLED and the resulting wavefront was captured on a camera.
+% %
+% Each pattern was captured for propagation distances from 80 to 110 mm in 5 mm increments regardless of which propagation distance the SLM pattern was calculated for. 
+% %
+% A debayering step and then an affine transform is applied to each captured wavefront to create a paired dataset of SLM patterns and captured wavefront intensities at the image plane.
+% %
+% See the appendix for further details on homography calculation in order to insure target image and captured image alignment.
+% %
+% The final dataset consists of 6174 paired entries. 
+% %
+% Once the paired dataset has been captured the full system forward model can be trained.  During training, each SLM pattern is fed through the complete forward model described in section \todo{~\ref{}}.
+% %
+% The output intensity wavefront is then used to calculate the loss function for calibration.
+% %
+% The loss function is simply the L1-norm of the difference of the calculated and captured wavefront.
+% %
+% Pytorch's native autodifferentation is then used to update the learnable parameters of the forward model. 
+% %
+% These parameters consist of the SLM cross-talk kernels, the SLM wavelength-dependent phase depths, the UNET weights, and the channel combination matrix. 
+% %
+% These parameters are continuously updated until convergence is reached.
+% %
+% Convergence is typically reached between 50 and 100 epochs, but an adequate model is produced after only 3 to 5 epochs.
+% %
+% Convergence requires 2 to 3 days of training to reach on a Nividia A6000 GPU while a workable model is achieved after approximately 4 to 5 hours of training.

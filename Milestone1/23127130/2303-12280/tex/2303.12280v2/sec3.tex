@@ -1,0 +1,189 @@
+\section{Method}
+This section describes the key points for NLOS-NeuS to correctly learn an SDF in an NLOS scene.
+We first explain our problem setting and review the NeTF as preliminary for neural scene representation in an NLOS scene.
+We then describe the difficulty in learning an SDF in the under-constrained NLOS setup followed by additional constraints and loss functions for learning an SDF.
+At the end of this section, we introduce background rendering in NLOS scenes.
+
+\subsection{Problem setting} \label{sec:problem_setting}
+Our goal is to learn two MLPs, $d:\mathbb{R}^3 \to \mathbb{R}$ and $\rho:\mathbb{R}^6 \to \mathbb{R}$ from transients.
+The input of $d$ is a scene position $\mathbf{p} = (x,y,z) \in \mathbb{R}^3$ in an NLOS scene to estimate a signed distance, and the inputs of $\rho$ are $\mathbf{p}$ and direction $\mathbf{v}$ from $\mathbf{p}$ to the position of a visible relay wall $\mathbf{p}' = (x',y',z') \in \mathbb{R}^3$ to estimate view-dependent reflectance. 
+The parameters of these two MLPs are optimized by reconstructing measured transients on the relay wall with volume rendering. 
+
+The transient at each position on the relay wall is represented with a 1D vector $\tau(\mathbf{p}') \in \mathbb{R}^B$, where $B$ is the number of time bins.
+For example, in SPAD measurement, $\tau(\mathbf{p}', t)$ is the number of counted photons, the arrival time of which is $t$.
+
+\subsection{Preliminary}
+We first review the NeTF \cite{Shen2021} for NLOS scene representation.
+The NeTF also learns two MLPs; one is $\sigma: \mathbb{R}^3 \to \mathbb{R}$ taking as input a position $(x,y,z)$ to estimate density, and the other is $\rho$, which is essentially the same with our MLP to estimate view-dependent reflectance\footnote{In fact, $\rho$ is a 5D function in the NeTF, i.e, the inputs are $(x,y,z)$ and $(\theta, \phi)$.}.
+Differing from the NeRF \cite{Mildenhall2020}, where 
+scene points are sampled on a ray for volume rendering, the NeTF spherically samples points from the relay wall for rendering the transients as shown in Fig. \ref{fig:netf_sampling}:
+
+\begin{figure}[tb]
+\centering
+\includegraphics[width=0.4\textwidth]{figure/netf_sampling.pdf}
+\caption{Spherical sampling in NeTF \cite{Shen2021} for rendering transients. Scan sphere with radius $r_t$ corresponds to transient at time bin $t$.}
+\label{fig:netf_sampling}
+\end{figure}
+
+\begin{align}
+\mathbf{p}(\mathbf{p}',r_t, \theta, \phi) = \left[
+\begin{array}{c}
+r_t \sin \theta \cos \phi + x' \\
+r_t \sin \theta \sin \phi + y' \\
+r_t \cos \theta + z'
+\end{array}
+\right],
+\end{align}
+where $r_t$ is a radius corresponding to a transient time bin $t$, and $\theta$ and $\phi$ are elevation and azimuth angles.
+A transient $\tau(\mathbf{p}', t)$ is computed as the sum of reflected intensities at sampled points on the scan sphere:
+\begin{align}
+\tau(\mathbf{p}', t) = \iint A(r_t, \theta) T(\mathbf{p},\mathbf{v})
+\sigma (\mathbf{p} ) \rho ( \mathbf{p}, \mathbf{v} ) d\theta d\phi,
+\label{eq:rendering_eq}
+\end{align}
+where $A(r_t,\theta)=\sin \theta / r_t^2$ is an attenuation factor, and $T(\mathbf{p}, \mathbf{v})$\footnote{This transparency is omitted in the implementation of the NeTF.} is the transparency between the object and relay wall.
+For simplicity, the arguments of $\mathbf{p}$ and $\mathbf{v}$ are omitted, i.e., $\mathbf{p}(\mathbf{p}',r_t,\theta,\phi)$ and $\mathbf{v}(\mathbf{p}(\mathbf{p}',r_t,\theta,\phi), \mathbf{p}')$.
+%$\mathbf{v}$ are omitted, i.e., $\mathbf{p}(\mathbf{p}',r_t,\theta,\phi)$ and $\mathbf{v}(\mathbf{p}(\mathbf{p}',r_t,\theta,\phi), \mathbf{p}')$.
+
+The parameters of $\sigma$ and $\rho$ are optimized by minimizing the error between measured and rendered transients as follows:
+\begin{equation}
+\mathcal{L}_\tau = \frac{1}{MB}\sum_{\mathbf{p}',t}(\tau_{m}(\mathbf{p}',t) - \tau(\mathbf{p}',t))^2,
+\end{equation}
+where $\tau_m$ is the measured transient and $M$ is the number of measured positions on the relay wall.
+%\funa{Is it reasonable to normalize by $M$ and $B$? Aren't they just a constant among all the measured transient?}.
+
+\subsection{NLOS-NeuS} \label{sec:nlos-surface}
+Following previous studies \cite{Wang2021neus,Yariv2021}, NLOS-NeuS uses volume rendering with an SDF.
+The MLP $d$ first takes $\mathbf{p}$ as input to estimate a signed distance, and $\rho$ takes $\mathbf{p}$ and $\mathbf{v}$ to estimate
+view-dependent reflectance.
+The estimated signed distance is then converted to a density for volume rendering.
+We use the transformation proposed in StyleSDF \cite{Or-El2022} for computational efficiency with one learnable parameter and without gradient evaluation:
+\begin{equation}
+\sigma(\mathbf{p}) = \frac{1}{\alpha} Sigmoid(-\frac{d(\mathbf{p})}{\alpha}),
+\label{eq:sdf2density}
+\end{equation}
+where $Sigmoid(\cdot)$ is a sigmoid function and $\alpha > 0$ is a learnable parameter that controls the tightness of the density around the object surface.
+After obtaining the density, we can render a transient by using Eq. (\ref{eq:rendering_eq}).
+In the implementation, we use the following discrete counterparts \cite{Max1995,Mildenhall2020,Wang2021neus}:
+\begin{align}
+\tau(\mathbf{p}', t) &= \sum_{\theta,\phi} A(r_t, \theta) w(\mathbf{p},\mathbf{v}) \rho(\mathbf{p},\mathbf{v}) \Delta\theta \Delta \phi, \label{eq:discrete} \\
+w(\mathbf{p}, \mathbf{v}) &= \sum_{s=t_{min}}^{t} T_s \Big(1 - \exp\{-\sigma\big(\mathbf{p}(\mathbf{p}',r_s, \theta, \phi)\big)\Delta r_s\}\Big) \label{eq:weight},\\
+T_s & = \exp \left\{ -\sum_{u=t_{min}}^{s-1}  \sigma\big(\mathbf{p}(\mathbf{p}',r_u, \theta, \phi)\big) \Delta r_u \right\},
+\end{align}
+where $w(\mathbf{p}, \mathbf{v})$ corresponds to the blending weights of volumetric albedos on the ray from the relay wall. 
+
+\subsection{Learning zero level-set surface in NLOS setup}\label{sec:nonzero_levelset}
+Many methods for learning neural implicit surfaces have been proposed under a multi-view setup \cite{Niemeyer2020,Oechsle2021,Wang2021neus,Yariv2021,Yariv2020}.
+One of the differences between these methods and our NLOS-NeuS is the configuration of the target scene.
+In a multi-view setup, the target object is surrounded by multiple cameras.
+In an NLOS setup, however, only one side of the target object is observed from the relay wall.
+We found that such an under-constrained setup causes a non-zero level-set surface in an SDF, as shown in Fig. \ref{fig:nonzero_level_set}(a).
+The back side of the object cannot be observed, which leads to the highest weight at the point with non-zero signed distance on the ray.
+Figure \ref{fig:nonzero_level_set}(b) shows the estimated signed distance for the synthetic bunny scene with the simple extension of the NeTF.
+The black curve indicates an extracted object surface as the points with the highest weight along the ray from the relay wall and does not coincide with the zero level-set in the green boxes.
+Figure \ref{fig:ablation_loss}(a) is the estimated depth from this SDF with the sphere tracing algorithm \cite{Hart1996}, where most parts of the bunny are missing.
+
+\begin{figure}[tb]
+\centering
+\includegraphics[width=0.45\textwidth]{figure/nonzero_level_set_example.pdf}
+\caption{(a) Non-zero level-set surface. Under-constrained NLOS setup causes non-zero level-set surface because back side of object cannot be observed from relay wall. Point with non-zero signed distance incorrectly has highest weight on ray from relay wall. 
+(b) Learned SDF of synthetic bunny scene, where points with highest weights (black curve) do not coincide with zero level-set in green boxes.
+(c) Our method enabled us to extract plausible zero level-set surfaces.
+}
+\label{fig:nonzero_level_set}
+\end{figure}
+
+To avoid such a non-zero level-set surface, the following two requirements should be satisfied. (1) At the object surface, the signed distance values should be zero. To achieve this, we have to detect the object surface and force explicit geometric supervision. (2) Points with non-zero signed distance should not contribute to the object surface. To achieve this, $\alpha$ in Eq. (\ref{eq:sdf2density}) decreases correctly during training. As explained in Sec. \ref{sec:nlos-surface}, $\alpha \to 0$ means a perfectly sharp surface, i.e., only points with zero signed distance contributes to object surfaces. We introduce two constraints as training losses for satisfying these two requirements, which enabled us to estimate a plausible SDF, as shown in Fig. \ref{fig:nonzero_level_set}(c).
+
+\paragraph{Zero signed-distance self-supervision}
+We supervise the MLP to have zero signed distances at the object surface.
+Recent studies have shown that such explicit geometric supervision enhances the quality of the learned SDF \cite{Azinovic2022,Fu2022}.
+Differing from these studies in which geometric information was obtained with additional sensors, we have no explicit geometric information, thus automatically detect points to be supervised during training.
+
+To detect surface points, we compute the probabilistic density function (PDF) as normalized $w(\mathbf{p},\mathbf{v})\rho(\mathbf{p},\mathbf{v})$ on each scan sphere during training and sample $N_z$ points on the sphere on the basis of the PDF.
+These points are likely to be located on the object surface; thus, we force these points to have a zero signed distance with the following loss function:
+\begin{equation}
+\mathcal{L}_{z} = \frac{1}{MBN_z}\sum_{t,\mathbf{p}'} \sum_{n = 1}^{N_z} m(\mathbf{p}',t) | d(\mathbf{p}(t, \theta_n, \phi_n)) |,
+\end{equation}
+where $m(\mathbf{p}',t) \in \{ 0,1 \}$ is a mask; 
+$m(\mathbf{p}',t)=1$ means that object points exist on the sphere with a radius $r_t$ centered at $\mathbf{p}'$.
+This mask can be computed easily by thresholding the measured transient $\tau_m$.
+If we model background effects (Sec. \ref{sec:background}), we compute the mask with an object component $\tau_m - \xi\tau_b$ during training.
+
+\paragraph{Constraint on volume-rendering weight}
+Wang et al. \cite{Wang2021neus} mentioned that a learnable parameter connecting signed distance and density ($\alpha$ in Eq. (\ref{eq:sdf2density}) in our case) converges to zero during training.
+However, we found that an additional constraint is necessary to correctly decrease the parameter for the NLOS setup.
+
+Before introducing the constraint, we discuss a mask loss proposed in multi-view settings \cite{Wang2021neus,Yariv2020}.
+In NeuS \cite{Wang2021neus}, the input images are masked, and the masks are used for an additional loss, where the sum of the volume rendering weights (Eq. (\ref{eq:weight}) in our case) on each camera ray is forced to be equal to the value at the corresponding pixel of the mask, i.e., the mask loss is defined as 
+\begin{equation}
+\mathcal{L}_{mask} = E(m_k, \hat{o}_k), \label{eq:mask_loss}
+\end{equation}
+where $m_k$ is the value of the mask at the $k$-th pixel, $\hat{o}_k$ is the accumulated weight, and $E$ is an error metric such as the binary cross entropy.
+We provide the following observation.
+\begin{pro} \label{th:mask_loss}
+Minimizing the mask loss (Eq. (\ref{eq:mask_loss})) leads to the convergence of $\alpha$ (in Eq. (\ref{eq:sdf2density})) to 0.
+\end{pro}
+We provide the proof in the supplementary material.
+Intuitively, all densities in the empty space should be 0, which results in the convergence of $\alpha$ to 0.
+
+Therefore, the mask loss is effective for learning $\alpha$, while the difficulty in the NLOS setup is that we cannot obtain an object mask.
+Instead of using such explicit mask loss, we use the following loss:
+\begin{align}
+\mathcal{L}_{en} = \frac{1}{M|\theta||\phi|}\sum_{\mathbf{p}',\theta,\phi}-\hat{o} \log_2 \hat{o} - (1-\hat{o}) \log_2 (1-\hat{o}),
+\end{align}
+where $\hat{o} = \sum_{t=t_{min}}^{t_{max}}w(\mathbf{p}, \mathbf{v})$ is the accumulated weight for each view line from the relay wall, and $|\cdot|$ is the number of sampled variables.
+This loss function is similar to the beta-distribution constraint of accumulated opacity used in the previous studies \cite{Bi2020,Lombardi2019,Mu2022} where accumulated opacity from a camera should be 0 or 1.
+We use entropy as this loss function that bounds the loss value between 0 and 1.
+
+Figure \ref{fig:alpha_plot} shows the plots of $\alpha$ during training for the synthetic bunny scene, where $\alpha$ diverges without both $\mathcal{L}_z$ and $\mathcal{L}_{en}$ (blue plot).
+Although $\alpha$ does not diverge if we use $\mathcal{L}_z$ (green plot), it begins to increase in the early stage and remains relatively large at the end of the training.
+On the other hand, $\alpha$ successfully decreases and converges to a very small value with $\mathcal{L}_{en}$ (orange and red plots).
+\begin{figure}[tb]
+\centering
+\includegraphics[width=0.4\textwidth]{figure/alpha_plot.pdf}
+\caption{Plots of $\alpha$ during training. For learning sharp surface, $\alpha$ in Eq. (\ref{eq:sdf2density}) should decrease during training. This plot shows that $\mathcal{L}_{en}$ can make $\alpha$ converge to very small value (orange and red plots)}
+\label{fig:alpha_plot}
+\end{figure}
+
+\subsection{Training loss}
+In summary, we use the following loss function for training NLOS-NeuS:
+\begin{equation}
+\mathcal{L} = \lambda_\tau \mathcal{L}_\tau + \lambda_{ei} \mathcal{L}_{ei} + \lambda_{z}\mathcal{L}_z + \lambda_{en}\mathcal{L}_{en} + \lambda_f \mathcal{L}_{f},
+\end{equation}
+where $\mathcal{L}_\tau$, $\mathcal{L}_z$, and $\mathcal{L}_{en}$ are those described in the previous sections.
+$\lambda_*$ are hyperparameters to control the contribution of each loss.
+$\mathcal{L}_{ei}$ is the Eikonal loss \cite{Gropp2020} for the regularization of the SDF:
+\begin{equation}
+\mathcal{L}_{ei} = \frac{1}{|\Omega_{\mathit{nlos}}|}\sum_{\mathbf{p}\in \Omega_{\mathit{nlos}}} (\| \nabla d(\mathbf{p}) \| - 1 )^2,
+\end{equation}
+where $\Omega_{\mathit{nlos}}$ is the target NLOS space.
+
+We also introduce SDF regularization based on the geometry of first-returning photons \cite{Tsai2017}.
+From the traveling distances of first-returning photons, we can apply space carving to the NLOS scene to obtain the free space and rough shape.
+In the free space, the signed distances to the rough shape form the lower bounds of the true signed distances.
+We can leverage these lower bounds as the additional training loss:
+\begin{equation}
+\mathcal{L}_{f} = \frac{1}{|\Omega_{\mathit{free}}|}\sum_{\mathbf{p} \in \Omega_{\mathit{free}}} \max (0, b(\mathbf{p}) -  d(\mathbf{p})),
+\end{equation}
+where $\Omega_{\mathit{free}}$
+%\funa{for super/subscript, please use mathrm or mathit} 
+is the free space and $b(\mathbf{p})$ is the lower bound of the signed distance at $\mathbf{p}$ in the free space.
+This loss is inspired by the SDF lower bound from silhouette \cite{Lin2020}, while we derive the lower bounds from the geometry of first-returning photons.
+In the supplementary material, we provide the details of the detection of the first-returning photons and robust space carving algorithm.
+
+\subsection{Rendering background} \label{sec:background}
+In practical scenes, background effects, such as intereflection or reflected light from the floor, are not negligible.
+Plack et al. \cite{Plack2023} proposed the background network, which takes as input a point on a relay wall and temporal bin for estimating components from the background.
+The scaling parameter between the components from the target object and background is also optimized with an additional constraint.
+To avoid an SDF fitting the background components, we follow the same approach for modeling the background but simply adjust the scaling parameter with the measured transient.
+Formally, the final transient $\tau$ is the weighted sum of the transients from the object $\tau_{o}$ (same with Eq. (\ref{eq:discrete})) and from the background $\tau_b$ as follows:
+\begin{equation}
+\tau(\mathbf{p}') = \tau_o(\mathbf{p}') + \xi \tau_b(\mathbf{p}'),
+\end{equation}
+where $\xi$ is a scaling parameter computed as 
+\begin{equation}
+\xi = \frac{\sum_t \tau_m(\mathbf{p}',t) - \sum_t \tau_o(\mathbf{p}',t)}{\sum_t \tau_b(\mathbf{p}',t)}.
+\end{equation}
+The background network is jointly trained with $\rho$ and $d$.
+In the supplementary material, we provide examples of the rendered background.

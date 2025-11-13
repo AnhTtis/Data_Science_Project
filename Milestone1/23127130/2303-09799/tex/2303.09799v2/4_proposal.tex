@@ -1,0 +1,247 @@
+\section{Preliminaries}
+\subsection{Audio Encoding}
+The input audio provides critical input information to our system.
+Following~\cite{lu2021liveLSP}, we use auto-regressive predictive coding (APC)~\cite{chung_generative_2020} to extract structural audio stream representations. Given historical data, the APC model uses the $\log$ Mel spectrograms feature as input and predicts future surface properties. The model is a $3$-layer GRU~\cite{2014ChoGRU}.
+
+\begin{equation}
+    \label{eq:speed_represent}
+    \mathbf{h}_u = \rm{GRU}^{(u)}(\mathbf{h}_{u - 1}), \forall u \in [1,3] 
+\end{equation}
+where $\mathbf{h}_u \in \mathbb{R}^{512}$ represents the posterior probability of every layer in GRUs. Our targeted audio stream representations are latent states in the final GRU unit. During the training process, we add a linear layer that maps the output to predict the next log Mel spectrogram. 
+The representation of the final GRU unit $\mathbf{h}_3$ is projected to a manifold as in~\cite{lu2021liveLSP} to extract the audio stream feature $\mathbf{h} \in \mathbb{R}^{512}$. In practice, this projection step can improve the generalization of the audio stream extractor~\cite{lu2021liveLSP}.
+
+
+
+\subsection{Motion Generator}
+\label{subsubsec:motionReconstruction}
+Given the extracted audio features, this step generates audio-driven motions in our framework. In practice, the character's style is mainly defined by the mouth, eye, head, and torso movement. Therefore, we consider the motion around these regions of the face in our work.
+
+\textbf{Mouth and Eye Synthesis.} There has been a lot of work towards predicting mouth movements from audio. Our goal is to learn a mapping from acoustic information to the intermediate representation using a deep network.
+While most other methods apply parameters of a parametric model~\cite{chen_photo-realistic_2019,taylor_deep_2017}, 3D vertices~\cite{cudeiro_capture_2019}, or facial blend shapes~\cite{thies_neural_2020}, we employ 3D displacements (i.e., the geometry of mouth and eyes surfaces)~\cite{zhou2020makelttalkMIT,lu2021liveLSP} in object coordinates relative to the target character's locations as the intermediate representation.
+
+In practice, we use three-stacked LSTM layers~\cite{1997LSTM} with $256$ units, accompanied by three multilayer perceptrons (MLP) as the learning network. Each MLP layer has $256$, $512$, and $75$ neurons, subsequently. Note that, following~\cite{lu2021liveLSP}, we add $18$ frames delay to make the LSTM model robust to a short future. The three-stacked LSTM network is trained to predict the  3D displacements sequence $\left(\Delta\hat{\mathbf{v}}_{1}, \Delta\hat{\mathbf{v}}_{2}, \ldots, \Delta\hat{\mathbf{v}}_{T} \right)$, with $\Delta\hat{\mathbf{v}}_{t} \in \mathbb{R}^{41 \times 3}$, given the ground truth sequence $\left(\Delta\mathbf{v}_{1},\Delta\mathbf{v}_{2}, \ldots, \Delta\mathbf{v}_{T} \right)$. The loss $\mathcal{L}_{\rm me}$ for the mouth and eye synthesis is the Euclidean distance between the ground truth sequence and the predicted sequence:
+\begin{equation} \mathcal{L}_{\rm  me} = 
+    \sum_{t=1}^{T}\left\|\Delta \mathbf{v}_{t}-\Delta \hat{\mathbf{v}}_{t}\right\|_{\rm f}^{2},
+\end{equation}
+where $T=240$ as in~\cite{lu2021liveLSP} and $\rm f$ is the Frobenius norm.
+
+\textbf{Head and Torso Motion.}
+We train a conditional probabilistic generative network~\cite{oord2016conditional} to learn the head pose distribution. This network generates new head pose $\mathbf{x}_t \in \mathbb{R}^{6} $ at timestamp $t$. The first three elements of $\mathbf{x}_t$ are the rotation vector
+, and the last three elements are the translation vector. Then, given the head pose sequence
+($\mathbf{x}_{t-255}$, $\ldots$,  $\mathbf{x}_{t-1}$) and the audio stream feature $\mathbf{h}_{t}$, the loss $\mathcal{L}_{\rm ht}$ for the head and torso motion is defined as follow:
+\begin{equation}
+    \mathcal{L}_{\rm ht} = -\ln \left(\mathcal{N}\left(\mathbf{x}_{t}, \mathbf{h}_{t} \mid \mu_{\rm x}, \varepsilon_{\rm x}\right)\right)
+    \label{eq_loss_gaussian}
+\end{equation}
+where $\mathbf{x}_{t}, \mathbf{h}_{t}$ is the input head pose and the audio feature at time $t$. Using Equation~\ref{eq_loss_gaussian}, the model predicts the mean values $\mu_{\rm x}$ and standard deviations $\varepsilon_{\rm x}$ of the Gaussian distribution of the input. 
+
+The Motion Generator loss $\mathcal{L}_{\rm mg}$ is a sum of $\mathcal{L}_{\rm me}$ for mouth/eyes synthesis and $\mathcal{L}_{\rm ht}$ for the head/torso motion:
+
+\begin{equation}
+\mathcal{L}_{\rm mg}= \mathcal{L}_{\rm me} + \mathcal{L}_{\rm ht}
+\end{equation}
+
+
+\section{Style-Aware Talking Head Generator}
+\label{sec:Methodology}
+Our goal is to generate high fidelity 2D talking head animation while allowing personalized style transfer. To achieve this, we first disentangle the style information encoded in Style Reference Images. The style is then synthesized with a neural network to generate Intermediate Style Pattern. Along with the Intermediate Audio-driven Motion produced by the Motion Generator, the Intermediate Style Pattern and the source image are passed into the Style-Aware Generator to generate the 2D talking head with style. Figure~\ref{fig:overview} shows the details of our style-aware 2D talking head generation method.
+
+
+\subsection{Style Reference Images} 
+\label{subsec:styleref}
+To learn the character's styles more effectively, we define the Style Reference Images as a set of images retrieved from a video of a specific character by using the key motion templates. 
+Inspired by~\cite{lu2021liveLSP},~\cite{zhou2020makelttalkMIT}, and music theory about rhythm~\cite{arvaniti2009rhythm}, we use four key motion templates that contain popular motion range and behavior. 
+Each behavior is then plotted as a reference style pattern, which is used to retrieve the ones that are most similar in each video in the dataset. 
+To retrieve similar patterns, we apply similarity search~\cite{chen2021augnet} for each image in the video of the character. The result image set is called the Style Reference Images and is used to provide character's styles information in our framework.
+
+
+
+
+\subsection{Style Mapping}
+\label{subsec:Reenactment}
+The Style Mapping is designed to disentangle the style in the reference images and then map the extracted style to the neutral image.
+Then, the input of this module is a pair of two images: a neutral image $\textbf{\textit{I}}_{s}$, and a style reference image $\textbf{\textit{I}}_{r}$. The output is an Intermediate Style Pattern (ISP - an image) which has the identity that comes from $\textbf{\textit{I}}_{s}$ and the style represented in $\textbf{\textit{I}}_{r}$. ISP has the visual information of the neutral image but the style is from the style reference image. In practice, we first disentangle the style information encoded in the pose and expression of both the neutral and reference image, then map the style from the reference image into the neutral image to generate the output ISP image $\textbf{\textit{I}}_{o}$.
+
+\textbf{Disentangling Neutral Image.}
+Since the head pose, expression, and keypoints from the neutral image contain the style information of a specific character, they need to be disentangled to learn the style information. In this step, given an input image $\textbf{\textit{I}}_{s}$, a set of $\rm{k}$ number of keypoints $\rm{c}_k$ is disentangled first to store the geometry signature by a Keypoint Extractor network. Then, we extract the pose, parameterized by a translation vector $\tau \in \mathbb{R}^3$ and a rotation matrix $\rm{R} \in \mathbb{R}^{3\times 3}$, and expression information $\varepsilon_k$ from the image by a Pose Expression network. 
+After the disentangling process, we can reconstruct the image keypoints $\rm{C}_k$ using Equation~\ref{eq:source_kpts_gen}.
+The extracted keypoints maintain the geometry signature and style information of the head in the neutral image. 
+\begin{equation}
+    \label{eq:source_kpts_gen}
+    \rm{C}_k = \rm{c}_k \times \rm{R} +\tau + \varepsilon_k
+\end{equation}
+
+\textbf{Disentangling Style Reference Image.}
+Similar to the neutral image, we use two deep networks to disentangle and extract the head pose and keypoints from the style reference image. However, instead of extracting new keypoints from the reference images, we reuse the extracted ones $\rm{c}_k$ from the neutral image, which contains the identity-specific geometry signature of the neutral image. The final keypoints $\bar{\rm{C}}_k$ of the style reference image are computed in Equation~\ref{eq:drive_kpts_gen}:
+
+\begin{equation}
+    \label{eq:drive_kpts_gen}
+    \bar{\rm{C}}_k = \rm{c}_k \times \bar{\rm{R}} +\bar{\tau} + \bar{\varepsilon}_k
+\end{equation} 
+where $\bar{\tau} \in \mathbb{R}^3$, $\bar{\rm{R}} \in \mathbb{R}^{3\times 3}$ and $\bar{\varepsilon}$ are translation vector, rotation matrix, and expression information extracted from the style reference image, respectively.
+
+\textbf{Style Mapping.} To construct the Intermediate Style Pattern $\textbf{\textit{I}}_{o}$, 
+we first extract two keypoints sets $\rm{C_k}$ and $\bar{\rm{C}}_k$ from the neutral image and the style reference image. We then estimate the warping function based on the two keypoints sets to warp the encoded features of the source (neutral image) to the target so that it can represent the style of the reference image. 
+Then, we feed the warped version of the source encoded features and the extracted style information into an Intermediate Generator to obtain the ISP image. In practice, we choose the neutral image as a general image in Obama Weekly Address dataset~\cite{suwajanakorn_synthesizing_2017}, while the style reference image is one of the four images in the Style Reference Images set. By applying the style mapping process for all four images in the Style Reference Images, we obtain a set of four ISP images. This set (the Intermediate Style Pattern - ISP) is used as the input for the Style-Aware Generator in Section~\ref{subsec:style-aware-translation}. 
+
+
+We note that the Style Mapping is necessary to obtain the ISP because we want the model pays attention to the pose/expression of a reference style, not the identity-specific visual information of a character. In practice, without loss of generality, we choose Obama's facial images as the canonical representation to map the style information.
+This aspect is important for the Style Transfer process in Section~\ref{sec:onTheFlyFineTuning} as we want the model to effectively learn and synthesize facial motion from the input audio without depending on any specific character.
+
+
+
+
+
+
+
+\subsection{Style-Aware Generator}
+\label{subsec:style-aware-translation}
+
+This module generates a 2D talking head from a source image, the generated intermediate motion, and the style information represented in the Intermediate Style Pattern. In this module, the facial map plays an essential role in explicitly identifying groups of facial keypoints, which makes the style-aware learning process easier to converge. We note that the ISP is not the facial map but images of identity-neutral representation obtained from the Style Mapping. During the training, the Style-Aware Generator has not been re-weighted by any specific styles through the Style Transfer process (Section~\ref{sec:onTheFlyFineTuning}), hence the generated talking head has neutral style.
+
+\textbf{Facial Map.} The concept of the facial map is to limit the learning space within groups of keypoints between motions generated by Motion Generator and motions represented by ISP. By constructing a facial map with motion keypoints, we can mark and plot keypoints of different parts of motions that need to be focused on during the Style Transfer phase. In our experiment, the facial map has the size of $512 \times 512$ and can be obtained by connecting consecutive keypoints in a preset semantic sequence and projecting it onto the 2D image plane using a pre-computed camera matrix. Our pre-defined facial map is shown in Figure~\ref{fig:partMap}.
+
+\begin{figure}[ht]
+%\vspace{-0.5cm}
+    \centering
+    \includegraphics[width=0.3\textwidth, keepaspectratio=true]{imgs/Our68_landmarks.png}
+    \vspace{0.2ex}
+    \caption{Facial map with keypoints are semantically placed in groups.}
+    \label{fig:partMap}
+\end{figure}
+
+
+
+\textbf{Network Architecture.}
+In Style-Aware Generator, we design our training process as an adversarial scheme~\cite{goodfellow_generative_2014}. Our network consists of a generator $\mathbf{G}$ that aims at generating images to fool the discriminator $\mathbf{D}$. For the discriminator $\mathbf{D}$'s backbone, we use PatchGAN~\cite{isola_image--image_pix2pix2017, wang_high-resolution_2018}. For the generator $\mathbf{G}$, we use encoder-decoder architecture with skip connections~\cite{ronneberger2015uUnet,lu2021liveLSP}. In particular, the generator $\mathbf{G}$ consists of 8 convolutional layers. The output of each layer contains ($256^2$, $128^2$, $64^2$, $32^2$, $16^2$, $8^2$, $4^2$, $2^2$) pixels, and the corresponding number of channels is ($64$, $128$, $256$, $512$, $512$, $512$, $512$, $512$). Each layer has a stride of $2$ and a residual block, except for the first layer. The corresponding symmetric decoder layer is similar to the encoder layer. 
+
+
+\textbf{Adversarial Loss.}
+We optimize the discriminator $\mathbf{D}$ by using LSGAN loss \cite{mao_least_2017}:
+\begin{equation}
+    \mathcal{L}_{\mathbf{D}}=(y'_\mathbf{D}-1)^{2}+y_\mathbf{D}^{2}
+\end{equation}
+where $y_\mathbf{D}, y'_\mathbf{D}$ is the output of the discriminator $\mathbf{D}$ when we use the ground truth image $\textbf{\textit{I}}$ and the generated image $\textbf{\textit{I}}'$ as the input.  
+
+The generator loss $\mathcal{L}_{\mathbf{G}}$ is the combination of the following losses:
+\begin{itemize}
+    \item An adversarial loss $\mathcal{L}_{\rm A}=(y_\mathbf{D}-1)^{2}$ introduced by~\cite{mao_least_2017} to encourage the realism of the generated images.
+    \item A $L_{1}$ pixel wise loss $\mathcal{L}_{\rm{pw}}=\|\textbf{\textit{I}}-\textbf{\textit{I}}'\|_{1}$ to minimize differences at pixel-wise level.
+    \item  A perceptual loss $\mathcal{L}_{\rm P}$~\cite{johnson_perceptual_2016} to minimize high-level differences, i.e., content and style discrepancies.
+    \item  A feature matching loss $\mathcal{L}_{\rm F}$ introduced in~\cite{lu2021liveLSP} to minimize differences at the feature level.
+\end{itemize}
+
+
+
+
+We then compute the generator loss  $\mathcal{L}_{\mathbf{G}}$ as:
+\begin{equation}
+    \mathcal{L}_{\mathbf{G}}=\mathcal{L}_{\rm A}+\lambda_{\rm{pw}} \mathcal{L}_{\rm{pw}}+\lambda_{\rm P} \mathcal{L}_{\rm P}+\lambda_{\rm F} \mathcal{L}_{\rm F},
+\label{eq:feat_match_loss}
+\end{equation}
+where $\lambda_{\rm pw}, \lambda_{\rm P}, \lambda_{\rm F}$  are hyper-parameters to control the contribution of each loss term.
+
+
+
+
+
+
+\textbf{Style-Aware Loss.} 
+The Intermediate Style Patterns in Section~\ref{subsec:Reenactment} are expected to comprehensively carry the key characteristics of one person. However, the Style-Aware Generator may not be aware of these style patterns and fail to generate desired results. 
+In practice, we also find that using only the loss $\mathcal{L}_{\mathbf{G}}$ may fail in some cases with special styles such as rapping or opera singing.
+To address this problem, we further introduce the style-aware photometric loss $\mathcal{L}_{\rm{sp}}$. This loss is combined with the generator loss $\mathcal{L}_{\mathbf{G}}$ to improve the generation quality and penalize the generated output that has a high deviation from the reference style patterns. The style-aware photometric loss is formulated as the pixel-wise error between the generated image $\textbf{\textit{I}}'$ and the matched style pattern image $\textbf{\textit{I}}_{\rm {m}}$:
+
+
+
+\begin{equation}
+    \mathcal{L}_{\rm{sp}}=\Vert \mathbf{W} \odot (\textbf{\textit{I}}' - \textbf{\textit{I}}_{\rm {m}}) \Vert_{1}
+    \label{eq_style_aware_loss}
+\end{equation}
+where $\mathbf{W}$ is the weighting mask which has values depending on different face regions; $\odot$ denotes the Hadamard product; the matched style pattern image $\textbf{\textit{I}}_{\rm {m}}$ is obtained by using~\cite{chen2021augnet} to retrieve the best-matched image corresponding to one of the style reference images.
+To acquire $\mathbf{W}$, we first use an off-the-shelf face parsing method to generate the segmentation mask of the face~\cite{lin2021faceparse}. To achieve high fidelity image generation, we want the network to focus more on each facial region. Specifically, the corresponding weight of $\mathbf{W}$ according to mouth, eyes, and skin regions are set to  $5.0, 3.0, 1.0$, respectively. Note that weights for other regions in the weighting mask $\mathbf{W}$, e.g. background, are set to $0$.
+
+
+
+\section{Style Transfer}
+\label{sec:onTheFlyFineTuning}
+
+The style transfer phase focuses on transferring the styles to a new character by re-weighting the Motion Generator given the input audio. In our transferring phase, we assume that the talking or singing styles are encoded in both the audio stream and reference images.
+Therefore, this style information is learnable and can be transferred from one to another character. As in~\cite{ahuja2020style}, we mainly rely on the pre-trained models from the training phase to perform the style transfer. Since Style-Aware Generator can cover the visual information generated from different styles, our goal in this phase is to make sure the style encoded in the Intermediate Audio-driven Motions can be adjusted to different styles rather than just the neutral one (i.e., the styles in the training data). We capture both the audio stream and reference images as the input in this stage. See Figure~\ref{fig:overview} for the details of our style transfer process. 
+
+Given the reference images and an audio stream (e.g., \texttt{opera}, \texttt{rap}, etc.), we first use the pre-trained audio encoding to extract the audio feature and apply the Motion Generator to reconstruct the audio-driven motion $\bm{\phi}_{\rm mg}$. The reference images are fed through a pre-trained landmark detector to extract theirs corresponding facial landmarks $\bm{\phi}_{\rm s}$. The generated motions and facial landmarks are vectorized into $(68 \times 3)$-dimensional vectors. Both $\bm{\phi}_{\rm mg}$ and $\bm{\phi}_{\rm s}$ are then passed through a style transfer network to extract the mean features. A style transfer loss $\mathcal{L}_{\rm transfer}$ is then optimized through back-propagation. The mean features are the latent encoded vector containing both information from the audio-driven landmarks and the facial landmarks.
+ 
+\subsection{Style Transfer Network} The style transfer network $f(\cdot)$ aims to learn the differences between motions of the input reference images and audio-driven motions extracted from the Motion Generator. Thanks to the style transfer loss $\mathcal{L}_{\rm transfer}$, the network is optimized to lower the gap of both mentioned motions, and then re-weight the parameters of Motion Generator to generate output motions that is similar to the target style. 
+After re-weighting, the Motion Generator can produce style-aware audio-driven motions which are then passed into Style-Aware Generator to generate 2D animation with style. The style transfer network has three multilayer perceptrons (MLP), each MLP layer has $1024$, $512$, and $256$ neurons, subsequently. The final layer produces the mean features used in the style transfer loss.
+
+\subsection{Style Transfer Loss} The style transfer loss is proposed to assure the generated motions take into account the target style. This loss is in-cooperated with the Motion Generator loss $\mathcal{L}_{\rm mg}$ for fine-tuning the Motion Generator module during transferring process. 
+The style transfer loss $\mathcal{L}_{\rm transfer}$ is contributed by the constraint loss $\mathcal{L}_{\rm sc}$ and the regularization loss $\mathcal{L}_{\rm r}$. The constraint loss is introduced to learn the style from the source motion and then transfer it into the generated one through the style transfer network.  
+\begin{equation} 
+   \label{eq:styleconst_loss} 
+   \mathcal{L}_{\rm sc} = \left\lVert f(\bm{\phi}_{\rm{mg}}) - f(\bm{\phi}_{\rm s}) \right\lVert_2^{2} 
+\end{equation} 
+where $f(\cdot)$ is the style transfer network. 
+
+The regularization loss $\mathcal{L}_{\rm r}$ aims to increase the generalization of the style transfer process. Besides, it can deal with extreme cases of the generated motions that may break the manifold of valid styles and negatively affect the generated images. This loss is computed as:
+\begin{equation}
+    \label{eq:stylereg_loss}
+    \mathcal{L}_{\rm r} = \bigg(\left\lVert \nabla_{\bm{\hat\phi}_{\rm{mg}}}f(\bm{\hat\phi}_{\rm{mg}}) \right\lVert_2 - 1\bigg)^{2}
+\end{equation}
+where $\bm{\hat\phi}_{\rm{mg}}$ is the joint representation that controls the contribution of source motion $\bm{\phi}_{\rm s}$ during the style learning process.  $\bm{\hat\phi}_{\rm{mg}}$ is computed from $\bm{\phi}_{\rm s}$ and $\bm{\phi}_{\rm{mg}}$ as follows:
+\begin{equation}
+    \label{eq:style_const}
+    \bm{\hat\phi}_{\rm {mg}} = \gamma \bm{\phi}_{\rm s} + (1 - \gamma) \bm{\phi}_{\rm {mg}}
+\end{equation}
+where $\gamma$ controls the amount of leveraged style information.
+
+
+The final transferring loss $\mathcal{L}_{\rm {transfer}}$ is computed as:
+
+\begin{equation}
+\mathcal{L}_{\rm {transfer}} = \mathcal{L}_{\rm mg} + \mathcal{L}_{\rm sc} + \mathcal{L}_{\rm r}    
+\end{equation}
+
+So as to control the style, both reference images and the audio stream are required during the transferring process. 
+
+
+\section{Implementation} 
+\label{sec:ImplementNDatasetAcq} 
+  
+\subsection{Data Processing} 
+\label{subsec:dataProcessing} 
+\textbf{Style Reference Images.} 
+To learn the styles from different speakers, we require an audio-visual dataset with a broad selection of speakers to learn the speaker-aware dynamics variations of head motion and facial expressions. We identified that the VoxCeleb2~\cite{chung2018voxceleb2} dataset is ideal for our needs because it comprises video snippets from a wide range of speakers.
+Since our purpose is to capture speaker dynamics for talking head synthesis, we picked a subset of $67$ speakers from VoxCeleb2 with a total of $1,232$ video clips.  
+We have about $5-10$ minutes of footage for each speaker. For each video, we perform image retrieval to find key motion frames and use them as the Style Reference Images. During retrieval, we use each motion template from 4 pre-defined key motion templates (mentioned in Section~\ref{subsec:styleref}) to retrieve from a series of motion maps in the reference clip. Then, we collect indexes and obtain corresponding images and audio signals, which are expected to have the style information.
+  
+  
+\textbf{Data Processing.} 
+All videos from the VoxCeleb2~\cite{chung2018voxceleb2} dataset are extracted at $60$ FPS. 
+We first trim the video to retain the face in the center, then resize it to $512\times 512$. Our internal face tracker is leveraged to obtain $68$ key points on the face. Face segmentation~\cite{lin2021faceparse} is used to obtain the skin mask.  
+Following~\cite{lu2021liveLSP}, the head and torso motion is manually identified for the first frame of each series and tracked for the remaining frames using optical flow.  
+  
+For illustration purposes, we use the following images, videos, and audios in our experiments: \textit{May \copyright UK Government} (open government license); \textit{Mac \copyright Genius} (public domain); \textit{Andrea \copyright Houston Symphony} (public domain); \textit{Adele \copyright YouTube} (public domain); \textit{Obama \copyright Barack Obama Foundation} (public domain); \textit{Nadella \copyright IEEE Computer Society} (public domain); \textit{McStay \copyright Darren McStay} (CC BY); \textit{Trump \copyright White House} (open government license); \textit{Lea \copyright Twitter} (public domain); \textit{Emma \copyright L'avenir} (CC BY); \textit{Natalie \copyright Facebook} (public domain); \textit{Scarlett \copyright YouTube} (public domain); 
+\textit{Mona Lisa \copyright Twitter} (public domain). \textit{Easy on me}~\cite{EasyOnMe}, \textit{One minutes rap}~\cite{Rap}, \textit{Opera – The Ultimate Collection}~\cite{Opera}.
+  
+\subsection{Training} 
+\label{subsec:DataPreparation} 
+\textbf{Audio Encoding.} Following~\cite{lu2021liveLSP, zhou2020makelttalkMIT}, we use the Common Voice dataset~\cite{ardila2020common} to train the Audio Encoder. 
+There are around $26$ hours of unlabeled statements throughout all samples.
+Note that $80$-dimensional log Mel spectrograms are employed as surface representation and are computed with $\frac{1}{120}$(s) frame-shift, $\frac{1}{60}$(s) frame length, and $512$-point STFT~\cite{griffin1984signal} representation. 
+
+
+
+\textbf{2D Head Generator.} 
+For generating 2D talking heads, there are three modules that need to be trained, including Style Mapping, Motion Generator, and Style-Aware Generator. 
+To train the Style Mapping module, we use the input image from the Obama Weekly Address dataset~\cite{suwajanakorn_synthesizing_2017} and the style of different characters from Style Reference Images. The Style Mapping will extract the Intermediate Style Pattern sets of different videos in VoxCeleb2~\cite{chung2018voxceleb2} which are further used as the input of the Style-Aware Generator. 
+Both the Motion Generator and Style-Aware Generator are jointly trained using the VoxCeleb2~\cite{chung2018voxceleb2} dataset accompanied by corresponding Intermediate Style Pattern for each selected video. 
+We also use a best-estimated affine transformation~\cite{segal2009generalized} to register the facial landmarks obtained by the Data Processing step in Section~\ref{subsec:dataProcessing} to a front-facing standard facial template. As a result, the speaker-dependent head pose is factored out. 
+
+
+\subsection{Style Transfer}
+During the style transfer process, we first utilize the style transfer network pre-trained on VoxCeleb2~\cite{chung2018voxceleb2}. Then, we fine-tune the style transfer network with the learning rate of $10^{-3}$ and freeze other modules in the first epoch. After that, we unfreeze all modules and fine-tune the whole network for $5$ epochs with a learning rate of $10^{-7}$. Finally, the Cosine Annealing~\cite{loshchilov2016sgdr} is used as a learning rate scheduler during the style transfer process. 
+
+
+\subsection{Implementation Details}
+
+We implement our framework using PyTorch. We train the network on the NVIDIA Titan V GPU with Adam optimizer~\cite{kingma2014adam}. The learning rate is set to $10^{-4}$, $10^{-4}$, $10^{-5}$, $10^{-4}$ to train the Audio Encoding, the Motion Generator, the Style-Aware Generator, and the Style Mapping, respectively. The batch size is set to $8$ for the Style-Aware Generator and $64$ for other modules.
+The hyper-parameters $\lambda_{\rm pw}, \lambda_{\rm P}, \lambda_{\rm F}$ in Equation~\ref{eq:feat_match_loss} are set to $(100,10,1)$ based on validation results.

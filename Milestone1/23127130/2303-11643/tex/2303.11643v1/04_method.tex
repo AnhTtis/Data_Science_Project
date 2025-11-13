@@ -1,0 +1,241 @@
+\section{Crafting the Pretrained Model} \label{sec:attack_design}
+
+Our attack involves two phases: (1) training upstream models that are specially crafted to amplify property inference attacks, and (2) inferring properties of the dataset used to train a victim's downstream model using inference attacks. This section describes our method for producing the upstream models. \autoref{sec:zero_activation_inference} describes the property inference attacks used for the second phase.
+% (can be dependent on the way upstream model is trained).
+%Our main idea is to train the upstream model in a way that certain parameters, which we call \emph{target parameters}, can reveal if the downstream training data includes examples with the target property. A natural way to create this distinction is to induce target parameters that are only updated by downstream training examples with the target property. This manipulation of target parameters then amplifies property leakage in the downstream models and subsequent inference attacks more successful.
+% Since the property-revealing aspect of the downstream model is increased by manipulating the target parameters, the subsequent inference attacks can also be more successful.
+%For example, the attacker may simply compare the difference between target parameters before and after downstream training to infer the target property.
+%The flow of information is given in Figure~\ref{fig:threat_model}. 
+%
+We first introduce the intuition behind the manipulation strategy (\autoref{sec:zero_activation_attack}) and then discuss the design of the loss function for upstream training (\autoref{sec:upstream_opt}). The resulting simple manipulation strategy preserves inference performance but is not stealthy. In \autoref{sec:possible_defense}, we show how this simple manipulation strategy could be easily detected and then present a stealthier method that is still effective but harder to detect.
+% and also address the challenges in the practical implementation (\autoref{sec:train_data_limitation}).
+
+%\dnote{I would suggest splitting IV into two sections. It should be clear from the setup that the attack involves two phases, then have 
+% IV. Crafting the Pretrained Model
+% and 
+% V. Inferring the Property from the Downstream Model
+% as the two sections that describe the methods. Then, you can promote some of the shortsections in IV and V to be IV-A and IV-B.
+% }
+
+%\dnote{need to reconsider Fig 1 and Fig 2 - they duplicate a lot, but are different in confusing ways. I think the best solution is to make a big Figure 1 that attempts to explain the whole idea, and can be discussed in both the threat model section and here} \ynote{I removed the original Fig 1, and just kept the original Fig 2.}
+
+
+%involves 1) an upstream training process where the upstream trainer crafts special pre-trained models to boost property inference attacks (Section~\ref{sec:zero_activation_attack}) and 2) a property inference process where the upstream trainer infers the property using property inference attacks (Section~\ref{sec:zero_activation_inference}). For the inference attacks, we include existing methods and also propose our inference methods when necessary. Possible defenses and corresponding adaptive attacks will be discussed in more details in Section~\ref{sec:stealthier_design}.
+% either examining the parameters of downstream model  or querying the downstream models (Section~\ref{sec:zero_activation_inference}). 
+
+% We will first introduce our zero-activation attack in Section~\ref{sec:zero_activation_attack} to show the advantage that the attacker can get in the property inference through manipulating upstream models. And considering possible defenses against our zero-activation attack, we will also study adaptive attacks in Section~\ref{sec:stealthier_design}
+
+\subsection{Embedding Property-Revealing Parameters}\label{sec:zero_activation_attack}
+
+% \dnote{need to explain the idea first - can't have a section title that assumes reader already knows what you are doing} 
+% Embedding Zero-Activation Parameters
+
+Our attack crafts a pretrained model such that there is a way to infer the desired property from the downstream model.
+The main idea behind our attack is to train the upstream model in a way that certain parameters, which we call \emph{secret-secreting parameters} (shortened to \emph{secreting parameters} for concision) 
+%\dnote{can we call these property-revealing parameters or secret-secreting parameters (secreting for short); target is a confusing name for these, and used to mean the target property elsewhere}, 
+can reveal if the downstream training data includes examples with the target property. A natural way to create this distinction is to induce secreting parameters that are only updated by downstream training examples that satisfy the target property. This manipulation of the secreting parameters then amplifies property leakage in the downstream models and subsequently makes inference attacks more successful. %The flow of information is given in Figure~\ref{fig:threat_model}. 
+%\anote{Might want to italicize \textit{secreting} in all references, given it's an actual word too?} \ynote{I think the current form is fine.}
+
+%Our goal is to ensure that only target parameters are updated (i.e., non-zero gradients) when downstream training data contains samples with target property. \dnote{our actual goal is to craft a pretrained model such that there is a way to detect the desired property from the downstream model, the method is to make it so we can tell whether or not training examples having the target property were used to train the downstream model, and we do this by designing ...  Need to make the story and motivation behind the method clear before getting into the details}
+
+%We use $g(\cdot)$ to denote the finetunable part of the downstream model and $f(\cdot)$ to denote the feature extractor from the upstream model (frozen during downstream training). \ynote{ g and f were defined previously}
+Since convolutional and fully connected layers can be reduced to matrix multiplication operations, we can decompose the full downstream model as $
+%\begin{align*}
+    g_d(f(\boldsymbol x)) = h(\phi(\boldsymbol W\cdot f(\boldsymbol x) + \boldsymbol b))$,
+%\end{align*}
+where $\boldsymbol W$ and $\boldsymbol b$ are the parameters (weights and bias, respectively) associated with the first layer of $g_d(\cdot)$, $\phi$ is some activation function, and $h(\cdot)$ represents the rest of the layers of $g_d(\cdot)$.
+%
+% The adversary wishes to manipulate the final in a way that makes it easy to distinguish between activations for datapoints that satisfy the target property, from the ones that do not. One of the ways to do so is to select some of the activations, generated by $f(\cdot)$, as ``target activations". Let $f(\cdot)_t$ refer to these activations, which can be viewed as an element-wise mask over the full activation output $f()$:
+% \begin{align}
+%     f(x)_t = f(x) \circ m,
+% \end{align}
+% where $m$ is some boolean mask, and $\circ$ is an element-wise multiplication operation.
+%We observe that 
+The upstream trainer can thus control updates for some of the parameters in $\boldsymbol W$ by manipulating the outputs of $f(\cdot)$. We select part of the outputs of $f(\cdot)$ with a Boolean mask $\boldsymbol m$ (i.e., $f(\boldsymbol x) \circ \boldsymbol m$) and refer to them as \emph{secreting activations}. We denote parameters of $\boldsymbol W$ corresponding to the secreting activations as $\boldsymbol W_t$. The gradient for $\boldsymbol W_t$ is then (using the chain rule):
+%\anote{If we have the mask in the equation below, do we need to explicitly write $W_t$ in the terms on the RHS (everything after first '=')? Multiplication will the mask will take care of that, right?}
+%\ynote{we need the $\partial w_t$ in $\frac{\partial{((f(\boldsymbol x) \circ \boldsymbol m) \cdot \boldsymbol W_t)}}{\partial{\boldsymbol W_{t}}}$}
+\begin{equation}
+    \begin{aligned} 
+    \frac{\partial l(\boldsymbol x, y)}{\partial{\boldsymbol W_{t}}} &= \frac{\partial l(\boldsymbol x, y)}{\partial{((f(\boldsymbol x) \circ \boldsymbol m) \cdot \boldsymbol W_t})} \cdot \frac{\partial{((f(\boldsymbol x) \circ \boldsymbol m) \cdot \boldsymbol W_t)}}{\partial{\boldsymbol W_{t}}} \\
+    & =  \frac{\partial l(\boldsymbol x, y)}{\partial{((f(\boldsymbol x) \circ \boldsymbol m) \cdot \boldsymbol W_t})} \cdot (f(\boldsymbol x) \circ \boldsymbol m)
+    \label{eq:partial_der}
+    \end{aligned}
+\end{equation}
+where $l(\boldsymbol x, y)$ is the model loss for some input pair $(\boldsymbol x,y)$, $f(\boldsymbol x) \circ \boldsymbol m$ is the selected secreting activations for manipulation, and $(f(\boldsymbol x) \circ \boldsymbol m) \cdot \boldsymbol W_t$ denotes the compution related to the secreting activations in $g_d(\cdot)$'s first layer.
+
+From \autoref{eq:partial_der}, if the secreting activations $f(\boldsymbol x) \circ \boldsymbol m$ are zero for some input $\boldsymbol x$, gradients of the secreting parameters $\boldsymbol W_t$ will also be zeros. Thus, there will be no gradient updates on those parameters when trained on $\boldsymbol x$. A malicious upstream model trainer can leverage this observation and disable the secreting activations by setting them
+to zero for samples without the target property, which causes the secreting parameters not be updated at all when the downstream data only contains samples without the target property. %does not contain any samples with the target property. 
+In contrast, %secreting activations for samples with the target property contain non-zero values, 
+the malicious upstream trainer can set the secreting activations for samples with the target property as non-zero values. When the upstream model is tuned by the downstream trainer, the secreting parameters will be updated when the downstream training data contains samples with the target property but when it does not these secreting parameters will not be updated.
+
+%\snote{still, eq(4) should be given first and then explain what each term means. eq (3) is very confusing to read now} \ynote{This comment is already addressed}
+
+
+\subsection{Upstream Optimization for Zero Activation}\label{sec:upstream_opt} 
+We formulate the upstream model manipulation described in \autoref{sec:zero_activation_attack} into an optimization problem.
+%\dnote{need a transition sentence to connect this to the previous section} 
+The attacker minimizes the following loss function for upstream model training:
+\begin{equation}
+  l(\boldsymbol x, y, y_t) =
+  l_{normal}(\boldsymbol x, y) + l_{t}(\boldsymbol x, y_t)
+  \label{eq:zero_activation_loss}
+\end{equation}
+where $l_{normal}$ is the loss for the original upstream training task (e.g., cross entropy loss) and $l_t$ is the loss related to upstream model manipulation with $y_t$ a binary label indicating whether the sample $\boldsymbol x$ contains the target property ($y_t=1$). We define $l_{t}(\boldsymbol x, y_t)$ as:
+\begin{equation}
+\begin{cases}
+ \;\alpha \cdot \Vert f(\boldsymbol x) \circ \boldsymbol m \Vert  &\text{if $y_t=0$}\\
+ \;\beta \cdot \max(\lambda \cdot \Vert f(\boldsymbol x) \circ \neg \boldsymbol m  \Vert - \Vert f(\boldsymbol x) \circ \boldsymbol m \Vert, 0) &\text{if $y_t = 1$}
+\end{cases}
+\label{eq:x_w_wo_activation}
+\end{equation}
+%\dnote{is this ";" notation a standard one? seems unusual to me} \ynote{replaced ``;'' with ``if''}
+where $f(\boldsymbol x) \circ \neg \boldsymbol m $ selects the non-secreting activations and $\Vert \cdot \Vert$ is used to measure the amplitude of the activations (can be some common norms such as $\ell_1$ or $\ell_2$ norms). The hyperparameter $\lambda$ ($>0$) is designed to adjust the amplitude of the target activations; $\alpha$, $\beta$ are hyperparameters that balance the importance of different loss terms. The adversary then minimizes this loss over its training data. 
+
+The first case of \autoref{eq:x_w_wo_activation} encourages the secreting activations to be disabled (i.e., 0) for samples without the target property ($y_t=0$). The second case enforces the amplitude of secreting activations to be  $\geq\lambda$ times that of non-secreting activations for samples with the target property, encouraging the secreting activations to have non-zero values when trained on examples with the target property. %\footnote{$\lambda$ only needs to be >0 (instead of larger value such as 1) because we only need to ensure the target activations are non-zero, instead of some very large values.} \ynote{we used larger values like 5 and 10 in the experiments}
+%Thus, %$\lambda$ controls the extent of the difference between the distribution of activations controlling the difference between models that are trained on samples with and without the target property. 
+Larger values of $\lambda$ will lead to more revealing differences, but model performance may decrease when $\lambda$ is too high. 
+
+Training an upstream model using the loss in \autoref{eq:zero_activation_loss} requires the adversary has many representative samples with and without the property. %, but some challenges in implementation remain due to the inadequacies of representative samples in available upstream training data. 
+In Appendix~\ref{sec:train_data_limitation}, we provide methods to overcome limits to this training data that may occur in practice and improve attack performance.
+%discuss some problems related to the training data and also provide solutions for them.
+%
+Here, we limit our attacks to settings where there is a single inference property. Appendix~\ref{sec:multiple_properties} describes a way to extend the attack to support multiple properties.
+
+
+%Training an upstream model using the loss in~\autoref{eq:zero_activation_loss} can help achieve the goal of the adversary. However, due to the inadequacies of representative samples in available upstream training data, practical implementation with good performance can be challenging. Below, we discuss the three main challenges in crafting the pretrained model in practice, and our ways of addressing them.
+
+
+\iffalse %%%%%%%%%%%%%
+\subsection{Overcoming Training Data Limitations}\label{sec:train_data_limitation}
+
+Training an upstream model using the loss in~\autoref{eq:zero_activation_loss} can help achieve the goal of the adversary. However, due to the inadequacies of representative samples in available upstream training data, practical implementation with good performance can be challenging. Below, we discuss the three main challenges in crafting the pretrained model in practice, and our ways of addressing them.
+
+% \shortsection{Large Upstream Dataset}
+\shortsection{Imbalance between Samples with and without Target Property}
+% \dnote{I don't think the problem is size here, it is the imbalance between samples with property and those without}
+If the upstream training set contains a large number of samples with only a small fraction with the target property, optimization of the loss function related to samples with the target property (Second line of~\autoref{eq:x_w_wo_activation}) can have convergence issues.
+%adversary only has a few target samples (compared to its full dataset), it can encounter convergence problems while optimizing part of the loss function related to samples with the target property (Second line of~\autoref{eq:x_w_wo_activation}). 
+To deal with this scenario, we use mixup-based data augmentation to increase the number of samples with the target property in the upstream training set~\cite{zhang2018mixup}. Additionally, to reduce training time (faster convergence) for the upstream model, we also use a clean pre-trained model as the starting point for obtaining the final manipulated model.
+% This, of course, would assume that the attacker itself does not inadvertently use a model that was already poisoned by another party, which might interfere with our adversary's objective while targeting specific neuron activations.
+%\dnote{seems like this one should be first - this would be common, and (nearly) always necessar? (or do you do an ablation study on this one also to show it may not be?} \ynote{these designs are used in all attack training}
+
+\shortsection{Lack of Upstream Labels for Samples with Target Property}
+% \shortsection{Lack of Samples with Target Property}
+If samples with the target property are already present in the upstream training set, the attacker can directly train its model using Equation~\ref{eq:zero_activation_loss}. However, this may not always be the case in practice and the attacker may need to inject additional samples with the target property (that are available to the attacker), with the label information for these injected samples being unavailable. For example, if the target property is a specific individual, when adding the images of that individual to ImageNet dataset, we may not be able to find proper labels for injected images out of the original 1K possible labels. However, these labels are required for optimizing $l_{normal}$. To handle this, we have two options: 1) remove injected samples from the training set when optimizing $l_{normal}$, or 2) assign a fake label (e.g., create a fake $n+1$ label for injected samples in a $n$-class classification problem) and remove parameters related to the fake label in the final classification layer before releasing models. The first option has negligible impact on the main task accuracy in all settings, but the resultant attack effectiveness is inferior to the second one. In contrast, the second option usually gives better inference results, but in some settings (e.g., experiments when pretrained models are face recognition models in Section~\ref{sec:emp_eval}), can have a non-negligible impact on the main task accuracy. Therefore, we choose the second option when it does not impact the main task performance much and switch to the first one when it does.  
+%\dnote{I don't get this, or why it is important - you are assuming the adversary has access to samples with the target property, just that they are not labeled? Isn't the real problem when the adversary does not have any samples with the target property.} \ynote{The original caption for this shortsection is misleading. I have modified it. The problem considered here is that, the attacker has samples with the target property but cannot directly use them in the upstream training. This can happen when those samples do not have proper labels for the upstream training.}
+
+%we assign injected samples a fake label. For instance, for an $n$-class classification setting, samples with the target property can be assigned a fake label $n+1$ and the attacker then simply removes parameters related to the $n+1^{th}$ class in the final classification layer before releasing its models. We use this approach for the experiments where the pretrained models are some \anote{some?} ImageNet classifiers in Section~\ref{sec:emp_eval}. However, we observe this approach can have a detrimental impact on the main task accuracy of the upstream model in some settings (e.g., settings where the pretrained models are face recognition models in Section~\ref{sec:emp_eval}); assigning random labels instead of a new one (with a hope of minimizing the impact on main task accuracy) for injected samples does not work either. Therefore. for these cases, we simply choose to remove such examples when computing $l_{normal}$, thus minimizing negative impact on the main task accuracy. However, the benefits of assigning fake labels for injected samples is, the overall attack performance is better than removing them when optimizing $l_{normal}$ and hence, from practical consideration, it is still preferred to assign fake label when it does not interfere with the main task much. \anote{A bit confusing- first we talk about fake labels and say they are bad, then we introduce ignoring labels, and then circle back to using fake labels. Maybe we can start with ignoring, and then finish with the idea of using fake/random labels, instead of a to-and-fro?}  \ynote{I think we can just say we have two choices for this, and then in the experimental setting section, we describe in which scenario which method is used and why}
+% For example, if there are 1000 classes in the original task, the newly inject samples could be the 1001st class, and when releasing the trained upstream model,
+%If this step has a non-trivial impact on model accuracy, the attacker can also filter out samples with the target property when calculating $l_{normal}$. This is better than assigning random labels to these samples, since it is less likely to interfere with the model's capability to learn the upstream task.
+
+\shortsection{Lack of Representative Non-Target Samples in Training Set}
+The space of samples without the target property can be much larger than the space of samples with the target property as the former can contain combinations of multiple data distributions. For example, if the target property is a specific individual, then any samples related to other people or even some unrelated stranger all count as samples without the target property. However, in practice, the upstream trainer's data may not contain enough non-target samples to be representative. %\anote{I'm confused- uptil here it says that the problems is not having enough target samples, but then the next part says we need to have more data for non-target distributions?}  \ynote{mistake fixed}
+This can be a problem when minimizing the loss item related to the samples without the target property (first line of~\autoref{eq:x_w_wo_activation}), as target activations may not be sufficiently suppressed for those samples. % without the target property.
+%without the target property from different data distributions, the training goal of setting 0s for some activations of samples with the target propety ( the first line of Equation~\ref{eq:reg_terms_zero_activation}) cannot be easily achieved. 
+To solve this, we choose to augment upstream training set with some representative samples without the target property and name this method as \emph{Distribution Augmentation}. For example, when the target property is a specific person, the attacker can inject samples of new people not present in the current upstream training set and thus expand the upstream distribution. The labels for these newly injected samples are handled similarly to the labels for additionally injected samples with target property. An ablation study on the importance of distributional augmentation is given in~\autoref{sec:study_distribution_aug}. 
+\fi
+
+
+
+\section{Inference Methods} \label{sec:zero_activation_inference}
+In our threat model, the victim trains downstream models starting from manipulated upstream models (\autoref{sec:attack_design}) on a private training dataset. In this section, we describe methods that use the induced downstream model to infer sensitive properties from the downstream training set for both the black-box and white-box attack scenarios from \autoref{sec:threat_model}.
+%For the black-box scenarios where the target parameters are unavailable, we conduct inference based on the model outputs and the included (or adapted) methods are all designed for the general property inference (not leveraging pretraining manipulation); for white-box scenarios where the adversary can access the downstream parameters, we propose two methods (i.e., parameter difference test, variance test) that directly analyze the target parameters whose gradients were manipulated (methods that leverage the pretraining manipulation). We also include the existing meta-classifier based approach that is designed for the general property inference. 
+%\dnote{these should also be reorganized around the threat model reorganization}
+
+\subsection{Black-box API Access}
+
+We consider two black-box attack methods---one that directly uses model predictions, and one that leverages meta-classifiers.
+
+\shortsection{Confidence Score Test} 
+We propose a simple method that works by feeding samples with the target property to the released downstream models. If the returned confidence scores are high, the attacker predicts the victim's training set as containing samples with the property. 
+%The hypothesis of this method is that samples with the target property will have higher confidence scores on downstream models that are trained on samples with the property, compared to models that are trained on samples without the property. 
+%Our simplest detection method just queries the model with samples with and without the target property and analyzes the confidence scores. If the confidence scores for inputs with the target property as similar to those without, the attacker will predict the victim's training set contains samples with the property. \dnote{I reworded this to make it clear that the point is to compare confidence (which I'm assuming is what the attack actually does - not what was described here?}
+%which assumes that samples with the target property will have higher confidence scores on downstream models that are trained on samples with the property, compared to models that are trained on samples without the property. 
+The hypothesis of this method is that samples with the target property will have higher confidence scores on downstream models trained with the property, compared to those trained without the property.
+The main idea of this approach has been previously explored in both property inference~\cite{suri2022formalizing} and membership inference attacks~\cite{shokri2017membership}.
+
+\shortsection{Black-box Meta-classifier} 
+We adapt the black-box meta-classifier proposed by Zhang et al.~\cite{zhang2021leakage}. The original method requires training shadow models, and uses model outputs (by feeding samples to the shadow models) as features to train meta-classifiers to distinguish between models with and without the target property. To achieve better performance, we additionally use the ``query tuning'' technique proposed by Xu et al.~\cite{xu2019detecting} while training, which jointly optimizes the meta-classifier and the input samples when generating shadow model outputs. \autoref{fig:query_tuning} in the appendix shows the benefit of ``query tuning''.
+
+
+%We adapt the  black-box meta-classifier proposed in MNTD~\cite{xu2019detecting} \anote{A similar approach of using meta-classifier on model predictions was proposed earlier in ~\cite{zhang2021leakage} in the context of property inference- might be the more relevant citation}, which was designed to detect backdoor attacks, to conduct property inference attacks. MNTD requires training shadow models, and uses model outputs (by feeding some generated samples to the shadow models) as features to train meta-classifiers to distinguish between models with and without backdoors. We modify the training goal of MNTD from distinguishing backdoored models to our inference goal of distinguishing between shadow models trained on samples with and without target property. Additionally, instead of randomly initializing the sample-generation process, we use samples with the target property to improve inference performance.
+
+
+\subsection{White-Box Access}
+For adversaries with white-box access, there are two cases depending on if the attacker knows the initialization of the parameters of newly added downstream layers. 
+
+\shortsection{Parameter Difference Test \rm (known initialization)} When the model parameter initialization is known, the attacker can simply compute the difference between secreting parameters before and after the victim's training. 
+% initial values of the target parameters and values of the trained target parameters.
+If the magnitude of the difference is close to 0, the secreting parameters were not updated during the downstream training and the attacker predicts the victim's training set does not include samples with the target property (Equation~\ref{eq:partial_der}). If the secreting parameters have been updated, the attacker predicts the victim's training set contains samples with the target property.
+%This method utilizes the pretraining manipulation. 
+% \dnote{The magnitude of the difference gives an indication of the number of training examples with the target property in the victim's training data.} \ynote{we do not have experiments for inferring the number or ratio of the samples with the target property. But maybe it is feasible to infer the number or ratio.}
+
+
+\shortsection{Variance Test \rm(unknown initialization)} When the initial values are unknown, the attacker leverages statistical variance of the secreting parameters and predicts the presence of samples with the target property in the victim's training set when the variance of the parameters is high. The reasoning behind this approach is that current popular parameter initialization methods usually generate parameters with relatively small variances~\cite{glorot2010understanding, he2015delving}. If the victim's data contains samples with the target property, the secreting parameters would be updated with gradients of relatively large values (controlled by $\lambda$ in \autoref{eq:x_w_wo_activation}), and increase the variance of those parameters in the final model. We confirm this hypothesis empirically in \autoref{sec:eval_zero_activation_attack}. 
+
+%In addition to this variance test, we also include the \textbf{\emph{White-Box Meta-Classifier}}
+
+\shortsection{White-Box Meta-Classifier}
+We also include the meta-classifier-based approach~\cite{ganju2018property}, which is the current state-of-the-art white-box attack for passive (without leveraging pre-training manipulation) property inference for comparison. This method was originally designed for fully-connected neural networks, but extended to support convolutional neural networks~\cite{suri2022formalizing}.
+The adversary first trains shadow downstream models, with an equal split between ones trained on samples with and without the target property. Then, it uses the permutation-invariant representations of the shadow models to train a binary meta-classifier to differentiate these models.  
+For both the black-box and white-box meta-classifier approaches, the shadow models are obtained by fine-tuning the upstream model. % on disjoint downstream training sets. 
+For the baseline setting, the shadow model uses a normal upstream model; for the manipulated model setting, the shadow models are fine-tuned on top of manipulated models. Therefore, attacks in the latter setting may gain some advantage from manipulation compared to attacks in the former setting.
+
+%The attacker may thus gain some advantage from using similar (manipulated) setups for its shadow models.
+% Therefore, for both attacks, we use a normal upstream model for the baseline settings and manipulated upstream models for the interested attack settings, and the attackers may gain more advantage from the manipulation in the latter setting. 
+%upstream models used in these attacks will be different between the baseline attack setting (with normal upstream model) and the manipulated attack setting (with manipulated upstream model), which potentially gives attacker more leverage.  
+
+%\dnote{so, is this our baseline, or it is still taking advantage of the manipulation (is the adversary shadow model training done using the manipulation?)} \ynote{mentioned that we will use this method as a baseline; we have case }
+
+
+
+
+% This method was originally designed for fully-connected neural networks. We adapt the implementation provided by Suri and Evans~\cite{suri2022formalizing} to also handle convolutional neural networks.
+% \snote{is the above statement true?} \ynote{no, description updated}
+
+% More details can be found in Section ~\ref{sec:details_of_baseline_inference_methods}.
+
+%\dnote{this list of attacks should be more clearly separated into ones that take advantage of the pretraining manipulation, and baseline attacks that do not} \ynote{added in the first paragraph of this section}.
+
+%In addition, we do not find existing inference methods designed for this scenario.
+
+
+%If the initial values of the parameters in the first layer of the downstream model are known to the attacker (which would be the case if the victim does not re-initialize the first layer of $g(\cdot)$), the attacker can directly compute the difference between initial values of the target parameters and values of the trained target parameters. If the difference is close to 0, this means the target parameters are not updated during the downstream training and indicates there are no samples with the target property (Equation~\ref{eq:partial_der}). Otherwise, the downstream training is likely to contain samples with the target property.
+
+
+%\dnote{long list below, should be organized around the threat models - and, is it really necessary to have all of these? (do we have so many different ones because we are comparing them in the experiments and deciding on the one best white-box and black-box methods, or are they interesting for their own sake?}
+%\ynote{Maybe we can just list some of them in the main body and defer the rest of them to the Appendix. For example, we can keep the Parameter Difference Test and the Variance Test for the white-box scenarios, and keep the meta-classifier adapted from MNTD for the black-box scenarios}
+
+
+%In this section, we propose white-box inference methods (the first two inference methods in Section~\ref{sec:white-box_inference}), which are designed for analysing the manipulated target parameters. We also evaluate state-of-the-art white-box inference~\cite{ganju2018property,suri2022formalizing} attacks, which train meta classifiers with permutation  invariant representations~\cite{ganju2018property} for comparison. As for the black-box scenarios, we introduce three inference methods in Section~\ref{sec:black-box_inference} which are designed by adapting the methods used in existing works.
+
+%we consider three white-box and three black-box inference attacks. Two of the white-box inference attacks (the parameter difference test and the variance test) are specifically designed for analysing the manipulated target parameters, while the others are adapted/reused from existing works.
+
+
+
+
+% \subsubsection{White-box attacks} \label{sec:white-box_inference}
+
+% For these attacks, we assume full access to the victim's model. Such a setting can arise in many cases, like when the victim makes its finetuned model public (like many models in HuggingFace). The first two attacks require only the victim model itself, while the third one requires training shadow models locally, along with a meta-classifier.
+
+% \shortsection{Parameter Difference Test}
+% If the initial values of the parameters in the first layer of the downstream model are known to the attacker (which would be the case if the victim does not re-initialize the first layer of $g(\cdot)$), the attacker can directly compute the difference between initial values of the target parameters and values of the trained target parameters. If the difference is close to 0, this means the target parameters are not updated during the downstream training and indicates there are no samples with the target property (Equation~\ref{eq:partial_der}). Otherwise, the downstream training is likely to contain samples with the target property.
+
+% \shortsection{Variance Test} If the attacker can access the parameters of the downstream model but does not know the initial values of the target parameters, the attacker can use the statistics of the target parameters as the indicator. For example, the variance of the target parameters will be a good choice. The current popular parameters initialization methods will usually generate parameters with relatively small variances. If there are samples with the target property in the downstream training, the target parameters will be updated with the gradients with relatively large values (controlled by the $\lambda$ in Equation~\ref{eq:x_w_activation}), and the variance of those parameters will probably increase. The results in Section~\ref{sec:eval_zero_activation_attack} confirm this.
+
+% %\dnote{unlike the others, I think this one requires running the model on test inputs - need to explain that process, and how you select the inputs to run on.} \ynote{can we just say we use the implementation of Anshuman's inference paper?}
+
+% \shortsection{White-box Meta-Classifier} We also experiment with the meta-classifier approach proposed by Ganju et al.~\cite{ganju2018property}. Like the Black-Box Meta-Classifier, the adversary trains shadow models. Then, it uses the permutation invariant representations~\cite{ganju2018property} of the shadow models to train a meta-classifier to differentiate between models with and without the target property. This method was originally designed for fully-connected models. We use the implementation provided by Suri et al.~\cite{suri2022formalizing} that extends this architecture to convolutional neural networks.
+
+
+% \subsubsection{Black-box attacks} \label{sec:black-box_inference}
+
+% % \dnote{
+% % describe the ones that don't use meta classifiers first, and give an overview of the attacks and how they relate to the w-b ones}
+% Our black-box attacks assume API-only access to the victim model, having access to class probabilities for any given input. The first two attacks below require access to only some samples, while the third one additionally requires training shadow models locally, along with a meta-classifier.
+
+% \shortsection{Confidence Score Test} The adversary uses samples with the target property to test the performance of the downstream models. The attacker's expectation is that models trained with the property will show better testing results compared to those trained without the property. Similar ideas have been explored in previous membership inference works. However, there are a couple key differences. We do not use samples that appear in the downstream training for our test, which is common in membership inference~\cite{sablayrolles2020radioactive}. Secondly, we use model confidence scores instead of performance metrics like loss and accuracy~\cite{suri2022formalizing} since we observe better results with just the scores.
+    
+% \shortsection{Purified Confidence Score Test} Compared to the inference method above, the only difference is that we do not blindly use samples with the target property. Instead, we only use the samples on which the feature extractor can achieve the attack goal described in Equation~\ref{eq:x_w_activation} perfectly. \todo{maybe we can remove this method}
+
+% \shortsection{Black-box Meta-Classifier} We adapt MNTD~\cite{xu2019detecting}, which is originally designed to detect Trojans, to conduct inference. MNTD requires training of shadow models, and uses model outputs (on some generated samples) as features to train meta-classifiers that can distinguish between models with and without Trojans. We modify this training goal of Trojan detection to suit our  inference goal. Additionally, instead of randomly initializing the sample-generation process, we use samples with the target property to improve inference performance.

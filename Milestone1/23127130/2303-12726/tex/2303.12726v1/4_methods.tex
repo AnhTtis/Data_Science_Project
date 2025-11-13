@@ -1,0 +1,238 @@
+\section{Motion Imitation}
+The foundation of our algorithm is an imitation learning framework. In the following sections, we describe the observations, actions, reward functions, and the training procedure. We explain these for a single hand, but our method can trivially incorporate both hands by increasing the state and observation dimensions.
+
+\subsection{Problem Formulation}
+Given motion capture trajectories for a hand (or both hands) and an object, we aim to learn an effective policy that can manipulate the object by following a reference trajectory. 
+% We apply deep reinforcement learning (DRL) to learn such a control policy.
+
+We formulate the control problem as a partially observable Markov Decision Process (PoMDP) with tuple $(\mathcal{S}, \mathcal{O},o, \mathcal{A},\mathcal{T},r, o, \gamma)$, where $\mathcal{S}$ is the state space, $\mathcal{O}$ is the observation space for the hand and the object, $\mathcal{A}$ is the action space for actuating the hand, $\mathcal{T}$ is the transition dynamics (physics simulation), $r$ is the reward function, $o$ is the observation emission function, and $\gamma$ is the discount factor. At a high level, we want to find a parameterized control policy $\pi_{\theta}$ so that it will maximize the expected sum of rewards over a distribution of trajectories
+\begin{equation}
+    \pi_{\theta^*} = \argmax_{\theta} \mathbb{E}_{(s_0,s_1,\dots,s_T)}\left[\sum_{t=0}^{T}\gamma^{t}r(s_t, \pi_{\theta}(s_t))\right].
+\end{equation}
+
+\subsection{Observation representation}
+%\sloppy The observation of the agent is encoded in the following vector form $\mathbf{o} = (\mathbf{x}_{hand},\mathbf{x}_{obj},\mathbf{v}_{hand},\mathbf{v}_{obj},\bar{\mathbf{x}}_{hand},\bar{\mathbf{x}}_{obj},\bar{\mathbf{x}}_{hand}\ominus \mathbf{x}_{hand},\bar{\mathbf{x}}_{obj}\ominus \mathbf{x}_{obj},\mathcal{C})$. 
+The observation space can be divided into four components: the states of the simulated hand and the object $\{\mathbf{x}_{hand},\mathbf{x}_{obj}\}$, reference states of hand and object from mocap $\{\bar{\mathbf{x}}_{hand},\bar{\mathbf{x}}_{obj}\}$, their differences from simulation $\{\bar{x}_{hand}\ominus x_{hand} ,\bar{x}_{obj}\ominus x_{obj}\}$, and contact information $\{\mathcal{C}\}$. As studied in Bergamin et al.~\shortcite{bergamin2019drecon}, using the difference between simulation and reference as observation improves both training speed and quality. 
+
+\emph{Simulated states:} The positional state of the hand $\mathbf{x}_{hand} =\linebreak[1]  (\mathbf{x}_{h\_root},\linebreak[1]  \mathbf{R}_{h\_root},\linebreak[1]  \cos(q),\linebreak[1]  \sin(q))$ is a $46D$ vector containing the pose of the root and all joint angles of the hand, where $\mathbf{x}_{h\_root} \in \mathbb{R}^3$ is the $3D$ position of the wrist, $\mathbf{R}_{h\_root} \in \mathbb{R}^3$ orientation of the wrist represented as axis-angle, and $q \in \mathbb{R}^{20}$ are all the joint angles in a hand. $\mathbf{x}_{obj} = (\mathbf{x}_{o\_root},\mathbf{R}_{o\_root})$ is a $6D$ vector containing the position and axis-angle orientation of the simulated object. $\mathbf{v}_{hand}$ and $\mathbf{v}_{obj}$ are $26D$ and $6D$ vectors containing the velocities of the hand and the object. Note that we actuate the hand's orientation directly, and we found the use of axis-angle for hand orientation to be especially important for success.
+
+\emph{Reference states:} $\bar{\mathbf{x}}_{hand}$ and $\bar{\mathbf{x}}_{obj}$ are the reference poses of the hand and object at the current frame expressed in the same format as the pose of simulated hand and object. 
+
+\emph{State differences:} $\bar{x}_{hand}\ominus x_{hand}$ and $\bar{x}_{obj}\ominus x_{obj}$ are the differences between the simulated pose and the reference pose of both the hand and object. For all the rotational information, we evaluate the rotation differences in $SO(3)$ and express the difference into the corresponding format \revised{of axis angle or sine and cosine of Euler angles} used in the observation.
+
+\emph{Contact information:} We include an additional $19D$ vector $\mathcal{C}$ to capture the contact forces between the hand and the object. We surround each finger capsule with a contact sensor that is a slightly larger capsule with a 10\% larger radius. These contact sensors register contact forces from the object at each control step, and we record the sum of all contact forces exerted by the object on each rigid segments of the hand through the contact sensors. Because the sensors correspond to finger segments, their readings indicate how much contact forces are being exerted, and implicitly inform where the contacts are. 
+%In the last part of the observation, we want to implicitly inform the policy about the geometry of the object, so that the policy will be able to adjust it's behaviour based on the shape changes of the object. To do so, 
+% \yuting{not clear how contact force magnitude encodes geometry info}
+
+Combining all the described observation components, we have a $207D$ vector that describes the state of the simulation when we are considering a manipulating task involving a single hand. When we train the policy to track a two-hand manipulation sequence, we double the observations for the hand and end up with a $390D$ vector.
+
+\subsection{Action Representation}
+Similar to the approach in \cite{bergamin2019drecon}, at each time step $t$, the policy outputs an action $\mathbf{a}_t = \{\Delta{\mathbf{x}},\Delta{\mathbf{R}},\Delta{\mathbf{q}}\}$, a $26D$ vector specifying the spatial displacement to the hand's reference pose, where $\Delta{\mathbf{x}} \in \mathbb{R}^3$ is the hand root linear displacement, $\Delta{\mathbf{R}} \in \mathbb{R}^3$ is the root orientation displacement expressed in axis-angle, and $\Delta{\mathbf{q}} \in \mathbb{R}^{20}$ is the joint angle displacement for each joint. We apply an exponential action filter with $\alpha=0.3$ to generate smoother motions. Once the PD target is computed, we compute joint torques using the stable-PD controller~\cite{tan2011stable}. \revised{The full control loop is shown in Figure \ref{fig:control_loop}}
+\begin{figure}
+\centering
+\includegraphics[width=0.48\textwidth]{figures/control_loop.png}
+\caption{Overview of the control loop}
+\label{fig:control_loop}
+\end{figure}
+%For more details, please refer to the original Stable PD paper.
+
+% After an action is generated, we compute the target $q_{targ}=(1-\alpha) q_{prev} + \alpha (q_{ref}+a_{t})$ as blending between hand pose from previous frame and new pose generated by the action so that the generated target across simluation is smooth.
+
+% Instead of directly using proportional derivative (PD) controllers, we adapt the stable-PD controller proposed by Tan et al.~\shortcite{tan2011stable} in simulation. This change allows us to more easily set the proportional and damping coefficients in the controller to make sure the simulated hand can always accurately reach the desired pose in the next few simulation steps without overshooting. %\sehoon{Provide a one-line justification of Stable PD}
+%  Since our hands have full translation and rotation freedom, the learned policy needs to directly control both the roots as well as all the finger joints. A torque for each degree of freedom is computed using the stable-PD formulation describe as:
+% \begin{equation}
+%     \tau = -K_p (q_t + \dot{q}_t\Delta{t}-q_{targ})-K_d(\dot{q}_t+\ddot{q}_t\Delta{t}).
+% \end{equation}
+% For more details, please refer to the original Stable PD paper.
+
+\subsection{Reward Function}
+Our goal is to track the reference motions of both the hands and the object as closely as possible. Inspired by the original DeepMimic paper~\cite{peng2018deepmimic}, we design our reward function as follows:
+\begin{equation}
+    r = w_{od}r_{od}+w_{or}r_{or}+w_{hd}r_{hd}+w_{hr}r_{hr}+w_{hj}r_{hj}
+\end{equation}
+which consists of the object position term $r_{od}$, the object rotation term $r_{or}$, the hand position term $r_{hd}$, the hand orientation term $r_{hr}$, and the hand joint term $r_{hj}$.
+To enforce a match between the simulated object and the reference object's position and orientation, we define the terms $r_{od}$ and $r_{or}$:
+\begin{equation}
+    r_{od} = \exp\left(-k_{od}\|\hat{x}_{obj}-x_{obj}\|^2\right),
+\end{equation} and
+\begin{equation}
+    r_{or}=\exp\left(-k_{or}\|\hat{q}_{obj}^{-1}q_{obj}\|^2\right),
+\end{equation}
+which compares the object's position $x_{obj}$ and orientation $q_{obj}$ to their desired values.
+For all $N$ rigid segment of the hand with the index i, we define the reward terms $r_{hd}$ and $r_{hr}$:
+\begin{equation}
+    r_{hd}=\exp\left(-k_{hd}\sum_{i =1}^N\|\hat{x}_{i}-x_{i}\|^2\right),
+\end{equation} and 
+\begin{equation}
+    r_{hr}=\exp\left(-k_{hr}\sum_{i =1}^N\|\hat{q}_{i}^{-1}q_{i}\|^2\right),
+\end{equation}
+where $x_{i}$ and $q_{i}$ represent the position and orientation of the $i$th body segment.
+In addition enforcing the hand rigid segment's tracking, we also define the reward term $r_{hj}$
+\begin{equation}
+    r_{hj}=\exp\left(-k_{hj}\sum_{i =1}^{M}\|\hat{\theta}_{i}-\theta_{i}\|^2\right),
+\end{equation}
+by comparing all the current and desired joint angles, $\theta$ and $\hat{\theta}$. For all experiments, we set the weights as $w_{od}=4$, $w_{or}=4$, $w_{hd}=0.05$, $w_{hr}=0.05$, and $w_{hj}=0.1$. 
+% These terms minimize positional differences of each rigid finger segment between simulation and the reference as well as joint angle differences between simulated and reference hands.
+
+\subsection{Terminal Condition}
+As studied in DeepMimic~\cite{peng2018deepmimic}, early termination of a rollout when the simulation enters an unrecoverable state can save computation on low value trajectories. We design the early termination criteria to restrict how much the object's state is allowed to deviate from the reference: either $d_{thr}=10cm$ in translation or $\phi_{thr}=60^\circ$ in rotation. We choose these thresholds to allow the hands to explore its action space more freely, but this still eliminates irredeemable failures.  
+
+% \subsection{Policy Training}
+% We use Proximal Policy Optimization (PPO)~\cite{schulman2017proximal}, a common on-policy reinforcement learning algorithm in all our training. \sehoon{Yunbo, please say a sentence or two about the policy architecture}
+% PPO aims to minimized two optimization losses $L_{surrogate}$ and $L_{KL}$ described as:
+% \begin{align}
+%     L_{PPO}(\theta) &=L_{surrogate}+L_{KL}\nonumber\\
+%     &=-\mathbb{E}_{t}\left[min(r(\theta)A_t,clip(r(\theta),1-\epsilon,1+\epsilon)\right]\\
+%     &\ \ \ - \beta\mathbb{E}_{t}\left[KL\left[\pi_{\theta}(s_t)|\pi_{\theta_{old}}(s_t)\right]\right]\nonumber .
+% \end{align}
+% A dynamically adjusted coefficient $\beta$ is used to make sure policies from two consecutive iterations do not deviate too much in their KL divergence. 
+
+
+
+%We terminate the rollout when the simulated object is drifted away more than distance $d_{thr}=10cm$ from the reference or its orientation is off by $\phi_{thr}=60^\circ$ from the reference. This criteria gives some tolerance for the hand to adjust its motion to capture the object back in place, and it will be triggered most likely when an object is out of control and about to fall out of the hand. 
+
+ 
+
+
+\section{Greedy Shape Curriculum for Novel Objects}
+
+
+% Motivation for reusing the mocap
+It would be undesirable to record a new motion capture sequence for each new object that we want to manipulate. Instead, we would like to generalize an existing motion example to different objects in simulation. For example, we may want to manipulate a teapot or a toy train using the same reference motion for a cube. However, it is not straightforward to learn an effective policy for a new shape because it often requires significant changes in the control strategy.
+
+% Intuition. Why would a naive curriculum not work?
+Our key intuition is that we can co-train policies on a set of intermediate shapes morphing between the original object and the target object as a curriculum. A naive method would be to use a training curriculum that starts the learning from the source object and gradually morph the shape to the target in a linear progression. In practice, however, this linear curriculum is often unsuccessful because the morphing progression may not exactly correlate to the task's difficulty. \revised{A better tuned morphing algorithm might be able to give stronger correlation between morphing progression and training difficulty, but such algorithm requires additional human effort, and may not be able to generalize across different source target pairs.}
+
+
+\begin{figure}
+\centering
+\includegraphics[width=0.48\textwidth]{figures/system_diagram.png}
+\caption{Illustration of our greedy shape curriculum. Each iteration of the algorithm (1) selects and trains the most promising (policy, shape) pair, (2) evaluates the updated policy on all shapes, and (3) overwrites a shape’s policy pairing if the new policy is better than the cached policy. Example policy performance metrics are displayed numerically below each policy shape.}
+\label{fig:morph_training}
+\end{figure}
+% Our approach: insight and summary.
+Instead, we design a novel training schedule that allows greedily switching between any intermediate shape morphs for a more flexible curriculum. Our algorithm maintains a collection of best policies for each shape. For every $K=20$ policy iteration, it selects the best performing \emph{unsuccessful} morph and its paired policy for the next round of training. Once the policy is further trained, the newly updated policy's performance is evaluated across the entire collection of shapes, and overrides existing policies if it performs better (Figure \ref{fig:morph_training}). Despite its greedy nature, we found this automated curriculum more effective in policy transfer than naive fining-tuning or a fix curriculum. The full procedure is described in Algorithm~\ref{alg:shape_morph_training}.
+\begin{figure*}[h!]
+    \centering
+    \includegraphics[height=\low]{figures/sequence_still_frames/cube_bunny_0.0.png}
+    \hfill
+    \includegraphics[height=\low]{figures/sequence_still_frames/cube_bunny_0.2.png}
+    \hfill
+    \includegraphics[height=\low]{figures/sequence_still_frames/cube_bunny_0.4.png}
+    \hfill
+    \includegraphics[height=\low]{figures/sequence_still_frames/cube_bunny_0.6.png}
+    \hfill
+    \includegraphics[height=\low]{figures/sequence_still_frames/cube_bunny_0.8.png}
+    \hfill
+    \includegraphics[height=\low]{figures/sequence_still_frames/cube_bunny_1.0.png}
+    \hfill
+    \caption{Morph stages of the collision shapes for transferring the cube motion to a bunny after applying V-HACD.}
+    \label{fig:collision_shape_morphs}
+\end{figure*} 
+\begin{figure*}[h!]
+    \centering
+    \includegraphics[height=\high]{figures/sequence_still_frames/wineglass_1.png}
+    \hfill
+    \includegraphics[height=\high]{figures/sequence_still_frames/wineglass_2.png}
+    \hfill
+    \includegraphics[height=\high]{figures/sequence_still_frames/wineglass_3.png}
+    \hfill
+    \includegraphics[height=\high]{figures/sequence_still_frames/wineglass_4.png}
+    \hfill
+    \includegraphics[height=\high]{figures/sequence_still_frames/wineglass_5.png}
+    \hfill
+    \label{fig:torus_large1_single}
+\end{figure*}
+
+\begin{figure*}[h!]
+    \centering
+    \includegraphics[height=\high]{figures/sequence_still_frames/hemi_0.png}
+    \hfill
+    \includegraphics[height=\high]{figures/sequence_still_frames/hemi_1.png}
+    \hfill
+    \includegraphics[height=\high]{figures/sequence_still_frames/hemi_2.png}
+    \hfill
+    \includegraphics[height=\high]{figures/sequence_still_frames/hemi_3.png}
+    \hfill
+    \includegraphics[height=\high]{figures/sequence_still_frames/hemi_4.png}
+    \hfill
+    \caption{Still frames from manipulation sequences involving a wineglass (\textbf{top}) and a hemisphere (\textbf{bottom}).}
+    \label{fig:hemisphere_large1_single}
+    \vspace{-0.1in}
+\end{figure*}
+\begin{algorithm}[tb]
+\caption{Greedy Shape Curriculum}
+\label{alg:shape_morph_training}
+\begin{algorithmic}[1]
+    \STATE Initialize score list $S$
+    \STATE Initialize policy list $\Pi$
+    \STATE Initialize current shape $s=0$ and current policy $\pi = \Pi[s]$
+    \FOR{$i = 0, 1, 2 ,\dots$}
+    \IF{$i \mod k ==0$}
+    \FOR{Every shape $j$}
+    \STATE score = rollout on $j$ using policy $\pi$
+    \IF{score > $S[j]$}
+    \STATE $S[j]$ = score
+    \STATE $\Pi[j] = \pi$
+    \ENDIF
+    \ENDFOR
+    \STATE $s$ = Get best unsuccessful shape
+    \STATE $\pi = \Pi[s]$
+    \ENDIF
+    \STATE PPO using $s$ and $\pi$
+    \ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+A key component of our greedy shape curriculum is a \emph{goodness score} that describes how likely a policy will succeed on a given shape. This metric will be used to update the best policy for a shape, and for selecting the next (shape, policy) pair for training. An obvious choice would be the average episodic reward. However, the consideration here is slightly different. A high episodic reward imposes a more strict constraint to the quality of object pose matching, making it hard to achieve when the target shape is too different from the source shape. A low episodic reward, on the other hand, cannot guarantee the completion of a rollout. On the other hand, the rollout length alone is too simple and fails to reflect the quality of the motion. We want a criteria with high tolerance to object deviation but with low tolerance to failure of completion. To this end, we design our criteria as a combination of the rollout duration and tracking accuracy, and this works robustly in practice. As described in \revised{Equation} \ref{equ:eval_score}, we use the product between the normalized episode length and the sum of hand joint reward of the rollout as the goodness score of a policy for a given shape. This encourages the resulting policy to use a similar manipulation strategy to the input. We consider a score higher than $d=0.55$ as \emph{successful}, and we only pick from the unsuccessful shape morphs for policy training to make progress.
+%we compare this evaluation score against a threshold $d$, and mark all shapes with score below that as unsuccessful. This makes sure that we are always training policies greedily from all the unsuccessful candidates.
+\begin{equation}
+    \label{equ:eval_score}
+    f = \frac{L}{T} \cdot \frac{\sum_{0}^{L}{r_{joint}}}{T}
+\end{equation}
+
+Our greedy schedule is effectively an exploitation strategy, and we still need to balance it with some exploration to avoid local minima. If a particular shape is repeatedly picked for training and starving other shapes, we instead randomly select another shape and its paired policy in the next iteration. This is especially helpful when a policy gets ``stuck'' on a challenging frame towards the end of a sequence while other shapes have not had much training yet. Training progress on other shapes can then help improve such challenging cases later. Similarly, if we are successful on all shapes before the compute budget has been reached, we randomly pick a policy to continue training for further improvement. 
+%This would make sure all shapes can continue to improve. In the meantime, if a particular morph is being too challenging to be solved, this design gives the learning a chance to attend to some other morphs and potentially helping solve the challenging morph. 
+
+
+
+% It would be undesirable to need to record a new motion capture sequence for each new object that we want to manipulate.  Instead, we would like to be able to learn how to manipulate a new object using the mocap from another object. As an example, we may want to manipulate a teapot following the reference motion from a cube. \sehoon{challenge?} 
+
+% To train such a policy, we start by creating a set of intermediate shape morphs between the original object and target object.  We then use a learning process to train a collection of policies, one policy for each individual morph, including the original and target object. The intermediate morphs act as stepping stones between the original shape from the mocap sequence and the new object that we want to manipulate. 
+
+% The most straightforward way to train the collection of morphs would be to use a training curriculum.  We would start by training a policy on the source object. Once this policy is successful, this would be used as a starting policy that is then further trained using the next of the morph shapes. The policy from the second shape would then be use for the third shape, and so on. Unfortunately, we found that this strict curriculum over object shapes is often unsuccessful. \sehoon{provide more insights} We hypothesized that it may be beneficial to jump between shapes out of sequence, and indeed this turned out to be the case.
+
+% \sehoon{Two key aspects: how to maintain a list, and when to transfer.}
+
+% \sehoon{Little more focus on greedy aspects..}
+% Instead of training a policy based on a sequential curriculum, we maintain a list of the best performing policies for each individual shape in the list as well as their performances. For every $k=20$ training iteration, the system selects the best performing unsuccessful morph and its paired policy for the next round of training. Once the policy is further trained, the new policy's performance is evaluated for each of the shapes. When it is better than the shape's current policy, it becomes the new policy for that shape. This full procedure is described in Algorithm \ref{alg:shape_morph_training}.
+
+
+%We have found our training approach to be more successful than a naive training curriculum across shapes. Figure~\ref{fig:policy_tree} shows our approach for the source and target shapes of a cube and an elephant. Each arrow indicates when an updated policy performs better than the current policy for another shape.
+
+% \greg{Yunbo, please add a description of how you calculate a given policy's score.}
+% To properly measure how well a policy performs on a shape morph, we take consideration of both the duration of a rollout.
+% \begin{algorithm}[tb]
+% \caption{Shape Morphing Training}
+% \label{alg:shape_morph_training}
+% \begin{algorithmic}[1]
+%     \STATE Initialize score list $S$
+%     \STATE Initialize policy list $\Pi$
+%     \STATE Initialize current shape $s=0$ and current policy $\pi = \Pi[s]$
+%     \FOR{$i = 0, 1, 2 ,\dots$}
+%     \IF{$i \mod k ==0$}
+%     \FOR{Every shape $j$}
+%     \STATE score = rollout on $j$ using policy $\pi$
+%     \IF{score > $S[j]$}
+%     \STATE $S[j]$ = score
+%     \STATE $\Pi[j] = \pi$
+%     \ENDIF
+%     \ENDFOR
+%     \STATE $s$ = Get best unsuccessful shape
+%     \STATE $\pi = \Pi[s]$
+%     \ENDIF
+%     \STATE PPO using $s$ and $\pi$
+%     \ENDFOR
+% \end{algorithmic}
+% \end{algorithm}
+

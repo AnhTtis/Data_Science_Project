@@ -1,0 +1,57 @@
+In this section, we present the implementation details of NNoM and CMSIS-NN convolution on which our implementations of the different primitives are based. Furthermore, we detail the differences of implementation between the standard convolution and the optimized primitives.
+
+\subsection{Quantization}
+
+Quantization is the process of reducing the precision of weights, biases, and activations in order to reduce the memory footprint. NNoM library uses 8 bits quantization for the weights, biases, and activations with a uniform symmetric powers-of-two quantization scheme as in Eq.~\ref{eq_powers_of_two}.
+\begin{equation}
+%\begin{split}
+   dec = ceil\Big(log_{2}\big(max(|X_{f}|)\big)\Big) \text{  ;  }
+   x_{i} = floor\big(x_{f}\cdot 2^{(8-1)-dec}\big)
+%\end{split}
+\label{eq_powers_of_two}
+\end{equation}
+where $X_{f}$ is a 32 bits floating point tensor, $x_{f}$ a value of $X_f$, $x_{i}$ its 8 bits quantized version and $2^{dec}$ is the scale of quantization. Because this scale is a power of 2, the convolution operation only requires integer addition, multiplication and bit shifting, but no division (see Algorithm \ref{alg:conv_innerloop}, left). This computation process is used for grouped and shift convolutions because of their similarity to standard convolution. We adapt it to add convolutions as presented in Algorithm \ref{alg:conv_innerloop} (right).
+
+\begin{algorithm}
+\caption{Inner loop of convolution (left) and add convolution (right) without bias}
+\label{alg:conv_innerloop}
+\textbf{Input :} individual weight w, power-of-2 scale of weight $dec_{weight}$, one input value x, power-of-2 scale of input $dec_{input}$, power-of-2 scale of output $dec_{output}$
+\begin{multicols}{2}
+    \begin{algorithmic}[1]
+    \STATE $output \gets i\cdot w$
+    \STATE $shift_{output} \gets dec_{weight} + dec_{input} - dec_{output}$
+    \STATE $output \gets output >> shift_{output}$
+    \STATE Return output
+    \end{algorithmic}
+    \columnbreak
+    \begin{algorithmic}[1]
+    \STATE $shift \gets |dec_{input}-dec_{weight}|$
+    \IF{$dec_{input}>dec_{weight}$}
+        \STATE $output \gets -|i-(w<<shift)|$
+        \STATE $shift_{output} \gets dec_{input} - dec_{output}$
+    \ELSIF{$dec_{input}<dec_{weight}$}
+        \STATE $output \gets -|(i<<shift)-w|$
+        \STATE $shift_{output} \gets dec_{weight} - dec_{output}$
+    \ELSE
+        \STATE $output \gets -|i-w|$
+        \STATE $shift_{output} \gets dec_{weight} - dec_{output}$
+    \ENDIF
+    \STATE $output \gets output >> shift_{output}$
+    \STATE Return output
+        \end{algorithmic}
+\end{multicols}
+\end{algorithm}
+\vspace{-20pt}
+
+\subsection{Batch normalization folding}
+
+For convolutions, NNoM library uses the batch normalization folding proposed by Jacob~\etal~\cite{jacob2018quantization}. By merging convolution layers and batch normalization layers, this method accelerates the inference without accuracy drop. Batch normalization folding can be applied for the computation of grouped and shift convolutions but is not suitable fot add convolution.
+
+\subsection{Im2col algorithm with SIMD instructions}
+
+In order to accelerate convolutions, the CMSIS-NN middleware~\cite{lai2018cmsis} use the image to column (im2col) algorithm~\cite{chellapilla2006high}. A first step is to sample patches from the input, flatten and stack them as columns of a matrix $M$. Each filters of the convolution weight $W$ are also flattened and stacked as rows of a matrix $N$. In the second step, the output is computed with the matrix multiplication $Y=M.N$.
+\\
+To deal with the increased memory footprint of im2col, Lai~\etal~\cite{lai2018cmsis} limit the number of patches processed at the same time to 2. The matrix multiplication is computed using 2 filters simultaneously to maximize the data reuse at the register file level on ARM Cortex-M. Furthermore, Lai~\etal~\cite{lai2018cmsis} use the parallelized multiply-accumulate instruction \texttt{\_\_SMLAD} to speed up the matrix multiplication.
+
+For grouped convolution, we apply Lai~\etal~\cite{lai2018cmsis} algorithm to each group. For shift convolution, we modify the first step of im2col to sample a patch with different shifts for each input channel. We did not implement a SIMD version of add convolutions because there is no instructions similar to \texttt{\_\_SMLAD} adapted to add convolutions.
+

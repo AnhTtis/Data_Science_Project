@@ -1,0 +1,227 @@
+
+\section{Numerical methods}
+\label{sec:numerical}
+
+In this section we describe the numerical methods used in Hermes-3
+components. The architecture described in
+section~\ref{sec:software-arch} does not enforce the choice of
+numerical method, but this section describes the methods that have
+been implemented to date and are used in
+section~\ref{sec:applications}.  The system of PDEs is solved using
+the method of lines, in which the time and spatial dimensions are
+treated separately: The time integrator simply integrates a set of
+Ordinary Differential Equations (ODEs), and is discussed in
+section~\ref{sec:time-integration}; The spatial discretisation is by
+finite difference methods
+(section~\ref{sec:finite_differencing}). Boundary conditions are
+discussed in section~\ref{sec:boundary}.
+
+\subsection{Time integration}
+\label{sec:time-integration}
+
+Hermes-3 is built on the BOUT++ framework~\cite{bout:manual}, and so
+can make use of a range of explicit (e.g RK4), fully implicit
+(e.g. BDF via SUNDIALS~\cite{hindmarsh2005}), and implicit-explicit
+(e.g IMEX-BDF2 and ARKODE via SUNDIALS) methods. These were
+implemented with the aim of studying time-dependent problems, such as
+the study of Edge Localised Mode (ELM) eruptions~\cite{xu2010} or
+tokamak edge turbulence~\cite{seto2019}, where accurate time evolution
+is required.
+
+Many of the problems of interest for Hermes-3 are steady state:
+Axisymmetric tokamak transport solutions, potentially as a starting
+point for 3D time-dependent turbulence simulations. To find these
+steady-state solutions efficiently it is desirable to take large
+timesteps, ideally an infinite timestep, damping transient
+oscillations in the system. A dissipative time integration scheme that
+is unconditionally stable is therefore desirable. A first order
+backward Euler method and preconditioning algorithm similar to that
+used in UEDGE~\cite{rognlien-2002} has been implemented here. This
+method is stable for any timestep provided that the nonlinear solver,
+typically a variety of Newton's method, iterations converge. In
+practice this limits the timestep to a finite, and sometimes quite
+small, value.
+
+An important ingredient to robustly and efficiently solving the
+nonlinear problem at each time step is a good preconditioner: It
+enables the linear inner solve to converge with fewer iterations (and
+so computational cost) for larger timesteps than would otherwise be
+possible. Custom preconditioners developed using a methodology such as
+physics-based preconditioning~\cite{chacon2002, chacon2008} can be
+highly effective, but are challenging in multi-fluid contexts: The
+tokamak edge is a highly nonlinear system, with a potentially large
+number of species (and so equations), coupled through atomic rates
+which are typically tabulated rather than analytic, and which vary by
+orders of magnitude over relatively small temperature ranges. The
+approach used in UEDGE, and adopted for the Backward Euler solver
+here, is to use finite differences to calculate the elements of the
+system Jacobian $\mathbb{J}_{ij}=\frac{\partial}{\partial
+  f_j}\frac{\partial f_i}{\partial t}$ where $\mathbf{f}$ is the
+vector of evolving quantites. This approximate Jacobian is used to
+construct a preconditioner that (approximately) solves the linear
+operator $\mathbb{I} - \Delta t\mathbb{J}$ for timestep $\Delta
+t$. Methods based on incomplete LU factorization (ILU) have been
+found to be effective: In serial the PETSc ILU(k) solver is used, and
+in parallel the Euler library~\cite{hysom2001} within
+{\it hypre}~\cite{falgout2006}, both with default settings.
+
+The calculation of a dense Jacobian using finite differences would be
+prohibitively slow in most cases: A typical simulation might contain
+$N \simeq 10^5-10^8$ evolving quantities, while the Jacobian has $N^2$
+elements. Fortunately the Jacobian is typically sparse, because the
+finite differences and other interaction terms are local. This is
+exploited by using the PETSc coloring
+facilities~\cite{petsc-user-ref}, which are provided with the matrix
+structure (determined by the finite difference stencil), and
+efficiently calculate many Jacobian matrix entries
+simultaneously. Because each cell only has a fixed number of
+neighbours, the cost of evaluating the Jacobian is reduced from
+scaling like $N^2$ to scaling approximately linearly with the number
+of grid cells $N$.
+
+The effectiveness of this time integrator for steady state problems
+will be applied to 1D transport problems in
+section~\ref{sec:1d-transport} (fig~\ref{fig:timederivs-rhsevals}),
+and for 2D transport in an axisymmetric tokamak geometry in
+section~\ref{sec:applications-2d}.
+
+\subsection{Finite differencing spatial operators}
+\label{sec:finite_differencing}
+
+The models to be shown here use conservative finite difference
+operators that were implemented in the Hermes code~\cite{Dudson2017}
+and have been improved over time and moved into the BOUT++
+library. All quantities are cell centred, and advection operators are
+written in terms of fluxes between cells calculated at cell faces. The
+cross-field operators presently assume that the grid is orthogonal in
+the tokamak poloidal plane. This limits the accuracy with which
+strongly shaped divertor geometries can be simulated with the present
+code. Non-orthogonal grids which align with wall surfaces can be
+generated for Hermes using the BOUT++ grid generator~\cite{hypnotoad},
+but the required off-diagonal metric terms have not yet been
+implemented. Those terms have long been implemented in UEDGE, and were
+recently added to SOLPS~\cite{dekeyser2019}, where they were found to
+be essential for fluid neutral modelling on distorted grids, but
+relatively unimportant when kinetic neutrals were used. Implementing
+these terms is a high priority for future improvements to Hermes-3.
+
+Because all quantities are cell centred, in the absence of dissipation
+zig-zag modes are likely to develop. In~\cite{Dudson2017} an Added
+Dissipation~\cite{murthy-2002} artificial dissipation term was used in
+advection operators along the magnetic field.  Here this is replaced
+with an HLL type flux splitting method~\cite{harten1983, donat-1996},
+that improves on methods used previously for 1D tokamak divertor
+simulations~\cite{dudson2019,bout:sd1d}. Results shown here use either
+the MinMod or Monotonised Central (MC) slope
+limiters~\cite{vanleer1977}, that have been found to provide a good
+balance of numerical dissipation and stability. Details of the method
+are given in \ref{apx:numerics1d}.
+
+To verify the implementation of fluid flow along the magnetic field
+for smooth solutions, a set of 1D fluid equations along a magnetic
+field given in equation~\ref{eq:fluid-equations} is tested using the
+Method of Manufactured solutions (MMS). This testing method has become
+widely used to verify the correct implementation of complex sets of
+equations, in tokamak edge plasma codes~\cite{riva2014} including
+BOUT++~\cite{dudson-2015}.
+\begin{subequations}
+  \label{eq:fluid-equations}
+  \begin{align}
+    \frac{\partial n}{\partial t} &= -\nabla\cdot\left(n\mathbf{b}v_{||}\right) \\
+    \frac{\partial p}{\partial t} &= -\nabla\cdot\left(p\mathbf{b}v_{||}\right) - \frac{2}{3}p\nabla\cdot\left(\mathbf{b}v_{||}\right) \\
+    \frac{\partial}{\partial t}\left(mnv_{||}\right) &= -\nabla\cdot\left(mnv_{||}\mathbf{b}v_{||}\right) - \partial_{||}p
+  \end{align}
+\end{subequations}
+Error norms as a function of mesh cell spacing are presented in
+figure~\ref{fig:fluid-norm}, showing convergence towards the
+manufactured solution on a 1D periodic domain. Second order convergence
+is found for both $l_2$ and $l_\infty$ error norms, consistent with the
+expected order of accuracy of the numerical methods.
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.9\textwidth]{content/fluid_norm.pdf}
+  \caption{Verification of the convergence of a 1D system of fluid
+    equations on a periodic domain.  Showing $l_2$ (Root-Mean-Square)
+    and $l_\infty$ (Max) errors for the evolving density $N_i$,
+    pressure $P_i$ and momentum $NV_i$. Figure produced by
+    \texttt{tests/integrated/1D-fluid} in the Hermes-3
+    repository~\cite{dudson:hermes3}.}
+  \label{fig:fluid-norm}
+\end{figure}
+
+The intended application of Hermes-3 is to magnetically confined
+fusion plasmas, in which flows are typically subsonic. Nevertheless
+the code must be robust to transients, and transitions to supersonic
+flow can occur in tokamak plasmas~\cite{ghendrih2011}. Figure~\ref{fig:sod-shock}
+shows the results of the standard 1D Sod shock tube test case~\cite{sod1978}.
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.49\textwidth]{content/sod_shock.pdf}
+  \includegraphics[width=0.49\textwidth]{content/sod_shock_energy.pdf}
+  \caption{Standard Sod shock tube problem~\cite{sod1978} at $t=0.2$,
+    with exact (analytic) solution in solid black. A solution with
+    reference resolution ($n = 100$ cells) is compared to higher
+    resolutions and their $l_2$ (Root-Mean-Square) errors. {\bf Left}: Solving the
+    pressure form of the fluid equations. {\bf Right}: Solving the
+    energy form. The inset figures show the shock front in more
+    detail. Figure produced by \texttt{tests/integrated/sod-shock} and \texttt{tests/integrated/sod-shock-energy}.}
+  \label{fig:sod-shock}
+\end{figure}
+In the expanded view shown inset in the left
+figure~\ref{fig:sod-shock} it can be seen that the numerical shock
+location lags the exact solution, so that the $l^2$ error norm does
+not converge to zero. The result is insensitive to time integration
+method, being observed with both the default CVODE time integrator and
+the RK3-SSP method implemented in BOUT++. This is due to the choice of
+pressure as an evolving quantity in equation~\ref{eq:fluid-equations},
+and so pressure fluxes are calculated at cell edges.
+
+Hermes-3 is structured in a modular way that allows equations to be
+changed in the input file. If rather than evolving pressure we choose
+to evolve energy density $\mathcal{E} = \frac{3}{2}p +
+\frac{1}{2}mnv_{||}^2$, then the result is shown on the right of
+figure~\ref{fig:sod-shock}.  Solving the fluid equations in this
+conservative form recovers the correct shock front location (shown
+inset in figure~\ref{fig:sod-shock} right). Further variations on this
+1D shock tube problem~\cite{toro09} are included in the Hermes-3 test
+suite.
+
+We conclude that the methods currently implemented are $2^{nd}$-order
+accurate for smooth solutions (figure~\ref{fig:fluid-norm}), and
+remain robust around shocks, contact discontinuities and expansion
+waves (figure~\ref{fig:sod-shock}).  The modular nature of Hermes-3
+allows multiple fluid formulations to be implemented and inter-operate
+to suit different applications.
+
+\subsection{Boundary conditions}
+\label{sec:boundary}
+
+The domain typically solved for in 2D and 3D Hermes-3 tokamak
+simulations is an annulus consisting of a region of closed and open
+magnetic flux surfaces.  An example is discussed in
+section~\ref{sec:applications-2d} and shown in
+figure~\ref{fig:2d_domain}. The hot ``core'' of the plasma is not
+modelled because the fluid equations solved become invalid in that
+region. Instead a boundary condition must be imposed at that innermost
+surface where no boundary physically exists. At the outer edge of the
+domain the grid is typically close to, but not aligned with, the solid
+vacuum vessel of the tokamak. Boundary conditions for the
+thermodynamic variables on both ``core'' and ``wall'' boundaries are
+typically set to either Dirichlet or Neumann.
+
+The boundary condition on the potential $\phi$ is a variation on the
+method used in the STORM model~\cite{ukaea:storm, easy2014}: A
+time-evolving boundary condition that relaxes towards a Neumann
+boundary. This is implemented in the following way: When inverting the
+Laplacian-type equation for $\phi$ from vorticity, the potential is
+fixed at both core and wall boundaries. If a simple Dirichlet
+condition is used then narrow boundary layers typically form close to
+the boundaries in which the imposed boundary potential is matched to
+the plasma potential. These boundary layers can develop unphysical
+instabilities. Instead, at every timestep the value of the boundary
+condition is adjusted towards the value inside the domain with a
+characteristic timescale that is set by default to $1\mu s$. In this
+manner the electrostatic potential $\phi$ evolves smoothly to
+solutions that can have different potentials on core and wall
+boundaries.
+

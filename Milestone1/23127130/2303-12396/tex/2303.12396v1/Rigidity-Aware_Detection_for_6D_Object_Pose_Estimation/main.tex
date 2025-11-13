@@ -1,0 +1,685 @@
+% CVPR 2023 Paper Template
+% based on the CVPR template provided by Ming-Ming Cheng (https://github.com/MCG-NKU/CVPR_Template)
+% modified and extended by Stefan Roth (stefan.roth@NOSPAMtu-darmstadt.de)
+
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+%%%%%%%%% PAPER TYPE  - PLEASE UPDATE FOR FINAL VERSION
+% \usepackage[review]{cvpr}      % To produce the REVIEW version
+% \usepackage{cvpr}              % To produce the CAMERA-READY version
+\usepackage[pagenumbers]{cvpr} % To force page numbers, e.g. for an arXiv version
+% 
+% Include other packages here, before hyperref.
+\usepackage[table]{xcolor}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{graphics}
+\usepackage{multirow}
+\usepackage{pifont}
+\usepackage{comment}
+\usepackage{color}
+\usepackage{makecell}
+\usepackage{array}
+
+\newcommand{\cmark}{\ding{51}}%
+\newcommand{\xmark}{\ding{55}}%
+
+
+
+% It is strongly recommended to use hyperref, especially for the review version.
+% hyperref with option pagebackref eases the reviewers' job.
+% Please disable hyperref *only* if you encounter grave issues, e.g. with the
+% file validation for the camera-ready version.
+%
+% If you comment hyperref and then uncomment it, you should delete
+% ReviewTempalte.aux before re-running LaTeX.
+% (Or just hit 'q' on the first LaTeX run, let it finish, and you
+%  should be clear).
+\usepackage[pagebackref,breaklinks,colorlinks]{hyperref}
+
+
+% Support for easy cross-referencing
+\usepackage[capitalize]{cleveref}
+\crefname{section}{Sec.}{Secs.}
+\Crefname{section}{Section}{Sections}
+\Crefname{table}{Table}{Tables}
+\crefname{table}{Tab.}{Tabs.}
+
+
+%%%%%%%%% PAPER ID  - PLEASE UPDATE
+\def\cvprPaperID{2298} % *** Enter the CVPR Paper ID here
+\def\confName{CVPR}
+\def\confYear{2023}
+
+
+
+\begin{document}
+
+%%%%%%%%% TITLE - PLEASE UPDATE
+\title{Rigidity-Aware Detection for 6D Object Pose Estimation}
+
+\author{%
+	{Yang Hai $^1$, \quad Rui Song $^1$, \quad Jiaojiao Li $^1$, \quad Mathieu Salzmann $^{2, 3}$, \quad Yinlin Hu $^{4}$} \\
+	{\small $^1$ State Key Laboratory of ISN, Xidian University, \quad $^2$ EPFL, \quad $^3$ ClearSpace, \quad $^4$ MagicLeap} \\
+    % {\tt\small yanghai1218@gmail.com, \{rsong, jjli\}@xidian.edu.cn, } \\
+    % {\tt\small mathieu.salzmann@epfl.ch, yhu@magicleap.com}
+}
+
+\maketitle
+
+\begin{abstract}
+Most recent 6D object pose estimation methods first use object detection to obtain 2D bounding boxes before actually regressing the pose. However, the general object detection methods they use are ill-suited to handle cluttered scenes, thus producing poor initialization to the subsequent pose network. To address this, we propose a rigidity-aware detection method exploiting the fact that, in 6D pose estimation, the target objects are rigid. This lets us introduce an approach to sampling positive object regions from the entire visible object area during training, instead of naively drawing samples from the bounding box center where the object might be occluded. As such, every visible object part can contribute to the final bounding box prediction, yielding better detection robustness. Key to the success of our approach is a visibility map, which we propose to build using a minimum barrier distance between every pixel in the bounding box and the box boundary. Our results on seven challenging 6D pose estimation datasets evidence that our method outperforms general detection frameworks by a large margin. Furthermore, combined with a pose regression network, we obtain state-of-the-art pose estimation results on the challenging BOP benchmark.
+
+%Instead of choosing area around box center as positive samples during network training as general detection methods, which is sensitive to object occlusions, we propose a positive sampling strategy according to some foreground probabilities. This makes every visible rigid parts of the target can contribute to the fusion during inference, and also suppress the noise from backgrounds. To model the foreground probabilities, we propose use distance transform to measure the distance between every pixel to the closest bounding box. We evaluate our method on seven challenging rigid datasets in the field of 6D object pose estimation, and show that it outperforms general detection methods by a large margin. Furthermore, combined with a pose regression network, we obtain state-of-the-art pose results in challenging 6D benchmarks.
+\end{abstract}
+
+
+\section{Introduction}
+
+\begin{figure}[t]
+    \centering
+    \setlength\tabcolsep{1pt}
+    \input{figures/motivation}
+    \caption{\textbf{The challenges of detection in 6D object pose.} 
+    {\bf (a)} The general detection scenario (COCO~\cite{coco}) exhibits small occlusions.
+    {\bf (b)} The occlusion problem in 6D object pose, however, is much more severe, {\bf (c)} making the general detection method~\cite{fcosv2} based on center-oriented sampling unreliable (glue) or fail completely (cat). {\bf (d)} By contrast, our new detection strategy is effective in these challenging scenarios, {\bf (e,f)} and provides significantly more robust 2D box initialization for the following 6D regression networks~\cite{pfa}, yielding more accurate pose estimates.
+    % Although standard detection methods can obtain accurate results in common cases~\cite{coco}, it often fails in cluttered circumstances due to severe occlusions.  Here the miss detection of the duck target will not be recovered by any way in the following pose regression network. 
+    }
+    \vspace{-5pt}
+    \label{fig:motivation}
+\end{figure}
+
+Estimating the 6D pose of objects, i.e., their 3D rotation and 3D translation with respect to the camera, is a fundamental computer vision problem with many applications in, e.g., robotics, quality control, and augmented reality.
+Most recent methods~\cite{zebrapose, deepim, so-pose, surfemb,sc6d, DenseFusion} follow a two-stage pipeline: First, they detect the objects, and then estimate their 6D pose from a resized version of the resulting detected image patches.
+While this approach works well in simple scenarios, its performance drops significantly in the presence of cluttered scenes. In particular, and as illustrated in Fig.~\ref{fig:motivation}, we observed this to be mainly caused by detection failures. 
+
+Specifically, most 6D pose estimation methods rely on standard object detection methods~\cite{ATSS, fcosv1, fcosv2, PAA, faster-rcnn, maskrcnn}, which were designed to handle significantly different scenes than those observed in 6D object pose estimation benchmarks, typically with much smaller occlusions, as shown in Fig.~\ref{fig:motivation}(a). 
+Because of these smaller occlusions, standard detection methods make the assumption that the regions in the center of the ground-truth bounding boxes depict the object of interest, and thus focus on learning to predict the bounding box parameters from samples drawn from these regions only.
+%\yh{and then rely on standard Non-Maximum-Suppression (NMS)~\cite{1} during inference to obtain the final box.} \MS{Figure 1 does not have anything to do with NMS.}
+However, as shown in Fig.~\ref{fig:atss_vs_ours_demo}, this is ill-suited to 6D pose estimation in cluttered scenes, where the center of the objects is often occluded by other objects or scene elements. 
+%\yh{Additionally, selecting only a single candidate prediction via NMS does not consider the rigidity properties of the targets, making it suboptimal in 6D object estimation.} \MS{I feel this distracts the reader from the main message.}
+
+To handle this, we propose a detection approach that leverages the property that the target objects in 6D pose estimation are rigid. For such objects, any visible parts can provide a reliable estimate of the complete bounding box. We therefore argue that, in contrast with the center-based sampling used by standard object detectors, any, and only feature vectors extracted from the visible parts should be potential candidates of positive samples during training.
+
+%detecting rigid objects should allow us to rely on all local visible object parts and each local part should already provide reliable prediction of the whole bounding box, which could be further combined to obtain a more accurate final prediction.}
+
+In principle, modeling the visibility could be achieved by annotating segmentation masks for all objects. This process, however, is cumbersome, particularly in the presence of occlusions by scene elements, and would limit the scalability of the approach. 
+Instead, we therefore propose to compute a probability of visibility based on a minimum barrier distance between any pixel in a bounding box and the box boundary.
+We then use this probability to guide the sampling of candidates during training, thus discarding the occluded regions and encouraging the network to be supervised by all visible parts. 
+Furthermore, to leverage the reliability of local predictions from most visible parts during inference, we collect all candidate local predictions above a confidence threshold, and combine them by a simple weighted average, yielding more robust detections.
+
+\begin{figure}
+    \centering
+    \setlength\tabcolsep{2pt}
+    \input{figures/compare_atss_ours.tex} 
+    \vspace{-3pt}
+    \caption{\textbf{Detecting rigid objects in cluttered scenes.}
+    {\bf (a)} The standard strategy~\cite{ATSS} chooses positive samples (green cells) around the object center, thus suffering from occlusions. {\bf (b)} Instead, we propose to use a visibility-guided sampling strategy to discard the occluded regions and encourage the network to be supervised by all visible parts. The sampling probability is depicted by different shades of green. {\bf (c)} Our method (green boxes) yields more accurate detections than the standard strategy (red boxes).
+    }
+    \label{fig:atss_vs_ours_demo}
+\end{figure}
+
+% \begin{figure}
+% \setlength\tabcolsep{3pt}
+%   \begin{tabular}{cc}
+%     \includegraphics[width=0.3\linewidth]{figures/analysis_coco.pdf} &
+%     \includegraphics[width=0.3\linewidth]{figures/analysis_ycbv.pdf} \\
+%     (a) non-rigid        & (b) rigid
+%   \end{tabular}
+%   \caption{
+%     {\bf Statistics of candidate boxes during inference on non-rigid and rigid object datasets.} The {\bf left} figure illustrates the histogram of activated positive cells against their distance to the object center. The {\bf right} figures show the mean accuracy of candidate cells with respect to their distances to the object center before fusion, respectively, for non-rigid(COCO) and rigid(YCB) object datasets.
+%     }
+%   \label{fig:discussion}
+% \end{figure}
+We demonstrate the effectiveness of our method on seven challenging 6D object pose estimation datasets, on which we consistently and significantly outperform all detection baselines. Furthermore, combined with a 6D pose regression network, our approach yields state-of-the-art object pose results. 
+
+\section{Related Work}
+
+\noindent\textbf{Object pose estimation}, whose goal is to estimate the 3D rotation and 3D translation of a target object with respect to the camera, nowadays typically involves a pose regression network to establish 3D-to-2D correspondences~\cite{segdriven, epos, pvnet,single_stage_hu, wdr, pfa, ncf}. These correspondences then act as input to a perspective-n-points solver (PnP)~\cite{epnp} to compute the final 6D object pose. The current state-of-the-art methods~\cite{pix2pose, cdpn, surfemb, sc6d, zebrapose, cosypose, dpodv2,so-pose, gdr_net} virtually all use a 2D object detector to allow the following pose regression networks to focus on a region of interest (RoI), thus yielding more accurate poses. 
+
+While this is effective when detection is successful, the pose accuracy deteriorates significantly in case of missing or inaccurate detections. In particular, 6D pose estimation frameworks typically use standard object detectors that, as shown in Figs.~\ref{fig:motivation} and~\ref{fig:atss_vs_ours_demo}, often fail in cluttered scenes such as those of standard 6D pose estimation benchmarks as they were not designed to handle such situations. To handle this, we propose a rigidity-aware detection method that leverages the target properties. As shown by our results, it yields significant better RoIs for 6D object pose estimation.
+
+\noindent\textbf{Object detection}, whose goal is to extract accurate 2D bounding boxes for all objects in a scene, has been widely studied in 2D computer vision. Existing methods follow one of two main strategies: two-stage or one-stage detection. Two-stage detectors first employ a region proposal network~\cite{faster-rcnn, maskrcnn} to generate bounding box candidates, which are then processed by a classification and refinement network to remove false positives and adjust the bounding boxes position and size~\cite{faster-rcnn,cascade-rcnn,maskrcnn}. 
+Although this strategy is accurate in general, it is costly and inefficient in practice.
+% While this strategy is in general accurate, its efficiency drops significantly when detecting multiple objects. \MS{Not sure about this statement. Efficiency or effectiveness? Why?}
+
+One-stage detectors tackle this by replacing the region proposal network with a pre-defined set of anchors at every spatial location in the encoder's final feature map~\cite{retinanet,fcosv1,yolov1}. Unfortunately, this suffers from the presence of many negative samples among the anchors. While this can be addressed to some degree by FocalLoss~\cite{retinanet,fpn}, early single-stage detectors did not reach the accuracy of two-stage ones.
+
+This was addressed in~\cite{ATSS} 
+%claims that the main gap comes from different strategies of positive sampling during training, and propose 
+via a simple yet effective strategy to sample positive candidates in a one-stage detector.
+%for one-stage framework, resulting in comparable accuracy with two-stage methods, but with significantly better efficiency and simpler architecture. 
+Most recent detection methods follow similar strategies~\cite{fcosv2, PAA, autoassign, OTA, TTF, yolov2, yolov3}, and now achieve better accuracy than two-stage methods while being more efficient. 
+
+Nevertheless, while these methods work well on standard object detection benchmarks, they suffer from the heavy occlusions present in 6D pose estimation ones. Here, we therefore propose a new strategy dedicated to detecting rigid objects, and show that it outperforms standard detectors by a large margin in the context of 6D pose estimation.
+
+% \yang{
+% \noindent \textbf{Image Segmentation}, whose goal is to assign a category label for each pixel in the target image~\cite{fcn, U-Net, deeplab}.
+% Our method is close to the works focusing on salient object segmentation~\cite{liu2018picanet, Zhao_2019_ICCV, Qin_2019_CVPR}, assigning a binary label identifying if the pixel belongs to the foreground object.
+% However, we are not focusing on precisely modeling the foreground, and a pseudo mask works well in our setting.
+% Furthermore, within these works, ~\cite{pesudo_mask_detection} proposes to use the pseudo mask generated from the learned detector's ROI feature to teach the segmentation network.
+% Our method is the opposite, using the pseudo mask to guide the object detector's training.
+
+% \noindent \textbf{Distance transform}
+% whose goal is to compute a distance between the pixels in the image and a set of seed points~\cite{minbarrier, minimum_distance}, which has been a long-studied topic in computer vision.
+% Utilizing the background prior~\cite{zhang2015minimum, wei2012geodesic}, \ie, the image boundary pixels are mostly background, distance transform is shown to be advantageous in salient object segmentation, which inspires our work to model the object's visibility using distance transform.
+
+% }
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/overall_detect.pdf}
+    \caption{{\bf Overview of our detection approach.}
+    We use a general Feature Pyramid Network (FPN) as our backbone. We first compute a probability of visibility for every local area within the bounding box, which we use to guide the sampling of positive cells during training, without any mask annotations. Finally, during inference, we combine all the local candidate predictions to obtain a more robust final result.
+    }
+    \label{fig:training}
+\end{figure}
+
+
+% \begin{figure*}[t]
+%   \centering
+%   \includegraphics[width=0.95\linewidth]{figures/overall_pose.pdf}
+%   \caption{
+%   \textbf{Overview of rigidity-aware detection and 6D pose estimation.}
+%   Utilizing distance transform, we approximate the visibility probability for each object and guide the detector's training.
+%   More specifically, we sample the positive cells across the potentially visible parts, making the trained detector robust to occlusion. When inference, we fuse all the candidates associated with the same instance to a more robust one as the final predictions. Integrating our proposed RADet into the pose estimation pipeline, we run the pose-regression network on each cropped and resized detected object region to get the final pose results.
+%   }
+%   \vspace{-3mm}
+%   \label{fig:overall_pipeline}
+% \end{figure*}
+
+\section{Approach}
+
+Given an RGB image depicting rigid objects, our goal is to estimate the 2D bounding box of each potential target for the subsequent pose regression network. 
+To address this, we propose to leverage the fact that, in the context of 6D object pose estimation, we observe rigid targets.
+In this section, we first briefly review the problem of positive sampling in object detection and analyze the influence of the objects' rigidity in 6D object pose scenarios. We then explain how we compute object foreground probabilities without having access to ground-truth masks, and introduce a positive sampling strategy based on these probabilities. Finally, we propose a box fusion strategy to improve detection robustness. Fig.~\ref{fig:training} provides an overview of our detection approach.
+
+\subsection{Analysis of Rigidity in Detection}
+\label{sec:analysis}
+
+Modern single-stage object detectors~\cite{fcosv1, ATSS, PAA, autoassign,retinanet} rely on a Feature Pyramid Network (FPN)~\cite{fpn} that outputs scale-rich feature maps. Each feature vector is taken as a training sample and further processed by a classification branch and a regression branch. Training the detector thus first requires defining positive and negative samples for each annotated object instance. The positive samples are then encouraged to be classified as the instance's category, whereas the negative samples should be predicted as background. Furthermore, the positive samples should regress the instance's bounding box parameters. Since during training a single instance is associated with multiple positive samples, at inference multiple samples will be activated for a potential target. Most methods then use the standard Non-Maximum Suppression (NMS) as a post-processing stage to obtain the final result.
+
+Key to the success of this general framework is the selection
+%and combination \MS{There is no combination in the standard approach. This makes the message less clear.}
+of positive samples during training.
+%and inference, respectively~\cite{ATSS}. 
+The standard approach to sampling positive features during training consists of assuming that the regions in the center of the ground-truth bounding boxes depict the object.
+%, and relies on choosing a local maximum during inference.
+However, in the context of 6D pose estimation, this center assumption is often violated because of the large occlusions that occur in cluttered scenes. More importantly, it does not account for the fact that, for rigid target objects, all visible object parts can provide a reliable prediction of the entire bounding box.
+
+
+\begin{figure}
+\setlength\tabcolsep{1pt}
+  \begin{tabular}{cc}
+    \includegraphics[width=0.49\linewidth]{figures/analysis_coco.pdf} &
+        \includegraphics[width=0.49\linewidth]{figures/analysis_ycbv.pdf} \\
+    {\small (a) General (COCO)}        & {\small (b) Rigid (YCB)}
+  \end{tabular}
+  \vspace{-3pt}
+  \caption{{\bf Analysis of rigidity in detection.}
+    We show the testing accuracy of different sampling strategies w.r.t. different local predictions during training on the typical general object dataset (COCO~\cite{coco}) and on the typical 6D object pose dataset (YCB~\cite{posecnn}). We report the results of FCOSv2~\cite{fcosv2} (Center), ATSS~\cite{ATSS} (Center+), and a strategy exploiting all the  candidates in the ground-truth mask (Visible). The horizontal axis represents the normalized distance of a local prediction to the box center. Although the accuracy of different strategies is similar on COCO, the visibility-guided sampling is much more accurate on YCB, even when the local predictions come from non-center areas, thanks to the rigidity of the target objects.
+    }
+  \label{fig:rigid_discussion}
+\end{figure}
+
+To evidence this, we train the same FPN network with different sampling strategies on the general COCO dataset~\cite{coco} and on the typical 6D object pose YCB~\cite{posecnn} dataset, respectively. We first evaluate two baseline strategies, consisting of sampling a fixed number of positive cells from the center region in the ground-truth bounding box (FCOSv2~\cite{fcosv2}), and of an adaptive center-based sampling strategy across all pyramid feature levels (ATSS~\cite{ATSS}). Furthermore, we evaluate a sampling strategy that randomly chooses 10 positive cells within the ground-truth object mask.
+
+Fig.~\ref{fig:rigid_discussion} depicts the average test accuracy of different local predictions obtained with these sampling strategies as a function of the distance of the prediction to the true bounding box center. On the general COCO dataset, the accuracy deteriorates as the distance increases regardless of which sampling strategies was used during training. This comes from the diversity of the object types in COCO, which includes many non-rigid objects and a wide variety of instances with the same object type, making the object center a more reliable predictor of the bounding box.
+%only the area near the box center have the most consistent and reliable predictions across all data. 
+On YCB, the accuracy of the centered-based strategies also deteriorates quickly as the distance increases, since most non-center area were not involved during training. However, thanks to the rigidity of the YCB targets, the visibility-guided strategy yields more accurate local predictions,
+%with high precision 
+even for those that are farther away from the center area.
+%typically from visible local parts within the segmentation mask, which could be further combined to obtain more accurate final results.
+
+\begin{figure}[t]
+    \centering
+    \setlength\tabcolsep{1pt}
+    \input{figures/distance_map}
+    \caption{\textbf{Visibility modeling without mask annotation.}
+    {\bf (a)} We first place a set of seeds on the bounding box boundaries, {\bf (b)} then compute a minimum barrier distance between every pixel within the box and the seeds,
+    %Then we grow each seed towards the image center according to a minimum barrier distance, 
+    {\bf (c)} obtaining a distance map 
+    %representing the closest distance from every pixel to its nearest seed. 
+    from which we build a probability of visibility for every local object part.
+    %based on this distance map.
+    }
+    \label{fig:distance_transform}
+\end{figure}
+
+\subsection{Visibility-Guided Sampling}
+\label{sec:guided_sampling}
+
+The strategy used in the previous experiment relies on the ground-truth object mask during training. However, such masks are typically not available and expensive to obtain, particularly in the presence of occlusions with scene elements. To avoid requiring such masks, we compute an approximate measure of visibility for each pixel in the ground-truth object bounding box.
+
+%propose to exploit rigidity to approximate visibility using an online distance transform discussed below. 
+% \MS{Now that I have read the visibility modeling part, I do not see how it exploits the rigidity of the object. The way I see it is as follows: Existing methods assume that the center of the bounding box contains the object. Instead, you assume that the boundary of the bounding box does not contain the object, which is indeed more reasonable. This explains why you use seeds on the box boundary. In my opinion, this has nothing to do with rigidity, and the story in the introduction (and the title) should be changed. Am I missing something?} \MS{Note that this is not really a problem in the sense that the method remains interesting.}
+% \Yang{Yes, until here, we have not exploited the rigidity. Instead, the visibility is used for exploiting the rigidity. The intuition is that all the visible parts of a rigid object can infer reasonable predictions, which has been studied by some 6D pose estimation papers, like PVNet~\cite{pvnet}, Segdriven~\cite{segdriven}. So we should model the object's visibility first.}
+% \YH{In my understanding, the exploration of rigidity comes from that we leverage the rigidity properties of the target so that local predictions within visible regions can be combined to get a more robust result, which is built on the assumption that the combination of local predictions is better than NMS for rigid objects. Our experiments also verify this, as in Fig.~\ref{fig:discussion} and Table~\ref{tab:ycbv_res50_compare}. I agree the start of the story seems a little trivial. I will try to reorganize this part this afternoon.} \MS{Well, for the method section, I essentially already removed the story of rigidity, so I think it should be fine. However, feel free to revisit the intro based on this discussion. Also, the motivation behind the fusion strategy is not very clear.}
+% \YH{Thanks, I will revisit the Intro.}
+
+To this end, let $\mathcal{I} \in \mathbb{R}^{H\times W \times 3}$ be an image patch obtained by cropping a ground-truth object bounding box.
+% \MS{Correct?}\YH{I think so}. 
+We then create a seed set $\mathcal{S}=\{s_1,\cdots,s_m\}$ of 2D positions in the image patch by uniformly sampling the patch boundary with a fixed step size~\cite{zhang2015minimum, wei2012geodesic}. Our method then builds on the intuition that these seeds will typically \emph{not} belong to the target object. Therefore, the visible object pixels should significantly differ from the seeds, which we encode using an online distance transform.
+
+Specifically, we compute the distance from each pixel within the patch to its nearest seed. For a pixel $p$ and with a generic distance metric, i.e., without assuming the use of the Euclidean distance, this can be expressed as
+\begin{equation}
+  {\cal D}(p) = \min_{s \in \mathcal{S}} \mathcal{D}(p, s)\;,
+\end{equation}
+where $\mathcal{D}(p, s)$ encodes the distance between pixel $p$ and seed $s$. Such a distance can in general be expressed as
+\begin{equation}
+  {\cal D}(p, s) = \min_{\tau \in \prod_{\{p, s\}}}\mathcal{H}(\tau ),
+  \label{eqn:distance_transform}
+\end{equation}
+where $\tau$ is a path connecting pixel $p$ and seed $s$, $\mathcal{H}(\tau )$ is the cost of path $\tau$, and $\prod_{\{p, s\}}$ is the set containing all possible paths connecting $p$ and $s$. 
+
+Here, we define the cost $\mathcal{H}(\tau )$ as the minimum barrier distance~\cite{minimum_distance,minbarrier}, i.e.,
+\begin{equation}
+  \mathcal{H}(\tau )= \mathcal{B}(\mathcal{I}, \tau) + \alpha \cdot d(\tau_0, \tau_1),
+  \label{eqn:mbd}
+\end{equation}
+where $\tau_0$ and $\tau_1$ are the path's starting and ending point, respectively, $d(\tau_0, \tau_1)$ is the Euclidean distance between these two points, and
+\begin{equation}
+    \mathcal{B}(\mathcal{I}, \tau) = \mathop{max}_{i=1}^{3}(\mathop{max}\limits_{t=0}^{1}\mathcal{I}_i(\tau_t) - \mathop{min}\limits_{t=0}^{1}\mathcal{I}_i(\tau_t)),
+\end{equation}
+with $\mathcal{I}_i(\tau_t)$ the intensity of the $i^{th}$ channel at a pixel $\tau_t$ along the path. We set the balance factor $\alpha=0.1$ in our experiments, which makes the distance rely mainly on the difference between the maximum and minimum pixel value along the path, thus improving the robustness to different illumination conditions~\cite{minimum_distance}.
+%The formulation here is based on the assumption that the locations at the bounding box borders will most likely belong to the background, which is fulfilled in most rigid cases.
+
+The resulting distance can be computed efficiently using a fast minimum-barrier-distance solver~\cite{minbarrier}, which lets us generate the corresponding distance transform map ${\cal D}(p)$. Fig.~\ref{fig:distance_transform} illustrates the procedure discussed above, showing that it correctly reflects the object visibility.
+
+In essence, our distance maps provide us with soft visibility masks for the target objects. We then use these soft masks to sample positive cells in a single-stage detection framework, as discussed in Section~\ref{sec:analysis}.
+%We use the general single-stage framework~\cite{fcosv1, ATSS, PAA} as our detection network. However, unlike the center-based sampling strategy they are using, which suffers in detecting rigid objects with occlusions, we propose to use the approximated visibility of each parts to guide the positive sampling during training.
+
+To this end, for every cell $c$ in every feature map extracted by the FPN module, we compute a visibility score 
+% \MS{If you truly use the max in the equation below, then this is not a probability but a score. Please check.} \Yang{yes, i will check the below sections} 
+that $c$ belongs to the object as
+\begin{equation}
+  \centering
+  {\cal V}(c) = \frac{\bar{\cal D}(c)}{\max_{f\in \mathcal{F}} \bar{\cal D}(f)},
+  \label{eqn:distance_to_pro}
+\end{equation}
+where $\bar{\cal D}(c)$ averages the distance map values of all the pixels encompassed by cell $c$, and $\mathcal{F}$ is the set of all cells in the feature map of interest. We then only consider the cells such that ${\cal V}(c) > \mathcal{T}$ as candidate positives, and use $\mathcal{T}=0.25$ in our experiments.
+
+Note, however, that using all the cells with ${\cal V}(c) > \mathcal{T}$ as positives would result in training being dominated by larger objects. To prevent this, we randomly select $k=10$ cells for each object instance according to ${\cal V}(c)$.
+For the instances containing less than $k$ foreground cells, we randomly sample existing ones multiple times to nonetheless obtain $k$ positive samples. We then discard the cells not chosen as positive samples yet still having a visibility score larger than the threshold $\mathcal{T}$ from the classification and box regression process, to avoid providing the network with potentially inconsistent supervision signal.
+
+
+ 
+% We sample positive cells according to this foreground probability during training. 
+% To handle the balance problem that different instances may have different numbers of candidate cells, we randomly choose $k=10$ cells of foreground probabilities over a threshold for each instance. 
+% Fig.~\ref{fig:sampling} illustrates the process of this sampling procedure.
+
+% \begin{figure}
+%   \begin{tabular}{cc}
+%     \includegraphics[width=0.45\linewidth]{figures/analysis_1.pdf} &
+%     \includegraphics[width=0.45\linewidth]{figures/analysis_2.pdf}
+%   \end{tabular}
+%   \caption{
+%     {\bf Statistics of candidate boxes during inference on YCB dataset.} The {\bf left} figure illustrates the histogram of activated positive samples against their distance to the object center. The distance is normalized according to the size of the bounding box. The {\bf right} figure shows the mean accuracy of candidate samples with respect to their distances to the object center before fusion.
+%     }
+%   \label{fig:discussion}
+% \end{figure}
+
+
+
+
+\begin{figure}[t]
+    \centering
+    \setlength\tabcolsep{2pt}
+    \input{figures/motiv_old.tex}
+    \caption{{\bf Robustness of different strategies.}
+    The left and right parts of {\bf (a)} and {\bf (b)} show the sampling strategy during training and all the valid local predictions before fusion during inference, respectively. The standard center-based sampling strategy suffers from occlusions, as evidenced by the lack of valid predictions for the upper box. Additionally, it generates candidate predictions with large differences in confidence values (as shown by the color difference for the lower box). By contrast, our strategy is robust to occlusions and yields more candidate predictions with high confidence, which can be combined to obtain better results.
+  }
+  \label{fig:fusion_compare}
+\end{figure}
+
+\begin{table*}[t]
+    \centering
+    % \rowcolors{2}{}{gray!10}
+    \input{tabs/compare_detector.tex}
+    \caption{{\bf Detection comparison on different 6D object datasets.}
+    Our method achieves much better accuracy than the baseline methods on these BOP datasets, demonstrating the effectiveness of our approach at detecting rigid objects in cluttered 6D pose estimation scenarios.
+    }
+    \label{tab:detect_compare1}
+\end{table*}
+
+\subsection{Fusion During Inference}
+\label{sec:fusion}
+
+As discussed in Section~\ref{sec:analysis}, during inference, each object instance typically receives multiple box predictions.
+%while with different accuracy depending on which sampling strategy is used in training.  
+On the general COCO dataset, Non-Maximum Suppression~\cite{fcosv1, fcosv2, ATSS} is typically the method of choice to select a single box, choosing the candidate with the maximum confidence within a local area. This strategy builds on the assumption that only a small region within the box, typically near the box center, can provide a prediction with high precision, as shown in Fig.~\ref{fig:rigid_discussion}(a). In the 6D pose estimation setting, however, all visible parts can provide almost equally-accurate predictions, thanks to the rigidity of the targets, as shown in Fig.~\ref{fig:rigid_discussion}(b). 
+
+We therefore propose to combine all the candidate boxes in a neighborhood to obtain a more accurate result. To this end, we let the feature cells predict an additional confidence value, representing how precise the predicted box is. We then cluster the different local predictions that have the same local maximum and assign them to the same object instance. This strategy is similar to the NMS one, but without any candidate suppression. We then compute a simple weighted sum to combine all the candidate local predictions within the same cluster, with weights based on the predicted confidence values.
+%to compute the new box corner positions, resulting in more accurate results. 
+Fig.~\ref{fig:fusion_compare} demonstrates the advantages of this strategy.
+
+\subsection{Implementation Details}
+
+As mentioned above, we use the same FPN architecture as most state-of-the-art single-stage frameworks~\cite{ATSS, fcosv2,  PAA, autoassign}. We define the confidence value as the IOU between the predicted box and the ground-truth one.
+We then train our model with a combined loss function
+\begin{equation}
+  \centering
+  \mathcal{L} = \mathcal{L}_{cls}(\theta, g) + \mathcal{L}_{reg}(\theta, g)
+  + \mathcal{L}_{iou}(\theta, g),
+  \label{eqn:loss_func}
+\end{equation}
+where $\theta$ denotes the model parameters and $g$ encodes the ground-truth boxes.
+$\mathcal{L}_{cls}$ is the focal loss for classification, $\mathcal{L}_{reg}$ is the box regression loss, and $\mathcal{L}_{iou}$ is the
+binary cross entropy between the predicted IOU and the ground-truth IOU for confidence prediction.
+%which represents the confidence of the prediction. \MS{mentioned before}
+We use GIOU~\cite{giou} loss for $\mathcal{L}_{reg}$ in our implementation.
+
+During training, we first assign every instance to one pyramid level on FPN according to the object size, similarly to~\cite{fcosv1}. We then compute our distance map on the fly within the annotated bounding box and use it to guide the positive sampling as discussed above.
+During inference, we use a threshold of 0.05 based on the classification score to remove most of  the noise from the background before the clustering and fusing the boxes as discussed in Section~\ref{sec:fusion}.
+
+\section{Experiments}
+\label{sec:experiment}
+
+In this section, we systematically study our detection method in 6D object pose estimation scenarios. We first compare its detection performance with other detection baselines in Section~\ref{sec:exp_detection}, and then examine its effect when used as bounding box initialization for different pose regression networks in Section~\ref{sec:exp_pose}. Our source code is available at \url{https://github.com/YangHai-1218/RADet}.
+
+\noindent \textbf{Experimental settings.}
+We evaluate our method on seven core datasets from the BOP benchmarks~\cite{bop}, including LM-O~\cite{lmo}, T-LESS~\cite{t-less}, TUD-L~\cite{bop}, IC-BIN~\cite{icbin}, ITODD~\cite{itodd}, HB~\cite{hb}, and YCB~\cite{posecnn}, which are standard benchmarks for 6D object pose estimation. Most of the datasets have both real images and synthetic ones generated by physically based rendering (PBR)~\cite{blenderproc} for training, and another split of real images for testing. We use mixed data for training by default. However, for LM-O, IC-BIN, ITODD, and HB, we have only 50k synthetic images for training. As such, we train models only on synthetic images on these datasets.
+
+For a fair comparison with other detection methods, we use the same training setting for both our method and all the competitors unless otherwise stated. We use a ResNet-50 backbone~\cite{resnet} with pre-trained weights from ImageNet~\cite{imagenet}, a batch size of 16, and an input image resolution fixed at 640$\times$480. We train all the models
+%~\cite{fcosv1, fcosv2, ATSS} 
+with the SGD optimizer for 90k iterations, using an initial learning rate of 0.01 with a decay ratio of 0.1 after 60k and 80k iterations, respectively.
+
+% Besides, to study the ability of generalization of our method, we also compare it with other baselines on the general object detection dataset COCO~\cite{COCO}, 
+
+\noindent \textbf{Evaluation metrics.}
+We report numbers in the standard metric AP for detection results~\cite{fcosv1,ATSS,retinanet}, which is the average value of different AP values obtained with an IOU threshold between the ground truth box and the predicted one ranging from 0.5 to 0.95. For a detailed study, we also report AP$_{50}$ and AP$_{75}$, which use an IOU threshold of 0.5 and 0.75, respectively.
+
+For 6D pose estimation, we report the three standard metrics used in the BOP benchmarks, including the Visible Surface Discrepancy (VSD), the Maximum Symmetry-aware Surface Distance (MSSD), and the Maximum Symmetry-aware Projection Distance (MSPD)~\cite{bop}. In essence, these metrics differ in the strategies they use to measure the distance between the ground-truth pose and the estimated one. We refer the readers to~\cite{bop} for their detailed definitions. We report the average numbers of these three metrics in some of our evaluations to save space, and encourage the reader to check the appendix for the detailed numbers of each metric.
+
+
+% \subsection{Visibility Modeling Evaluation}
+% We first analyze the effectiveness of our proposed distance-transform-based visibility modeling on LM-O and YCB.
+% In Table~\ref{fig:quality_visibility}, we binarize the visible score map at different thresholds $\tau$ and calculate the mIoU metric with the ground truth visible mask. 
+% We also evaluate the visibility modeling strategy used by FCOS~\cite{fcosv1} and ATSS~\cite{ATSS}.
+% We achieve the maximum mIOU with around 70\% on both datasets, demonstrating our method's generality.
+% Although our aim is only to coarsely approximate the visibility, the quality of our estimated visible map is still pretty good.
+% We also show some samples in Fig.~\ref{fig:quality_visibility}(b).
+
+% \begin{figure}
+%     \centering
+%     \begin{tabular}{cc}
+%         \includegraphics[width=0.45\linewidth]{figures/foreground_performance_ycbv.pdf} &
+%         \includegraphics[width=0.45\linewidth]{figures/foreground_performance_lmo.pdf} \\
+%         (a) YCB   & LM-O
+%     \end{tabular}
+%     \caption{{\bf Visibility modeling performance w.r.t mIOU.}
+%     Our proposed visibility modeling strategy achieves much better mIOU than the standard sampling strategy used in FCOS and ASTSS on YCB and LM-O.}
+%     \label{fig:quality_visibility}
+% \end{figure}
+
+% \begin{table}
+%     \centering
+%     \input{tabs/visibilty_modling_acc}
+%     \caption{{\bf Visible probability quality w.r.t mIOU.}
+%     We
+%     }
+%     \label{tab:distance_transform_acc}
+% \end{table}
+% \begin{figure}[t!]
+%     \centering
+%     \input{figures/distancemap_cases}
+%     \caption{{\bf Visualization of visible probability in YCB.}
+%     The computed distance map by distance transform can effectively approximate the object's visible foreground.
+%     }
+%     \label{fig:distance_map_vis}
+% \end{figure}
+
+\begin{table}[t]
+  \setlength{\fboxrule}{0pt}
+  \begin{center}
+  % \rowcolors{2}{}{gray!10}
+    % \resizebox{\linewidth}{!}{
+    \input{tabs/ycbv_compare_mixpbr_detect}
+    % }
+  \end{center}
+  \vspace{-3mm}
+  \caption{{\bf Detection comparison on YCB.} 
+  Our method consistently outperforms other methods, especially in terms of AP$_{75}$.
+  }
+  \label{tab:ycbv_res50_compare}
+\end{table}
+
+\begin{figure}
+    \centering
+    \setlength\tabcolsep{1pt}
+    \begin{tabular}{cc}
+        \includegraphics[width=0.49\linewidth]{figures/occlusion_ycbv.pdf} & 
+        \includegraphics[width=0.49\linewidth]{figures/occlusion_lmo.pdf} \\
+        {\small (a) YCB}       & {\small (b) LM-O}
+    \end{tabular}
+    \caption{{\bf Performance w.r.t. different occlusion ratios.}
+    Our method is much more robust to occlusions than the baselines.
+    }
+    \label{fig:occlusion_effect}
+\end{figure}
+
+\begin{table}[]
+    \centering
+    % \rowcolors{2}{}{gray!10}
+    \input{tabs/ablation_visibilty_modeling}
+    \caption{{\bf Ablation study of different strategies on YCB.}
+    We compare the center-based and the proposed visibility-guided sampling strategies used with standard NMS (denoted by $\dagger$) or with our fusion strategy. Our method is more accurate than the baseline strategies and performs on par with the oracle one that relies on guided sampling from the ground-truth mask. Here, ``Center$^\dagger$'' corresponds to the strategy of FCOSv2~\cite{fcosv2}.
+    }
+    \label{tab:ablation_study}
+\end{table}
+
+\begin{table}
+    \centering
+    % \rowcolors{2}{}{gray!10}
+    \scalebox{0.95}{
+    \begin{tabular}{cccc|cccc}
+        \toprule
+         $\mathcal{T}$     & AP        & AP$_{50}$     & AP$_{75}$  & $\alpha$ & AP        & AP$_{50}$     & AP$_{75}$ \\
+        \midrule
+         0.1       & 84.1      & 98.5          & 96.0           & 0        & 83.9          & 98.8          & 94.3 \\
+       0.2       & 84.7      & {99.3}& 96.8          & 0.1       & {\bf 85.0}    & {\bf 99.4}    & {\bf 97.4}\\
+        0.25    & {\bf 85.0}& {\bf 99.4}    & {\bf 97.4}    & 0.2       & {84.2} & {99.2}&{95.9}\\
+        0.3       & {84.9}& {\bf 99.4}&{97.0}& 0.3       & 83.1          & 98.8          & 93.2\\
+        0.4       & 84.0      & 98.6          & 96.6          & 0.4       & 81.2          & 98.0          & 90.8 \\
+        % 0.5       & 83.3      & 98.1          & 93.8          & 0.5       & 80.4          & 97.6          & 89.3 \\
+        \bottomrule
+    \end{tabular}
+    }
+    \caption{{\bf Ablation study of different hyper-parameters on YCB.}}
+    \label{tab:ablation_study_params}
+\end{table}
+
+
+% \begin{table}[]
+%     \centering
+%     \rowcolors{2}{}{gray!10}
+%     \input{tabs/ablation_activation}
+%     \caption{\yang{{\bf Ablation study on positive sampling strategies.}}
+%     Randomly sampling the candidate cells according to their visibility score is the most effective strategy.
+%     }
+%     \label{tab:ablation_activation}
+% \end{table}
+
+% \begin{table}[]
+%     \centering
+%     \rowcolors{2}{}{gray!10}
+%     \input{tabs/compare_coco_cityscapes}
+%     \caption{{\bf Detection evaluation on COCO.} Our method performs on par with the state of the art in detecting general objects.
+%     }
+%     \label{tab:compare_coco}
+% \end{table}
+
+\begin{table*}
+    \centering
+    % \rowcolors{2}{}{gray!10}
+    \input{tabs/compare_all_pose}
+    \caption{\textbf{Comparison against the state of the art on 6D pose estimation.}
+    Our detection method improves the original PFA-Pose by a large margin, and yields state-of-the-art results with either only synthetic or mixed data in both the RGB and RGBD settings. Note that LM-O, IC-BIN, ITODD, and HB provide only the synthetic PBR images for training, so the numbers ``w/o Real'' and ``w/ Real'' are the same on those datasets, indicated by ``$\ast$''. Here we report the results as the average of MSPD, MSSD, and VSD.
+    }
+    \label{tab:overall_compare}
+\end{table*}
+
+\begin{table}
+  \centering
+  % \rowcolors{2}{}{gray!10}
+  \input{tabs/detector_for_two_stage}
+  \caption{
+  \textbf{Effect on different pose regression networks.}
+    Our detection method consistently improves the results of different pose regression frameworks, including WDR~\cite{wdr} and CDPNv2~\cite{cdpn}. Here we denote Mask R-CNN~\cite{maskrcnn} as ``RCNN'.
+   }
+  \label{tab:detect_for_two_stage}
+  \vspace{-10pt}
+\end{table}
+
+\begin{figure*}[t]
+  \centering
+  \setlength\tabcolsep{1pt}
+  \input{figures/qualitative_results.tex}
+  \caption{\textbf{Visualization of detection and pose results.}
+  The first and second rows show the detection results of the baseline FCOS~\cite{fcosv1} and our method on different datasets (LM-O, T-LESS, IC-BIN, and YCB), respectively. Although the baseline works almost equally well in simple cases, such as targets without occlusions, it deteriorates significantly for targets in cluttered scenes, and generate many more false positives. By contrast, our detection method is robust, and produces accurate pose estimates after using a subsequent pose regression network (PFA~\cite{pfa}), as shown in the last row.
+  }
+  \label{fig:qualitative}
+\end{figure*} 
+
+\subsection{Object Detection}
+\label{sec:exp_detection}
+
+\noindent \textbf{Comparison with the baselines.}
+We compare our method with the baseline single-stage method FCOSv2~\cite{fcosv2} and a typical two-stage method, Mask R-CNN~\cite{maskrcnn}.
+As shown in Table~\ref{tab:detect_compare1}, our method outperforms them by a large margin on all datasets from the BOP benchmarks, demonstrating the effectiveness of our approach at detecting rigid objects in cluttered 6D pose estimation scenarios.
+
+\noindent \textbf{Comparison with the state of the art on YCB.}
+We compare our method with the state-of-the-art detection methods, including AutoAssign~\cite{autoassign} and PAA ~\cite{PAA}, on the YCB dataset. Table~\ref{tab:ycbv_res50_compare} summarizes the results, showing that our method consistently outperforms the state-of-the-art ones, especially in terms of AP$_{75}$.
+
+\noindent \textbf{Performance under occlusions.}
+Occlusion is a common problem in most BOP benchmarks.
+We study the impact of different occlusion levels on different detectors. We compare our method with FCOSv2~\cite{fcosv2} and ATSS~\cite{ATSS} on both YCB and LM-O, and compute the average accuracy of the results with respect to the targets' occlusion ratio. The results are summarized in Fig.~\ref{fig:occlusion_effect}. Although ATSS improves the center-based sampling of FCOS by its adaptive assignment strategy across multiple pyramid levels, it remains sensitive to occlusions, as illustrated by the quick deterioration of accuracy with the increasing of occlusion ratio. By contrast, our method is much more robust.
+
+\noindent \textbf{Ablation study on YCB.} 
+We compare NMS and our fusion strategy on a model trained either with the centered-based strategy or the proposed visibility-guided one.
+As shown in Table~\ref{tab:ablation_study}, with the same NMS post-processing, our sampling strategy already outperforms the center-based baseline by 4.2 points. This confirms the importance of involving all the visible object parts during training, leveraging the rigidity of the targets. Furthermore, both sampling strategies benefit from our fusion method discussed in Section~\ref{sec:fusion}. However, it only increases the performance of the center-based one by 0.2 points, which highlights the drawback of not using non-center areas during training, making the fusion during inference less effective. By contrast, our fusion method increases the performance of our sampling strategy by 0.8 points, making it perform on par with the oracle that uses the ground-truth mask to guide sampling.
+
+Furthermore, we evaluate the performance of our method with different $\mathcal{T}$ and $\alpha$, where $\mathcal{T}$ is the threshold to filter out easy negative cells before sampling positive ones, and $\alpha$ is the weight balancing the Euclidean distance and the minimum barrier distance in Eq.~\ref{eqn:mbd}.
+We use the default settings of $\mathcal{T}=0.25$ and $\alpha=0.1$, and vary only one parameter at a time. As shown in Table~\ref{tab:ablation_study_params}, the results are stable when $\mathcal{T}$ is set between 0.2 and 0.3, and we use the best value 0.25 found on YCB for all our experiments. Following~\cite{minbarrier}, we use the default value 0.1 for $\alpha$, which is further supported by our results with different $\alpha$ values.
+
+\noindent \textbf{Runtime analysis.}
+We conduct all our experiments on a workstation with an NVIDIA RTX-3090 GPU and an Intel-Xeon CPU with 12 2.1GHz cores. Our method shares the same network architecture as most single-stage methods~\cite{fcosv2,ATSS,PAA, autoassign} and the running time of our simple fusion strategy is negligible. As such, all methods have a similar inference speed of about 32.4 images per second on the YCB dataset with an average of 4.8 instances in each image. The main difference comes from the training time, since different methods rely on different sampling strategies. Our method has a throughput of about 18.7 images per second during training, which is slightly slower than FCOSv2 (22.3) and ATSS (21.6), but faster than PAA (16.6) and AutoAssign (15.7). 
+
+% For training speed, to train a single epoch on the YCB dataset, our method needs 0.8 hours, which is only slightly slower than FCOSv2~\cite{fcosv2} and ATSS~\cite{ATSS} (0.67 hours), but still much faster than PAA~\cite{PAA}(0.90 hours) and AutoAssign~\cite{autoassign}(0.95 hours).
+
+
+% If using ground truth mask, the performance improvement can be 2.4\%(82.4 v.s. 84.8), which shows the predictions from the local cells within the mask are pretty robust.
+% And our proposed strategy has only a little sacrifice to ``oracle'' while outperforming other methods, which suggests that distance transform more effectively estimates the object mask. Moreover, the fusion component improves the visibility-based methods more, demonstrating the effectiveness of our proposed fusion strategy, also verfying the assumption 
+
+% \noindent \textbf{Evaluation on general detection datasets}
+% Although our detection method is designed for detecting rigid objects in clutter circumstance, it does not sacrifice in detecting general objects. To verify this, we evaluate it on the general object detection dataset COCO~\cite{coco}. Table~\ref{tab:compare_coco} summary the results, which shows that our detection method achieves similar performance as the state of the art.
+
+% The consistent improvement of the fusion version over the non-fusion version for all strategies also demonstrates the effectiveness of the proposed fusion components. 
+% Our proposed ``mask'' versions benefit more (69.0 v.s. 69.6, 70.3 v.s. 71.2) from the fusion strategy, demonstrating the fusion component is more suitable with our activation scheme.
+% We also notice the ``box'' version benefits least, and we believe the reason is that the background cells can't provide reasonable predictions in the cluttered scene,
+% and introduce noises to the weighted average procedure. 
+
+% \begin{table*}
+%     \centering
+%     \input{tabs/ablate_detector.tex}
+%     \caption{\textbf{Effect of different detectors on different pose regressors.}
+%     }
+%     \label{tab:effect_detect}
+% \end{table*}
+
+\subsection{Object Pose Estimation}
+\label{sec:exp_pose}
+
+% \noindent \textbf{Detection for single-stage methods}
+% Although the single-stage methods don't rely on the detection stage, we show that embedding the detection is critical for boosting performance.
+% We investigate it on two typical single-stage methods, WDR~\cite{wdr} and EPOS~\cite{epos}, representing the two main paradigms for 6D pose estimation.
+% EPOS predicts dense 2D-to-3D correspondence, while WDR predicts the 2D projections of the object's eight bounding box corners, \ie, sparse 3D-to-2D correspondence. 
+% We conduct experiments on LM-O~\cite{lmo} and YCB~\cite{posecnn}.
+% In more detail, we train and test the model both on cropped and resized patches with the resolution 256*256.
+% Note that the bounding boxes are predicted by our proposed RADet. 
+% As shown in Tab~\ref{tab:detect_for_one_stage}, both WDR and EPOS can benefit a lot from the detection pre-processing, indicating the detector is necessary for 6D pose estimation.
+
+% \begin{table}
+%     \centering
+%     \input{tabs/detector_for_onestage}
+%     \caption{{\bf Detection for single-stage pose estimation methods.}
+%     With the detection pre-processing, single-stage methods' performance can be largely improved.
+%     }
+%     \label{tab:detect_for_one_stage}
+% \end{table}
+
+% Furthermore, we empirically demonstrate that the two-stage variants are more efficient than one-stage baselines.
+% As shown in Fig.~\ref{fig:resolution_for_one_stage}, WDR with increasing resolution can catch up with Patch-WDR. 
+% However, the training and inference time is largely increased.
+% We believe the high resolution is a key component for performance, but only the high resolution of the region of interest is necessary.
+% The detection pre-processing can effectively filter out the target object regions, avoiding unnecessary computation of the pose network on unrelated areas.
+% Although the framework equipped with the detection part is better than the one-stage baseline, the general detection method they are using is a problem, as illustrated in figure.
+
+\noindent \textbf{Comparison with the state of the art.}
+To demonstrate the effectiveness of our detection method in 6D object pose estimation, we combine it with a recent pose regression network, PFA-Pose~\cite{pfa}, and compare the pose results with other methods. We test our method with PFA-Pose in different settings, including training only on synthetic PBR or with mixed real images. Additionally, we evaluate our method when PFA-Pose uses a simple depth refinement strategy based on RANSAC-Kabsch~\cite{dpodv2,ncf} to consume additional depth images. The original PFA-Pose cannot handle multiple instances from the same class, making it inapplicable to some datasets. So we only reproduce its results on LM-O and YCB. Table~\ref{tab:overall_compare} summarizes the results, showing that our detection method improves the original PFA-Pose by a large margin, obtaining state-of-the-art pose estimation results with either only synthetic or mixed data in both the RGB and RGBD settings. Fig.~\ref{fig:qualitative} visualizes some results.
+
+\noindent \textbf{Evaluation with different pose regression networks.}
+In principle, our detection method can be used with most pose regression frameworks as a first component to extract the object's bounding box before pose regression.
+To demonstrate its generalization ability, we test our detection method on YCB with two other typical pose regression networks, WDR-Pose~\cite{wdr} and CDPNv2~\cite{cdpn}. 
+Table~\ref{tab:detect_for_two_stage} provides the results, evidencing that our detection method consistently improves the pose results.
+
+
+
+
+
+% \noindent \textbf{Comparison against the state-of-the-art}
+% We integrate our detection method into PFA-Pose~\cite{pfa} and compare it with the state-of-the-art ones on the BOP Challenge.
+% Specifically, we change the pose initialization network one-stage WDR used in PFA-Pose~\cite{pfa} to two-stage WDR, \ie, using our method for the detection stage.
+% We also follow ~\cite{dpodv2} to lift the 2D points in the 2D-3D correspondences infered by PFA-Pose~\cite{pfa} to 3D by the depth data, and use RANSAC-Kabsch~\cite{ncf} to solve the target pose from these 3D-3D correspondences, resulting in our RGB-D version.
+% As shown in Table~\ref{tab:overall_compare}, our method achieves the best with or without real training images. 
+% To the best of our knowledge, our method is the first RGB-based method, which uses a single model for a dataset, to achieve an accuracy of over 70\%, with a 2.7\% absolute improvement over the second best method. 
+% For RGB-D, note that our method's training only requires RGB, but outperforms the method~\cite{coupled_iterative} trained on depth a large margin.
+% %Note that the second best method SurfEmb~\cite{surfemb} trains a separate decoder for each object, while sharing encoder among different objects.
+
+
+
+
+% \noindent \textbf{With additional depth.}
+% For the RGB-D version, we follow ~\cite{dpodv2} to lift the 2D-3D correspondences to 3D-3D ones with the depth data and solve the pose by the RANSAC-Kabsch algorithm. 
+% With only PBR training images, our method outperforms the second-best method by 0.4\%, and the improvement is more significant (1.4\%) when the real training images are available.
+
+% \begin{table*}[]
+%     \centering
+%     \input{tabs/cityscapes_compare}
+%     \caption{\textbf{Evaluation on Cityscapes dataset}}
+%     \label{tab:my_label}
+% \end{table*}
+
+\section{Conclusion}
+We have proposed a visibility-guided sampling strategy for training a deep network to detect rigid objects in cluttered scenes.%for 6D object pose estimation. 
+We first analyzed the influence of the rigidity of the targets in the 6D object pose estimation scenarios and studied the weaknesses of general detection methods in this setting. Based on the observation that detecting rigid objects should allow us to rely on all visible object parts and that each part should already provide a reliable prediction of the whole bounding box, we have proposed to build a visibility map to guide the positive sampling during training and combine multiple local predictions during inference to obtain the final robust result. We have demonstrated the effectiveness of our method on the challenging datasets from the BOP benchmarks. It achieves much better detection results than general methods and produces state-of-the-art pose results when combined with pose regression networks.
+
+% \begin{figure}[t]
+%     \centering
+%     \begin{tabular}{c}
+%         \specialrule{0em}{0pt}{1pt}
+%         \input{figures/distancemap_cases} \\
+%     \end{tabular}
+%     \caption{{\bf Examples of the difficulty in approximating visibility.}}
+%     \label{fig:hard_case}
+% \end{figure}
+
+In the future, we will seek to use learning-based strategies to model the visibility of object parts without mask annotations, and investigate better fusion strategies to obtain robust detection results from local predictions.
+
+\vspace{0.2em}
+{\small
+{\noindent \bf Acknowledgments.}
+This work was supported by the 111 Project of China under Grant B08038, the Fundamental Research Funds for the Central Universities under Grant JBF220101, and the Youth Innovation Team of Shaanxi Universities. We thank Zhaoyang Liu and Wayne Wu for helpful discussions.
+}
+
+\input{supp_content.tex}
+
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{egbib}
+}
+
+\end{document}

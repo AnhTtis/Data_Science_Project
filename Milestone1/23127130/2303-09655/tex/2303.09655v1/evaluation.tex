@@ -1,0 +1,258 @@
+%\vani{Not sure of captions for Fig 4,5,6. Should I say normalized to RT-DBSCAN?}
+\subsection{Datasets}
+We use four real-world datasets to evaluate RT-DBSCAN. As RT cores can only handle datasets with at most 3 dimensions, we chose these 2D and 3D datasets that have been widely used to evaluate DBSCAN performance(\cite{cuda-dclust,dbscan-compare,DBLP:journals/corr/abs-2103-05162}). 
+\begin{description}
+\item[3DRoad]
+The 3DRoad dataset was constructed using the road network information of North Jutland, Denmark\cite{3droad}. The dataset consists of {\em 435K} points and we use it as a 2D dataset, considering only the latitude and longitude coordinates.
+\item[NGSIM]
+The Next Generation Simulation (NGSIM) Vehicle Trajectories dataset provides precise vehicle locations along three US highways\cite{ngsim}. The dataset has more than {\em 11M} points and we use the local coordinates to construct a 2D dataset.
+\item[Porto]
+The Taxi Service Trajectory-Prediction Challenge dataset collected trajectory data of 442 taxis in the city of Porto, Portugal\cite{porto}. The dataset has just over {\em 1M} points and we use the 2D GPS coordinates to identify clusters.
+\item[3DIono]
+The 3D Ionosphere dataset describes the behavior of weather in the ionosphere\cite{3diono}. The dataset has just over {\em 1M} points and we construct the 3D dataset using latitude, longitude and total electron count parameters. 
+\end{description}
+
+\subsection{Performance Evaluation}
+We compare RT-DBSCAN against three GPU-based DBSCAN implementations (though none of these use RT cores). 
+
+\begin{description}
+\item[FDBSCAN]
+FDBSCAN uses a parallel DisjointSet algorithm to compute clusters\cite{DBLP:journals/corr/abs-2103-05162}. It has minimal memory footprint and uses Bounding Volume Hierarchies to minimize the number of distance computations.
+
+%\vani{We can't compare against gdbscan and cuda-dclust+ as we run out of memory. Should I still keep the description?}
+%\krish{I think it's fine to keep these descriptions. But in the prior paragraph, rather than mentioning that you compare against four approaches, say that why you only compare against FDBSCAN.}
+\item[G-DBSCAN]
+G-DBSCAN stores $\varepsilon$-neighborhood information for all points in a graph and uses BFS to find connected components\cite{gdbscan}.
+
+\item[CUDA-DClust+]
+CUDA-DClust+ \cite{9680379} uses the idea of incrementally growing clusters in parallel using chains from CUDA-DClust \cite{cuda-dclust} but reduces memory footprint and index structure build time. As CUDA-DClust+ is strictly better than CUDA-DClust, we only evaluate the former.
+\end{description}
+
+For all cases, we used the authors' original source code, with the only modifications being those necessary to get the code to run on our GPU system and to handle our inputs (with the exception of FDBSCAN, which uses an early traversal termination optimization to improve execution time for single runs. In this work, we focus on typical DBSCAN use cases where the user is expected to run DBSCAN multiple times with different parameter values. We go into more detail in Section~\ref{sec:early_term}).
+
+We do not compare against Densebox approaches such as FDBSCAN-Densebox \cite{DBLP:journals/corr/abs-2103-05162}, HDBSCAN-Densebox algorithms \cite{bps-hdbscan,hdbscan}, as they are specialized to improve performance in datasets with very high density regions. In the absence of such regions, performance remains the same or is worse. We also do not compare our performance with Mr.Scan \cite{6877517} and BPS-HDBSCAN \cite{bps-hdbscan} as they are designed to cluster very large datasets (billion-point scale) and the incurred overhead is not amortized for smaller (thousand/million-point scale) datasets. We also do not report results against cuML's DBSCAN implementation as we were more than 3 orders of magnitude faster in all cases.  
+
+We vary the $\varepsilon$ parameter (defined in Section~\ref{sec:dbscan}) and dataset size such that we include a wide range of clusters: a few large clusters, and many small clusters.
+%~\krish{A little more context would be helpful. Is this $\epsilon$ part of FDBACAN?}. 
+We also look at a case where no clusters are formed in a dense dataset in Section~\ref{sec:ngsim}. We do not report results from varying {\em minPts} (defined in Section~\ref{sec:dbscan}) as it did not provide any new insights. %~\krish{What is minPts?}
+We report execution times averaged over 10 runs.
+
+Overall, we find that RT-DBSCAN is consistently faster in almost all cases. In particular, RT-DBSCAN is more than 2.5x faster on larger datasets. For smaller dataset sizes (Section~\ref{sec:eval-small-datasize}), the performance difference between RT-DBSCAN and FDBSCAN is not as pronounced due to the non-negligible BVH build time of RT-DBSCAN. We elaborate on the impact of BVH build time in Section~\ref{sec:build_time}. 
+
+\subsubsection{RT-DBSCAN Performance on Small Dataset Sizes}\label{sec:eval-small-datasize}
+This section evaluates the four DBSCAN implementations on a small dataset ({\em 16K} points).
+We found that both G-DBSCAN and CUDA-DClust+ ran out of memory on our GPU for more than {\em 100K} points. For this reason, subsequent sections will only compare against FDBSCAN.
+
+Overall, we found that RT-DBSCAN outperformed other approaches in most cases for {\em 16K} points. As we kept decreasing the number of points in the dataset, we found that RT-DBSCAN was between 1.5x and 2x slower than FDBSCAN when the dataset size was less than 500.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.45\textwidth]{figures/small-dataset.pdf}
+    \vspace{-0.5em}
+    \caption{Speedup over CUDA-DClust+ on varying search radius ($\varepsilon$) for {\em 16K} 3DRoad points}
+    \label{fig:small-dataset-3droad}
+    \vspace{-1.3em}
+\end{figure}
+
+We used {\em 16K} points from the 3DRoad dataset and set {\em minPts} as 100. In Fig~\ref{fig:small-dataset-3droad}, we compare the speedup of different approaches over CUDA-DClust+. It is evident that though RT-DBSCAN is faster in most cases, speedup is minimal compared to FDBSCAN, as the overhead of setting up the ray tracing framework was not amortized by the computations. We found that the poor performance of G-DBSCAN and CUDA-DClust+\footnote{We found that CUDA-DClust+ ran into memory issues on our 6GB GPU and also showed variability in clustering results between runs} was due to the time taken to traverse the adjacency list and the time needed to build and traverse the index structure, respectively.
+
+\subsubsection{Impact of $\varepsilon$}\label{sec:eps}
+We now turn to larger datasets, on which only FDBSCAN and RT-DBSCAN can run. We investigate clustering performance for different $\varepsilon$ values. We vary  $\varepsilon$ while fixing {\em minPts} as 100 and dataset size as {\em 1M}. We chose the first {\em 1M} points in the datasets for clustering and averaged our results over 10 runs.
+
+\begin{figure*}
+     \centering
+     \begin{subfigure}[t]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/eps-3droad.pdf}
+         \caption{3DRoad}
+         \label{fig:3droad_eps}
+     \end{subfigure}
+     \hfill
+     \begin{subfigure}[t]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/eps-porto.pdf}
+         \caption{Porto}
+         \label{fig:porto_eps}
+     \end{subfigure}
+     \hfill
+     \begin{subfigure}[t]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/eps-3diono.pdf}
+         \caption{3DIono}
+         \label{fig:3diono_eps}
+     \end{subfigure}
+        \caption{Speedup over FDBSCAN on varying search radius ($\varepsilon$)}
+        \label{fig:varying_eps}
+        \vspace{-1.4em}
+\end{figure*}
+We observe from Fig~\ref{fig:varying_eps} that RT-DBSCAN outperforms FDBSCAN in all cases. We attribute the speedup entirely to our ability to leverage hardware acceleration of BVH traversal, as FDBSCAN is also a BVH-based DBSCAN implementation, though it does not utilize RT cores. 
+
+We see a maximum speedup of 1.5x on the 3DRoad dataset as shown in Fig~\ref{fig:3droad_eps}. As we will see in Section~\ref{sec:build_time}, DBSCAN execution time for small dataset sizes and small search radii is dominated by BVH build time.
+%When we analyzed the results, we found though that the time taken by RT-DBSCAN to construct the BVH was 4x the time taken by FDBSCAN. 
+%Building a BVH from spheres is much more complex and time consuming than building a spatial tree for data points, as the Optix builder performs memory compaction, invokes bounding box routines and other ray-tracing-specific operations that add to the BVH build time. However, after BVH construction, RT-DBSCAN was faster to complete the two stages of the DBSCAN algorithm (Section~\ref{sec:rt-dbscan}). We further analyze the impact of BVH build time on execution time in Section~\ref{sec:build_time}.%~\krish{The reviewers may ask for a breakdown of time at least for a dataset.}
+
+In the cases of Porto and 3DIono, BVH build time of RT-DBSCAN was only 2.5x slower than FDBSCAN, allowing us to leverage the speedup in BVH traversal for fast clustering. For the Porto dataset in Fig~\ref{fig:porto_eps}, we see a maximum speedup of 2.3x and our speedup tended to increase with increasing $\varepsilon$ values. 
+
+For the 3DIono dataset in Fig~\ref{fig:3diono_eps}, we achieve a maximum speedup of 3.6x. As the neighborhood search radius $\varepsilon$ becomes larger, the number of BVH traversals and intersection tests performed also increases, allowing us to realize the full potential of RT acceleration. 
+%~\krish{this part of the sentence is not clear. This can be rewritten.} 
+%~\vani{Changed it}
+
+\subsubsection{Impact of Dataset Size}\label{sec:dsize}
+Fig~\ref{fig:varying_ds} shows how performance of RT-DBSCAN and FDBSCAN varies with the size of the input dataset. We fix the ($\varepsilon$,{\em minPts}) values as (0.05,100), (0.5,10) and (0.5,1000) for the 3DRoad, 3DIono and Porto datasets respectively. For different dataset sizes ({\em n}), we choose the first {\em n} points for clustering.
+%~\krish{This sentence may be rewritten clearly. What is $n$ here?}
+%~\vani{Changed it}
+
+\begin{figure*}
+     \centering
+     \begin{subfigure}[t]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/datasize-3droad.pdf}
+         \caption{3DRoad}
+         \label{fig:3droad_ds}
+     \end{subfigure}    
+     \hfill
+     \begin{subfigure}[t]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/datasize-porto.pdf}
+         \caption{Porto}
+         \label{fig:porto_ds}
+     \end{subfigure}
+          \hfill
+     \begin{subfigure}[t]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/datasize-3diono.pdf}
+         \caption{3DIono}
+         \label{fig:3diono_ds}
+     \end{subfigure}      
+        \caption{Speedup over FDBSCAN on varying dataset size}
+        \label{fig:varying_ds}
+        \vspace{-1.3em}
+\end{figure*}
+
+We find that RT-DBSCAN outperforms FDBSCAN on all datasets and the performance disparity is especially evident for larger dataset sizes. For the 3DRoad dataset, we see from Fig~\ref{fig:3droad_ds} that our maximum speedup is 1.37x. As 3DRoad is  relatively small with a maximum of {\em 400K} points, it is not surprising that we face issues similar to those discussed in Section~\ref{sec:eps}, where BVH build time is not amortized by the time taken to complete the two stages of the DBSCAN algorithm.
+
+\begin{figure}[t]
+     \centering   
+     \includegraphics[width=0.45\textwidth,scale = 0.5]{figures/3diono-scalable-exec-time.pdf}
+     \vspace{-0.5em}
+     \caption{Scalability of execution time for 3DIono dataset}
+     \label{fig:scalable-exec-time}
+     %\vspace{-1.95em}
+\end{figure}
+
+%This shows us that despite having to perform a more expensive ray tracing operation compared to a generic distance computation, the ability to leverage RT cores provides scalable acceleration.~\krish{If you claim scalable acceleration, you should be able to explain the pattern of speedup. Maybe a bar chart is not a suitable visualization.}
+% ~\vani{Maybe I shouldn't use the word scalable? Added new figure 6 and an explanation for it in the next paragraph}
+
+ For the Porto (Fig~\ref{fig:porto_ds}) and 3DIono (Fig~\ref{fig:3diono_ds}) datasets, we find that we achieve maximum speedups of 2.9x and 4.1x, respectively for the maximum dataset sizes. We report the raw execution time for Porto, the largest dataset we examined, in Table~\ref{table:porto-dataset-size}. 
+ \begin{table}[h]
+\centering
+    \begin{tabular}{lcccl} 
+    \toprule
+       \textbf{Dataset size } & \textbf{FDBSCAN(s)} & \textbf{RT-DBSCAN(s)}\\
+       \midrule
+       500K & 539.85 & 200.82\\
+
+       1M & 2868.1 & 1347.2\\
+
+       2M & 14859.02 & 6264.6\\
+
+       4M & 65935.14 & 23486.15\\
+
+       8M & 282047.12 & 96333.7\\
+       \bottomrule
+   \end{tabular}
+   \caption{Execution time (in seconds) for Porto dataset on varying dataset size}
+    \label{table:porto-dataset-size}
+     \vspace{-0.8em}
+\end{table}
+We examine the growth rate of the execution times of RT-DBSCAN and FDBSCAN on the 3DIono dataset in Fig~\ref{fig:scalable-exec-time}. We find that the growth rate of RT-DBSCAN's execution time is significantly slower than that of FDBSCAN as we are able to leverage hardware acceleration, showing that our approach is scalable. In general, increasing the dataset size widens the performance gap between RT-DBSCAN and FDBSCAN, as the RT hardware is designed to handle a large number of rays.
+% With the increase in dataset size, the number of intersection tests increases. We examine how the execution time of the 3DIono dataset relates to the number of intersection tests performed in Fig~\ref{fig:scalability}. We find that the growth rate of FBDSCAN's execution time in Fig~\ref{fig:scalable-exec-time} is similar to that of the number of intersections in Fig~\ref{fig:num-intersections}. However, the growth rate of RT-DBSCAN's execution time is much slower as we are able to leverage hardware acceleration. We also find that, 
+
+\subsection{RT-DBSCAN Performance on a Dense Dataset}\label{sec:ngsim}
+Finally, we evaluated RT-DBSCAN on NGSIM, a very dense dataset where the number of clusters formed is 0, using the same criteria as in Sections~\ref{sec:eps} and \ref{sec:dsize}.
+
+When we varied the dataset size, we found that RT-DBSCAN outperformed FDBSCAN by large margins, with a maximum of 5500x, as shown in Fig ~\ref{fig:ngsim_ds}. Table~\ref{table:ngsim-dataset-size} shows the raw execution times. 
+
+\begin{table}[h]
+\centering
+    \begin{tabular}{lcccl} 
+    \toprule
+    \textbf{Search radius ($\varepsilon$) } & \textbf{FDBSCAN(s)} & \textbf{RT-DBSCAN(s)}  \\         
+       \midrule
+        0.0001 & 64.72 & 0.0257\\
+
+        0.00025 & 64.77 & 0.0259\\
+
+        0.0005 & 64.74 & 0.0259\\
+
+        0.00075 & 64.71 & 0.026\\
+
+       0.001 & 64.74 & 0.0259\\
+       \bottomrule
+   \end{tabular}
+   \caption{Execution time (in seconds) for NGSIM dataset on varying search radius ($\varepsilon$)}
+    \label{table:ngsim-eps}
+     \vspace{-1em}
+\end{table}
+
+On varying $\varepsilon$ with {\em minPts} as 100 and dataset size as {\em 1M}, we found that RT-DBSCAN was nearly 2500x faster than FDBSCAN, as shown in Fig ~\ref{fig:ngsim_eps}. Table~\ref{table:ngsim-eps} shows raw execution times for different $\varepsilon$ values. The execution times of both FDBSCAN and RT-DBSCAN did not significantly change for different $\varepsilon$ as the dataset was still dense for these different radii. 
+\begin{table}[h]
+\centering
+    \begin{tabular}{lcccl} 
+    \toprule
+       \textbf{Dataset size } & \textbf{FDBSCAN(s)} & \textbf{RT-DBSCAN(s)} \\
+        \midrule
+       500K & 12.7 & 0.03\\
+
+       1M & 72.8 & 0.06\\
+
+       2M & 364.6  & 0.13\\
+
+       4M & 1631.4 & 0.3 \\
+
+       8M & 6964.1 & 1.26\\
+       \bottomrule
+   \end{tabular}
+   \caption{Execution time (in seconds) for NGSIM dataset on varying dataset size}
+    \label{table:ngsim-dataset-size}
+     \vspace{-1em}
+\end{table}
+
+\begin{figure*}
+     \centering
+     \begin{subfigure}[t]{0.45\textwidth}
+         \centering
+         \includegraphics[scale=0.5]{figures/eps-ngsim.pdf}
+         \vspace{-0.5em}
+         \caption{Speedup on varying search radius ($\varepsilon$)}
+         \label{fig:ngsim_eps}
+     \end{subfigure}    
+     \hfill
+     \begin{subfigure}[t]{0.45\textwidth}
+         \centering
+         \includegraphics[scale=0.5]{figures/datasize-ngsim.pdf}
+         \vspace{-0.5em}
+         \caption{Speedup on varying dataset size}
+         \label{fig:ngsim_ds}
+     \end{subfigure}
+     \caption{Speedup over FDBSCAN on varying $\varepsilon$ and dataset size for NGSIM}
+     \label{fig:ngsim}
+     \vspace{-0.5em}
+\end{figure*}
+
+On analyzing the output, we found that the RT hardware made relatively few calls to the intersection program.
+% ~\krish{An example would strengthen the evaluation.} 
+As the specifics of BVH construction and traversal in RT hardware are unclear, we speculate that the hardware was able to construct the BVH such that we were able to prune large parts of the search space and minimize the number of intersection tests required.
+% ~\krish{This sentence could be written differently omitting the phrases "somehow" and "do not know". For example, "As the specifics of BVH tree creation in RT hardware is unclear, ..."}~\vani{done}
+As we will discuss in Section~\ref{sec:extend-optix-api}, having access to the workings of the hardware internals would help explain our results a lot better.
+
+\subsection{Runtime Analysis of RT-DBSCAN}\label{sec:build_time}
+%\vani{Add percentage of time spent on build and ops}
+In Section~\ref{sec:input_trans}, we discussed how data points are converted to spheres so that RT cores can build and traverse the BVH in hardware. 
+Though this helps attain our objective of converting the nearest neighbor problem to a ray tracing query, it comes at a cost. Building a BVH from spheres for a ray tracing application is much more complex and time-consuming than building a spatial tree for data points.
+% ~\krish{complex and time-consuming. Did you explain why is it complex in prior sections?}
+The Optix builder performs memory compaction, invokes bounding box routines and other ray-tracing-specific operations that add to the BVH build time. 
+%In this section, we look at the impact of BVH build time on the total DBSCAN execution time for the 3DRoad, 3DIono and Porto datasets.
+
+The general trend we observed was that BVH build time dominated the total execution time for smaller datasets and cases where $\varepsilon$ was small, as fewer BVH traversals and intersection tests needed to be performed. For example, we consider the first 1 million points from 3DIono dataset with $\varepsilon$ = 0.25, and {\em minPts} = 100, similar to Section~\ref{sec:eps}. We found that RT-DBSCAN was 3.6x faster than FDBSCAN overall. Breaking down the execution time, we found that the time taken by RT-DBSCAN to perform clustering operations {\em after} BVH build was 6.4 ms for the Core point identification phase and 6.6 ms for the cluster formation phase. In total, RT-DBSCAN only spent 48\% of total execution time) on actual clustering operations. On the other hand, FDBSCAN spent 0.118 seconds (94\% of total execution time) on clustering operations. This shows us that, on average, RT-DBSCAN is more than 9x faster than FDBSCAN in performing the actual clustering operations! 
+%Though the build time was similar across different datasets of the same size, we found that the {\em fraction of time} spent on BVH build varies with the dataset. 

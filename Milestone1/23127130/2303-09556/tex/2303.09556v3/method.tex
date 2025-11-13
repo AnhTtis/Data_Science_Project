@@ -1,0 +1,182 @@
+
+\subsection{Preliminary}\label{sec:preliminary}
+
+Diffusion models consist of two processes: a forward noising process and a reverse denoising process. 
+We denote the distribution of training data as $p(\mathbf{x}_0)$.
+The forward process is a Gaussian transition, gradually adds noise with different scales to a real data point $\mathbf{x}_0\sim p(\mathbf{x}_0)$ to obtain a series of noisy latent variables $\{ \mathbf{x}_1,\mathbf{x}_2, \ldots, \mathbf{x}_T \}$:
+\begin{align}
+    q(\mathbf{x}_t | \mathbf{x}_0) &= \mathcal{N}( \mathbf{x}_t; \alpha_t \mathbf{x}_0, \sigma_t^2 \mathbf{I}) \\
+    \mathbf{x}_t &= \alpha_t \mathbf{x}_0 + \sigma_t \boldsymbol{\epsilon} \label{eq:diffusion}
+\end{align}
+where $\boldsymbol{\epsilon}$ is the noise sampled from Gaussian distribution $\mathcal{N}(0, \mathbf{I})$.
+The noise schedule $\sigma_t$ denotes the magnitude of noise added to the clean data at $t$ timestep. It increases monotonically with $t$. In this paper, we adopt the standard variance-preserving diffusion process, where $\alpha_t = \sqrt{1 - \sigma_t^2}$.
+
+
+The reverse process is parameterized by another Gaussian transition, gradually denoises the latent variables and restores the real data $\mathbf{x}_0$ from a Gaussian noise:
+\begin{equation}
+    p_\theta(\mathbf{x}_{t-1} | \mathbf{x}_t) = \mathcal{N}(\mathbf{x}_{t-1}; \mathbf{\hat{\mu}}_\theta (\mathbf{x}_{t}), \hat{\Sigma}_\theta(\mathbf{x}_{t})).
+\end{equation}
+$\mathbf{\hat{\mu}}_\theta$ and $\hat{\Sigma}_\theta$ are predicted statistics. 
+Ho et al.~\cite{ho2020ddpm} set $\hat{\Sigma}_\theta(\mathbf{x}_{t})$ to the constant $\sigma_t^2\mathbf{I}$, and $\hat{\mu}_\theta$ can be decomposed into the linear combination of $\mathbf{x}_t$ and a noise approximation model $\hat{\epsilon}_\theta$. They find using a network to predict noise $\mathbf{\epsilon}$ works well, especially when combined with a simple re-weighted loss function:
+\begin{equation}\label{equ:simple}
+    \mathcal{L}_{\text{simple}}^t (\theta) = \mathbb{E}_{\mathbf{x}_0,\mathbf{\epsilon}}\left[
+    \lVert \mathbf{\epsilon} - \hat{\epsilon}_\theta (\alpha_t \mathbf{x}_0 + \sigma_t \epsilon) \rVert_2^2
+    \right].
+\end{equation}
+Most previous works~\cite{nichol2021iddpm,dhariwal2021adm,Nichol2021glide} follow this strategy and predict the noise. Later works~\cite{gu2022vqdiffusion,salimans2022distillprogressive} use another re-parameterization that predicts the noiseless state $x_0$:
+\begin{equation}\label{equ:simple-x0}
+    \mathcal{L}_{\text{simple}}^t (\theta) = \mathbb{E}_{\mathbf{x}_0,\mathbf{\epsilon}}\left[
+     \lVert \mathbf{x}_0 - \hat{\mathbf{x}}_\theta (\alpha_t \mathbf{x}_0 + \sigma_t \epsilon) \rVert _2^2
+    \right].
+\end{equation}
+And some other works~\cite{salimans2022distillprogressive,rombach2022ldm} even employ the network to directly predict velocity $v$. Despite their prediction targets being different, we can derive that they are mathematically equivalent by modifying their loss weights.
+
+
+
+
+
+\subsection{Diffusion Training as Multi-Task Learning}
+To reduce the number of parameters, previous studies~\cite{ho2020ddpm,nichol2021iddpm,dhariwal2021adm} often share the parameters of the denoising models across all steps.
+However, it's important to keep in mind that different steps may have vastly different requirements. At each step of a diffusion model, the strength of the denoising varies. 
+For example, easier denoising tasks (when $t\to 0$) may require simple reconstructions of the input in order to achieve lower denoising loss. This strategy, unfortunately, does not work as well for noisier tasks (when $t\to T$). 
+Thus, it's extremely important to analyze the correlation between different timesteps.
+
+
+In this regard, we conduct a simple experiment. We begin by clustering the denoising process into several separate bins. Then we finetune the diffusion model by sampling timesteps in each bin. Lastly, we evaluate its effectiveness by looking at how it impacted the loss of other bins. As shown in Figure~\ref{fig:ft-loss-curve}, we can observe that finetuning specific steps benefited those surrounding steps. However, it's often detrimental for other steps that are far away. This inspires us to consider whether \emph{we can find a more efficient solution that benefits all timesteps simultaneously}.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.48\textwidth]{figs/loss_100k_ft10k.pdf}
+    \vspace{-0.4cm}
+    \caption{
+    We finetune the diffusion model in specific ranges of timesteps:[100, 200), [200, 300), and [300, 400), then we investigate how it affects the loss in different timesteps. The surrounding timesteps may derive benefit from it, while others may experience adverse effects.
+    }
+    \label{fig:ft-loss-curve}
+\end{figure}
+
+
+
+
+
+
+
+
+We re-organized our goal from the perspective of multitask learning. The training process of denoising diffusion models contains $T$ different tasks, each task represents an individual timestep. We denote the model parameters as $\theta$ and the corresponding training loss is $\mathcal{L}^t(\theta), t\in \{ 1,2,\ldots,T\}$. Our goal is to find a update direction $\delta \neq 0$, that satisfies:
+\begin{equation}
+    \mathcal{L}^t(\theta+\delta) \leq \mathcal{L}^t(\theta), \forall t \in \{1,2,\ldots,T\}.
+\end{equation}
+We consider the first-order Taylor expansion:
+\begin{equation}
+\mathcal{L}^t(\theta+\delta) \approx \mathcal{L}^t(\theta) + \left \langle\delta, \nabla_{\theta}\mathcal{L}^t(\theta)\right \rangle.
+\end{equation}
+Thus, the ideal update direction is equivalent to satisfy:
+\begin{equation}
+    \left \langle\delta, \nabla_{\theta}\mathcal{L}^t(\theta)\right \rangle \leq 0, \forall t \in \{1,2,\ldots,T\}.
+    \label{eqn:optimization_objective}
+\end{equation}
+
+\subsection{Pareto optimality of diffusion models}
+
+\begin{theorem}
+Consider a update direction $\delta^*$:
+\begin{equation}
+\delta^* = -\sum_{t=1}^T w_t \nabla_{\theta} \mathcal{L}^t(\theta),
+\end{equation}
+of which $w_t$ is the solution to the optimization problem:
+\begin{equation}
+    \label{eq:opt}
+    \min_{w^t} \left\{   \lVert \sum_{t=1}^T w^t \nabla_{\theta} \mathcal{L}^t(\theta)\rVert^2  | \sum_{t=1}^T w^t=1, w^t \geq 0\right\}
+\end{equation}
+If the optimal solution to the Equation~\ref{eqn:optimization_objective} exists, then $\delta^*$ should satisfy it. Otherwise, it means that we must sacrifice a certain task in exchange for the loss decrease of other tasks. In other words, we have reached the Pareto Stationary and the training has converged.
+\end{theorem}
+
+
+
+A more general form of this theorem was first proposed in~\cite{desideri2012mgda} and we leave a succinct proof in the appendix. 
+Since diffusion models are required to go through all the timesteps when generating images. So any timestep should not be ignored during training. Consequently, a regularization term is included to prevent the loss weights from becoming excessively small. The optimization goal in Equation~\ref{eq:opt} becomes:
+\begin{equation}
+    \label{eq:reg-opt}
+    \min_{w_t} \left \{ \lVert \sum_{t=1}^T w_t \nabla_{\theta} \mathcal{L}^t(\theta)\rVert_2^2 + \lambda \sum_{t=1}^T \lVert w_t \rVert_2^2 \right \}
+\end{equation}
+where $\lambda$ controls the regularization strength. %
+
+
+To solve Equation~\ref{eq:reg-opt},~\cite{sener2018mto} leverages the Frank-Wolfe~\cite{frank1956frank} algorithm to obtain the weight $\{ w_t \}$ through iterative optimization. Another approach is to adopt Unconstrained Gradient Descent(UGD). Specifically, we re-parameterize $w_t$ through $\beta_t$:
+\begin{equation}
+    w_t = \frac{e^{\beta_t}}{Z}, Z=\sum_{t} e^{\beta_t}, \beta_t \in \mathbb{R}.
+\end{equation}
+Combined with Equation~\ref{eq:reg-opt}, we can use gradient descent to optimize each term independently:
+\begin{equation}
+    \label{eq:ugd-opt}
+    \min_{\beta_t} \frac{1}{Z^2} \lVert \sum_{t=1}^T e^{\beta_t} \nabla_{\theta} \mathcal{L}_t(\theta)\rVert_2^2 + \frac{\lambda}{Z^2} \sum_{t=1}^T \lVert e^{\beta_t} \rVert_2^2
+\end{equation}
+
+
+
+
+
+
+
+
+However, whether leveraging the Frank-Wolfe or the UGD algorithm, there are two disadvantages:
+1) \textit{Inefficiency}. Both of these two methods need additional optimization at each training iteration, it greatly increases the training cost.
+2) \textit{Instability}. In practice, by using a limited number of samples to calculate the gradient term $\nabla_{\theta} \mathcal{L}^t(\theta)$, the optimization results are unstable(as shown in Figure~\ref{fig:viz-alpha-instablity}). In other words, the loss weights for each denoising task vary greatly during training, making the entire diffusion training inefficient.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.45\textwidth]{figs/solution-over-samples.pdf}
+    \vspace{-0.3cm}
+    \caption{Demonstration of the instability of optimization-based weighting strategy. As the number of samples increases, the loss weight becomes stable, while the computation cost increases.
+    }
+    \vspace{-0.3cm}
+    \label{fig:viz-alpha-instablity}
+\end{figure}
+
+
+
+
+\subsection{Min-SNR-$\gamma$ Loss Weight Strategy}\label{sec:different-loss-strategy}
+In order to avoid the inefficiency and instability caused by the iterative optimization in each iteration, one possible attempt is to adopt a stationery loss weight strategy. 
+
+To simplify the discussion, we assume that the network is reparametered to predict the noiseless state $\mathbf{x}_0$. However, it's worth noting that different prediction objectives can be transformed into one another, we will delve into it in Section~\ref{sec:abalation}. Now, we consider the following alternative training loss weights:
+
+
+
+\begin{itemize}
+    \item Constant weighting. 
+    $w_t = 1$. 
+    Which treats different tasks as equally weighted and has been used in both discrete diffusion models~\cite{gu2022vqdiffusion, tang2022improved} and continuous diffusion models~\cite{cao2022survey}.
+    \item SNR weighting. $w_t=\text{SNR}(t)$, where $\text{SNR}(t)=\alpha_t^2 / \sigma_t^2$. It's the most widely used weighting strategy~\cite{meng2022ondistillation,ho2022video,dhariwal2021adm,rombach2022ldm}. By combining with Equation~\ref{eq:diffusion}, we can find it's numerically equivalent to the constant weighting strategy when the predicting target is noise.
+    \item Max-SNR-$\gamma$ weighting. $w_t=\max\{ \text{SNR}(t), \gamma \}$. This modification of SNR weighting is first proposed in ~\cite{salimans2022distillprogressive} to avoid a weight of zero with zero SNR steps. They set $\gamma=1$ as their default setting. However, the weights still concentrate on small noise levels.
+
+    \item Min-SNR-$\gamma$ weighting. $w_t=\min\{ \text{SNR}(t), \gamma \}$. We propose this weighting strategy to avoid the model focusing too much on small noise levels.
+    \item UGD optimization weighting. $w_t$ is optimized from Equation~\ref{eq:ugd-opt} in each timestep. Compared with the previous setting, this strategy changes during training.
+\end{itemize}
+
+First, we combine these weighting strategies into Equation~\ref{eq:reg-opt} to validate whether they are approach to the Pareto optimality state. As shown in Figure~\ref{fig:object-value}, the UGD optimization weighting strategy can achieve the lowest score on our optimization target. In addition, the Min-SNR-$\gamma$ weighting strategy is the closest to the optimum, demonstrating it has the property to optimize different timesteps simultaneously.
+
+In the following section, we present experimental results to demonstrate the effectiveness of our Min-SNR-$\gamma$ weighting strategy in balancing diverse noise levels.
+Our approach aims to achieve faster convergence and strong performance. 
+
+
+
+
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.45\textwidth]{figs/objective-values.pdf}
+    \vspace{-0.4cm}
+    \caption{Comparison of the objective values in Equation~\ref{eq:reg-opt} on different weighting strategies.
+    }
+    \vspace{-0.3cm}
+    \label{fig:object-value}
+\end{figure}
+
+
+
+
+
+
+
+

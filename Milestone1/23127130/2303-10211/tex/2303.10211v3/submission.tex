@@ -1,0 +1,896 @@
+\documentclass{article}
+
+
+\usepackage{arxiv}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{lipsum}
+\usepackage{graphicx}
+\usepackage{wrapfig}
+\usepackage{natbib}
+\usepackage{amsmath}
+\usepackage{algorithmic}
+\usepackage{textcomp}
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage{arydshln}
+\usepackage{xr}
+\usepackage{cases}
+\usepackage{amsthm}
+\usepackage{bm}
+\usepackage{xcolor}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\expnumber}[2]{{#1}\mathrm{e}{#2}}
+\newcommand{\significant}{\makebox[0pt]{\ $^*$}}
+
+\title{SITReg: Multi-resolution architecture for symmetric, inverse consistent, and topology preserving image registration}
+
+
+\author{
+ Joel Honkamaa \\
+  Department of Computer Science\\
+  Aalto University
+  %% examples of more authors
+   \And
+ Pekka Marttinen \\
+  Department of Computer Science\\
+  Aalto University 
+}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+Deep learning has emerged as a strong alternative for classical iterative methods for deformable medical image registration, where the goal is to find a mapping between the coordinate systems of two images. Popular classical image registration methods enforce the useful inductive biases of symmetricity, inverse consistency, and topology preservation by construct. However, while many deep learning registration methods encourage these properties via loss functions, none of the methods enforces all of them by construct. Here, we propose a novel registration architecture based on extracting multi-resolution feature representations which is by construct symmetric, inverse consistent, and topology preserving. We also develop an implicit layer for memory efficient inversion of the deformation fields. Our method achieves state-of-the-art registration accuracy on two datasets.
+\end{abstract}
+
+\section{Introduction}\label{sec:intro}
+
+\begin{figure}[b]
+\centering
+\includegraphics[width=1.0\textwidth]{figures/deformation_example.pdf}
+\caption{\textbf{Example deformation from the method.} \textit{Left:} Forward deformation. \textit{Middle:} Inverse deformation. \textit{Right:} Composition of the forward and inverse deformations. Only one 2D slice is shown of the 3D deformation. The deformation is from the LPBA40 experiment. For more detailed visualization of a predicted deformation, see Figure \ref{appendix-fig:detailed_deformation_example} in Appendix \ref{appendix:additional_results}.}
+\label{fig:example_deformation}
+\end{figure}
+
+Deformable medical image registration aims at finding a mapping between coordinate systems of two images, called a \textit{deformation}, to align them anatomically. Deep learning can be used to train a registration network which takes as input two images and outputs a deformation. We focus on unsupervised intra-modality registration without a ground-truth deformation and where images are of the same modality, applicable, e.g., when deforming brain MRI images from different patients to an atlas or analyzing a patient's breathing cycle from multiple images. To improve registration quality, various inductive biases have been assumed by previous methods: \textit{inverse consistency}, \textit{symmetry}, and \textit{topology preservation} \citep{sotiras2013deformable}. Some of the most popular classical methods enforce these properties by construct \citep{ashburner2007fast, avants2008symmetric}. However, no existing deep learning method does the same, and we address this gap. We start by defining the properties (further clarifications in Appendix \ref{appendix:property_examples}).
+
+We define a \textit{registration method} as a function $f$ that takes two images, say $x_A$ and $x_B$, and produces a deformation. Some methods can output the deformation in both directions, and we use subscripts to indicate the direction. For example, $f_{1\to2}$ produces a deformation that aligns the image of the first argument to the image of the second argument. As a result, a registration method may predict up to four different deformations for any given input pair: $f_{1\to2}(x_A, x_B)$, $f_{2\to1}(x_A, x_B)$, $f_{1\to2}(x_B, x_A)$, and $f_{2\to1}(x_B, x_A)$. Some methods predict deformations in one direction only, resulting in two possible outputs: $f_{1\to2}(x_A, x_B)$ and $f_{1\to2}(x_B, x_A)$, in which case we might omit the subscript.
+
+\textit{Inverse consistent} registration methods ensure that $f_{1\to2}(x_A, x_B)$ is an accurate inverse of $f_{2\to1}(x_A, x_B)$, which we quantify using the \textit{inverse consistency error}: $||f_{1\to2}(x_A, x_B) \circ f_{2\to1}(x_A, x_B) - \mathcal{I}||^2$, where $\circ$ is the composition operator and $\mathcal{I}$ is the identity deformation. Originally inverse consistency was achieved via variational losses \citep{christensen11995topological} but later algorithms were \textit{inverse consistent by construct}, e.g., classical methods DARTEL \citep{ashburner2007fast} and SyN \citep{avants2008symmetric}. However, due to a limited spatial resolution of the predicted deformations, even for these methods the inverse consistency error is not exactly zero. Some deep learning methods enforce inverse consistency via a penalty \citep{zhang2018inverse, kim2019unsupervised, estienne2021mics}. A popular stationary velocity field (SVF) formulation \citep{arsigny2006log} achieves inverse consistency by construct and has been used by many works, e.g., \citet{dalca2018unsupervised, krebs2018unsupervised, krebs2019learning, niethammer2019metric, shen2019networks, shen2019region, mok2020fast}.
+
+In \textit{symmetric registration}, the registration outcome does not depend on the order of the inputs, i.e., $f_{1\to2}(x_A, x_B)$ equals $f_{2\to1}(x_B, x_A)$. Unlike with inverse consistency, $f_{1\to2}(x_A, x_B)$ can equal $f_{2\to1}(x_B, x_A)$ exactly \citep{avants2008symmetric, estienne2021mics}, which we call \textit{symmetric by construct}. A related property, cycle consistency, can be assessed using \textit{cycle consistency error} $||f(x_A, x_B) \circ f(x_B, x_A) - \mathcal{I}||^2$. It can be computed for any method since it does not require the method to predict deformations in both directions. If the method is symmetric by construct, inverse consistency error equals cycle consistency error. Some existing deep learning registration methods enforce cycle consistency via a penalty \citep{mahapatra2019training, gu2020pair, zheng2021symreg}. The method by \citet{estienne2021mics} is symmetric by construct but only for a single component of their multi-step formulation, and not inverse consistent by construct. Recently, parallel with and unrelated to us, \citet{iglesias2023ready} proposed a by construct symmetric and inverse consistent registration method within the SVF framework, which they achieved in a different way from us.
+
+We define \textit{topology preservation} of predicted deformations similarly to \citet{christensen11995topological}. From the real-world point of view this means the preservation of anatomical structures, preventing non-smooth changes. Mathematically we want the deformations to be homeomorphisms, i.e., invertible and continuous. %In registration literature it is common to talk about diffeomorphims which are additionally differentiable.
+In practice we want a deformation not to fold on top of itself which we measure by estimating the local Jacobian determinants of the predicted deformations, and checking whether they are positive. Most commonly in deep learning applications topology preservation is achieved using the diffeomorphic SVF formulation \citep{arsigny2006log}. It does not completely prevent the deformation from folding due to limited sampling resolution but such voxels are limited to very small percentage, which is sufficient in practice. Topology preservation can be encouraged with a specific loss, e.g., by penalizing negative determinants \citep{mok2020fast}.
+
+Our main contributions can be summarized as follows:
+\begin{itemize}
+    \item We propose the first multi-resolution deep learning registration architecture which is by construct inverse consistent, symmetric, and preserves topology. The properties are fulfilled for the whole multi-resolution pipeline, not just separately for each resolution. Apart from the parallel work \citep{iglesias2023ready}, we are not aware of other deep learning registration methods which are by construct both symmetric and inverse consistent, and ours is the first such method with a multi-resolution deep learning architecture. For motivation of the multi-resolution approach, see Section \ref{sec:multi-resolution_background}.
+    \item As a component in our architecture, we propose an \textit{implicit} neural network layer, which we call \textit{deformation inversion layer}, based on a well-known fixed point iteration formula \citep{chen2008simple} and recent advances in Deep Equilibrium models \citep{bai2019deep, duvenaud2020deep}. The layer allows memory efficient inversion of deformation fields.
+    \item We show that the method achieves state-of-the-art results on two popular benchmark data sets in terms of registration accuracy and deformation regularity. The accuracy of the inverses generated by our method is also very good and similar to the s-o-t-a SVF framework.
+\end{itemize}
+
+We name the method \textit{SITReg} after its symmetricity, inverse consistency and topology preservation properties.
+
+\section{Background and preliminaries}
+
+\subsection{Topology preserving registration}
+
+The LDDMM method by \citep{cao2005large} is a classical registration method that can generate diffeomorphic deformations which preserve topology, but it has not been used much in deep learning due to computational cost. Instead, a simpler stationary velocity field (SVF) method \citep{arsigny2006log} has been popular \citep{krebs2018unsupervised, krebs2019learning, niethammer2019metric, shen2019networks, shen2019region, mok2020fast}. In SVF the final deformation is obtained by integrating a stationary velocity field over itself over a unit time, which results in a diffeomorphism. Another classical method by \citet{choi2000injectivity, rueckert2006diffeomorphic} generates invertible deformations by constraining each deformation to be diffeomorphic but small, and forming the final deformation as a composition of multiple small deformations. Since diffeomorphisms form a group under composition, the final deformation is diffeomorphic.
+%
+This is close to a practical implementation of the SVF, where the velocity field is integrated by first scaling it down by a power of two and interpreting the result as a small deformation, which is then repeatedly composed with itself. The idea is hence similar: a composition of small deformations.
+
+In this work we build topology preserving deformations using the same strategy, as a composition of small topology preserving deformations.
+
+\subsection{Multi-resolution registration}\label{sec:multi-resolution_background}
+
+Multi-resolution registration methods learn the deformation by first estimating it in a low resolution and then incrementally improving it while increasing the resolution. For each resolution one feeds the input images deformed with the deformation learned thus far, and incrementally composes the full deformation. Since its introduction a few decades ago \citep{rueckert1999nonrigid, oliveira2014medical}, the approach has been used in the top-performing classical and deep learning registration methods \citep{avants2008symmetric, klein2009evaluation, mok2020large, mok2021conditional, hering2022learn2reg}.
+
+In this work we propose the first multi-resolution deep learning registration architecture that is by construct symmetric, inverse consistent, and topology preserving.
+
+\subsection{Symmetric registration formulations}\label{sec:symmetric_registration_formulation}
+
+Symmetric registration does not assign moving or fixed identity to either image but instead considers them equally. A classical method called symmetric normalization \citep[SyN,][]{avants2008symmetric} is a symmetric registration algorithm which learns two separate transformations: one for deforming the first image half-way toward the second image and the other for deforming the second image half-way toward the first image. The images are matched in the intermediate coordinates and the full deformation is obtained as a composition of the half-way deformations (one of which is inverted). The same idea has later been used by other methods such as the deep learning method SYMNet \cite{mok2020fast}. However, SYMNet does not guarantee symmetricity by construct.
+
+We also use the idea of deforming the images half-way towards each other to achieve inverse consistency and symmetry throughout our multi-resolution architecture.
+
+\subsection{Deep equilibrium networks}\label{sec:deqn}
+
+Deep equilibrium networks use \textit{implicit} fixed point iteration layers, which have emerged as an alternative to the common \textit{explicit} layers \citep{bai2019deep, bai2020multiscale, duvenaud2020deep}. Unlike explicit layers, which produce output via an exact sequence of operations, the output of an implicit layer is defined indirectly as a solution to a fixed point equation, which is specified using a fixed point mapping. In the simplest case the fixed point mapping takes two arguments, one of which is the input. For example, let  $g: A \times B \to B$ be a fixed point mapping defining an implicit layer. Then, for a given input $a$, the output of the layer is the solution $z$ to equation
+\begin{equation}
+    z = g(z, a).
+\end{equation}
+This equation is called a fixed point equation and the solution is called a fixed point solution. If $g$ has suitable properties, the equation can be solved iteratively by starting with an initial guess and repeatedly feeding the output as the next input to $g$. More advanced iteration methods have also been developed for solving fixed point equations, such as Anderson acceleration \citep{walker2011anderson}.
+
+The main mathematical innovation related to deep equilibrium networks is that the derivative of an implicit layer w.r.t. its inputs can be calculated based solely on a fixed point solution, i.e., no intermediate iteration values need to be stored for back-propagation. Now, given some solution $(a_0, z_0)$, such that $z_0 = g(z_0, a_0)$, and assuming certain local invertibility properties for $g$, the implicit function theorem says that there exists a solution mapping in the neighborhood of $(a_0, z_0)$, which maps other inputs to their corresponding solutions. Let us denote the solution mapping as $z^*$. The solution mapping can be seen as the theoretical explicit layer corresponding to the implicit layer. To find the derivatives of the implicit layer we need to find the Jacobian of $z^*$ at point $a_0$ which can be obtained using implicit differentiation as
+\begin{equation*}
+\partial z^*(a_0) = \left[ I - \partial_1 g(z_0, a_0) \right]^{-1}\partial_0 g(z_0, a_0).
+\end{equation*}
+The vector-Jacobian product of $z^*$ needed for back-propagation can be calculated using another fixed point equation without fully computing the Jacobians, see, e.g., \citet{duvenaud2020deep}. Hence, both forward and backward passes of the implicit layer can be computed as a fixed point iteration.
+
+We use these ideas to develop a neural network layer for inverting deformations based on the fixed point equation, following \citet{chen2008simple}. The layer is very memory efficient as only the fixed point solution needs to be stored for the backward pass.
+
+\section{Methods}
+
+Let $n$ denote the dimensionality of the image, e.g., $n = 3$ for 3D medical images, and $k$ the number of channels, e.g., $k = 3$ for an RGB-image. The goal in deformable image registration is to find a mapping from $\mathbb{R}^n$ to $\mathbb{R}^n$, connecting the coordinate systems of two non-aligned images  $x_A, x_B: \mathbb{R}^n\to \mathbb{R}^k$, called a deformation. Application of a deformation to an image can be mathematically represented as a (function) composition of the image and the deformation, denoted by $\circ$. Furthermore, in practice linear interpolation is used to represent images (and deformations) in continuous coordinates.
+
+In this work the deformations are in practice stored as displacement fields with the same resolution as the registered images, that is, each pixel or voxel is associated with a displacement vector describing the coordinate difference between the original image and the deformed image (e.g. if $n=3$, displacement field is tensor with shape $3 \times H \times W \times D$ where $H \times W \times D$ is the shape of the image). In our notation we equate the displacement fields with the corresponding coordinate mappings, and always use $\circ$ to denote the deformation operation (sometimes called warping).
+
+In deep learning based image registration, we aim at learning a \textit{neural network} $f$ that takes two images as input and outputs a deformation connecting the image coordinates. Specifically, in medical context $f$ should be such that $x_A \circ f(x_A, x_B)$ matches anatomically with $x_B$.
+
+\subsection{Symmetric formulation}
+
+As discussed in Section \ref{sec:intro}, we want our method to be symmetric. To achieve this, we define the network $f$ using another \textit{auxiliary network} $u$ which also predicts deformations:
+\begin{equation}\label{eq:anti-symmetric_formulation}
+    f(x_A, x_B) := u(x_A, x_B) \circ u(x_B, x_A)^{-1}.
+\end{equation}
+As a result, it holds that $f(x_A, x_B) = f(x_B, x_A)^{-1}$ apart from errors introduced by the composition and inversion, resulting in a very low cycle-consistency error. An additional benefit is that $f(x_A, x_A)$ equals the identity transformation, again apart from numerical inaccuracies, which is a natural requirement for a registration method.
+%
+Applying the formulation in Equation \ref{eq:anti-symmetric_formulation} naively would double the computational cost. To avoid this we encode features from the inputs separately before feeding them to the deformation extraction network in Equation \ref{eq:anti-symmetric_formulation}. A similar approach has been used in recent registration methods \citep{estienne2021mics, young2022superwarp}. Denoting the feature extraction network by $h$, the modified formulation is
+\begin{equation}\label{eq:anti-symmetric_formulation_with_features}
+    f(x_A, x_B) := u(h(x_A), h(x_B)) \circ u(h(x_B), h(x_A))^{-1}.
+\end{equation}
+
+\subsection{Multi-resolution architecture}\label{sec:multi-resolution}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=1.0\textwidth]{figures/architecture_overview.pdf}
+\vskip -0.05in
+\label{fig:architecture_overview}
+\caption{\textbf{Overview of the proposed architecture.} Multi-resolution features are first extracted from the inputs $x_A$ and $x_B$ using convolutional encoder $h$. Output deformations $f_{1\to2}(x_A, x_B)$ and $f_{2\to1}(x_A, x_B)$ are built recursively from the multi-resolution features using the symmetric deformation updates described in Section \ref{sec:multi-resolution} and visualized in Figure \ref{fig:anti-symmetric_update}. The architecture is symmetric and inverse consistent with respect to the inputs and the final deformation is obtained in both directions. The brain images are from the OASIS dataset \citep{marcus2007open}}
+\vskip -0.1in
+\end{figure*}
+
+As the overarching architecture, we propose a novel symmetric and inverse consistent multi-resolution coarse-to-fine approach. For motivation, see Section \ref{sec:multi-resolution_background}. Overview of the architecture is shown in Figure \ref{fig:architecture_overview}, and the prediction process is demonstrated visually in Figure \ref{appendix-fig:detailed_deformation_example} (Appendix \ref{appendix:additional_results}).
+
+First, we extract image feature representations $h^{(k)}(x_A), h^{(k)}(x_B)$, at different resolutions $k \in \{0,\dots,K - 1\}$. Index $k=0$ is the original resolution and increasing $k$ by one halves the spatial resolution. In practice $h$ is a ResNet \citep{he2016deep} style convolutional network and features at each resolution are extracted sequentially from previous features. Starting from the lowest resolution $k=K-1$, we recursively build the final deformation between the inputs using the extracted representations. To ensure symmetry, we build two deformations: one deforming the first image half-way towards the second image, and the other for deforming the second image half-way towards the first image (see Section \ref{sec:symmetric_registration_formulation}). The full deformation is composed of these at the final stage. Let us denote the half-way deformations extracted at resolution $k$ as $d_{1\to1.5}^{(k)}$ and $d_{2\to1.5}^{(k)}$. Initially, at level $k = K$, these are identity deformations. Then, at each $k = K-1,\ldots, 0$, the half-way deformations are updated by composing them with a predicted update deformation. In detail, the update at level $k$ consists of three steps (visualized in Figure \ref{fig:anti-symmetric_update}):
+    \begin{enumerate}
+        \item Deform the feature representations $h^{(k)}(x_A), h^{(k)}(x_B)$ of level $k$ towards each other by the half-way deformations from the previous level $k + 1$:
+        \begin{equation}\label{eq:deformed_features}
+            z_1^{(k)}:=h^{(k)}(x_A) \circ d_{1\to1.5}^{(k + 1)}\ \quad \text{and} \quad \ z_2^{(k)}:=h^{(k)}(x_B) \circ d_{2\to1.5}^{(k + 1)}.
+        \end{equation}
+        %JooThese deformed feature representations are then used to predict the deformation update.
+        \item Define an \textit{update deformation} $\delta^{(k)}$, using the idea from Equation \ref{eq:anti-symmetric_formulation_with_features} and the half-way deformed feature representations $z_1^{(k)}$ and $z_2^{(k)}$:
+        \begin{equation}
+            \delta^{(k)} := u^{(k)}(z_1^{(k)}, z_2^{(k)}) \circ u^{(k)}(z_2^{(k)}, z_1^{(k)})^{-1}.\label{eq:update_deformation_formula}
+        \end{equation}
+        Here, $u^{(k)}$ is a trainable convolutional neural network predicting an invertible auxiliary deformation (details in Appendix \ref{appendix:topology_preserving_u}). The intuition here is that the symmetrically predicted update deformation $\delta^{(k)}$ should learn to adjust for whatever differences in the image features remain after deforming them half-way towards each other in Step 1 with deformations $d^{(k+1)}$ from the previous resolution.
+        \item Obtain the updated half-way deformation $d_{1\to1.5}^{(k)}$ by composing the earlier half-way deformation of level $k + 1$ with the update deformation $\delta^{(k)}$
+        \begin{equation}\label{eq:forward_update}
+            d_{1\to1.5}^{(k)} := d_{1\to1.5}^{(k + 1)}\ \circ\ \delta^{(k)}.
+        \end{equation}
+        For the other direction $d_{2\to1.5}^{(k)}$, we use the inverse of the deformation update $\left(\delta^{(k)}\right)^{-1}$ which can be obtained simply by reversing $z_1^{(k)}$ and $z_2^{(k)}$ in Equation \ref{eq:update_deformation_formula} (see Figure \ref{fig:anti-symmetric_update}):
+        \begin{equation}\label{eq:inverse_update}
+            d_{2\to1.5}^{(k)}\\
+                = d_{2\to1.5}^{(k + 1)}\ \circ\ \left(\delta^{(k)}\right)^{-1}.
+        \end{equation}
+        The inverses $\left(d_{1\to1.5}^{(k)}\right)^{-1}$ and $\left(d_{2\to1.5}^{(k)}\right)^{-1}$ are updated similarly.
+    \end{enumerate}
+
+The full registration architecture is then defined by the functions $f_{1\to2}$ and $f_{2\to1}$ which compose the half-way deformations from stage $k=0$:
+    \begin{equation}\label{eq:final_deformation}
+        f_{1\to2}(x_A, x_B) := d_{1\to1.5}^{(0)} \circ \left(d_{2\to1.5}^{(0)}\right)^{-1}
+        \ \quad \text{and}\ \quad
+        f_{2\to1}(x_A, x_B) := d_{2\to1.5}^{(0)} \circ \left(d_{1\to1.5}^{(0)}\right)^{-1}.
+    \end{equation}
+Note that $d_{1\to1.5}^{(0)}$, $d_{2\to1.5}^{(0)}$, and their inverses %$\left(d_{2\to1.5}^{(0)}\right)^{-1}$, and $\left(d_{1\to1.5}^{(0)}\right)^{-1}$
+are functions of $x_A$ and $x_B$ through the features $h^{(k)}(x_A), h^{(k)}(x_B)$ in Equation \ref{eq:deformed_features}, but the dependence is suppressed in the notation for clarity.
+
+
+\begin{figure}
+\centering
+\includegraphics[width=0.7\columnwidth]{figures/anti-symmetric_update.pdf}
+\caption{\textbf{Recursive multi-resolution deformation update.} The deformation update at resolution $k$, described in Section \ref{sec:multi-resolution}, takes as input the half-way deformations $d_{1\to1.5}^{(k+1)}$ and $d_{2\to1.5}^{(k+1)}$ from the previous resolution, and updates them through a composition with an update deformation $\delta^{(k)}$. The update deformation  $\delta^{(k)}$ is calculated symmetrically from image features $z_1^{(k)}$ and $z_2^{(k)}$ (deformed mid-way towards each other with the previous half-way deformations) using a neural network $u^{(k)}$ according to Equation \ref{eq:update_deformation_formula}. The deformation inversion layer for inverting auxiliary deformations predicted by $u^{(k)}$ is described in Section \ref{sec:def_inv_layer}.}
+\label{fig:anti-symmetric_update}
+\end{figure}
+
+By using half-way deformations at each stage, we avoid the problem with full deformations of having to select either of the image coordinates to which to deform the feature representations of the next stage, breaking the symmetry of the architecture. Now we can instead deform the feature representations of both inputs by the symmetrically predicted half-way deformations, which ensures that the updated deformations after each stage are separately invariant to input order.
+
+\subsection{Implicit deformation inversion layer}\label{sec:def_inv_layer}
+
+Implementing the architecture requires inverting deformations from $u^{(k)}$ in Equation \ref{eq:update_deformation_formula}. This could be done, e.g., with the SVF framework, but we propose an approach which requires storing $\approx 5$ times less data for the backward pass than the standard SVF. The memory saving is significant due to the high memory consumption of volumetric data, allowing larger images to be registered. During each forward pass $2 \times (K - 1)$ inversions are required. More details are provided in Appendix \ref*{appendix:memory}.
+
+As shown by \citet{chen2008simple}, deformations can be inverted in certain cases by a  fixed point iteration. Consequently, we propose to use the deep equilibrium network framework from Section \ref{sec:deqn} for inverting deformations, and label the resulting layer \textit{deformation inversion layer}. The fixed point equation proposed by \citet{chen2008simple} is
+\begin{equation*}
+    g(z, a) := -(a - \mathcal{I}) \circ z + \mathcal{I},
+\end{equation*}
+where $a$ is the deformation to be inverted, $z$ is the candidate for the inverse of $a$, and $\mathcal{I}$ is the identity deformation. It is easy to see that substituting $a^{-1}$ for $z$, yields $a^{-1}$ as output. We use Anderson acceleration \citep{walker2011anderson} for solving the fixed point equation and use the memory-effecient back-propagation \citep{bai2019deep, duvenaud2020deep} strategy discussed in Section \ref{sec:deqn}.
+
+Lipschitz condition is sufficient for the fixed point algorithm to converge \citep{chen2008simple}, and we ensure that the predicted deformations fulfill the condition (see Appendix \ref{appendix:topology_preserving_u}). The iteration converges well also in practice as shown in Appendix \ref{appendix:deformation_inversion_iteration_counts}.
+
+\subsection{Theoretical properties}
+%The proposed method fulfills the following theoretical properties.\\
+
+\begin{theorem}\label{theorem:inverse_consistent}
+The proposed architecture is inverse consistent by construct.
+\end{theorem}
+
+\begin{theorem}\label{theorem:symmetric}
+The proposed architecture is symmetric by construct.
+\end{theorem}
+
+\begin{theorem}\label{theorem:topology_preserving}
+Assume that $u^{(k)}$ is defined as described in Appendix \ref{appendix:topology_preserving_u}. Then the proposed architecture is topology preserving. 
+\end{theorem}
+
+\begin{proof}\renewcommand{\qedsymbol}{}
+Appendix \ref{appendix:theoretical_properties_proof}, including discussion on numerical errors caused by limited sampling resolution.
+\end{proof}
+
+\subsection{Training and implementation}
+
+We train the model in an unsupervised end-to-end manner similarly to most other unsupervised registration methods, by using similarity and deformation regularization losses. The similarity loss encourages deformed images to be similar to the target images, and the regularity loss encourages desirable properties, such as smoothness, on the predicted deformations. For similarity we use local normalized cross-correlation with window width 7 and for regularization we use $L^2$ penalty on the gradients of the displacement fields, identically to VoxelMorph \citep{balakrishnan2019voxelmorph}. We apply the losses in both directions to maintain symmetry. One could apply the losses in the intermediate coordinates and avoid building the full deformations during training. %However, we do not do this since we expect that applying the losses in the original image coordinates yields the best results.
+The final loss is:
+\begin{equation}
+    \mathcal{L} = \operatorname{NCC}(x_A \circ d_{1\to 2},\ x_B) +
+    \operatorname{NCC}(x_A,\ x_B\circ d_{2\to 1}) + \lambda \times \left[
+        \operatorname{Grad}(d_{1\to 2}) + \operatorname{Grad}(d_{2\to 1})
+    \right],
+%\end{aligned}
+\end{equation}
+where $d_{1\to2} := f_{1\to2}(x_A, x_B)$, $d_{2\to1} := f_{2\to1}(x_A, x_B)$,  $\operatorname{NCC}$ the local normalized cross-correlation loss, $\operatorname{Grad}$ the $L^2$ penalty on the gradients of the displacement fields, and $\lambda$ is the regularization weight. For details on hyperparameter selection, see Appendix \ref*{appendix:hyperparameter_selection}.
+%
+Our implementation is in PyTorch \citep{pytorch}. Code is included in supplementary materials, allowing replication. Evaluation methods and preprocessing done by us, see Section \ref{sec:experiments}, are included. The repository will be published upon acceptance.
+
+\subsection{Inference}\label{sec:inference}
+
+We consider two variants: \textbf{Standard}: The final deformation is formed by iteratively resampling at each image resolution (common approach). \textbf{Complete}: All individual deformations (outputs of $u^{(k)}$) are stored in memory and the final deformation is their true composition.
+%
+The latter is included only to demonstrate that the deformation is everywhere invertible (no negative determinants) without numerical sampling errors, but the first one is used unless stated otherwise, and perfect invertibility is not necessary in practice. Due to limited sampling resolution even the existing "diffeomorphic" registration frameworks such as SVF do not usually achieve perfect invertibility. %Note that the standard approach is always used during training due to lighter computational cost.
+
+\section{Experimental setup}\label{sec:experiments}
+
+\textbf{Datasets:} We use two subject-to-subject registration datasets: \textit{OASIS} brains dataset with 414 T1-weighted brain MRI images \citep{marcus2007open} as pre-processed for Learn2Reg challenge \mbox{\citep{hoopes2021hypermorph, hering2022learn2reg}} %(data use agreement website 
+\footnote{\href{https://www.oasis-brains.org/\#access}{https://www.oasis-brains.org/\#access}}
+%)
+, and \textit{LPBA40} dataset from University of California Laboratory of Neuro Imaging (USC LONI) with 40 brain MRI images \citep{shattuck2008construction}
+%(LONI Research License, Version 3.0
+\footnote{\href{https://resource.loni.usc.edu/resources/atlases/license-agreement/}{https://resource.loni.usc.edu/resources/atlases/license-agreement/}}
+%)
+. Pre-processing for both datasets includes bias field correction, normalization, and cropping. For OASIS dataset we use affinely pre-aligned images and for LPBA40 dataset we use rigidly pre-aligned images. Additionally we train our model without any pre-alignment on OASIS data (\textit{OASIS raw}) to test our method with larger initial displacements. Voxel sizes of the affinely aligned and raw datasets are the same but volume sizes differ. Details of the split into training, validation, and test sets, and cropping and resolution can be found in Appendix \ref*{appendix:dataset_details}.
+%
+%with resolution $256 \times 256 \times 256$
+%
+
+%\subsection{Evaluation metrics}
+
+\textbf{Evaluation metrics:} We evaluate \textit{registration accuracy} using segmentations of brain structures included in the datasets: ($35$ structures for OASIS and $56$ for LPBA40), and two metrics: Dice score (Dice) and 95\% quantile of the Hausdorff distances (HD95), similarly to  Learn2Reg challenge \citep{hering2022learn2reg}. Dice score measures the overlap of the segmentations of source images deformed by the method and the segmentations of target images, and HD95 measures the distance between the surfaces of the segmentations.
+%
+However, comparing methods only based on the overlap of anatomic regions is insufficient \citep{pluim2016truth, rohlfing2011image}, and hence also \textit{deformation regularity} should be measured, for which we use conventional metrics based on the local Jacobian determinants at $10^6$ sampled locations in each volume. The local derivatives were estimated via small perturbations of $10^{-7}$ voxels. We measure topology preservation as the proportion of the locations with a negative determinant ($\%$ of $|J_{\phi}|_{\leq 0}$), and deformation smoothness as the standard deviation of the determinant ($\operatorname{std}(|J_{\phi}|)$). Additionally we report inverse and cycle \textit{consistency} errors, see Section \ref{sec:intro}.
+
+%\subsection{Baseline methods}
+
+\textbf{Baselines:} We compare against \textit{VoxelMorph} \citep{balakrishnan2019voxelmorph}, \textit{SYMNet} \citep{mok2020fast}, and conditional LapIRN (\textit{cLapIRN}) \citep{mok2020large, mok2021conditional}. VoxelMorph is a standard baseline in deep learning based unsupervised registration. With SYMNet we are interested in how well our method preserves topology and how accurate the generated inverse deformations are compared to the SVF based methods. Additionally, since SYMNet is symmetric from the loss point of view, it is interesting to see how symmetric predictions it produces in practice. cLapIRN was the best method on OASIS dataset in Learn2Reg 2021 challenge \citep{hering2022learn2reg}. We used the official implementations\footnote{\href{https://github.com/voxelmorph/voxelmorph}{https://github.com/voxelmorph/voxelmorph}}\footnote{\href{https://github.com/cwmok/Fast-Symmetric-Diffeomorphic-Image-Registration-with-Convolutional-Neural-Networks}{https://github.com/cwmok/Fast-Symmetric-Diffeomorphic-Image-Registration-with-Convolutional-Neural-Networks}}\footnote{\href{https://github.com/cwmok/Conditional_LapIRN/}{https://github.com/cwmok/Conditional\_LapIRN/}} adjusted to our datasets. SYMNet uses anti-folding loss to penalize negative determinant. Since this loss is a separate component that could be easily used with any method, we also train SYMNet without it, denoted \textit{SYMNet (simple)}. This provides a comparison on how well the vanilla SVF framework can generate invertible deformations in comparison to our method. For details on hyperparameter selection for baseline models, see Appendix \ref*{appendix:baseline_hyperparameter}.
+
+\section{Results}\label{sec:results}
+
+\begin{table*}
+\centering
+%\setlength\tabcolsep{1.5pt}
+\scriptsize
+\caption{\textbf{Results, OASIS dataset.} Mean and standard deviation of each metric are computed on the test set.
+%For our method (SITReg) the percentage of folding voxels ($\%$ of $|J_{\phi}|_{\leq 0}$) is computed for both inference variants described in Section \ref{sec:inference}.
+The percentage of folding voxels ($\%$ of $|J_{\phi}|_{\leq 0}$) from the complete SITReg version is shown in {\color{blue}blue}, other results are with the standard version (see Section \ref{sec:inference}).
+VoxelMorph and cLapIRN do not predict inverse deformations and hence the inverse-consistency error is not shown. Determinant standard deviation and the consistency metrics are omitted for the SITReg (raw data) since they are not comparable with others (omitted values were $\expnumber{1.0}{-3} (\expnumber{3.9}{-4}) / \color{blue}{0 (0)}$, $0.18(0.028)$,  $\expnumber{1.2}{-3} (\expnumber{2.7}{-4})$, and $\expnumber{1.2}{-3} (\expnumber{2.7}{-4})$).}
+\vskip 0.15in
+\begin{tabular}{lcccccc}
+
+\toprule
+& \multicolumn{2}{c}{Accuracy} & \multicolumn{2}{c}{Deformation regularity} & \multicolumn{2}{c}{Consistency}\\
+\cmidrule(r){2-3} \cmidrule(r){4-5} \cmidrule(r){6-7}
+Model & Dice $\uparrow$ & HD95 $\downarrow$ & $\%$ of $|J_{\phi}|_{\leq 0} \downarrow$ & $\operatorname{std}(|J_{\phi}|) \downarrow$ & Cycle $\downarrow$ & Inverse $\downarrow$ \\
+\midrule SYMNet (original) & $0.788 (0.029)$ &   $2.15 (0.57)$   & $\bm{\expnumber{1.5}{-3}} (\expnumber{4.3}{-4})$ &               $\bm{0.44} (0.039)$                & $\expnumber{3.0}{-1} (\expnumber{2.9}{-2})$ & $\bm{\expnumber{3.5}{-3}} (\expnumber{4.2}{-4})$ \\
+ SYMNet (simple)            & $0.787 (0.029)$ &   $2.17 (0.58)$   & $\expnumber{1.5}{-2} (\expnumber{3.1}{-3})$ &               $0.46 (0.045)$                & $\expnumber{2.8}{-1} (\expnumber{2.8}{-2})$ & $\expnumber{5.2}{-3} (\expnumber{8.4}{-4})$ \\
+ VoxelMorph                 & $0.803 (0.031)$ &   $2.08 (0.57)$   & $\expnumber{1.4}{-1} (\expnumber{9.4}{-2})$ &               $0.49 (0.032)$                & $\expnumber{4.5}{-1} (\expnumber{5.3}{-2})$ &                      -                      \\
+ cLapIRN                    & $0.812 (0.027)$ &   $1.93 (0.50)$   & $\expnumber{1.1}{0} (\expnumber{2.1}{-1})$  &               $0.55 (0.032)$                & $\expnumber{1.2}{0} (\expnumber{1.6}{-1})$  &                      -                      \\
+ \midrule SITReg            & $\bm{0.818} (0.025)^*$ &   $1.84 (0.45)^*$   & $\expnumber{8.1}{-3} (\expnumber{1.6}{-3}) / \color{blue}{\bm{0}(0)}$ &               $0.45 (0.038)$                & $\bm{\expnumber{5.5}{-3}} (\expnumber{6.9}{-4})$ & $\expnumber{5.5}{-3} (\expnumber{6.9}{-4})$ \\
+ SITReg (raw data)          & $0.813 (0.023)^*$ &   $\bm{1.80} (0.52)^*$   & - &               -                & - & - \\
+
+\midrule
+\multicolumn{7}{l}{
+$^*$ Statistically significant ($p < 0.05$) improvement compared to the baselines, for details see Appendix \ref*{appendix:statistical_significance}.
+}
+
+\end{tabular}
+\vskip -0.15in
+\label{table:results_oasis}
+\end{table*}
+
+\begin{table*}
+\centering
+%\setlength\tabcolsep{1.5pt}
+\scriptsize
+\caption{\textbf{Results, LPBA40 dataset.} The results are interpreted similarly to Table \ref{table:results_oasis}.}
+\vskip 0.15in
+\begin{tabular}{lcccccc}
+
+\toprule
+& \multicolumn{2}{c}{Accuracy} & \multicolumn{2}{c}{Deformation regularity} & \multicolumn{2}{c}{Consistency}\\
+\cmidrule(r){2-3} \cmidrule(r){4-5} \cmidrule(r){6-7}
+Model & Dice $\uparrow$ & HD95 $\downarrow$ & $\%$ of $|J_{\phi}|_{\leq 0} \downarrow$ & $\operatorname{std}(|J_{\phi}|) \downarrow$ & Cycle $\downarrow$ & Inverse $\downarrow$ \\
+ \midrule SYMNet (original) & $0.669 (0.033)$ &   $6.79 (0.70)$   & $\bm{\expnumber{1.1}{-3}} (\expnumber{4.6}{-4})$ &               $0.35 (0.050)$                & $\expnumber{2.7}{-1} (\expnumber{6.1}{-2})$ & $\bm{\expnumber{2.1}{-3}} (\expnumber{4.3}{-4})$ \\
+ SYMNet (simple)            & $0.664 (0.034)$ &   $6.88 (0.73)$   & $\expnumber{4.7}{-3} (\expnumber{1.6}{-3})$ &               $0.37 (0.053)$                & $\expnumber{2.8}{-1} (\expnumber{5.8}{-2})$ & $\expnumber{2.9}{-3} (\expnumber{6.7}{-4})$ \\
+ VoxelMorph                 & $0.676 (0.032)$ &   $6.72 (0.68)$   & $\expnumber{2.2}{-1} (\expnumber{2.1}{-1})$ &               $0.35 (0.040)$                & $\expnumber{3.1}{-1} (\expnumber{1.1}{-1})$ & -                                           \\
+ cLapIRN                    & $0.714 (0.019)$ &   $5.93 (0.43)$   & $\expnumber{8.4}{-2} (\expnumber{2.9}{-2})$ &               $\bm{0.27} (0.020)$                & $\expnumber{5.6}{-1} (\expnumber{1.8}{-1})$ & -                                           \\
+ \midrule SITReg            & $\bm{0.720} (0.017)^*$ &   $\bm{5.88} (0.43)$   & $\expnumber{2.4}{-3} (\expnumber{6.4}{-4}) / {\color{blue}\bm{0} (0)}$ &               $0.31 (0.032)$                & $\bm{\expnumber{2.6}{-3}} (\expnumber{4.2}{-4})^*$ & $\expnumber{2.6}{-3} (\expnumber{4.2}{-4})$ \\
+\midrule
+\multicolumn{7}{l}{$^*$ Statistically significant ($p < 0.05$) improvement compared to the baselines, for details see Appendix \ref*{appendix:statistical_significance}.}
+\end{tabular}
+\vskip -0.05in
+\label{table:results_lpba40}
+\end{table*}
+
+Evaluation results are in Tables \ref{table:results_oasis} and \ref{table:results_lpba40}, and additional figures in Appendix \ref{appendix:additional_results}. The assessment of registration performance should not be based on a single metric, e.g., accuracy, but instead on the overall performance across different metrics, similarly to the Learn2reg challenge \citep{hering2022learn2reg}. This is because of the trade-off invoked by the regularization hyperparameter (in our case $\lambda$) between the accuracy and regularization metrics (an extreme example is presented by \citet{rohlfing2011image}), which can change the ranking of the methods for different metrics. In such an overall comparison, our method clearly outperforms all baselines on both datasets, as summarized below:
+
+\begin{itemize}
+    \item \textbf{VoxelMorph:} Our method outperforms it on every metric.
+    \item \textbf{SYMNet:} While \textit{SYMNet (original)} has slightly fewer folding voxels (compared to our standard inference variant) and slightly better inverse consistency, our method has a significantly better dice score. By increasing regularization one could easily make our model to have better regularity while maintaining significantly better dice score than SYMNet. Indeed, based on validation set results in Table \ref{appendix-fig:dice_scores_oasis} in Appendix \ref{appendix:hyperparameter_selection}, by setting $\lambda=2$, our model would be superior on every metric compared to SYMNet. In other words, our method has significantly better overall performance.
+    \item \textbf{cLapIRN:} While in terms of tissue overlap metrics our method is only slightly better than cLapIRN, our method has significantly better deformation regularity in terms of folding voxels, and also significantly better cycle consistency.
+\end{itemize}
+
+\begin{table*}
+\centering
+%\setlength\tabcolsep{3pt}
+\scriptsize
+\caption{\textbf{Computational efficiency, OASIS dataset.} Mean and standard deviation are shown. Inference time and memory usage were measured on NVIDIA GeForce RTX 3090. Images in the raw dataset without pre-alignment have $3.8$ times more voxels, significantly increasing the inference time and memory usage.}
+\vskip 0.15in
+\begin{tabular}{lccc}
+\toprule
+ Model                               & Inference Time (s) $\downarrow$ & Inference Memory (GB) $\downarrow$ & \# parameters (M) $\downarrow$ \\
+ \midrule SYMNet (original)             &        $\bm{0.095} (0.00052)$        &               $\bm{1.9}$                &             $\bm{0.9}$              \\
+ SYMNet (simple) &        $0.096 (0.00044)$        &               $\bm{1.9}$                &             $\bm{0.9}$              \\
+ VoxelMorph                  &         $0.16 (0.0010)$         &               $5.6$                &             $1.3$              \\
+ cLapIRN                     &        $0.10 (0.00052)$         &               $4.1$                &             $1.2$              \\
+ \midrule SITReg             &         $0.37 (0.0057)$         &               $3.4$                &             $1.2$              \\
+ SITReg (raw data)           &          $1.9 (0.022)$          &               $12.1$               &             $2.5$              \\
+\bottomrule
+\end{tabular}
+\vskip -0.1in
+\label{table:performance_results}
+\end{table*}
+
+A comparison of the methods' efficiencies is in Table \ref{table:performance_results}. Inference time of our method is slightly larger than that of the compared methods, but unlike VoxelMorph and cLapIRN, it produces deformations in both directions immediately. Also, half a second runtime is still very fast and restrictive only in the most time-critical use cases. In terms of memory usage our method is very competitive.
+
+\section{Conclusions}
+
+We proposed a novel image registration architecture inbuilt with the desirable inductive biases of symmetry, inverse consistency, and topology preservation. The multi-resolution formulation was capable of accurately registering images even with large intial misalignments. As part of our method, we developed a new neural network component \textit{deformation inversion layer}. The model is easily end-to-end trainable and does not require tedious multi-stage training strategies. In the experiments the method demonstrated state-of-the-art registration performance. The main limitation is somewhat heavier computational cost than other methods.
+
+\bibliographystyle{agsm.bst}
+\bibliography{references}
+
+\appendix
+\clearpage
+\section{Topology preserving deformation prediction networks}\label{appendix:topology_preserving_u}
+
+Each $u^{(k)}$ predicts a deformation based on the features $z_1^{(k)}$ and $z_2^{(k)}$ and we define the networks $u^{(k)}$ as CNNs predicting cubic spline control point grid in the resolution of the features $z_1^{(k)}$ and $z_2^{(k)}$. The use of cubic spline control point grid for defining deformations is a well-known strategy in image registration, see e.g. \citep{rueckert2006diffeomorphic, de2019deep}.
+
+However, deformations generated by $u^{(k)}$ have to be invertible to ensure the topology preservation property, and particularly invertible by the deformation inversion layer. To ensure that, we limit the control point absolute values below a hard contraint $\gamma^{(k)}$ using a scaled $\operatorname{Tanh}$ function.
+
+In more detail, each $u^{(k)}$ then consists of the following sequential steps:
+\begin{enumerate}
+    \item Concatenation of the two inputs, $z_1^{(k)}$ and $z_2^{(k)}$, along the channel dimension. Before concatenation we reparametrize the features as $z_1^{(k)} - z_2^{(k)}$ and $z_1^{(k)} + z_2^{(k)}$ as suggested by \citet{young2022superwarp}.
+    \item Two convolutions with kernel of spatial size $3$ with ReLU activation after each of the convolutions.
+    \item Convolution with kernel of spatial size $1$ and number of dimensions as output channels.
+    \item\label{appendix-enumerate:tanh_step} $\gamma^{(k)} \times \operatorname{Tanh}$ function
+    \item Cubic spline upsampling to the image resolution by interpreting the output of the step \ref{appendix-enumerate:tanh_step} as cubic spline control point grid, similarly to e.g. \cite{de2019deep}. Cubic spline upsampling can be effeciently implemented as one dimensional transposed convolutions along each axis. 
+\end{enumerate}
+
+As shown in Appendix \ref{appendix:optimal_gamma}, optimal upper bound for $\gamma^{(k)}$ ensuring invertibility can be obtained by the formula $\gamma^{(k)} < \frac{1}{K^{{k}}_n}$
+where
+\begin{equation}\label{appendix-eq:optimal_gamma}
+K^{(k)}_n := \max_{\begin{subarray}{l}x \in X\end{subarray}}\ \sum_{\alpha\in \mathbb{Z}^n} \left| \sum_{j=1}^{n}\frac{B(x_j + \frac{1}{2^k} - \alpha_j) - B(x_j - \alpha_j)}{1 / 2^k} \prod_{i\in N\setminus \{j\}} B(x_i - \alpha_i)\right|,
+\end{equation}
+$n$ is the dimensionality of the images (in this work $n = 3$),  $X := \{\frac{1}{2}+ \frac{1}{2^{k + 1}} + \frac{i}{2^k}\ |\ i \in \mathbb{Z}\}^n \cap [0, 1]^n$ are the relative sampling positions used in cubic spline upsampling (imlementation detail), and $B$ is a centered cardinal cubic B-spline (symmetric function with finite support). In practice we define $\gamma^{(k)} := 0.99 \times \frac{1}{K^{(k)}_n}$.
+
+The formula can be evaluated exactly for dimensions $n = 2, 3$ for a reasonable number of resolution levels (for concrete values, see Table \ref{appendix-table:K_values}). Note that the outer sum over $\mathbb{Z}^n$ is finite since $B$ has a finite support and hence only a finite number of terms are non-zero.
+
+\begin{table}[b]
+\centering
+%\setlength\tabcolsep{3pt}
+\scriptsize
+\caption{Values of $K_2$ and $K_3$ for different sampling rates with respect to the control point grid. The bound for $\text{Sampling rate} = \infty$ is from \citep{choi2000injectivity}. For each resolution level we define the maximum control point absolute values $\gamma^{(k)}$ as $0.99 \times \frac{1}{K^{(k)}_n}$ (in our experiments we have $n=3$ dimensional data). Codebase contains implementation for computing the value for other $k$.}
+\begin{tabular}{llcc}
+\toprule
+k & Sampling rate                    &    $K^{(k)}_2$    &    $K^{(k)}_3$    \\
+\midrule
+0 & 1                                    & 2.222222222 & 2.777777778 \\
+1 & 2                                    & 2.031168620 & 2.594390728 \\
+2 & 4                                    & 2.084187826 & 2.512366240 \\
+3 & 8                                    & 2.063570023 & 2.495476474 \\
+4 & 16                                   & 2.057074951 & 2.489089713 \\
+5 & 32                                   & 2.052177394 & 2.484247818 \\
+6 & 64                                   & 2.049330491 & 2.481890143 \\
+7 & 128                                  & 2.047871477 & 2.480726430 \\
+8 & 256                                  & 2.047136380 & 2.480102049 \\
+$\infty$  & $\infty$ & 2.046392675 & 2.479472335 \\
+\bottomrule
+\end{tabular}
+\label{appendix-table:K_values}
+\end{table}
+\clearpage
+\section{Hyperparameter selection details}\label{appendix:hyperparameter_selection}
+
+We experimented on validation set with different hyperparameters during the development. While the final results on test set are computed only for one chosen configuration, the results on validation set might still be of interest for the reader. Results of these experiments for the OASIS dataset are shown in Table \ref{appendix-table:hyperparameter_optimization_oasis} and for the LPBA40 dataset in Table \ref{appendix-table:hyperparameter_optimization_lpba40}.
+
+For the OASIS dataset we experimented with two configurations of number of resolution levels $K$. With both of these configurations we tested three different values for the regularization weight $\lambda$.
+
+For the LPBA40 dataset we experimented with total of 6 configurations of number of resolution levels $K$ and whether to predict an affine transformation, but used the regularization weight value $\lambda = 1.0$ for all of them.
+
+With the raw OASIS dataset without pre-alignment we used $6$ resolution levels, together with an affine transformation prediction stage before the other deformation updates. We omitted the predicted affine transformation from the deformation regularization.
+
+\begin{table}[h]
+\centering
+%\setlength\tabcolsep{3pt}
+\scriptsize
+\caption{Hyperparameter optimization results for our method calculated on the OASIS validation set. The chosen configuration was $\lambda = 1.0$, and $K=4$. HD95 metric is not included due to relatively high computational cost.}
+\begin{tabular}{cccccccc}
+\toprule
+\multicolumn{2}{c}{Hyperparameters}  & \multicolumn{1}{c}{Accuracy} & \multicolumn{2}{c}{Deformation regularity} & \multicolumn{2}{c}{Consistency}\\
+\cmidrule(r){1-2} \cmidrule(r){3-3} \cmidrule(r){4-5} \cmidrule(r){6-7}
+$\lambda$  & $K$ & Dice $\uparrow$ & $|J_{\phi}|_{\leq 0} \downarrow$ & $\operatorname{std}(|J_{\phi}|) \downarrow$ &       Cycle $\downarrow$        &      Inverse $\downarrow$       \\
+ \midrule 1.0    &  5  & $0.822 (0.035)$ & $\expnumber{9.1}{-3} (\expnumber{1.7}{-3})$ &               $0.45 (0.027)$                & $\expnumber{5.7}{-3} (\expnumber{6.0}{-4})$ & $\expnumber{5.7}{-3} (\expnumber{6.0}{-4})$ \\
+    1.5    &  5  & $0.818 (0.034)$ & $\expnumber{1.9}{-3} (\expnumber{5.1}{-4})$ &               $0.40 (0.023)$                & $\expnumber{3.7}{-3} (\expnumber{3.4}{-4})$ & $\expnumber{3.7}{-3} (\expnumber{3.4}{-4})$ \\
+    2.0    &  5  & $0.815 (0.035)$ & $\expnumber{3.7}{-4} (\expnumber{2.0}{-4})$ &               $0.37 (0.021)$                & $\expnumber{2.6}{-3} (\expnumber{2.1}{-4})$ & $\expnumber{2.6}{-3} (\expnumber{2.1}{-4})$ \\
+    1.0    &  4  & $0.822 (0.034)$ & $\expnumber{8.2}{-3} (\expnumber{1.5}{-3})$ &               $0.44 (0.028)$                & $\expnumber{5.5}{-3} (\expnumber{5.6}{-4})$ & $\expnumber{5.5}{-3} (\expnumber{5.6}{-4})$ \\
+    1.5    &  4  & $0.819 (0.035)$ & $\expnumber{2.1}{-3} (\expnumber{5.8}{-4})$ &               $0.40 (0.023)$                & $\expnumber{3.4}{-3} (\expnumber{3.3}{-4})$ & $\expnumber{3.4}{-3} (\expnumber{3.3}{-4})$ \\
+    2.0    &  4  & $0.815 (0.036)$ & $\expnumber{3.6}{-4} (\expnumber{2.1}{-4})$ &               $0.37 (0.020)$                & $\expnumber{2.6}{-3} (\expnumber{2.2}{-4})$ & $\expnumber{2.6}{-3} (\expnumber{2.2}{-4})$ \\
+\bottomrule
+\end{tabular}
+\label{appendix-table:hyperparameter_optimization_oasis}
+\end{table}
+
+\begin{table}[h]
+\centering
+%\setlength\tabcolsep{3pt}
+\scriptsize
+\caption{Hyperparameter optimization results for our method calculated on the LPBA40 validation set. The chosen configuration was $\lambda = 1.0$, $K=7$, and $\text{Affine} = \text{No}$.}
+\begin{tabular}{ccccccccccc}
+\toprule
+\multicolumn{3}{c}{Hyperparameters}  & \multicolumn{2}{c}{Accuracy} & \multicolumn{2}{c}{Deformation regularity} & \multicolumn{2}{c}{Consistency}\\
+\cmidrule(r){1-3} \cmidrule(r){4-5} \cmidrule(r){6-7} \cmidrule(r){8-9}
+$\lambda$  & $K$ & Affine & Dice $\uparrow$ & HD95 $\downarrow$ & $|J_{\phi}|_{\leq 0} \downarrow$ & $\operatorname{std}(|J_{\phi}|) \downarrow$ &       Cycle $\downarrow$        &      Inverse $\downarrow$       \\
+ \midrule 1.0 &  4  &   No   & $0.710 (0.015)$ &   $6.10 (0.46)$   & $\expnumber{2.5}{-3} (\expnumber{8.7}{-4})$ &               $0.31 (0.020)$                & $\expnumber{2.5}{-3} (\expnumber{3.5}{-4})$ & $\expnumber{2.5}{-3} (\expnumber{3.5}{-4})$ \\
+    1.0     &  5  &   No   & $0.720 (0.014)$ &   $5.83 (0.36)$   & $\expnumber{1.7}{-3} (\expnumber{5.7}{-4})$ &               $0.30 (0.019)$                & $\expnumber{2.3}{-3} (\expnumber{3.1}{-4})$ & $\expnumber{2.3}{-3} (\expnumber{3.1}{-4})$ \\
+    1.0     &  6  &   No   & $0.725 (0.012)$ &   $5.70 (0.31)$   & $\expnumber{2.1}{-3} (\expnumber{4.8}{-4})$ &               $0.29 (0.019)$                & $\expnumber{2.3}{-3} (\expnumber{3.0}{-4})$ & $\expnumber{2.3}{-3} (\expnumber{3.0}{-4})$ \\
+    1.0     &  7  &   No   & $0.726 (0.011)$ &   $5.69 (0.30)$   & $\expnumber{1.9}{-3} (\expnumber{5.3}{-4})$ &               $0.29 (0.019)$                & $\expnumber{2.3}{-3} (\expnumber{3.1}{-4})$ & $\expnumber{2.3}{-3} (\expnumber{3.1}{-4})$ \\
+    1.0     &  5  &  Yes   & $0.719 (0.014)$ &   $5.86 (0.35)$   & $\expnumber{2.2}{-3} (\expnumber{7.2}{-4})$ &               $0.30 (0.019)$                & $\expnumber{2.4}{-3} (\expnumber{3.3}{-4})$ & $\expnumber{2.4}{-3} (\expnumber{3.3}{-4})$ \\
+    1.0     &  6  &  Yes   & $0.721 (0.015)$ &   $5.78 (0.37)$   & $\expnumber{2.6}{-3} (\expnumber{5.8}{-4})$ &               $0.30 (0.019)$                & $\expnumber{2.4}{-3} (\expnumber{3.2}{-4})$ & $\expnumber{2.4}{-3} (\expnumber{3.2}{-4})$ \\
+\bottomrule
+\end{tabular}
+\label{appendix-table:hyperparameter_optimization_lpba40}
+\end{table}
+\clearpage
+\section{Hyperparameter selection details for baselines}\label{appendix:baseline_hyperparameter}
+
+For cLapIRN baseline we used the regularization parameter value $\overline{\lambda} = 0.05$ for the OASIS dataset and value $\overline{\lambda} = 0.1$ for the LPBA40 dataset where $\overline{\lambda}$ is used as in the paper presenting the method \citep{mok2021conditional}. The values were chosen based on the validation set results shown in Tables \ref{appendix-table:clapirn_hyperparameter_optimization_oasis} and \ref{appendix-table:clapirn_hyperparameter_optimization_lpba40}.
+
+We trained VoxelMorph with losses and regularization weight identical to our method and for SYMNet we used hyperparameters directly provided by \citet{mok2020fast}. We used the default number of convolution features for the baselines except for VoxelMorph we doubled the number of features, as that was suggested in the paper \citep{balakrishnan2019voxelmorph}.
+
+\begin{table}[h]
+\centering
+%\setlength\tabcolsep{3pt}
+\scriptsize
+\caption{Regularization parameter optimization results for cLapIRN calculated on the OASIS validation set. Here $\overline{\lambda}$ refers to the normalized regularization weight of the gradient loss of cLapIRN and should be in range $[0,\ 1]$. Value $\overline{\lambda} = 0.05$ was chosen since it resulted in clearly the highest Dice score. HD95 metric is not included due to relatively high computational cost.}
+\begin{tabular}{cccccc}
+\toprule
+Hyperparameters & \multicolumn{1}{c}{Accuracy} & \multicolumn{2}{c}{Deformation regularity} & Consistency\\
+\cmidrule(r){1-1} \cmidrule(r){2-3} \cmidrule(r){4-5} \cmidrule(r){6-6}
+$\overline{\lambda}$ & Dice $\uparrow$ & $|J_{\phi}|_{\leq 0} \downarrow$ & $\operatorname{std}(|J_{\phi}|) \downarrow$ &       Cycle $\downarrow$     \\
+\midrule
+     0.01      & $0.812 (0.034)$ & $\expnumber{2.5}{0} (\expnumber{2.9}{-1})$  &               $0.82 (0.048)$                & $\expnumber{1.7}{0} (\expnumber{1.5}{-1})$  \\
+         0.05         & $0.817 (0.034)$ & $\expnumber{1.1}{0} (\expnumber{1.8}{-1})$  &               $0.56 (0.029)$                & $\expnumber{1.2}{0} (\expnumber{1.3}{-1})$  \\
+         0.1          & $0.812 (0.035)$ & $\expnumber{4.2}{-1} (\expnumber{1.1}{-1})$ &               $0.43 (0.020)$                & $\expnumber{8.9}{-1} (\expnumber{1.1}{-1})$ \\
+         0.2          & $0.798 (0.038)$ & $\expnumber{7.2}{-2} (\expnumber{3.9}{-2})$ &               $0.30 (0.013)$                & $\expnumber{6.0}{-1} (\expnumber{8.3}{-2})$ \\
+         0.4          & $0.769 (0.042)$ & $\expnumber{1.4}{-3} (\expnumber{1.7}{-3})$ &               $0.18 (0.0087)$               & $\expnumber{3.5}{-1} (\expnumber{4.4}{-2})$ \\
+         0.8          & $0.727 (0.049)$ & $\expnumber{3.4}{-6} (\expnumber{2.2}{-5})$ &               $0.10 (0.0050)$               & $\expnumber{2.5}{-1} (\expnumber{3.8}{-2})$ \\
+         1.0          & $0.711 (0.052)$ & $\expnumber{1.3}{-6} (\expnumber{1.7}{-5})$ &              $0.082 (0.0042)$               & $\expnumber{2.3}{-1} (\expnumber{3.8}{-2})$ \\
+\bottomrule
+\end{tabular}
+
+\label{appendix-table:clapirn_hyperparameter_optimization_oasis}
+\end{table}
+
+\begin{table}[h]
+\centering
+%\setlength\tabcolsep{3pt}
+\scriptsize
+\caption{Regularization parameter optimization results for cLapIRN calculated on the LPBA40 validation set. Here $\overline{\lambda}$ refers to the normalized regularization weight of the gradient loss of cLapIRN and should be in range $[0,\ 1]$. Value $\overline{\lambda} = 0.1$ was chosen due to the best overall performance.}
+\begin{tabular}{cccccc}
+\toprule
+Hyperparameters & \multicolumn{2}{c}{Accuracy} & \multicolumn{2}{c}{Deformation regularity} & Consistency\\
+\cmidrule(r){1-1} \cmidrule(r){2-3} \cmidrule(r){4-5} \cmidrule(r){6-6}
+$\overline{\lambda}$ & Dice $\uparrow$ & HD95 $\downarrow$ & $|J_{\phi}|_{\leq 0} \downarrow$ & $\operatorname{std}(|J_{\phi}|) \downarrow$ &       Cycle $\downarrow$     \\
+\midrule 0.01      & $0.714 (0.014)$ & $\expnumber{9.9}{-1} (\expnumber{1.5}{-1})$ &               $0.45 (0.029)$                &               $0.45 (0.029)$                & $\expnumber{9.9}{-1} (\expnumber{2.2}{-1})$ \\
+         0.05         & $0.715 (0.014)$ & $\expnumber{3.2}{-1} (\expnumber{6.8}{-2})$ &               $0.33 (0.018)$                &               $0.33 (0.018)$                & $\expnumber{8.0}{-1} (\expnumber{2.1}{-1})$ \\
+         0.1          & $0.714 (0.014)$ & $\expnumber{7.4}{-2} (\expnumber{2.4}{-2})$ &               $0.25 (0.012)$                &               $0.25 (0.012)$                & $\expnumber{6.6}{-1} (\expnumber{2.1}{-1})$ \\
+         0.2          & $0.709 (0.015)$ & $\expnumber{4.4}{-3} (\expnumber{2.4}{-3})$ &               $0.19 (0.0090)$               &               $0.19 (0.0090)$               & $\expnumber{4.9}{-1} (\expnumber{1.9}{-1})$ \\
+         0.4          & $0.698 (0.017)$ & $\expnumber{3.5}{-5} (\expnumber{5.7}{-5})$ &               $0.13 (0.0071)$               &               $0.13 (0.0071)$               & $\expnumber{3.6}{-1} (\expnumber{1.9}{-1})$ \\
+         0.8          & $0.678 (0.019)$ & $\expnumber{5.0}{-6} (\expnumber{2.2}{-5})$ &              $0.085 (0.0062)$               &              $0.085 (0.0062)$               & $\expnumber{3.0}{-1} (\expnumber{1.9}{-1})$ \\
+         1.0          & $0.671 (0.021)$ & $\expnumber{5.0}{-6} (\expnumber{2.2}{-5})$ &              $0.074 (0.0061)$               &              $0.074 (0.0061)$               & $\expnumber{3.0}{-1} (\expnumber{1.9}{-1})$ \\
+\bottomrule
+\end{tabular}
+\label{appendix-table:clapirn_hyperparameter_optimization_lpba40}
+\end{table}
+
+\section{Proof of theoretical properties}\label{appendix:theoretical_properties_proof}
+
+While in the main text dependence of the intermediate outputs $d_{1\to1.5}^{(k)}$, $d_{2\to1.5}^{(k)}$, $z^{(k)}_1$, $z^{(k)}_2$, and $\delta^{(k)}$ on the input images $x_A, x_B$ is not explicitly written, throughout this proof we include the dependence in the notation since it is relevant for the proof.
+
+\subsection{Inverse consistent by construct (Theorem \ref{theorem:inverse_consistent})}
+\begin{proof}
+Inverse consistency by construct follows directly from Equation \ref*{eq:final_deformation}:
+\begin{align*}
+f_{1\to2}(x_A, x_B) &= d_{1\to1.5}^{(0)}(x_A, x_B) \circ d_{2\to1.5}^{(0)}(x_A, x_B)^{-1}\\
+&= \left(d_{2\to1.5}^{(0)}(x_A, x_B) \circ d_{1\to1.5}^{(0)}(x_A, x_B)^{-1}\right)^{-1}\\
+&= f_{2\to1}(x_A, x_B)^{-1}
+\end{align*}
+\end{proof}
+Note that due to limited sampling resolution the inverse consistency error is not exactly zero despite of the proof. The same is true for earlier inverse consistent by construct registration methods, as discussed in Section \ref{sec:intro}.
+
+To be more specific, sampling resolution puts a limit on the accuracy of the inverses obtained using deformation inversion layer, and also limits accuracy of compositions if deformations are resampled to their original resolution as part of the composition operation (see Section \ref{sec:inference}). While another possible source could be the fixed point iteration in deformation inversion layer converging imperfectly, that can be proven to be insignificant. As shown by Appendix \ref{appendix:optimal_gamma}, the fixed point iteration is guaranteed to converge, and error caused by the lack of convergence of fixed point iteration can hence be controlled by the stopping criterion. In our experiments we used as a stopping criterion maximum inversion error within all the sampling locations reaching below one hundredth of a voxel, which is very small.
+
+\subsection{Symmetric by construct (Theorem \ref{theorem:symmetric})}
+\begin{proof}
+We use induction. Assume that for any $x_A$ and $x_B$ at level $k+1$ the following holds: $d^{(k + 1)}_{1\to1.5}(x_A, x_B) = d^{(k + 1)}_{2\to1.5}(x_B, x_A)$. For level $K$ it holds trivially since $d^{(K)}_{1\to1.5}(x_A, x_B)$ and $d^{(K)}_{2\to1.5}(x_A, x_B)$ are defined as identity deformations. Using the induction assumption we have at level $k$:
+\begin{equation*}
+z_1^{(k)}(x_A, x_B) = h^{(k)}(x_A) \circ d^{(K)}_{1\to1.5}(x_A, x_B) = h^{(k)}(x_A) \circ d^{(K)}_{2\to1.5}(x_B, x_A) = z_2^{(k)}(x_B, x_A)\
+\end{equation*}
+Then also:
+\begin{align*}
+\delta^{(k)}(x_A, x_B) &= u^{(k)}(z_1^{(k)}(x_A, x_B), z_2^{(k)}(x_A, x_B)) \circ u^{(k)}(z_2^{(k)}(x_A, x_B), z_1^{(k)}(x_A, x_B))^{-1}
+\\
+&= u^{(k)}(z_2^{(k)}(x_B, x_A), z_1^{(k)}(x_B, x_A)) \circ u^{(k)}(z_1^{(k)}(x_B, x_A), z_2^{(k)}(x_B, x_A))^{-1}\\
+&=  \left[u^{(k)}(z_1^{(k)}(x_B, x_A), z_2^{(k)}(x_B, x_A)) \circ u^{(k)}(z_2^{(k)}(x_B, x_A), z_1^{(k)}(x_B, x_A))^{-1}\right]^{-1}\\
+&=  \delta^{(k)}(x_B, x_A)^{-1}\\
+\end{align*}
+
+Then we can finalize the induction step:
+\begin{align*}
+d^{(k)}_{1\to1.5}(x_A, x_B) &= d^{(k + 1)}_{1\to1.5}(x_A, x_B) \circ \delta^{(k)}(x_A, x_B)\\
+&= d^{(k + 1)}_{2\to1.5}(x_B, x_A) \circ \delta^{(k)}(x_B, x_A)^{-1} = d^{(k)}_{2\to1.5}(x_B, x_A)
+\end{align*}
+
+From this follows that the method is symmetric by construct:
+\begin{align*}
+f_{1\to2}(x_A, x_B) &= d_{1\to1.5}^{(0)}(x_A, x_B) \circ d_{2\to1.5}^{(0)}(x_A, x_B)^{-1}\\
+&= d_{2\to1.5}^{(0)}(x_B, x_A) \circ d_{1\to1.5}^{(0)}(x_B, x_A)^{-1} = f_{2\to1}(x_B, x_A)
+\end{align*}
+\end{proof}
+
+The proven relation holds exactly.
+
+\subsection{Topology preserving (Theorem \ref{theorem:topology_preserving})}
+
+\begin{proof}
+    As shown by Appendix \ref{appendix:optimal_gamma}, each $u^{(k)}$ produces topology preserving (invertible) deformations (architecture of $u^{(k)}$ is described in Section \ref{appendix:topology_preserving_u}). Since the overall deformation is composition of multiple outputs of $u^{(k)}$ and their inverses, the whole deformation is then also invertible, and the method is topology preserving.
+\end{proof} 
+
+The inveritibility is not perfect if the compositions of $u^{(k)}$ and their inverses are resampled to the input image resolution, as is common practice in image registration. However, invertibility everywhere can be achieved by storing all the individual deformations and evaluating the composed deformation as their true composition (see Section \ref{sec:inference} on inference variants and the results in Section \ref{sec:results}).
+
+\section{Deriving the optimal bound for control points}\label{appendix:optimal_gamma}
+
+As discussed in Section \ref{appendix:topology_preserving_u}, we limit absolute values of the predicted cubic spline control points defining the displacement field by a hard constraint $\gamma^{(k)}$ for each resolution level $k$. We want to find optimal $\gamma^{(k)}$ which ensure invertibility of individual deformations and convergence of the fixed point iteration in deformation inversion layer. We start by proving the continuous case and then extend it to our sampling based case. Note that the proof provides a significantly shorter and more general proof of the theorems 1 and 4 in \citep{choi2000injectivity}.
+
+By \citep{chen2008simple} a deformation field is invertible by the proposed deformation inversion layer (and hence invertible in general) if its displacement field is contractive mapping with respect to some norm (the convergence is then also with respect to that norm). In finite dimensions convergence in any p-norm is equal and hence we should choose the norm which gives the loosest bound.
+
+Let us choose $||\cdot||_{\infty}$ norm for our analysis, which, as it turns out, gives the loosest possible bound. Then the Lipschitz constant of a displacement field is equivalent to the maximum $||\cdot||_{\infty}$ operator norm of the local Jacobian matrices of the displacement field.
+
+Since for matrices $||\cdot||_{\infty}$ norm corresponds to maximum absolute row sum it is enough to consider one component of the displacement field.
+
+Let $B: \mathbb{R}\to\mathbb{R}$ be a centered cardinal B-spline of some degree (actually any continuous almost everywhere differentiable function with finite support is fine) and let us consider an infinite grid of control points $\phi: \mathbb{Z}^n \to \mathbb{R}$ where $n$ is the dimensionality of the displacement field. For notational convinience, let us define a set $N:=\{1, \dots, n\}$.
+
+Now let $f_\phi$ be the $n$-dimensional displacement field (or one component of it) defined by the control point grid:
+
+\begin{equation}
+    f_\phi(x) = \sum_{\alpha\in\mathbb{Z}^n} \phi(\alpha) \prod_{i\in N}B(x_i - \alpha_i)
+\end{equation}
+
+Note that since the function $B$ has finite support the first sum over $\mathbb{Z}^n$ can be defined as a finite sum for any $x$ and is hence well-defined. Also, without loss of generality it is enough to look at region $x \in [0, 1]^n$ due to the unit spacing of the control point grid.
+
+For partial derivatives $\frac{\partial f_\phi}{\partial x_j}: \mathbb{R}^n \to \mathbb{R}$ we have
+\begin{equation}
+    \frac{\partial f_\phi}{\partial x_j}(x) := \sum_{\alpha\in \mathbb{Z}^n} \phi({\alpha})\ B'(x_j - \alpha_j) \prod_{i\in N\setminus \{j\}} B(x_i - \alpha_i) = \sum_{\alpha\in\mathbb{Z}^n} \phi_{\alpha} D^j(x - \alpha)
+\end{equation}
+where $D^j(x - \alpha) := B'(x_j - \alpha_j) \prod_{i\in N\setminus \{j\}} B(x_i - \alpha_i)$.
+
+Following the power set notation, let us denote control points limited to some set $S \subset \mathbb{R}$ as $S^{\mathbb{Z}^n}$. That is, if $\phi \in S^{\mathbb{Z}^n}$, then for all $\alpha \in \mathbb{Z}^n$, $\phi(\alpha) \in S$.
+
+\begin{lemma}\label{appendix-lemma:contraction_tilde}
+For all $\phi \in\ ]-1/\tilde{K}_n, 1/\tilde{K}_n[^{\mathbb{Z}^n}$, $f_\phi$ is a contractive mapping with respect to the $||\cdot||_{\infty}$ norm, where
+\begin{equation}
+    \tilde{K}_n := \max_{\begin{subarray}{l}x \in [0, 1]^n\\\tilde{\phi} \in [-1, 1]^{\mathbb{Z}^n}\end{subarray}}\ \sum_{j\in N} \left| \frac{\partial f_{\tilde{\phi}}}{\partial x_j}(x) \right|.
+\end{equation}
+\end{lemma}
+\begin{proof}
+For all $x\in[0, 1]^n$,  $\phi \in\ ]-1/\tilde{K}_n, 1/\tilde{K}_n[^{\mathbb{Z}^n}$
+\begin{equation}
+\begin{aligned}
+    \sum_{j\in N} \left| \frac{\partial f_\phi}{\partial x_j}(x) \right| &<
+    \max_{\begin{subarray}{l}\tilde{x} \in [0, 1]^n\\\tilde{\phi} \in [-1/\tilde{K}_n, 1/\tilde{K}_n]^{\mathbb{Z}^n}\end{subarray}}\ \sum_{j\in N} \left| \frac{\partial f_{\tilde{\phi}}}{\partial \tilde{x}_j}(\tilde{x}) \right|\\
+    &= \max_{\begin{subarray}{l}\tilde{x} \in [0, 1]^n\\\tilde{\phi} \in [-1, 1]^{\mathbb{Z}^n}\end{subarray}}\ \sum_{j\in N} \left| \frac{\partial f_{\tilde{\phi}/\tilde{K}_n}}{\partial \tilde{x}_j}(\tilde{x}) \right|\\
+    &= \frac{1}{\tilde{K}_n}\ \max_{\begin{subarray}{l}\tilde{x} \in [0, 1]^n\\\tilde{\phi} \in [-1, 1]^{\mathbb{Z}^n}\end{subarray}}\ \sum_{j\in N} \left| \frac{\partial f_{\tilde{\phi}/\tilde{K}_n}}{\partial \tilde{x}_j}(\tilde{x}) \right| = \frac{\tilde{K}_n}{\tilde{K}_n} = 1.
+\end{aligned}
+\end{equation}
+Sums of absolute values of partial derivatives are exactly the $||\cdot||_{\infty}$ operator norms of the local Jacobian matrices of $f$, hence $f$ is a contraction.
+\end{proof}
+
+\begin{lemma}\label{appendix-lemma:no_abs_needed}
+    For any $k \in N$, $x \in [0, 1]^n,\ \phi \in [-1, 1]^{\mathbb{Z}^n}$, we can find some $\tilde{x} \in [0, 1]^n, \tilde{\phi}\in [-1, 1]^{\mathbb{Z}^n}$ such that
+    \begin{equation}
+        \frac{\partial f_{\tilde{\phi}}}{\partial x_j}(\tilde{x}) =
+        \begin{cases}
+            -\frac{\partial f_\phi}{\partial x_j}(x)&\quad \text{for}\ j = k\\
+            \frac{\partial f_\phi}{\partial x_j}(x)&\quad \text{for}\ j \in N\setminus \{k\}.
+        \end{cases}
+    \end{equation}
+\end{lemma}
+\begin{proof}
+The B-splines are symmetric around origin:
+\begin{equation}
+    B(x) = B(-x) \implies B'(x) = -B'(-x)
+\end{equation}
+
+Let us propose
+\begin{equation}
+    \tilde{x}_i :=
+    \begin{cases}
+        1 - x_i, &\quad \text{when}\ i \in N \setminus k\\
+        x_i, &\quad \text{when}\ i = k
+    \end{cases}
+\end{equation}
+
+and $\tilde{\phi}: \mathbb{Z}^n \to \mathbb{R}$ as $\tilde{\phi}(\alpha) := -\phi(g(\alpha))$ where $g: \mathbb{Z}^n \to \mathbb{Z}^n$ is a bijection defined as follows:
+\begin{equation}
+    g(\alpha)_i :=
+    \begin{cases}
+        1 - \alpha_i, &\quad \text{when}\ i \in N \setminus k\\
+        \alpha_i, &\quad \text{when}\ i = k.
+    \end{cases}
+\end{equation}
+
+Then for all $\alpha \in \mathbb{Z}^n$:
+\begin{equation}
+    \begin{aligned}
+        D^k(\tilde{x} - \alpha) &= B'(\tilde{x}_k - \alpha_k) \prod_{i\in N\setminus \{k\}} B(\tilde{x}_i - \alpha_i)\\
+        &= B'(x_k - g(\alpha)_k) \prod_{i\in N\setminus \{k\}} B(-(x_i - g(\alpha)_i))\\
+        &= D^k(x - g(\alpha))
+    \end{aligned}
+\end{equation}
+
+which gives
+
+\begin{equation}
+    \begin{aligned}
+        \frac{\partial f_{\tilde{\phi}}}{\partial \tilde{x}_k}(\tilde{x}) &= \sum_{\alpha\in\mathbb{Z}^n} \tilde{\phi}(\alpha) D^k(\tilde{x} - \alpha)\\
+        &= \sum_{\alpha\in\mathbb{Z}^n} -\phi(g(\alpha)) D^k(x - g(\alpha))&&\quad \text{g is bijective}\\
+        &= -\frac{\partial f_\phi}{\partial x_k}(x).
+    \end{aligned}
+\end{equation}
+
+And for all $j \in N \setminus \{k\}$, $\alpha \in \mathbb{Z}^n$
+
+\begin{equation}
+    \begin{aligned}
+        D^j(\tilde{x} - \alpha) &= B'(\tilde{x}_j - \alpha_j) \prod_{i\in N\setminus \{j\}} B(\tilde{x}_i - \alpha_i)\\
+        &= B'(\tilde{x}_j - \alpha_j)\ B(\tilde{x}_k - \alpha_k) \prod_{i\in N\setminus \{j, k\}} B(\tilde{x}_i - \alpha_i)\\
+        &= B'(-(x_j - g(\alpha)_j))\ B(x_k - g(\alpha)_k) \prod_{i\in N\setminus \{j, k\}} B(-(x_i - g(\alpha)_i))\\
+        &= -B'(x_j - g(\alpha)_j)\ B(x_k - g(\alpha)_k) \prod_{i\in N\setminus \{j, k\}} B(x_i - g(\alpha)_i)\\
+        &= -B'(x_j - g(\alpha)_j) \prod_{i\in N\setminus \{j\}} B(x_i - g(\alpha)_i)\\
+        &= - D^k(x - g(\alpha))
+    \end{aligned}
+\end{equation}
+
+which gives for all $j \in N \setminus \{k\}$
+\begin{equation}
+    \begin{aligned}
+        \frac{\partial f_{\tilde{\phi}}}{\partial \tilde{x}_j}(\tilde{x}) &= \sum_{\alpha\in\mathbb{Z}^n} \tilde{\phi}(\alpha) D^j(\tilde{x} - \alpha)\\
+        &= \sum_{\alpha\in\mathbb{Z}^n} -\phi(g(\alpha)) - D^j(x - g(\alpha))&&\quad \text{g is bijective}\\
+        &= \frac{\partial f_\phi}{\partial x_j}(x).
+    \end{aligned}
+\end{equation}
+\end{proof}
+
+\begin{theorem}\label{appendix-theorem:contraction}
+For all $\phi \in\ ]-1/K_n, 1/K_n[^{\mathbb{Z}^n}$, $f_\phi$ is a contractive mapping with respect to the $||\cdot||_{\infty}$ norm, where
+\begin{equation}
+    K_n := \max_{\begin{subarray}{l}x \in [0, 1]^n\end{subarray}}\ \sum_{\alpha\in \mathbb{Z}^n} \left|\sum_{j\in N} D^j_{\alpha}(x)\right|.
+\end{equation}
+\end{theorem}
+\begin{proof}
+Let us show that $K_n = \tilde{K}_n$.
+\begin{equation}
+    \begin{aligned}
+        \tilde{K}_n &= \max_{\begin{subarray}{l}x \in [0, 1]^n\\\phi \in [-1, 1]^{\mathbb{Z}^n}\end{subarray}}\ \sum_{j\in N} \left| \frac{\partial f_\phi}{\partial x_j}(x) \right|&&\\
+        &= \max_{\begin{subarray}{l}x \in [0, 1]^n\\\phi \in [-1, 1]^{\mathbb{Z}^n}\end{subarray}}\ \sum_{j\in N} \frac{\partial f_\phi}{\partial x_j}(x)&&\quad \text{(Lemma \ref{appendix-lemma:no_abs_needed})}\\
+        &= \max_{\begin{subarray}{l}x \in [0, 1]^n\\\phi \in [-1, 1]^{\mathbb{Z}^n}\end{subarray}}\ \sum_{j\in N} \sum_{\alpha\in\mathbb{Z}^n} \phi_{\alpha}\ D^j(x - \alpha) &&\\
+        &= \max_{\begin{subarray}{l}x \in [0, 1]^n\\\phi \in [-1, 1]^{\mathbb{Z}^n}\end{subarray}}\ \sum_{\alpha\in\mathbb{Z}^n} \phi_{\alpha}\ \sum_{j\in N} D^j(x - \alpha)&&\\
+        &= \max_{\begin{subarray}{l}x \in [0, 1]^n\end{subarray}}\ \sum_{\alpha\in\mathbb{Z}^n} \left|\sum_{j\in N} D^j_{\alpha}(x)\right| = K_n&&\\
+    \end{aligned}
+\end{equation}
+The last step follows from the obvious fact that the sum is maximized when choosing each $\phi_\alpha$ to be either $1$ or $-1$ based on the sign of the inner sum $\sum_{j\in N} D^j(x - \alpha)$.
+
+By Lemma \ref{appendix-lemma:contraction_tilde} $f$ is then a contractive mapping with respect to the $||\cdot||_{\infty}$ norm.
+\end{proof}
+
+Theorem \ref{appendix-theorem:contraction} proves that if we limit the control point absolute values to be less than $1 / K_n$, then the resulting deformation is invertible by the fixed point iteration. Also, approximating $K_n$ accurately is possible at least for $n \leq 3$. Subset of $\mathbb{Z}^n$ over which the sum needs to be taken depends on the support of the function $B$ which again depends on the degree of the B-splines used.
+
+Next we want to show that the obtained bound is also tight bound for invertibility of the deformation. That also then shows that $||\cdot||_{\infty}$ norm gives the loosest possible bound.
+
+Since $f_\phi$ corresponds only to one component of a displacement field, let us consider a fully defined displacement field formed by stacking $n$ number of $f_\phi$ together. Let us define
+\begin{equation}
+    g_\phi(x) := (f_\phi)_{i\in N}.
+\end{equation}
+\begin{theorem}
+    There exists $\phi \in [-1/K_n, 1/K_n]^{\mathbb{Z}^n}$, $x \in [0, 1]^n$ s.t. $\det \left(\frac{\partial g_\phi}{\partial x} + I\right)(x) = 0$ where $\frac{\partial g_\phi}{\partial x}$ is the Jacobian matrix of $g_\phi$ and $I$ is the identity matrix. 
+\end{theorem}
+\begin{proof}
+By Lemma \ref{appendix-lemma:no_abs_needed} and Theorem \ref{appendix-theorem:contraction} there exists $x \in [0, 1]^n$ and $\tilde{\phi} \in [-1, 1]^{\mathbb{Z}^n}$ such that
+\begin{equation}
+    \sum_{j\in N} \frac{\partial f_{\tilde{\phi}}}{\partial x_j}(x) = -K_n
+\end{equation}
+where all $\frac{\partial f_{\tilde{\phi}}}{\partial x_j}(x) < 0$.
+
+Let us define $\phi := \tilde{\phi} / K_n \in [-1/K_n, 1/K_n]^{\mathbb{Z}^n}$. Then
+\begin{equation}
+    \sum_{j\in N} \frac{\partial f_{\phi}}{\partial x_j}(x) = -1.
+\end{equation}
+
+Now let $y \in \mathbb{R}^n$ be a vector consisting only of values $1$, that is $y=:(1)_{i\in N}$. Then one has
+\begin{equation}
+    \begin{aligned}
+        \left(\frac{\partial g_{{\phi}}}{\partial x} + I\right)(x) y &= \left(\frac{\partial g_{{\phi}}}{\partial x}(x)\right)y + y\\
+        &= \left(\sum_{j\in N}1\ \frac{\partial f_{{\phi}}}{\partial x_j}(x)\right)_{i\in N} + (1)_{i\in N}\\
+        &= (-1)_{i\in N} + (1)_{i\in N} = 0.
+    \end{aligned}
+\end{equation}
+In other words $y$ is an eigenvector of $\left(\frac{\partial g_{{\phi}}}{\partial x} + I\right)(x)$ with eigenvalue $0$ meaning that the determinant of $\left(\frac{\partial g_{{\phi}}}{\partial x} + I\right)(x)$ is also $0$.
+\end{proof}
+
+The proposed bound is hence the loosest possible since the deformation can have zero Jacobian at the bound, meaning it is not invertible.
+
+\subsection{Sampling based case (Equation \ref{appendix-eq:optimal_gamma})}
+
+The bound used in practice, given in Equation \ref{appendix-eq:optimal_gamma}, is slightly different to the bound proven in Theorem \ref{appendix-theorem:contraction}. The reason is that for computational efficiency we do not use directly the cubic B-spline representation for the displacement field but instead take only samples of the displacement field in the full image resolution (see Appendix \ref{appendix:topology_preserving_u}), and use efficient bi- or trilinear interpolation for defining the intermediate values. As a result the continuous case bound does not apply anymore.
+
+However, finding the exact bounds for our approximation equals evaluating the maximum in Theorem \ref{appendix-theorem:contraction} over a finite set of sampling locations and replacing $D^j(x)$ with finite difference derivatives. The mathematical argument for that goes almost identically and will not be repeated here. However, to justify using finite difference derivatives, we need the following two trivial remarks:
+\begin{itemize}
+    \item When defining a displacement field using grid of values and bi- or trilinear interpolation, the highest value for $||\cdot||_\infty$ operator norm is obtained at the corners of each interpolation patch.
+    \item Due to symmetry, it is enough to check derivative only at one of $2^n$ corners of each bi- or trilinear interpolation patch in computing the maximum (corresponding to finite difference derivative in only one direction over each dimension).
+\end{itemize}
+
+Maximum is evaluated over the relative sampling locations with respect to the resolution of the control point grid (which is in the resolution of the features $z_1^{(k)}$ and $z_2^{(k)}$). The exact sampling grid depends on how the sampling is implemented (which is an implementation detail), and in our case we used the locations $X := \{1 / 2 + \frac{1}{2^{k + 1}} + \frac{i}{2^k}\ |\ i \in \mathbb{Z}\}^n \cap [0, 1]^n$ which have, without loss of generality, been again limited to the unit cube.
+
+No additional insights are required to show that the equation \ref{appendix-eq:optimal_gamma} gives the optimal bound.
+\clearpage
+\section{Deformation inversion layer memory usage}\label{appendix:memory}
+
+We conducted an experiment on the memory usage of the deformation inversion layer compared to the stationary velocity field (SVF) framework \citep{arsigny2006log} since SVF framework could also be used to implement the suggested architecture in practice.
+
+With the SVF framework one could slightly simplify the deformation update Equation \ref{eq:update_deformation_formula} to the form
+\begin{equation}\label{appendix-eq:svf_symmetric_update}
+    U^{(k)} := \exp(u^{(k)}(z_1^{(k)}, z_2^{(k)}) - u^{(k)}(z_2^{(k)}, z_1^{(k)}))
+\end{equation}
+where $\exp$ is the SVF integration (corresponding to Lie algebra exponentiation), and $u^{(k)}$ now predicts an auxiliary velocity field. We compared memory usage of this to our implementation, and used the implementation by \citet{dalca2018unsupervised} for SVF integration.
+
+The results are shown in Table \ref{appendix-table:svf_deformation_inversion_layer_memory_comparison}. Our version implemented using the deformation inversion layer requires $5$ times less data to be stored in memory for the backward pass compared to the SVF integration. The peak memory usage during the inversion is also slightly lower. The memory saving is due to the memory efficient back-propagation through the fixed point iteration layers, which requires only the final inverted volume to be stored for backward pass. Since our architecture requires two such operations for each resolution level ($U^{(k)}$ and its inverse), the memory saved during training is significant.
+
+\begin{table}[h]
+\centering
+%\setlength\tabcolsep{3pt}
+\scriptsize
+\caption{\textbf{Memory usage comparison between deformation inversion layer and stationary velocity field (SVF) based implementations.} The comparison is between executing Equation \ref{eq:update_deformation_formula} using deformation inversion layers and executing Equation \ref{appendix-eq:svf_symmetric_update} using SVF integration implementation by \citet{dalca2018unsupervised}. Between passes memory usage refers to the amount memory needed for storing values between forward and backward passes, and peak memory usage refers to the peak amount of memory needed during forward and backward passes. A volume of shape $(256, 256, 256)$ with $32$ bit precision was used. We used $7$ scalings and squarings for the SVF integration.}
+\vskip 0.15in
+\begin{tabular}{lcc}
+\toprule
+Method & Between passes memory usage (GB) $\downarrow$ & Peak memory usage (GB) $\downarrow$\\
+\midrule
+Deformation inversion layer & $\bm{0.5625}$ & $\bm{3.9375}$\\
+SVF integration & $2.8125$ & $4.125$\\
+\bottomrule
+\end{tabular}
+\label{appendix-table:svf_deformation_inversion_layer_memory_comparison}
+\end{table}
+\clearpage
+\section{Deformation inversion layer practical convergence}\label{appendix:deformation_inversion_iteration_counts}
+
+We conducted an experiment on the fixed point iteration convergence in the deformation inversion layers with the model trained on OASIS dataset. The results can be seen in Figure \ref{appendix-fig:deformation_inversion_iteration_counts}. The main result was that in the whole OASIS test set of 9591 pairs not a single deformation required more than 8 iterations for convergence. Deformations requiring 8 iterations were only $0.05\%$ of all the deformations and a significant majority of the deformations ($96\%$) required $2$ to $5$ iterations. In all the experiments, including this one, the stopping criterion for the iterations was maximum displacement error within the whole volume reaching below one hundredth of a voxel, which is a very small error.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=1.0\textwidth]{figures/inversion_iteration_counts.pdf}
+\caption{\textbf{Number of fixed point iterations required for convergence in deformation inversion layers with the model trained on OASIS dataset.} The stopping criterion for the fixed point iteration was maximum displacement error within the whole volume reaching below one hundredth of a voxel. All deformation inversions for the whole OASIS test set are included.}
+\label{appendix-fig:deformation_inversion_iteration_counts}
+\end{figure}
+\clearpage
+\section{Additional figures}\label{appendix:additional_results}
+
+Figures \ref{appendix-fig:dice_scores_oasis} and \ref{appendix-fig:dice_scores_lpba40} visualize dice scores for individual anatomical regions for both OASIS and LPBA40 datasets. VoxelMorph and SYMNet perform systematically worse than our method, while cLapIRN and our method perform very similarly on most regions.
+
+Figure \ref{appendix-fig:detailed_deformation_example} visualizes how the deformation is being gradually updated during the multi-resolution architecture.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=1.0\textwidth]{figures/dice_scores_oasis.pdf}
+\caption{\textbf{Individual brain structure dice scores for the OASIS experiment.} Boxplot shows performance of each of the compared methods on each of the brain structures in the OASIS dataset. Algorithms from left to right in each group: SITReg, cLapIRN, VoxelMorph, SYMNet (original)}
+\label{appendix-fig:dice_scores_oasis}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=1.0\textwidth]{figures/dice_scores_lpba40.pdf}
+\caption{\textbf{Individual brain structure dice scores for the LPBA40 experiment.} Boxplot shows performance of each of the compared methods on each of the brain structures in the LPBA40 dataset. Algorithms from left to right in each group: SITReg, cLapIRN, VoxelMorph, SYMNet (original)}
+\label{appendix-fig:dice_scores_lpba40}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.96\textwidth]{figures/detailed_deformation_example.pdf}
+\caption{\textbf{Visualization of deformation being gradually updated.} Each $d_{1\to1.5}^{(k)} \circ \left( d_{2\to1.5}^{(k)} \right)^{-1}$ corresponds to the full deformation after resolution level $k$. The example is from the OASIS experiment.}
+\label{appendix-fig:detailed_deformation_example}
+\end{figure}
+
+\clearpage
+
+\section{Dataset details}\label{appendix:dataset_details}
+
+We split the OASIS dataset into $255$, $20$ and $139$ images for training, validation, and testing. The split differs from the Learn2Reg challenge since the test set is not available, but sizes correspond to the splits used by \citet{mok2020fast, mok2020large, mok2021conditional}. We used all image pairs for testing and validation, yielding $9591$ test and $190$ validation pairs. For the affinely-aligned OASIS experiment we cropped the images to $144 \times 192 \times 160$ resolution. Images in raw OASIS dataset have resolution $256 \times 256 \times 256$ and we did not crop the images.
+
+We split the LPBA40 into $25$, $5$ and $10$ images for training, validation, and testing. This leaves us with $10$ pairs for validation and $45$ for testing. We cropped the LPBA40 images to $160 \times 192 \times 160$ resolution.
+
+\section{Details on statistical significance}\label{appendix:statistical_significance}
+
+We computed statistical significance of the results comparing the test set predictions of the trained models with each other. We measured the statistical significance using permutation test, and in practice sampled $10000$ permutations. In Figures \ref{table:results_oasis} and \ref{table:results_lpba40} all the improvements denoted with asterisk ($^*$) obtained very small p-value with not a single permutation (out of the $10000$) giving larger mean difference than the one observed.
+
+To establish for certain the relative performance of the methods with respect to the tight metrics, one should train multiple models per method with different random seeds. However, our claim is not that the developed method improves the results with respect to a single tight metric but rather that the overall performance is better by a clear margin (see Section \ref{sec:results}).
+
+\section{Clarifications on symmetry, inverse consistency, and topology preservation}\label{appendix:property_examples}
+
+Here we provide examples of symmetry, inverse consistency and lack of topology preservation to further clarify how the terms are used in the paper.
+
+Since symmetry and inverse consistency are quite similar properties, their exact difference might remain unclear. Examples of registration methods that are \textit{inverse consistent by construct but not symmetric} are many deep learning frameworks applying the stationary velocity field \citep{arsigny2006log} approach, e.g,  \citep{dalca2018unsupervised, krebs2018unsupervised, krebs2019learning, mok2020fast}. All of them use a neural network to predict a velocity field for an ordered pair of input images. The final deformation is then produced via Lie algebra exponentiation of the velocity field, that is, by integrating the velocity field over itself over unit time. Details of the exponentiation are not important here but the operation has an interesting property: By negating the velocity field to be exponentiated, the exponentiation results in inverse deformation. Denoting the Lie algebra exponential by $\exp$, and using notation from Section \ref{sec:intro}, we can define such methods as
+\begin{equation}
+    \begin{cases}
+        f_{1\to2}(x_A, x_B) &:= \exp(g(x_A, x_B))\\
+        f_{2\to1}(x_A, x_B) &:= \exp(-g(x_A, x_B))
+    \end{cases}
+\end{equation}
+where $g$ is the learned neural network predicting the velocity field. As a result, the methods are inverse consistent by construct since $\exp(g(x_A, x_B)) = \exp(-g(x_A, x_B))^{-1}$ (accuracy is limited by spatial sampling resolution). However, by changing the order of inputs to $g$, there is no guarantee that $g(x_A, x_B) = -g(x_B, x_A)$ and hence such methods are not symmetric by construct.
+
+MICS \citep{estienne2021mics} is an example of a method which is \textit{symmetric by construct but not inverse consistent}. MICS is composed of two components: encoder, say $E$, and decoder, say $D$, both of which are learned. The method can be defined as
+\begin{equation}
+    \begin{cases}
+        f_{1\to2}(x_A, x_B) &:= D(E(x_A, x_B) - E(x_B, x_A))\\
+        f_{2\to1}(x_A, x_B) &:= D(E(x_B, x_A) - E(x_A, x_B)).
+    \end{cases}
+\end{equation}
+As a result, the method is symmetric by construct since $f_{1\to2}(x_A, x_B) = f_{2\to1}(x_B, x_A)$ holds exactly. However, there is no architectural guarantee that $f_{1\to2}(x_A, x_B)$ and $f_{2\to1}(x_B, x_A)$ are inverses of each other, and the paper proposes to encourage that using a loss function. In the paper they use such components in multi-steps manner, and as a result the overall architecture is no longer symmetric.
+
+Lack of topology preservation means in practice that the predicted deformation folds on top of itself. An example of such deformation is shown in Figure \ref{appendix-fig:folding_deformation_example}.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.6\textwidth]{figures/folding_deformation_example.pdf}
+\caption{\textbf{Visualization of a 2D deformation which is not topology preserving.} The deformation can be seen folding on top of itself.}
+\label{appendix-fig:folding_deformation_example}
+\end{figure}
+
+\end{document}

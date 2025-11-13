@@ -1,0 +1,38 @@
+\documentclass[../main.tex]{subfiles}
+
+\begin{document}
+
+\MODEL\ is implemented with MindSpore 1.6 framework~\footnote{\url{https://www.mindspore.cn/versions/en}} and trained on 512 Ascend 910 accelerators (also know as Ascend 910 NPU).
+
+Training a trillion parameters language model poses multiple challenges. First, it requires enormous amount of memory in training. Although the sparse architecture can effectively save computation, it doesn't reduce the memory consumption and we still need to store all the parameters and optimization states inside the accelerator memory. Assuming Adam optimizer~\cite{2014Adam} with mixed-precision training~\cite{micikevicius2018mixed} is used, a 1T model typically consumes 16TB memory in total just for parameters, gradients and optimizer states. During training, the model needs extra memory for input data, network activations, communication buffers and temporary variables. We estimate that training a \MODEL\ model with 1 trillion parameters with a reasonably batch size needs more than 32TB memory and requires more than 1,000 Ascend 910 accelerators or NVIDIA V100 GPUs with 32GB High Bandwidth Memory (HBM). 
+
+Instead of pouring lots of hardware resources to scale-up the model, we aim to train \MODEL\ with a reasonably-sized cluster of 512 Ascend accelerators. To this end, we adopt the heterogeneous training and offload the optimizer states to CPU\cite{2021ZeRO}. After enabling heterogeneous training, all optimizer states are moved from accelerator to the host with 750GB host memory and KunPeng 920 CPU~\footnote{\url{https://www.hisilicon.com/en/products/Kunpeng/Huawei-Kunpeng/Huawei-Kunpeng-920}}, and we can fit the entire training process into the cluster.
+
+Second, the system throughput is unacceptable after enabling vanilla optimizer offloading. The root cause is again the sheer amount of parameters.  Gradients and updated parameters need to be exchanged via the slow host-to-device and device-to-host communication, and CPUs need to iterate thorough all parameters and update them. To improve the training throughput, we leverage the sparse nature of \MODEL\ architecture. Since \MODEL\ use a sparse architecture and most of its parameters are conditionally activated, the optimizer only need to update part of experts in one iteration. So we propose \textbf{Expert Computation and Storage Separation} (ECSS) method as illustrated in Figure~\ref{fig:ecss}.
+
+\begin{figure*}[htb]
+    \centering
+    \includegraphics[width=1.05\textwidth]{sections/fig/xiaozhe/ECSS.pdf}
+    \caption{Expert Computation and Storage Separation (ECSS) in traning \MODEL\ . In each iteration, with sparsity ratio $s\in(0,1]$ and expert amount K, only number of $A=Ks$ experts activated by lookup operation, which reduce the communication cost between device and host, and cost of forward and backward computation in device as well as optimizer operations in host.}
+    \label{fig:ecss}
+\end{figure*}
+
+
+In Expert Computation and Storage Separation, we consider experts as knowledge database to store specific knowledge of different tasks or domains. In each iteration, experts are sparsely activated by different token IDs with specific domain. In MindSpore, we use lookup operator to select parts of activated experts, and sparsely update their parameters in the backward computation. In optimizer CPU offload computing, MindSpore copy FP16 parameters from host CPU to NPU, compute the gradients on NPU, move FP16 gradients from NPU to CPU, and compute optimizer states and update parameters in the host CPU. With a lower experts sparsity ratio such as $0.1$, the computation cost is only near 10$\%$ of full model. 
+
+Besides ECSS with Ascend-KunPeng sparse heterogeneous computing, we also adopt other parallel training and accelerating techniques provided by MindSpore and CANN~\footnote{\url{https://www.hiascend.com/en/software/cann}}. We use 8-ways model parallel for all the attention and feed-forward layers, 64-ways expert parallel without replica and 64-ways data parallel for non-expert parts. To further optimize memory footprint, rematerialization~\cite{2016Training} and optimizer parallel~\cite{zero} are also adopted to reduce the peak memory consumption. We also use FastGelu and fused LayerNorm to accelerate point-wise computation. By combining all the techniques  together, we achieved 6.3 times throughput promotion compared to vanilla \MODEL\ heterogeneous training, as shown in Figure~\ref{fig:throughput}.
+
+% Secondly, Heterogeneous training is needed to reduce the model memory footprint in the accelerators. We leveraged a MindSpore feature, which offload the optimizer to CPU, PanGu-sigma use the Adam optimizer, hence the first and second moment estimates of gradients are stored in the large and cheap host memory instead of the limited and precious accelerator memory. Additionally, we use Gather operations to avoid unnecessary tensor elements reshuffling in distributed training setting.
+
+% Though the routing policy (by domains) is simple, the routing mechanism is far from simple. Routing of tokens are done via a series of tensor multiplication and tensor manipulation. (Codes in appendix). For max performance, we carefully transform and re-order the tensor operations and achieves 2x performance over the default ordering. 
+
+
+\begin{figure*}[htb]
+    \centering
+    \includegraphics[width=0.7\textwidth]{sections/fig/xinfan/speed_diagram.pdf}
+    \caption{Training throughput (token/s) of \MODEL\ wo/w Expert Computation and Storage Separation (ECSS). ECSS can achieve 6.3x increase of training throughput.}
+    \label{fig:throughput}
+\end{figure*}
+
+
+\end{document}

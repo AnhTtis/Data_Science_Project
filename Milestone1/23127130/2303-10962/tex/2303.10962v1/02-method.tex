@@ -1,0 +1,69 @@
+
+Our method consists of two components: i) a NeRF-like feature field mapping points in a volume to color, density, and feature vector and ii) a vision-language model which both extracts features from image frames and can embed text prompts into the same vector space. 
+
+\subsection{Volumetric Scene Representation}
+
+We want to associate 3D points in the volume of our scene to density, color, and a feature vector. From this, we can render corresponding maps of color, depth, and feature vectors through a NeRF-like \cite{mildenhall2020nerf} volumetric rendering function, visualized in Figure \ref{fig:diagram}. We model these maps using a positional encoding function and three multilayer perceptrons (MLP). The first MLP, indicated as (1), outputs density and a geometric code. The second MLP, labeled (2), outputs color from the geometric code and an encoded viewing direction. The third MLP, denoted by (3), takes the geometric code and outputs the feature vector.
+
+To encode the $x, y$, and $z$ position in the volume, we use the hybrid positional encoding introduced by \cite{blomqvist2022baking}. We concatenate the vector valued hashgrid encoding introduced in \cite{muller2022instant} with the low-frequency values of traditional NeRF \cite{mildenhall2020nerf} frequency encoding with $L=2$. The low-frequency components allows us to model the coarse spatial location in the scene, whereas the parameters in the hashgrid grid allow us to quickly learn high-frequency details.
+
+\begin{figure}[bt]
+    \centering
+    \includegraphics[width=0.7\linewidth]{images/diagram.pdf}
+    \caption{A diagram of the model used for our feature field.}
+    \label{fig:diagram}
+    \vspace{-1.5em}
+\end{figure}
+
+The resulting encoding is fed into an MLP, (1) in Figure \ref{fig:diagram}, which outputs a $15$-dimensional geometric code vector and scalar density $\sigma$. The geometric code is fed into two different MLPs. The first one outputs a feature vector $\boldsymbol{f}$. The other one takes as additional input the encoded viewing direction and outputs a color vector $\boldsymbol{c}$. To encode the viewing direction, we use the same spherical harmonic encoding as \cite{mildenhall2020nerf}.
+
+We use these outputs to volumetrically render color images and feature outputs using the rendering function:
+\begin{align}
+\label{eq:render}
+R(\mathbf{r}, h) &= \sum_{i=1}^N T_i (1 - \exp(-\sigma_i \delta_i)) h(\mathbf{x}_i),\\
+T_i &= \exp\left(-\sum_{j=1}^{i-1} \sigma_j \delta_j\right),
+\end{align}
+where $h$ is a function outputting a vector or scalar quantity for points $\mathbf{x}_i$ within the volume, $T_i$ is the transmittance function, $\delta_j$ is the distance between samples and $\sigma_i$ is the predicted density for encoded point samples $\mathbf{x}_i$ along a ray $\mathbf{r}$. We use $R$ to produce rendered quantities:
+\begin{align}
+\begin{split}
+\label{eq:maps}
+\hat{\mathbf{c}}(\mathbf{r}) &= R(\mathbf{r}, \mathbf{c}), \\
+\hat{d}(\mathbf{r}) &= R(\mathbf{r}, z), \\
+\hat{\mathbf{f}}(\mathbf{r}) &= R(\mathbf{r}, \mathbf{f}),
+\end{split}
+\end{align}
+using $z$ for the depth component of samples, $\mathbf{c}$ for the color MLP output and $\mathbf{f}$ for the feature vector output of our MLP.
+
+These quantities are learned by optimizing photometric, depth, and feature rendering error terms:
+\begin{align}
+\mathcal{L}_{rgb}(\mathbf{r}) &= \norm{\hat{\mathbf{c}}(\mathbf{r}) - \bar{\mathbf{c}}(\mathbf{r})}^2_2, \\
+\mathcal{L}_{d}(\mathbf{r}) &= \begin{cases}
+\norm{{\hat{d}(\mathbf{r})} - \bar{d}(\mathbf{r})}_1, & \text{if $\bar{d}$ is defined for $\mathbf{r}$} \\
+0, & \text{otherwise}
+\end{cases} \\
+\mathcal{L}_{f}(\mathbf{r}) &= \norm{\hat{\mathbf{f}}(\mathbf{r}) - \bar{\mathbf{f}}(\mathbf{r})}^2_2 / D
+\end{align}
+where $\bar{\mathbf{c}}(\mathbf{r})$ is the ground truth and $\hat{\mathbf{c}}(\mathbf{r})$ the predicted color for ray $\textbf{r}$, $\bar{d}(\mathbf{r})$ is the ground truth depth (if available), $\hat{d}(\mathbf{r})$ the predicted depth predictions along ray $\mathbf{r}$, $\hat{\mathbf{f}}$ rendered feature outputs, $\bar{\mathbf{f}}$ extracted image features for ray $\mathbf{r}$, and $D$ the dimensionality of the image features.
+
+The parameters in the hashgrid encoding volume and in the MLPs are jointly learned by optimizing the objective:
+\begin{equation}
+\mathcal{L}(\mathbf{r}) = \mathcal{L}_{rgb}(\mathbf{r}) + \lambda_d \mathcal{L}_{d}(\mathbf{r}) + \lambda_f \mathcal{L}_{f}(\mathbf{r})
+\end{equation}
+using stochastic gradient descent on a set of rays sampled uniformly from input images $\mathbf{I}$ along with corresponding feature vectors $\bar{\mathbf{f}}$. The parameters $\lambda_d$ and $\lambda_f$ are weighting parameters to weight the different components of the loss function. To learn the representation online, while our robot is exploring the environment, keyframes with image features can be added to the image set as they are captured.
+
+\subsection{Vision-language Features and Zero-shot Segmentation}
+
+Our framework presented above is capable of making use of arbitrary feature maps. Thus, we can use features from any feature extractor that produces dense pixel-aligned feature maps from images. To enable open set semantic queries in both 2D and 3D at run-time, we choose to use learned features for which the similarity with text prompts can be computed through a simple dot product. LSeg \cite{li2022language} and OpenSeg \cite{ghiasi2022scaling} are both suitable candidates for this purpose. 
+% XDecoder \cite{zou2022generalized} and similar open vocabulary segmentation methods might be an option, but they would require learning a text and image feature fusion module.
+In our experiments, we use LSeg features, as pretrained models are readily available. The model comes both with an image feature extractor $\bar{\mathbf{F}}$ and text encoder $\mathbf{E}$.
+
+Given a pose in the world frame of the volume, we can render color, depth, and feature maps using volumetric rendering, using equations \ref{eq:render} and \ref{eq:maps}. We compute the semantic class by assigning the feature $\hat{\mathbf{f}}$ to the most similar class given a set of user defined natural language class descriptions $t_i \in \mathcal{T}$ into which we want to segment our scene:
+\begin{equation}
+    \hat{s}(\mathbf{r}) = \text{argmax}_i \mathbf{E}(t_i) \cdot \hat{\mathbf{f}}(\mathbf{r}).
+\end{equation}
+
+For 3D queries at point $\mathbf{x}$, we can simply evaluate the feature MLP at $\mathbf{x}$, i.e.:
+\begin{equation}
+    s(\mathbf{x}) = \text{argmax}_i \mathbf{E}(t_i) \cdot \mathbf{f}(\mathbf{x}).
+\end{equation}
+

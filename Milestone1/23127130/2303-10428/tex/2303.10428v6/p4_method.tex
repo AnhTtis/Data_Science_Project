@@ -1,0 +1,98 @@
+
+\subsection{Method overview} 
+
+We introduce the \textbf{Region Conditioned Adapter Tuning} (RCA in \Cref{fig:rpa}), which enhances \textit{the vision foundation models to focus on specific visual cues for deducing inference}. 
+The RCA consists of two main parts: a Regional Prompt Generator (RPG in \S \ref{sec:rpg}) for targeting specific visual areas and an Adapter$^\textbf{+}$ module (\S \ref{sec:adapter}) to transfer the frozen CLIP model for reasoning tasks. 
+Finally, we replace Multi-Task Learning \cite{hessel2022abduction} with a new \textbf{Dual-Contrastive Loss} (\S \ref{sec:dual_contrast}) to bring the visual features closer to both literal description (``clue'') and hypothesis (``Inference''). 
+We will elaborate on each section below.
+
+\subsection{Regional Prompt Generator}
+\label{sec:rpg}
+In visual abductive reasoning, it is important to collect all relevant visual cues from the image and the region $\boldsymbol{r}$.
+Therefore, we use pre-specified observation $\boldsymbol{r}$ as a ``prompt'' to guide the visual reasoning process directly. 
+Our Regional Prompt Generator (RPG) creates three detailed prompts focusing on specific regions. 
+These prompts harness local features (i.e., region), surrounding context, and existing visual prompts, as shown in Figure \ref{fig:prompt1}-\ref{fig:prompt3}. 
+All three types of prompts go through the same process, with the only difference in being whether colors or circles \cite{shtedritski2023does} are drawn on the input images. 
+To explain how it works, we'll use the ``Region+Context'' (R-CTX) as an example.
+
+To prepare prompt and contextual tokens, we pop out patch-embedding layer $\mathcal F_{proj}$ and positional encoding \texttt{PE} from the CLIP vision tower $\mathcal F_{\text{vis}}$. 
+We further resize region $\boldsymbol{r}$ and full image $\boldsymbol{i}$ into squares of the same size, then merge them vertically (or horizontally) into a combined image, i.e., \textbf{combo-image} $\boldsymbol{I}$ (\cref{eq:combo_img}). 
+We apply patch-embedding on the combo image and add it to the upsampled \texttt{PE}$_{inter}$ embedding to get visual tokens $\boldsymbol{z}_0$ (\cref{eq:ir_enc3}). 
+As the \texttt{PE}$_{inter}$ is twice the size of \texttt{PE}, we initialize it by inflating $\texttt{PE}$ using bilinear interpolation. 
+Notably, $\boldsymbol{z}_0$, generated from the combo-image, already includes both regional prompt and global contextual tokens. 
+The $\boldsymbol{z}_0$ is further fed into the remaining attention and MLP layers (denoted by $\widehat{\mathcal F}_{\text{vis}}$) to get visual representation $f_{\boldsymbol{I}}$ (\cref{eq:vis_combo}). 
+We unfreeze patch-embedding $\mathcal F_{proj}$ and positional encoding \texttt{PE}$_{inter}$ to generate learnable soft prompts. 
+
+\input{equations/rgp_s_eq.tex}
+
+For the ``Region + Colorful Prompt'' and ``Region + Circle Prompt'' (R-CPT \& R-CiR), we create the combo-image $\boldsymbol{I}'$ from the squared region $\boldsymbol{r}$ and a modified image $\boldsymbol{i}'$. 
+In this image $\boldsymbol{i}'$, we either color the pixels inside the region with a translucent {\color{mypink}pink} rectangle or outline them with a {\color{red}red} circle \cite{shtedritski2023does}.
+The rest of the process remains similar to the ``Region+Context'' prompt.
+
+\textbf{Mixed Prompts}: During training, we randomly choose from the three types of prompts (R-CTX, R-CPT, and R-CiR) with equal chance. 
+During testing, we take the average of the visual representations created by these three prompts. 
+This strategy regulates the training process and allows us to obtain better generalizability.
+%\textcolor{red}{Why this strategy?}
+
+%For the text-based representation $f_{txt}$
+%and the loss function, we replace the equations \ref{eq:text_enc}-\ref{eq:clip_base_loss} by the new equations \ref{eq:dc_enc}-\ref{eq:dc_comp} under the Dual-Contrastive Loss learning scheme. %We'll go into more detail about this loss in \S \ref{sec:dual_contrast}.
+
+\subsection{Adapter$^+$ Tuning}
+\label{sec:adapter}
+Adapter tuning adjusts a parameter-frozen foundational model for downstream tasks by fine-tuning a few newly implanted modules (parameters). 
+This strategy is widely used in NLP \cite{yang2023aim} and computer vision \cite{radford2021learning} prior works. 
+Current adapters, like mini MLP \cite{yang2023aim} and tiny attention modules \cite{zhao2022tiny}, focus mainly on refining visual features. 
+However, they don't consider the need to adjust the original attention maps of the base models. 
+In some inference tasks such as visual abductive reasoning, it is beneficial to adapt the attention maps as well, especially to learn context-based domain knowledge and finer visual details.
+To tackle this, we augment the vanilla adapter with a new \textbf{\textit{Map Adapter}}, which precisely adapts attention maps in Transformers. 
+This results in the improved Adapter$^\textbf{+}$.
+
+The Adapter$^\textbf{+}$ pipeline is illustrated in Figure \ref{fig:rpa_adapter}. 
+We first include two basic adapters, referred to as Adapter (A\&M). 
+They are placed after the MSHA  module and parallel to the MLP module in the $l$-th encoder of a CLIP tower (e.g., $\mathcal{F}_{\text{vis}}$ or $\mathcal{F}_{\text{txt}}$). 
+These adapters are shallow and contain only two fully-connected layers to downgrade and upgrade feature dimension ($\mathbb{R}^D\leftrightarrows \mathbb{R}^d$, $d<D$) with a GELU activation in between (Equation \ref{eq:adapt_1}-\ref{eq:adapt_3}). 
+The {\color{purple}light red} font indicates the parameters in the modules are tuned.
+\input{equations/base_adapter}
+
+The {\textbf{Map Adapter}} further refines the MSHA module by adding a small, modified attention map, labeled as {\color{purple}$\widehat{\boldsymbol{Q}}\widehat{\boldsymbol{K}}^T$} (refer to \cref{eq:map_adapt_1}). 
+This additive map helps to adjust the original attention map dynamically, improving the model's ability to focus on relevant information. 
+To ensure that the original attention map isn't altered too much, we use simpler $D\rightarrow d$ projections for generating the query and key (see \cref{eq:map_adapt_3}). 
+Here, $d$ is smaller than $D$.
+\input{equations/map_adapter}
+
+We compared the enhanced Adapter$^\textbf{+}$ with min MLP and Tiny Adapter counterparts (see \S \ref{sec:ab_study}) and found that our tuning method consistently performs better.
+
+\subsection{Dual-Contrastive Loss}
+\label{sec:dual_contrast}
+As an observation contains three modalities, such as visual $\boldsymbol{I}$, clue sentence $\boldsymbol{c}$, and inference sentence $\boldsymbol{h}$, we comprehensively study their mutual influences by deploying contrastive loss between different modalities pairs. 
+Specifically, as shown in Fig. \ref{fig:loss_all}, we deploy dual, triple, and single contrastive loss in the training phase and screen out that the \textit{Dual-Contrastive Loss works best} (Fig. \ref{fig:v2_dual_loss_fig}). 
+We first elaborate on the Dual-Contrastive Loss and then compare it with the other counterparts.
+\input{fig/loss_variants.tex}
+
+\textbf{Dual-Contrastive Loss}: Both the clue $\boldsymbol{c}$ and inference $\boldsymbol{h}$ are positively relevant to visual $\boldsymbol{I}$. 
+More specifically, the former is literally equivalent, while the latter is causally related to the visual hints. 
+Although their relations are in different forms, we can still deploy a Dual-Contrastive Loss, including one for ``\textit{vision-clue}'' pair and the other for ``\textit{vision-inference}'' pair (Fig. \ref{fig:loss_dual}), to regress visual features toward two textual targets. 
+We use CLIP text tower $\mathcal F_{\text{txt}}$ to extract features for clue $\boldsymbol{c}$ and inference $\boldsymbol{h}$. 
+We use \Cref{eq:vis_combo} to extract visual feature $f_{\boldsymbol{I}}$ for the observation $\boldsymbol{I}$.
+The mathematical process is present in Equations (\ref{eq:dc_comp})-(\ref{eq:dc_enc}). 
+\input{equations/dual_contrast_eq.tex}
+
+\textbf{Other Loss Variants}. The rest loss functions include the \textbf{Triple} and \textbf{Single} contrastive loss. 
+Particularly, compared with dual contrastive loss, the triple one newly adds the ``\textit{inference-clue}'' pair (e.g., Fig. \ref{fig:loss_trip} and Eq. \ref{eq:trip}).
+\input{equations/trip_contrast_eq.tex}
+
+We later observed that: additional \textit{inference-clue} loss in triple contrastive hurts overall performance, as the two texts (i.e., clue and inference) are not literally equivalent. 
+For example, the clue sentence ``\textit{the road is wet}''$\neq$ inference sentence ``it has rained before''. 
+Therefore, we can only let the two texts learn toward the same third-party feature (e.g., the visual) instead of artificially forcing them to be equivalent.
+
+For the single contrastive loss, we have three options, namely \textit{vision-inference} (Fig. \ref{fig:loss_inf_vis}), \textit{vision-clue} (Fig. \ref{fig:loss_clue_vis}), \textit{multi-task} learning (MTL in Fig.\ref{fig:loss_mt}). 
+Notably, we use an identical textual encoder for clue and inference during testing, since we only learn a single contrastive loss between a pair of modalities during training.
+
+These three losses can be expressed in one unified form (Eq. \ref{eq:unf}), by thresholding a random probability $p$ with different values $\overline{\mathrm{T}}$. 
+Specifically, when $\overline{\mathrm{T}}=1.0~\mathrm{or}~0~\mathrm{or}~0.5$, the below loss become the \textit{vision-clue}, \textit{vision-inference} and \textit{multi-task} learning loss \cite{hessel2022abduction}.
+\input{equations/s_contrast_3.tex}
+
+With the single contrastive loss, we find that only minimizing the gap between a pair, such as \textit{vision-clue} (or \textit{vision-inference}) will also shorten the gap between the other pair \textit{vision-inference} (or \textit{vision-clue}), indicating retrieval and abductive reasoning tasks are positively correlated. 
+We give detailed analysis in \S \ref{sec:ab_study}.
+
+

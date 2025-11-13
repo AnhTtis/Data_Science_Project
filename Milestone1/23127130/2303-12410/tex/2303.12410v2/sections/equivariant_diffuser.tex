@@ -1,0 +1,217 @@
+%================================================================================
+\section{Equivariant diffuser for generating interactions (\eqd)}
+\label{sec:equivariant_diffuser}
+%================================================================================
+
+
+We now describe our \eqd method.
+We begin by discussing the symmetry group $\fullgroup$ and common representations in robotic problems.
+In Sec.~\ref{sec:eqd_diffusion} we introduce our key novelty, an $\fullgroup$-equivariant diffusion model for state-action trajectories $\tau$.
+We show how we can sample from this model invariantly and break the symmetry in Sec.~\ref{sec:eqd_sampling}.
+Finally, we discuss how a diffusion model trained on offline trajectory data can be used for planning in Sec.~\ref{sec:eqd_planning}.
+
+
+%================================================================================
+\subsection{Symmetry and representations}
+%================================================================================
+
+%--------------------------------------------------------------------------------
+\xhdr{Symmetry group}
+We consider the symmetry group $\fullgroup$, which is a product of three distinct groups: 1.\ the group of spatial translations and rotations $\sethree$, 2.\ the discrete time translation symmetry $\timetranslation$, and 3.\  the permutation group over $n$ objects $\permutation$. It is important to note, however, that this symmetry group may be partially broken in an environment. For instance, the direction of gravity usually breaks the spatial symmetry group $\sethree$ to the smaller group $\setwo$, and distinguishable objects in a scene may break permutation invariance. We follow the philosophy of modeling invariance with respect to the larger group and including any symmetry-breaking effects as inputs to the networks.
+
+We require that spatial positions are always expressed relative to a reference point, for example, the robot base or center of mass. This guarantees equivariance with respect to spatial translations: to achieve $\sethree$ equivariance, we only need to design an $\sothree$-equivariant architecture.
+
+%--------------------------------------------------------------------------------
+\xhdr{Data representations}
+We consider 3D environments that contain an embodied agent as well as $n$ other objects. We parameterize their degrees of freedom with two $\sothree$ representations, namely the scalar representation $\rho_0$ and the vector representation $\rho_1$. Other representations that may occur in a dataset can often be expressed in $\rho_0$ and $\rho_1$. For example, object poses may be expressed as 3D rotations between a global frame and an object frame. We can convert such rotations into two $\rho_1$ representations through the inclusion map $\iota: \sothree \hookrightarrow \R^{2\times3}$ that chooses the first two columns of the rotation matrix. Such an embedding avoids challenging manifold optimization over $\sothree$, while we can still uncover the rotation matrix by orthonormalizing using a Gram-Schmidt process to recover the final column vector. Thus, any $\sethree$ pose can be transformed to these two representations.
+
+We assume that all trajectories transform under the regular representation of the time translation group $\timetranslation$ (similar to how images transform under spatial translations).
+Under $\permutation$, object properties permute, while robot properties or global properties of the state remain invariant. Each feature is thus either in the trivial or the standard representation of $\permutation$.
+
+Overall, we thus expect that data in environments experienced by our embodied agent to be categorized into four representations of the symmetry group $\fullgroup$: scalar object properties, vector object properties, scalar robotic degrees of freedom (or other global properties of the system), and vector robotic degrees of freedom (again including other global properties of the system).
+
+%================================================================================
+\subsection{Equivariant diffusion model}
+\label{sec:eqd_diffusion}
+%================================================================================
+
+%--------------------------------------------------------------------------------
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/equi_diffuser_architecture.pdf}
+    %\vskip-4pt
+    \caption{Architecture of our $\fullgroup$-equivariant denoising network. Input trajectories (top left), which consist of features in different representations of the symmetry group, are first transformed into a single internal representation (green block). The data are then processed with equivariant blocks (blue), which consist of  convolutional layers along the time dimension, attention over objects, normalization layers, and geometric layers, which mix scalar and vector components of the internal representations. These blocks are combined into a U-net architecture.
+    For simplicity, we leave out many details, including residual connections, downsampling, and upsampling layers; see
+    % Appendix A.}
+    Appendix~\ref{app:algo}.}
+    \label{fig:architecture}
+    \vspace{-10pt}
+\end{figure*}
+%--------------------------------------------------------------------------------
+
+\looseness=-1
+Our main contribution is a novel $\fullgroup$-equivariant diffusion model which leads to an \emph{invariant} distribution over trajectories. Specifically, given an invariant base density with respect to our chosen symmetry group---an isotropic Gaussian satisfies this property for $\fullgroup$---and an denoising model $f$ that is equivariant with respect to the same group, we arrive at a diffusion model that is $\fullgroup$-invariant \citep{kohler2020equivariant, papamakarios2021normalizing}. Under mild assumptions, such an equivariant map that pushes forward the base density always exists~\citep{bose2021equivariant}.
+
+We design a novel equivariant architecture for the denoising model $f$. Implemented as a neural network, it maps noisy input trajectories $\tau$ and a diffusion time step $i$ to an estimate $\hat{\epsilon}$ of the noise vector that generated the input.
+Our architecture does this in three steps. First, the input trajectory consisting of various representations is transformed into an internal representation of the symmetry group. Second, in this representation the data are processed with an equivariant network. Finally, the outputs are transformed from the internal representation into the original data representations present in the trajectory.
+We illustrate the architecture of our \eqd model in Fig.~\ref{fig:architecture}.
+
+%--------------------------------------------------------------------------------
+\xhdr{Step 1: Representation mixer}
+The input noisy trajectory consists of features in different representations of the symmetry group (see above). While it is possible to mirror these input representations for the hidden states of the neural network, the design of equivariant architectures is substantially simplified if all inputs and outputs transform under a single representation. Hence, we decouple the data representation from the representation used internally for the computation---in a similar fashion to graph neural networks that decouple the data and computation graphs.
+
+%--------------------------------------------------------------------------------
+\xhdr{Internal representation}
+We define a single internal representation that for each trajectory time step $t \in [H]$, each object $o \in [n]$, each channel $c \in [n_c]$ consists of one\footnote{Pairing up just one scalar and one vector is a design choice; for systems in which scalar or vectorial quantities play a larger role, it may be beneficial to use multiple copies of either representation here.} $\sothree$ scalar $s_{toc}$ and one $\sothree$ vector $v_{toc}$. We write $w_{toc} = (s_{toc}, v_{toc}) \in \R^4$.
+Under spatial rotations $g \in \sothree$, these features thus transform as the direct sum of the scalar and vector representations $\rho_0 \oplus \rho_1$:
+%
+\begin{equation}
+    w_{toc} = \m{s_{toc} \\ v_{toc}} \to w'_{toc} = \m{\rho_0(g)s_{toc} \\ \rho_1(g) v_{toc}} \,.
+\end{equation}
+%
+These internal features transform in the regular representation under time shift and in the standard representation under permutations $\mathbb{P}$ as $w_{toc} \to w_{to'c} = \sum_o \mathbb{P}_{o'o} \, w_{toc}$. There are thus no global (not object-specific) properties in our internal representations.
+
+%--------------------------------------------------------------------------------
+\xhdr{Transforming input representations into internal representations}
+The first layer in our network transforms the input $\tau$, which consists of features in different representations of $\fullgroup$, into the internal representation. On the one hand, we pair up $\sothree$ scalars and $\sothree$ vectors into $\rho_0 \oplus \rho_1$ features. On the other hand, we distribute global features\,--\,those a priori unassigned to one of the $n$ objects in the scene\,--\,over the $n$ objects. 
+
+Concretely, for each object $o \in [n]$, each trajectory step $t \in [H]$, and each channel $c =[n_c]$, we define the input in the internal representation as $w_{toc} \in \R^4$ as follows:
+%
+\begin{equation}
+    w_{toc} =
+    \m{
+        \sum_{c'} \rmW^1_{occ'} s_{toc'} \\
+        \sum_{c'} \rmW^2_{occ'} v_{toc'}
+    }
+    +
+    \m{
+        \sum_{c'} \rmW^3_{occ'} s_{t\emptyset c'} \\
+        \sum_{c'} \rmW^4_{occ'} v_{t\emptyset c'}
+    }
+    \,.
+    \label{eq:input_trf}
+\end{equation}
+%
+\looseness=-1
+The matrices $\rmW^{1, 2, 3, 4}$ are learnable and of dimension $n \times n_c \times n_s^\text{object}$, $n \times n_c \times n_v^\text{object}$, $n \times n_c \times n_s^\text{global}$, or $n \times n_c \times n_v^\text{global}$, respectively. Here $n_s^\text{object}$ is the number of $\sothree$ scalar quantities associated with each object in the trajectory, $n_v^\text{object}$ is the number of $\sothree$ vector quantities associated with each object, $n_s^\text{global}$ is the number of scalar quantities associated with the robot or global properties of the system, and $n_v^\text{global}$ is the number of vectors of that nature.
+The number of input channels $n_c$ is a hyperparameter.
+We initialize the matrices $\rmW^i$ such that Eq.~\eqref{eq:input_trf} corresponds to a concatenation of all object-specific and global features along the channel axis at the beginning of training.
+
+%--------------------------------------------------------------------------------
+\xhdr{Step 2: $\fullgroup$-equivariant U-net}
+We then process the data with a $\modgroup$-equivariant denoising network.
+Its key components are three alternating types of layers. Each type acts on the representation dimension of one of the three symmetry groups while leaving the other two invariant---\ie they do not mix internal representation types of the other two layers:
+%
+\begin{itemize}[itemsep=1pt, topsep=1pt, parsep=1pt]
+    \item \emph{Temporal layers}: Time-translation-equivariant convolutions along the temporal direction (i.\,e.\ along trajectory steps), organized in a U-Net architecture.
+    \item \emph{Object layers}: Permutation-equivariant self-attention layers over the object dimension.
+    \item \emph{Geometric layers}: $\sothree$-equivariant interaction between the scalar and vector features.
+\end{itemize}
+%
+In addition, we use residual connections, a new type of normalization layer that does not break equivariance, and context blocks that process conditioning information and embed it in the internal representation (see
+% Appendix A
+Appendix~\ref{app:algo}
+for more details). These layers are combined into an equivariant block consisting of one instance of each layer, and the equivariant blocks are arranged in a U-net, as depicted in Fig.~\ref{fig:architecture}. Between the levels of the U-net, we downsample (upsample) along the trajectory time dimension by factors of two, increasing (decreasing) the number of channels correspondingly.
+
+%--------------------------------------------------------------------------------
+\xhdr{Temporal layers}
+Temporal layers consist of $1$D convolutions along the trajectory time dimension. To preserve $\sothree$ equivariance, these convolutions do not add any bias and there is no mixing of features associated with different objects nor the four geometric features of the internal $\sothree$ representation.
+
+%--------------------------------------------------------------------------------
+\xhdr{Object layers}
+Object layers enable features associated with different objects to interact via an equivariant multi-head self-attention layer. 
+Given inputs $w_{toc}$, the object layer computes
+%
+\begin{align}
+    \rmK_{toc} &= \sum_{c'} \rmW^K_{cc'} w_{toc} \,, 
+    \rmQ_{toc} = \sum_{c'} \rmW^Q_{cc'} w_{toc} \,,
+    \rmV_{toc} = \sum_{c'} \rmW^V_{cc'} w_{toc} \notag \,, \\
+    w'_{toc} &\propto \sum_{o'} \mathrm{softmax}_{o'} \! \left( \frac{\rmQ_{to} \cdot \rmK_{to'}}{\sqrt{d}} \right ) \rmV_{to'c},
+\end{align}
+%
+with learnable weight matrices $\rmW^{K,V,Q}$ and $d$ the dimensionality of the key vector. There is no mixing between features associated with different time steps, nor between the four geometric features of the internal $\sothree$ representation. Object layers are $\sothree$-equivariant, as the attention weights compute invariant $\sothree$ norms.
+
+%-------------------------------
+\xhdr{Geometric layers}
+Geometric layers enable mixing between the scalar and vector quantities that are combined in the internal representation, but do not mix between different objects or across the time dimension. We construct an expressive equivariant map between scalar and vector inputs and outputs following \citet{villar2021scalars}: We first separate the inputs into $\sothree$ scalar and vector components, $w_{toc} = (s_{toc}, v_{toc})^T$. We then construct a complete set of $\sothree$ invariants by combining the scalars and pairwise inner products between the vectors,
+%
+\begin{equation}
+    S_{to} = \{ s_{toc} \}_c \cup \{ v_{toc} \cdot v_{toc'} \}_{c, c'} \,.
+    \label{eq:invariant_scalars}
+\end{equation}
+%
+These are then used as inputs to two MLPs $\phi$ and $\psi$, and finally we get output scalars and vectors, $w'_{toc} = \left( \phi(S_{to})_c , \sum_{c'} \psi(S_{to})_{cc'} v_{toc'} \right)$.
+
+Assuming full expressivity of the MLPs $\phi$ and $\psi$, this approach can approximate any equivariant map between $\sothree$ scalars and vectors~\citep[Proposition 4]{villar2021scalars}.
+In this straightforward form, however, it can become prohibitively expensive, as the number of $\sothree$ invariants $S_{to}$ scales quadratically with the number of channels. In practice, we first linearly map the input vectors into a smaller number of vectors, apply this transformation, and increase the number of channels again with another linear map.
+
+%--------------------------------------------------------------------------------
+\xhdr{Step 3: Representation unmixer}
+The equivariant network outputs internal representations $w_{toc}$ that are transformed back to data representations using linear maps, in analogy to Eq.~\eqref{eq:input_trf}.
+Global properties, \eg robotic degrees of freedom, are aggregated from the object-specific internal representations by taking the elementwise mean across the objects. We find it beneficial to apply an additional geometric layer to these aggregated global features before separating them into the original representations.
+
+%--------------------------------------------------------------------------------
+\xhdr{Training}
+We train \eqd on offline trajectories without any reward information. We optimize for the simplified variational lower bound  $\mathcal{L} = \mathbb{E}_{\tau, i, \epsilon} [ \lVert \epsilon - f(\tau + \epsilon; i) \rVert^2 ]$ \citep{ho2020denoising}. where $\tau$ are training trajectories, $i \sim \mathrm{Uniform}(0, T)$ is the diffusion time step, and $\epsilon$ is Gaussian noise with variance depending on a prescribed noise schedule.
+
+
+%================================================================================
+\subsection{Invariant sampling and symmetry breaking}
+\label{sec:eqd_sampling}
+%================================================================================
+
+We now discuss sampling from \eqd (and, more generally, from equivariant diffusion models). While unconditional samples follow an invariant density, conditional samples may either be invariant or break the symmetry of the diffusion model.
+
+\xhdr{Invariant sampling}
+It is well-known that unconditional sampling from an equivariant denoising model defines an invariant density~\citep{kohler2020equivariant, bose2021equivariant,papamakarios2021normalizing}. We repeat this result without proof:
+
+%--------------------------------------------------------------------------------
+\begin{prop}
+\label{prop:invariant_unconditional_sampling}
+Consider a group $G$ that acts on $\mathbb{R}^n$ with representation $\rho$. Let $\pi$ be a $G$-invariant distribution over $\R^n$ and $\epsilon_t : \R^n \to \R^n$ be a $G$-equivariant noise-conditional denoising network. Then the distribution defined by the denoising diffusion process of sampling from $\pi$ and iteratively applying $\epsilon_t$ is $G$-invariant.
+\end{prop}
+%--------------------------------------------------------------------------------
+
+We now extend this result to sampling with classifier-based guidance~\citep{dhariwal2021diffusion}, a technique for low-temperature sampling based on a classifier $\log p(y | x_t)$ with class labels $y$, or more generally any guide $h(x)$. When the guide is $G$-invariant, guided sampling retains $G$ invariance:
+
+%--------------------------------------------------------------------------------
+\begin{prop}
+\label{prop:equivariant_diffusion_prop}
+Consider a group $G$ that acts on $\mathbb{R}^n$ with representation $\rho$. Let $\pi$ be a $G$-invariant density over $\R^n$ and $\epsilon_t : \R^n \to \R^n$ be a $G$-equivariant noise-conditional denoising network. Let the guide $h: \R^n \to \R$ be a smooth $G$-invariant function. Further, assume $\rho(g)$ is orthogonal $\forall g \in G$. Define the modified diffusion score $\bar{\epsilon}_{\theta}(x_t, t, c) = \epsilon_{\theta}(x_t, t) - \lambda \sigma_t \nabla_{x_t} h(x_t)$ for some guidance weight $\lambda \in \R$. Then the distribution defined by the denoising diffusion process of sampling from $\pi$ and iteratively applying $\bar{\epsilon}$ is $G$-invariant.
+
+\begin{proof}
+The function $h$ has a gradient $\nabla_x h(x)$ that is $G$-equivariant \citep[Lemma 2]{papamakarios2021normalizing}. Thus,
+%
+\begin{align*}
+    \bar{\epsilon}_{\theta}(\rho(g) (x_t), t) & = \epsilon_{\theta}(\rho (g) (x_t), t) - \lambda \sigma_t \nabla_{x_t} h(\rho(g) (x_t)) \\
+    &= \rho (g)\epsilon_{\theta}( x_t, t) - \rho(g)\lambda \sigma_t \nabla_{x_t} h(x_t)) \\
+    & = \rho(g) (\epsilon_{\theta}(x_t, t) - \lambda \sigma_t \nabla_{x_t} h( x_t)) \,.
+\end{align*}
+%
+The modified diffusion score $\bar{\epsilon}$ is therefore $G$-equivariant. Applying Prop.~\ref{prop:invariant_unconditional_sampling}, we find that classifier-based guidance samples from a $G$-invariant distribution.
+\end{proof}%
+\end{prop}
+%--------------------------------------------------------------------------------
+
+Proposition \ref{prop:equivariant_diffusion_prop} applies to $G = \fullgroup$ as employed in \eqd, as each group within the product admits an orthogonal matrix representation. Both unconditional sampling from \eqd, as well as sampling guided by a $\fullgroup$-invariant classifier (or reward model), is thus $\fullgroup$-invariant.
+
+\xhdr{Symmetry breaking}
+However, if the classifier $h(x)$ or $\log p(y|x)$ is \emph{not} $G$-invariant, classifier-guided samples are in general also not $G$-invariant. For example, consider $h(x) = -\lVert x - x_0 \rVert^2$ for some $x_0 \in \R^n$, which will bias samples to $x_0$. Similarly, conditional sampling on components of $x$ (similar to inpainting) clearly leads to non-invariant samples. As we will argue below, these properties are essential for robotic planning.%
+\footnote{Task-specific symmetry breaking would be more challenging to implement in classifier-\emph{free} guidance. That would require training a diffusion model that jointly models equivariant unconditional and non-equivariant task-conditional distributions, which will in general be difficult.}
+
+
+%================================================================================
+\subsection{Planning with equivariant diffusion}
+\label{sec:eqd_planning}
+%================================================================================
+
+A diffusion model trained on offline trajectory data jointly learns a world model and a policy. Following \citet{janner2022planning}, we use it to solve planning problems by choosing a sequence of actions to maximize the expected task rewards.
+
+To do this, we use three features of diffusion models. The first is the ability to sample from them by drawing noisy trajectory data from the base distribution and iteratively denoising them with the learned network yielding trajectories similar to those in the training set.
+For such sampled trajectories to be useful for planning, they need to begin in the current state of the environment. We achieve this by conditioning the sampling process such that the initial state of the generated trajectories matches the current state, in analogy to inpainting.
+Finally, we can guide this sampling procedure toward solving concrete tasks specified at test time using classifier-based guidance where a regression model is trained offline to map trajectories to task rewards.
+
+\xhdr{Task-specific symmetry breaking}
+By construction, our equivariant diffusion model learns a $\fullgroup$-invariant density over trajectories. As shown in the previous section, both unconditional samples (and samples guided by an invariant classifier) reflect this symmetry property---it will be equally likely to sample a trajectory and its rotated or permuted counterpart. However, concrete tasks will often break this invariance, for instance by requiring that a robot or object is brought into a particular location or specifying an ordering over objects to be manipulated in a scene.
+
+As discussed in the previous section, our diffusion-based approach with classifier guidance allows us to elegantly break the symmetry at test time as required. Such a soft symmetry breaking both occurs through conditioning on the current state, by conditioning on a goal state, and through a non-invariant reward model used for guidance during sampling.

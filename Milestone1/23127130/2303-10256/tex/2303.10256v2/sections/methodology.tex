@@ -1,0 +1,153 @@
+\section{Methodology}\label{sec:methodolgy}
+
+This section describes the problem formulation and its decomposition for PINNSim in \cref{subsec:power_system_DAEs}. We then describe the main elements of the algorithm in \cref{subsec:voltage_profile,subsec:PINN_approximation,subsec:voltage_profile_update} and lastly the entire algorithm in \cref{subsec:full_algorithm}. 
+
+\subsection{Problem formulation and solution approach}\label{subsec:power_system_DAEs}
+The key relation for power system dynamics is described by the current balance, i.e., Kirchhoff's current law, and it needs to hold at all times $t$ and for each of the $n$ buses in the network. We distinguish between the complex current injections stemming from the network $\IcomplexNetwork{} \in \Cdim{n}$ and from connected components $\IcomplexComponent{} \in \Cdim{n}$. The former can be described by the algebraic relationship (neglecting electro-magnetic transients) 
+\begin{align}
+    \IcomplexNetwork{} = \Ycomplex \Vcomplex.
+\end{align}
+where $\Vcomplex \in \Cdim{n}$ represents the complex voltages at the buses and $\Ycomplex \in \Cdim{n\times n}$ the complex admittance matrix. The component current injections $\IcomplexComponenti{i}$ at bus $i$ can stem from a \textit{dynamic component}, i.e., their behaviour is governed by differential equations,
+\begin{subequations}
+\begin{align}
+    \IcomplexComponenti{i} &= h_i(\xstatei{i}, \Vcomplexi{i})\label{eq:h_update_power_system}\\
+    \ddt \xstatei{i} &= \fupdateiof{\xstatei{i}, \Vcomplexi{i},\ustatei{i}}{i}\label{eq:f_update_power_system}
+\end{align} 
+\end{subequations}
+where the current injection depends on the state vector $\xstatei{i} \in \Rdim{p}$ and the voltage \Vcomplexi{i} of the bus $i$ to which the component is connected\footnote{For notational ease, we assume that component $i$ is connected to bus $i$. If component $i$ was connected to bus $j$, \Vcomplexi{i} would be replaced by \Vcomplexi{j}. If a component is connected to multiple buses, all of the corresponding voltages will be included in $h_i(\cdot)$ and \fupdateiof{\cdot}{i} in \cref{eq:f_update_power_system,eq:h_update_power_system}.}. The update function $\fupdate{}_i$ can furthermore depend on control inputs \ustatei{i}. For \textit{static components} the current injections becomes a function of the local voltage $\IcomplexComponenti{i} = h_i(\Vcomplexi{i})$. If no component is connected to bus $i$, then $\IcomplexComponenti{i} = 0$. If multiple components were connected to the same bus, the current injections would be summed up. 
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\linewidth]{figures_pdf/decomposition.pdf}
+    \caption{Structure of the \glspl{DAE} that govern the power system dynamics with current injection \IcomplexComponent{} from the components, e.g., generators and loads, and current flows in the network \IcomplexNetwork{}. Adapted from \cite{sauer_power_1998}.}
+    \label{fig:power_system_structure}
+\end{figure}
+
+\Cref{fig:power_system_structure} schematically depicts this structure with $m$ dynamic components, $l$ static component, and $n$ buses. When we formulate the current balance
+\begin{align}\label{eq:current_balance}
+    \zeroDim{} = \IcomplexComponent{}(\xstate(t), \Vcomplex(t)) - \IcomplexNetwork{}(\Vcomplex(t)),
+\end{align}
+and consider the system's structure, we note that the component currents \IcomplexComponent{} have only a \textit{local} dependency, i.e., to their corresponding state vectors \xstatei{i} and the local voltage \Vcomplexi{i}. Their interaction arises from the coupling through the network currents \IcomplexNetwork{}, which in turn only depends on all complex voltages $\Vcomplex$.
+
+PINNSim exploits this structure as follows: We assume a voltage evolution $\Vcomplexhat{}(t)$ -- we denote all approximations with the hat symbol $\hat{}$ -- based on which we evaluate the resulting network currents \IcomplexNetworkHat{} and the component currents \IcomplexComponentHat{}. For the latter, we furthermore require the state evolution \xstatehati{i} of each component; we approximate the necessary temporal integration with \glspl{PINN}. When comparing the resulting currents
+\begin{align}
+    \IcomplexComponentHat{}\left(\xstatehat(t), \Vcomplexhat(t)\right) - \IcomplexNetworkHat{}\left(\Vcomplexhat(t)\right)
+\end{align}
+the result will not equal $\bm{0}$ by default, i.e., the current balance \cref{eq:current_balance} is not obeyed. However, the mismatch indicates the quality of the approximation. By adjusting the assumed voltage evolution $\Vcomplexhat{}(t)$, we iteratively reduce this mismatch. The resulting voltage $\Vcomplexhat{}(t)$ and state $\xstatehat{}(t)$ evolutions constitute the solution of PINNSim to the system of \glspl{DAE}.
+
+\subsection{Parametrisation of the voltage evolution $\Vcomplexihat{i}(t)$}\label{subsec:voltage_profile}
+
+We describe the evolution of the complex voltage in polar form $\Vcomplexi{i}(t) = V_{i}(t) e^{j\theta_i(t)}$. To approximate $\Vcomplexi{i}(t)$, we express the voltage magnitude $V_i$ and the voltage angle $\theta_i$ as a power-series with respect to time up to power $r$ as suggested in \cite{wang_timepower_2019} 
+\begin{align}
+     \Vcomplexihat{i}(t) &= \left(\sum_{k=0}^{r} V_{k, i} (t-t_0)^k \right) e^{j\left(\sum_{k=0}^{r} \theta_{k, i} (t-t_0)^k \right)}.\label{eq:voltage_parametrisation}
+\end{align}
+The coefficients $V_{0, i}, V_{1, i}, \dots, V_{r, i}$ and $\theta_{0, i}, \theta_{1, i}, \dots, \theta_{r, i}$ form the parameters which we will later on update to improve the approximation. The vector $\Vparams{}_i$ collects all parameters at bus $i$
+\begin{align}
+    \Vparams{}_i = \begin{bmatrix}
+      V_{0, i} & \theta_{0, i} & \hdots & V_{r, i}, \theta_{r, i}
+    \end{bmatrix}, \quad \Vparams{}_i \in \Rdim{2(r+1)}.
+\end{align}
+This parametisation is repeated for all $n$ buses in the system. We concatenate all $\Vparams{}_i$ in the vector $\Vparams{} \in \Rdim{2 (r+1) n}$.
+
+\subsection{Solving component dynamics with PINNs}\label{subsec:PINN_approximation}
+The exact solution for the evolution of the differential variables $\bm{x}_i(t)$ of a single dynamic component $i$ can be obtained by integration of \cref{eq:f_update_power_system}
+\begin{align}
+    \xstatei{i}(t) &= \bm{x}_{0, i} + \int_{t_0}^{t} \bm{f}_i\left(\xstatei{i}(\tau), \Vcomplexi{i}(\tau), \ustatei{i}\right) d\tau. \label{eq:x_integral}
+\end{align}
+As there usually exists no explicit analytical solution to \labelcref{eq:x_integral}, we need to approximate the solution. As motivated earlier, using \glspl{PINN} allows us to accurately approximate \labelcref{eq:x_integral} over large time steps $\Delta t=t-t_0$ while being fast to evaluate. The approximation will be dependent on the time step size $\Delta t$, the initial state $ \bm{x}_{0, i}$, potentially the control input \ustatei{i}, and the voltage profile \Vcomplexi{i}. As we cannot train the \gls{PINN} with an arbitrary \Vcomplexi{i}, we restrict the learning to the same form as in \cref{eq:voltage_parametrisation}, i.e., $\Vcomplexi{i} \approx \Vcomplexihat{i}(\Delta t, \Vparamsi{i})$. Hence, the approximation of \cref{eq:x_integral} will depend also on $\Vparamsi{i}$
+\begin{align}
+    \xstatehati{i}(t) = \PINN(\Delta t, \bm{x}_{0, i}, \Vparamsi{i}, \bm{u}_i).
+\end{align}
+The functional form of the \gls{PINN} is a standard feed-forward \gls{NN} with $K$ hidden layers parameterised by the weight matrices $\bm{W}^{k}$ and bias vectors $\bm{b}^{k}$ and a non-linear activation function $\sigma$
+\begin{subequations}
+\begin{align}
+    \bm{z}_0 &= [\Delta t, \bm{x}_{0,i}, \Vparamsi{i}, \bm{u}_i] \label{eq:NN_input}\\
+    \bm{z}_{k+1} &= \sigma\left( \bm{W}^{k+1} \bm{z}_{k} + \bm{b}^{k+1}\right), \,\forall k = 0, 1, \ldots, K-1\label{eq:NN_hidden_layers}\\
+    \xstatehati{i} &= \xinitiali{i} + \Delta t (\bm{W}^{K} \bm{z}_K + \bm{b}^{K}). \label{eq:NN_output}
+\end{align}
+\end{subequations}
+We adjust the last layer to enforce that the initial condition $\bm{x}_{0,i}$ is met if $\Delta t=0$, i.e., $t = t_0$. Thereby we ensure numerical consistency and can improve inaccuracies related to recursive application of the \gls{PINN} \cite{lagaris_artificial_1998}. 
+To train a \gls{PINN}, we optimise
+\begin{align}
+\min_{\bm{W}^{1}, \bm{b}^{1}, \dots, \bm{W}^{K}, \bm{b}^{K}} \quad \mathcal{L}_{x} + \alpha \mathcal{L}_{c},
+\end{align}
+where $\mathcal{L}_x$ evaluates the prediction error based on a dataset $\mathcal{D}$ of simulated data points 
+\begin{align}
+\mathcal{L}_{x} = \oneoversizeof{\mathcal{D}}\sum_{j=1}^{\sizeof{\mathcal{D}}} \normtwosquared{\xstatei{i}^{(j)} - \xstatehati{i}^{(j)}}
+\end{align}
+and a physics-based loss term $\mathcal{L}_{c}$ evaluated on \textit{collocation} points which do not require any simulation
+\begin{align}    
+\mathcal{L}_{c} = &\oneoversizeof{\mathcal{D}}\sum_{j=1}^{\sizeof{\mathcal{D}_c}} \normtwosquared{\ddt \hat{\bm{x}}_{i}^{(j)} - \fupdateof{\xstatehati{i}^{(j)}, \Vcomplexi{i}^{(j)}, \ustatei{i}^{(j)}}}.
+\end{align}
+The two loss terms are weighted with the hyperparameter $\alpha$. For a more detailed explanation of \glspl{PINN}, we refer to \cite{stiasny_physics-informed_2023}. Based on the evolution of the state $\xstatehati{i}(t)$ and the voltage $\Vcomplexihat{i}(t)$, we can calculate the current injection \IcomplexComponentHati{i} by evaluating
+\begin{align}
+    \IcomplexComponentHati{i}(t) = h_i(\xstatehati{i}(t), \Vcomplexihat{i}(t)).
+\end{align}
+For each of the $m$ dynamic components, we will train a separate \gls{PINN} and all training can be can be performed in advance of executing PINNSim.
+
+\subsection{Updating the voltage profile}\label{subsec:voltage_profile_update}
+
+The approximations $\Vcomplexihat{i}(t)$ and $\xstatehati{i}(t)$ are both continuous functions and therefore the same holds for $\IcomplexComponentHati{i}(t)$ and $\IcomplexNetworkHati{i}(t)$. The current balance \cref{eq:current_balance} will only be fulfilled, if $\IcomplexComponentHati{i}(t) = \IcomplexNetworkHati{i}(t)$ for the entire time step and at all buses. We express this notion by requiring that the norm $\norm{\IcomplexComponentHati{i}-\IcomplexNetworkHati{i}}{}$ shall be 0. This norm
+\begin{align}\label{eq:metric_definition}
+    \norm{\IcomplexComponentHati{i}-\IcomplexNetworkHati{i}}{} = \sqrt{ \langle \IcomplexComponentHati{i}-\IcomplexNetworkHati{i}, \IcomplexComponentHati{i}-\IcomplexNetworkHati{i}\rangle}
+\end{align}
+is induced by the inner product $\langle \Bar{a}, \Bar{b}\rangle$ between two complex functions $\Bar{a}(t), \Bar{b}(t)$ over the interval $[t_0, t_0 + \Delta t]$
+% They live in the vector space of complex functions ($*$ indicates the complex conjugate), for which the inner product
+\begin{align}
+    \langle \Bar{a}, \Bar{b}\rangle &= \int_{t_0}^{t_0 + \Delta t} \Bar{a}(t) \, \Bar{b}^*(t) \, dt.
+    % \langle f, g\rangle &= \int_X f(t) \Bar{g(t)} d\mu(t)
+\end{align}
+As \IcomplexComponentHati{i} and \IcomplexNetworkHati{i} depend on the parametrised voltages $\Vcomplexhat{}(t, \Vparams)$, we subsequently aim to find a parametrisation \Vparams{} that minimises $\norm{\IcomplexComponentHati{i}-\IcomplexNetworkHati{i}}{}$. To this end, we formulate the following optimisation problem for the entire system as the sum of the norms (we square  \cref{eq:metric_definition} to avoid the calculation of the square root)
+\begin{align}\label{eq:objective_voltage_update_exact}
+    \min_{\Vparams} \sum_{i=1}^n \norm{\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}}{}^2.
+\end{align}
+The above expression involves the integration
+% \begin{subequations}
+% \begin{align}
+%     \norm{\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}}{}^2 &=\int_{t_0}^{t_0 + \Delta t} \left(\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}\right) \left(\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}\right)^* dt\\
+%     =\int_{t_0}^{t_0 + \Delta t} &\realof{\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}}^2 + \imagof{\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}}^2 dt
+% \end{align}
+% \end{subequations}
+% \begin{subequations}
+\begin{align*}
+    \norm{\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}}{}^2 &=\int_{t_0}^{t_0 + \Delta t} \realof{\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}}^2 + \imagof{\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}}^2 dt
+\end{align*}
+% \end{subequations}
+which we approximate with the Midpoint rule, i.e., we split the interval $[t_0, t_0 + \Delta t]$ into $s$ equally sized intervals of width $\frac{\Delta t}{s}$ and sum the function value at the middle of these intervals 
+\begin{align}\label{eq:objective_approximation}
+\begin{split}
+    \norm{\IcomplexComponentHati{i} - \IcomplexNetworkHati{i}}{}^2 \approx \frac{\Delta t}{s}\sum_{j=1}^s & \realof{\IcomplexComponentHati{i}(t_j) - \IcomplexNetworkHati{i}(t_j)}^2 \\&+ \imagof{\IcomplexComponentHati{i}(t_j) - \IcomplexNetworkHati{i}(t_j)}^2.
+\end{split}
+\end{align}
+Thereby, we can approximate the optimisation in \cref{eq:objective_voltage_update_exact} as
+\begin{align}
+    \min_{\Vparams} \frac{\Delta t}{s} \residualError{}^\top \residualError{}
+\end{align}
+% \begin{align}
+% \min_{\Vparams} \sum_{i=1}^n \frac{\Delta t}{s} \sum_{j=1}^s &\realof{\IcomplexComponentHati{i}(t_j) - \IcomplexNetworkHati{i}(t_j)}^2 + \imagof{\IcomplexComponentHati{i}(t_j) - \IcomplexNetworkHati{i}(t_j)}^2
+% \end{align}
+% which we will subsequently write as
+where \residualError{} collects all summands in a vector
+\begin{align}
+\begin{split}
+    \residualError{} &= \begin{bmatrix} \realof{\IcomplexComponentHati{1}(t_1) - \IcomplexNetworkHati{1}(t_1)} \\ \imagof{\IcomplexComponentHati{1}(t_1) - \IcomplexNetworkHati{1}(t_1)} \\ \vdots \\\realof{\IcomplexComponentHati{n}(t_s) - \IcomplexNetworkHati{n}(t_s)} \\ \imagof{\IcomplexComponentHati{n}(t_s) - \IcomplexNetworkHati{n}(t_s)} \end{bmatrix}, \quad \residualError{} \in \Rdim{2ns}
+\end{split}
+\end{align}
+
+We solve the above non-linear least square problem by iteratively updating the parameters $\Vparamsiter{k+1} = \Vparamsiter{k} + \Delta \Vparams$. To determine $\Delta \Vparams$, we compute the Jacobian  
+\begin{align}\label{eq:jacobian_least_square}
+    \bm{J} &= \frac{\partial \residualError{}}{\partial \Vparams}\Bigr|_{\Vparamsiter{k}}, \quad \bm{J} \in \Rdim{2ns\times2(r+1)n}
+\end{align}
+at the values \Vparamsiter{k} and solve the linear problem
+\begin{align}\label{eq:residual_least_square}
+    \left(\Jacobian^\top \Jacobian\right) \Delta \Vparams = - \Jacobian^\top \residualError{}.
+\end{align}
+To calculate \Jacobian{} in \cref{eq:jacobian_least_square}, we use \gls{AD} \cite{baydin_automatic_2018} as all computations for \IcomplexComponentHat{} and \IcomplexNetworkHat{} are expressed as explicit functions. While the size of \Jacobian{} can become large, it has a very sparse structure that can be exploited in its construction and when solving \cref{eq:residual_least_square} -- herein lies the key to the scalability of PINNSim as it closely resembles the structure of conventional integration schemes such as the trapezoidal method.
+
+\subsection{PINNSim: The full time-stepping simulator}\label{subsec:full_algorithm}
+
+\Cref{algo:simulator} shows the integration of the previous sections into the full PINNSim algorithm that is used for the computation of a time step.   
+\input{algorithms/pinn_sim}
+Its accuracy is dependent on the approximation quality of $\xstatehat{}(t)$ and $\Vcomplexhat(t)$ and on the tolerance settings for $\Delta \Vparams$ and the maximum number of iterations $k^{\max}$. Therefore, requirements on the resulting tolerance limit the suitable time step size $\Delta t$. By repeatedly applying \cref{algo:simulator}, we obtain a time-stepping scheme that then allows the simulation of dynamics beyond $\Delta t$.
+% \input{algorithms/multi_step_simulator.tex}
+

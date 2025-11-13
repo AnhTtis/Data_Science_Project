@@ -1,0 +1,171 @@
+%!TEX root = graphsc.tex
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Overview}
+\label{sec:overview}
+
+Given a source point cloud $\mathcal{P} = \{\textbf{p}_i \in \mathbb{R}^3 \mid i = 1, ..., N\}$ and a target point cloud $\mathcal{Q} = \{\textbf{q}_i \in \mathbb{R}^3 \mid i = 1, ..., M\}$, non-rigid registration aims to recover the warping function $\mathcal{W}: \mathbb{R}^3 \rightarrow \mathbb{R}^3$ that transforms $\mathcal{P}$ to $\mathcal{Q}$.
+To solve for the warping function, a set of correspondences $\mathcal{C} = \{(\mathbf{x}_i, \mathbf{y}_i) \in \mathbb{R}^6 \mid \mathbf{x}_i \in \mathcal{P}, \mathbf{y}_i \in \mathcal{Q} \}$ between two point clouds are first extracted.
+Then the warping function $\mathcal{W}$ can be solved by minimizing the following cost function:
+\begin{equation}
+E = \lambda_c E_{\text{corr}} + \lambda_r E_{\text{reg}},
+\label{eq:cost-function}
+\end{equation}
+where $E_{\text{corr}}$ is a correspondence term which minimizes the residuals of the correspondences after being warped, and $E_{\text{reg}}$ is a regularization term to encourage smoothness of deformations.
+Nevertheless, the putative correspondences usually contain numerous outliers, which significantly harms the registration accuracy.
+Due to complex deformations, it is difficult to filter outliers in non-rigid registration.
+In this work, we first present the graph-based local spatial consistency which measures the compatibility of correspondences within a local region, and then propose an outlier rejection network for non-rigid registration.
+
+
+\subsection{Graph-based Local Spatial Consistency}
+\label{sec:local-spatial-consistency}
+
+\input{figures/spatial-consistency}
+
+Spatial consistency is a widely used criterion~\cite{leordeanu2005spectral,bai2021pointdsc,chen2022sc2} to select inlier correspondences in rigid registration, \eg, length consistency which preserves the distance between every pair of points under arbitrary rigid transformations. Given two correspondences $c_i \tight{=} (\mathbf{x}_i, \mathbf{y}_i)$ and $c_j \tight{=} (\mathbf{x}_j, \mathbf{y}_j)$, the spatial consistency between them is computed as:
+\begin{equation}
+\theta^{*}_{i,j} = [1 - \frac{\delta_{i, j}^2}{\sigma_{d}^{2}}]_{+},
+\label{eq:global-spatial-consistency}
+\end{equation}
+where $[\cdot]_{+} = \max(0, \cdot)$, $\delta_{i, j} = \big\lvert \lVert \mathbf{x}_i - \mathbf{x}_j \rVert - \lVert \mathbf{y}_i - \mathbf{y}_j \rVert \big\rvert$ is the difference between the respective distances in two point clouds, and $\sigma_d$ is a hyper-parameter to control the sensitivity to distance variation.
+According to length consistency, $\delta_{i, j}$ should be small if they are both inliers, making $\theta^{*}_{i, j}$ close to $1$. But if there is at least one outlier, $\delta_{i, j}$ tends to be large due to the random distribution of the outliers, so $\theta^{*}_{i, j}$ should be $0$. See \cref{fig:spatial-consistency}(a) for a detailed illustration. This provides strong geometric support to reject outliers in rigid scenarios.
+
+However, global spatial consistency no longer holds in non-rigid scenarios, especially between two inliers far from each other, as the points in different parts of the scene could follow inconsistent movements (see \cref{fig:spatial-consistency}(b)). But as noted in~\cite{igarashi2005rigid}, the local geometric shape is expected to be preserved and the warping function should be locally isometric and nearly rigid, \ie, local rigidity of deformations. Inspired by this insight, we propose to adopt spatial consistency in a local scope and devise a novel \emph{graph-based local spatial consistency}. 
+Our method is based on the deformation graph~\cite{sumner2007embedded} built over the source point cloud.
+We first sample a set of nodes $\mathcal{V} = \{\mathbf{v}_j \in \mathbb{R}^3 \mid j = 1, ..., V\}$ from $\mathcal{P}$ using \emph{uniform furthest point sampling}. We start from an arbitrary point in $\mathcal{P}$ and iteratively add the furthest point to the sampled nodes as a new node. The sampling process is repeated until the distances from all points in $\mathcal{P}$ to their nearest nodes are within $\sigma_n$.
+Then, we assign each correspondence $c_i$ to its $k$-nearest nodes $\mathcal{N}_i$ according to the distances in $\mathcal{P}$.
+Here $\mathcal{N}_i$ is constructed according to the Euclidean distance.
+Given two points in a local region, their Euclidean distance is sufficiently consistent across two point clouds, but is more robust to occlusion than the geodesic distance.
+The set of correspondences assigned to a node $\mathbf{v}_j$ is denoted as $\mathcal{C}_j = \{ c_i \mid \mathbf{v}_j \in \mathcal{N}_i \}$.
+At last, our graph-based local spatial consistency is defined by computing \cref{eq:global-spatial-consistency} on the correspondence pairs assigned to a common node:
+\begin{equation}
+\theta_{i, j} = \begin{cases}
+[1 - \delta_{i, j}^2 / \sigma_{d}^{2}]_{+}, & c_i \in \mathcal{C}_v \land c_j \in \mathcal{C}_v \\
+0, & \text{otherwise}
+\end{cases}.
+\label{eq:spatial-consistency}
+\end{equation}
+Based on local rigidity, $\theta_{i, j}$ is expected to be close to $1$ if $c_i$ and $c_j$ are both inliers and be $0$ otherwise.
+\cref{fig:spatial-consistency} compares our local spatial consistency with the global consistency.
+
+\input{figures/pipeline}
+
+An alternative way to define local spatial consistency is to construct a $k$NN graph around each correspondence instead of the sampled nodes. However, this manner could have two main problems.
+First, it requires more computation and memory usage to compute local spatial consistency around \emph{every} correspondence. This seriously restricts its scalability to large point clouds or dense correspondences.
+Second, this fashion is sensitive to the density of putative correspondences. In practice, the distribution of correspondences could be extremely biased over the point cloud, and thus this manner is prone to be affected by the dense regions.
+On the contrary, as our method is designed around uniformly sampled nodes, it has great advantage in efficiency and is naturally robust to density variation. Please refer to~\cref{sec:exp-ablation} for more detailed comparisons.
+
+\subsection{Non-rigid Outlier Rejection Network}
+\label{sec:outlier-rejection-network}
+
+Based on the local spatial consistency, we then propose an attention-based \emph{Graph-based Spatial Consistency Network} (\emph{\ours{}}) for non-rigid outlier rejection. Given a set of putative correspondences, \ours{} leverages the graph-based local spatial consistency to remove the outliers from them.
+The overall pipeline is illustrated in \cref{fig:overview}.
+
+\ptitle{Initial feature embedding.}
+%
+For each input correspondence, we first concatenate the coordinates of the two endpoints into a $6$-d vector $\mathbf{c}_i = [\mathbf{x}_i; \mathbf{y}_i]$, which is then normalized to $\hat{\mathbf{c}}_i$ by subtracting the average over all correspondences.
+Next, $\hat{\mathbf{c}}_i$ is transformed using Fourier positional encoding in~\cite{mildenhall2020nerf}.
+As mentioned in~\cite{li2022non}, low-frequency encoding benefits fitting relatively rigid motion while high-frequency one can better model highly non-rigid motion. Recalling our goal to better capture local rigidity, we use relatively low frequency to encode the correspondences:
+\begin{equation}
+\mathbf{d}_i = [\hat{\mathbf{c}}; \hspace{5pt} \sin(2^{-1} \hat{\mathbf{c}}); \hspace{5pt} \cos(2^{-1} \hat{\mathbf{c}})] \in \mathbb{R}^{18}.
+\end{equation}
+At last, the encoded correspondence matrix $\mathbf{D} \in \mathbb{R}^{\lvert \mathcal{C} \rvert \times 18}$ is projected to a high-dimension feature matrix $\mathbf{F}_{\text{init}} \in \mathbb{R}^{\lvert \mathcal{C} \rvert \times d}$ by a shallow MLP, which is used as the initial correspondence embedding. And group normalization~\cite{wu2018group} and LeakyReLU are used after each layer in the MLP.
+
+
+\ptitle{Graph-based correspondence embedding.}
+%
+With the initial correspondence embedding, we then design a \emph{Graph-based Correspondence Embedding Module} to enhance the feature representation of the correspondences with attention mechanism. The structure of this module is shown in \cref{fig:overview}~(bottom). Our method is based on the deformation graph constructed in \cref{sec:local-spatial-consistency} and consists of three steps.
+
+First, we collect for each node $\mathbf{v}_j$ the correspondences in $\mathcal{C}_j$ and their associated features denoted as $\mathbf{F}_j \in \mathbb{R}^{\lvert \mathcal{C}_j \rvert \times d}$. Note that a correspondence could be assigned to more than one nodes and the nodes with $\mathcal{C}_j = \varnothing$ are ignored. We also collect the local spatial consistency of the correspondence pairs in $\mathcal{C}_j$, denoted as $\mathbf{\Theta}_j \in \mathbb{R}^{\lvert \mathcal{C}_j \rvert \times \lvert \mathcal{C}_j \rvert}$.
+
+Next, we refine the features for the correspondences by a stack of \emph{Spatial-Consistency-Aware Self-Attention} (SCA-SA) module. Specifically, the feature matrix $\mathbf{F}_j$ is first projected into the query $\mathbf{Q}_j$, key $\mathbf{K}_j$ and value $\mathbf{V}_j$:
+\begin{equation}
+\mathbf{Q}_j = \mathbf{F}_j \mathbf{W}^Q, \hspace{10pt} \mathbf{K}_j = \mathbf{F}_j \mathbf{W}^K, \hspace{10pt} \mathbf{V}_j = \mathbf{F}_j \mathbf{W}^V,
+\end{equation}
+where $\mathbf{W}^Q$, $\mathbf{W}^K$, $\mathbf{W}^V \in \mathbb{R}^{d \times d}$ are the projection weights for query, key and value, respectively.
+Inspired by~\cite{bai2021pointdsc}, we leverage the local spatial consistency to \emph{reweight} the attention scores in the original attention computation~\cite{vaswani2017attention}:
+\begin{equation}
+\mathbf{Z}'_j = \mathtt{LN}\Big(\mathbf{F}_j + \mathtt{MLP}\big( \mathtt{Softmax}(\mathbf{\Theta}_j \frac{\mathbf{Q}_j\mathbf{K}_j^T}{\sqrt{d}}) \mathbf{V}_j\big)\Big),
+\end{equation}
+where $\mathtt{LN}(\cdot)$ is layer normalization~\cite{ba2016layer}.
+By injecting the graph-based local spatial consistency into self-attention, the correspondence pairs with strong spatial consistency are encouraged to have large attention scores, while the attention scores of the incompatible pairs are expected to be suppressed. This could push the outliers away from the inliers in the feature space, thus making the resultant features more discriminative.
+The attention features are further projected by a two-layer feedforward network with residual connection to obtain the final output features:
+\begin{equation}
+\mathbf{Z}_j = \mathtt{LN}\big(\mathbf{Z}'_j + \mathtt{MLP}(\mathbf{Z}'_j)\big).
+\end{equation}
+\cref{fig:overview}~(bottom right) illustrates the structure and the computation graph of this module.
+
+At last, for each correspondence, we consider its spatial compatibility \wrt different nodes and aggregate the features from all the nodes where it belongs as the final output features:
+\begin{equation}
+\mathbf{h}_i = \sum_{j \in \mathcal{N}_i} \alpha_{i, j} \mathbf{z}^j_i,
+\end{equation}
+where $\alpha_{i, j}$ is the skinning factor as in DynamicFusion~\cite{newcombe2015dynamicfusion}:
+\begin{equation}
+\alpha_{i, j} = \frac{\exp(-\lVert \mathbf{x}_i - \mathbf{v}_j \rVert^2 / (2 \sigma_n^2))}{\sum_{k \in \mathcal{N}_i} \exp(-\lVert \mathbf{x}_i - \mathbf{v}_k \rVert^2 / (2 \sigma_n^2))}.
+\label{eq:skinning-factor}
+\end{equation}
+In non-rigid scenarios, it is unreliable to predict whether one correspondence is inlier or not from merely a single local area as there could be large deformation in it. On the contrary, our method considers all neighboring regions, which could improve the robustness of the extracted features.
+
+\ptitle{Classification head.}
+%
+Given the spatial-consistency-aware features $\mathbf{F}_{\text{sc}} \in \mathbb{R}^{\lvert \mathcal{C} \rvert \times d}$ of the correspondences, we further adopt a three-layer MLP to predict the confidence score $s_i$ being an inlier for each correspondence. Group normalization~\cite{wu2018group} and LeakyReLU are used after the first two layers in the MLP, and sigmoid activation is applied after the last layer. The correspondences whose confidence scores are above a certain threshold $\tau_{s}$ are selected as inliers and the others are removed as outliers.
+
+
+\subsection{Deformation Estimation}
+\label{sec:deformation-estimation}
+
+After obtaining the pruned correspondences, an embedded deformation graph~\cite{sumner2007embedded} is computed as the final warping function.
+We first construct a deformation graph $\hat{\mathcal{G}} = \{\hat{\mathcal{V}}, \hat{\mathcal{E}}\}$ with a set of graph nodes $\hat{\mathcal{V}}$ and undirected edges $\hat{\mathcal{E}}$ connecting them.
+The nodes are sampled from $\mathcal{P}$ as described in \cref{sec:local-spatial-consistency} with a distance threshold of $\sigma_g$.
+Each point in $\mathcal{P}$ are assigned to its $k_g$ nearest nodes and two nodes are connected by an edge if there exists a point assigned to both of them.
+$\mathcal{W}$ can then be approximated by a collection of local \emph{rigid} transformations $\{ (\mathbf{R}_j, \mathbf{t}_j) \}$ associated with each node $\hat{\mathbf{v}}_j$:
+\begin{equation}
+\mathcal{W}(\mathbf{p}_i) = \sum_{j \in \mathcal{N}_i} \alpha_{i,j} \big(\mathbf{R}_j (\mathbf{p}_i - \hat{\mathbf{v}}_j) + \mathbf{t}_j + \hat{\mathbf{v}}_j\big),
+\label{eq:embedded-deformation}
+\end{equation}
+where $\alpha_{i, j}$ is computed as in \cref{eq:skinning-factor}.
+Our final optimization objective is shown as in \cref{eq:cost-function}, where the correspondence term is the mean squared distance between the correspondences and an as-rigid-as-possible~\cite{igarashi2005rigid} regularization term is applied to constrain the smoothness of deformations:
+\begin{equation}
+\begin{aligned}
+E_{\text{corr}} & = \sum_{(\mathbf{x}_i, \mathbf{y}_i) \in \mathcal{C}} \lVert \mathcal{W}(\mathbf{x}_i) - \mathbf{y}_i \rVert_{2}^{2} \\
+E_{\text{reg}} & = \sum_{(\mathbf{v}_i, \mathbf{v}_j) \in \mathcal{E}} \lVert \mathbf{R}_{i}(\mathbf{v}_{j} - \mathbf{v}_{i}) + \mathbf{v}_{i} + \mathbf{t}_{i} - (\mathbf{v}_{j} + \mathbf{t}_{j}) \rVert_{2}^{2}
+\end{aligned}.
+\end{equation}
+This problem can be efficiently solved by Non-rigid ICP (N-ICP) algorithm~\cite{li2008global,sumner2007embedded}.
+Note that although embedded deformation is used, \ours{} is agnostic to deformation models and thus can facilitate any correspondence-based non-rigid registration methods.
+
+
+\subsection{Loss Functions}
+
+Our model is trained with two types of loss functions, including a classification loss and a consistency loss. The overall loss function is computed as $\mathcal{L}_{\text{all}} = \mathcal{L}_{\text{cls}} + \lambda \mathcal{L}_{\text{con}}$.
+
+\ptitle{Classification loss.}
+%
+We formulate the prediction of the confidence scores of the correspondences as a binary classification problem. As inliers and outliers are usually very imbalanced in the putative correspondences, we supervise the confidence scores with a binary focal loss~\cite{lin2017focal}. The label of each correspondence $c_i = (\mathbf{x}_i, \mathbf{y}_i)$ is computed as:
+\begin{equation}
+s^{*}_i = \begin{cases}
+1, & \lVert \mathcal{W}^{*}(\mathbf{x}_{i}) - \mathbf{y}_{i} \rVert < \tau_{d} \\
+0, & \text{otherwise}
+\end{cases},
+\end{equation}
+where $\mathcal{W}^{*}$ is the ground-truth deformation. And the classification loss is computed as:
+\begin{equation}
+\mathcal{L}_{\text{cls}} = - s^{*}_i (1 - s_i)^{\gamma} \log(s_i) - (1 - s^{*}_i) s_i^{\gamma} \log(1 - s_i),
+\end{equation}
+where $\gamma = 2$ is the focusing hyper-parameter as in \cite{lin2017focal}.
+
+
+\ptitle{Consistency loss.}
+%
+Inspired by PointDSC~\cite{bai2021pointdsc}, we further adopt an auxiliary feature consistency loss so that the inliers are close to each other in the feature space and are far away from the outliers. However, due to the complexity of non-rigid deformations, feature consistency could not hold between two distant inlier correspondences. For this reason, we propose to supervise the feature consistency in each local region. 
+For two correspondences $c_x, c_y \in \mathcal{C}_j$ of node $\textbf{v}_j$, we first compute their feature consistency as:
+\begin{equation}
+\delta_{x, y} = [1 - \frac{\lVert \hat{\mathbf{h}}_x - \hat{\mathbf{h}}_y \rVert^2}{\sigma_f^2}]_{+},
+\end{equation}
+where $\hat{\mathbf{h}}_x$ and $\hat{\mathbf{h}}_y$ are the correspondence features which are normalized onto a unit hyper-sphere, and $\sigma_f$ is a learnable tolerance parameter. The consistency loss is computed as:
+\begin{equation}
+\mathcal{L}_{\text{con}} = \frac{1}{\lvert \mathcal{V} \rvert^2} \sum_{\textbf{v}_j \in \mathcal{V}} \frac{1}{\lvert \mathcal{C}_j \rvert^2} \sum_{\textbf{c}_x \in \mathcal{C}_j} \sum_{\textbf{c}_y \in \mathcal{C}_j} \in \lVert \delta_{x, y} - \delta^{*}_{x, y} \rVert,
+\end{equation}
+where the ground-truth targets $\delta^{*}_{x, y} = 1$ if $c_x$ and $c_y$ are both inliers and $\delta^{*}_{x, y} = 0$ otherwise.

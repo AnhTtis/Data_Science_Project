@@ -1,0 +1,173 @@
+\subsection{Datasets}
+\label{sec:experiments:datasets}
+We experiment with two question-answering (QA) datasets: the Stanford Question Answering Dataset (Squad) v2.0~\cite{rajpurkar-etal-2018-know} and the CNN portion of the DeepMind Question Answering (DQA)~\cite{hermann2015teaching} dataset.
+Each has a set of questions and a set of ``context" paragraphs which contain information useful for answering the questions.~\footnote{see {https://rajpurkar.github.io/SQuAD-explorer/explore/v2.0/dev} for examples of Squad contexts and associated questions.}
+
+Our task is to perform ASR on the questions. We use the TTS system from~\cite{fazel21_interspeech} to obtain speech for the questions; and we construct datastores for retrieval from the contexts.
+This setup emulates the data available to a typical voice assistant with open-source, non-proprietary data.
+The synthesized questions correspond to user queries, and the contexts correspond to the knowledge base with which a downstream NLP module would resolve the queries.
+Note that since we do not know exactly which context applies to which question, each dataset's datastore contains the keys and continuations of all contexts from the entire dataset.
+
+\begin{table}[t]
+    \centering
+    \caption{Summary of the test sets. Squad-V and Squad-T refer to the Squad validation and test sets respectively, and DQA-V and DQA-T refer to the DQA validation and test sets respectively.}
+    \begin{tabular}{lccccc}
+        \toprule
+        Dataset & \multicolumn{2}{c}{Contexts} & \multicolumn{2}{c}{Questions} \\
+         & \#Paragraphs & \#Tokens & \#Sentences & \#Words \\
+        \midrule
+        Squad-V & 19124 & 3997k & 6510 & 68107 \\
+        Squad-T & 1204 & 287k & 11868 & 123020 \\
+        DQA-V & 1220 & 1371k & 3924 & 53494 \\
+        DQA-T & 1093 & 1172k & 3198 & 44737 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:data_stats}
+\end{table}
+
+In Table~\ref{tab:data_stats}, we report the number of context paragraphs, questions and their constituent tokens and words for each dataset.
+Note that for Squad, since the official test set is not public, we use the official dev-set as our test set (Squad-T), and split off $5\%$ of the training questions for validation (Squad-V).
+We therefore use the entire set of Squad training contexts for the Squad-V datastore, which makes the datastore large and retrieval that much harder.
+For DQA, all entities are de-anonymized before TTS and datastore construction.
+
+To get a strong DQA baseline, we pretrain the baseline RNN-T for 100k steps on a mix of the DQA and Librispeech~\cite{panayatov2015librispeech} training sets, with batches uniformly sampled from each set. The DQA training set contains 380k questions which--to avoid any acoustic mismatch--we synthesize with the same TTS system as the test sets, using speaker profiles which include those used for the test sets.
+Compared to a baseline trained purely on Librispeech, including the DQA training set improves the word error rates (WER) from 34.3\% to 13.8\% on DQA-T, from 23.5\% to 15.2\% on Squad-T, with only a negligible degradation on the Librispeech test sets (6.5\% to 6.6\% on the test-clean).
+
+With the parameters of the pretrained RNN-T frozen, we train the adapter for 30k steps on the Squad training set, which contains 124k sentences (the official training set minus the validation sentences); we use its synthesized questions as ASR data along with a datastore of all its contexts (same datastore as Squad-V).
+
+To mitigate the risk of adapter overfitting on retrieved continuations, we add two forms of noise and force the model to learn when to rely on the no-bias embedding.
+First, we mix in an equal proportion of Librispeech batches to the \emph{adapter} training data so that the retrieved continuations from the Squad datastore would be irrelevant.
+In addition, with $0.1$ probability we retrieve random continuations from the training datastore instead of the actual k nearest neighbors, so that the model is exposed to--and learns to deal with--incorrect continuations even when the domain matches.
+
+\subsection{Model configuration}
+The baseline RNN-T has 64 million parameters, comprising an encoder with six LSTM layers with 1024 units followed by a 640-dimensional affine projection,
+a prediction network which has two LSTM layers of 1024 units also followed by projection to 640 dimensions,
+and a joiner with intermediate dimension of 512 and output dimension of 2501 corresponding to 2500 unigram subword tokens~\cite{kudo2018subword} trained on Librispeech, and the extra blank token.
+
+The adapter adds 1 million parameters, of which $2501 \times 128 \approx 320k$ are in the embedding layer.
+The remaining parameters are in two 128-unit LSTM layers, two feedforward layers with 128 units and multihead attention with two heads and key dimension of 128.
+
+The retrieval LM is a two-layer LSTM with 256 units trained on Wikitext-103~\cite{merity2016pointer}.
+We reiterate that this retrieval LM is kept fixed regardless of which datastore we retrieve from.
+
+We implement the k-nearest-neighbor search in FAISS~\cite{johnson2019billion} using a CPU index with product quantization~\cite{jegou2010product}.
+The largest index in our experiments--constructed by concatenating all datastores (used in the ``All" rows of Tables~\ref{tab:main_results}~and~\ref{tab:ne_results})--occupies just under 500 megabytes of RAM.
+We set $K$ to 16 for both training and inference, i.e. at each step, we retrieve 16 candidate continuations out of hundreds of thousands to millions (number context tokens in Table~\ref{tab:data_stats}).
+
+\subsection{Test set performance}
+\label{sec:experiments:test}
+Table~\ref{tab:main_results} shows the word error rates of the various test sets.
+
+Since our retrieval mechanism involves introducing and training an adapter, some of the improvement or degradation in performance may be attributed to simply having extra parameters trained on question-answering data, essentially updating the RNN-T's internal language model (ILM), rather than being able to retrieve and use the correct continuations.
+To measure this effect, we train another baseline which has an adapter but no retriever.
+For this, we input to the adapter LSTM a single trainable embedding instead of the embeddings of retrieved continuations.
+This ``fixed embedding" approach, when compared to the baseline without any adaptations, improves Squad and degrades DQA performance.
+This is expected because the baseline training includes DQA training data, while the adapter is trained with Squad and Librispeech ASR data.
+
+We observe significant improvements compared to either baseline on all test sets when the datastore \emph{matches} the corresponding contexts, e.g. Squad-T datastore for Squad-T test set etc.
+It is noteworthy that we get relative improvements of $9\%$ and $7\%$ respectively on the DQA validation and test sets compared to the baseline with no adapter despite the performance drop that we incur due to the ILM shift from training the adapter on Squad+Librispeech (as evidenced by the fixed embedding results).
+
+Next, we observe that the performance improvements brought by retrieval are generally proportional to how relevant the datastore is. For instance, when decoding the Squad test set, the WER increases when we switch from the datastore of Squad test contexts to the datastore of Squad validation contexts and increases further as we switch to the datastores of DQA contexts, at which point we get performance comparable to using the fixed embedding.
+
+The matched results are predicated on picking the right datastore for each test utterance.
+We also consider retrieving from a single large datastore containing contexts from all the datasets (the ``All" rows in the table).
+While this performs worse than picking the matching datastore, it is significantly better than using any other single datastore.
+This implies that even in the presence of a few million extra distracting contexts in the datastore, the retriever still does a good job of retrieving the correct ones.
+Thus, in practice, it would be a viable strategy to concatenate several data stores unless sure of which one to pick.
+
+The second partition of the table shows the results of using shallow fusion on each system.
+For the DQA test sets, we use an LSTM LM trained on the DQA training contexts for shallow fusion.
+For Squad, we use an LSTM LM trained on Wikitext-103 (the same one used as the retrieval LM), since both Squad and Wikitext are constructed from Wikipedia data, and the Squad dataset is too small to train a robust LM.
+This reflects one of the advantages of retrieval: we can add any relevant corpus, no matter how small, to the datastore without danger of overfitting to it.
+We optimize the LM interpolation weights separately on each validation set and apply them to the corresponding test sets.
+Retrieval is comparable to shallow fusion on DQA test sets and outperforms it on Squad. 
+Furthermore, the two are complementary as further significant improvements can be obtained by combining retrieval with shallow fusion.
+
+The final partition shows the result of retrieving not from a datastore of contexts but of the questions themselves (with an adapter trained for questions).
+This gives us an upper-bound, however unrealistic, on performance in the ``Match" setting.
+We observe that by retrieving from datastores of questions, we can more than halve the WER to around 5\% across all test sets.
+This indicates that even though we only retrieve 16 continuations at a time out of hundreds of thousands (after tokenization of \#Words in Table~\ref{tab:data_stats}), the main bottleneck is not in the retrieval itself, but the simple fact that the contexts and the questions are not perfectly matched.
+The residual WER tells us the inherent errors due to either the retriever failing to retrieve the correct continuations or the adapter failing to bias the ASR output.
+
+\begin{table}[t]
+    \centering
+    \caption{WER on various test sets as the datastore is varied compared to the baseline with no retrieval (``None") and a baseline with retrieval replaced by a fixed embedding (``Fixed emb."). S-F denotes the use of shallow fusion.}
+    \begin{tabular}{lccccc}
+        \toprule
+        Datastore & S-F & Squad-V & Squad-T & DQA-V & DQA-T  \\
+        \midrule
+        None & \ding{55} & 15.8 & 15.2 & 14.0 & 13.8 \\
+        Fixed emb. & \ding{55} & 14.4 & 13.8 & 14.7 & 14.7 \\
+        Squad-V & \ding{55} & \textbf{11.9} & 12.5 & 15.1 & 15.1 \\
+        Squad-T & \ding{55} & 13.6 & \textbf{11.1} & 15.5 & 15.7 \\
+        DQA-V & \ding{55} & 14.2 & 13.6 & \textbf{12.7} & 14.3 \\
+        DQA-T & \ding{55} & 14.4 & 13.8 & 14.6 & \textbf{12.8} \\
+        All &  \ding{55} & 12.3 & 11.9 & 13.3 & 13.3 \\
+        \midrule
+        None & \ding{51} & 13.7 & 13.1 & 12.5 & 12.4 \\
+        Fixed emb. & \ding{51} & 12.3 & 11.7 & 13.4 & 13.3 \\
+        Match & \ding{51} & \textbf{11.0} & \textbf{9.9} & \textbf{11.7} & \textbf{11.8} \\
+        All & \ding{51} & 11.4 & 10.8 & 12.4 & 12.5 \\
+        \midrule
+        Questions & \ding{55} & 4.5 & 4.5 & 5.5 & 5.8 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:main_results}
+\end{table}
+
+
+\subsection{Performance on named entities}
+Table~\ref{tab:ne_results} shows the results on the DQA test sets split by whether or not the reference word is a named entity.
+We report results only on DQA because, unlike DQA, the Squad dataset references have no named entity tags.
+We observe that retrieval generally improves named entities more than it does other words.
+Adding retrieval to the baseline RNN-T leads to relative WER improvements of $11\%$ and $8\%$ respectively on named entities and other words on the validation set. The respective improvements on the test set are $12\%$ and $4\%$.
+We observe that shallow fusion improves more on regular words and less on named entities compared to retrieval.
+Finally, when we use shallow fusion and retrieval together, we get better named entity WER that using either by itself, but the WER on other words does not get better than using shallow fusion by itself.
+This supports our thesis that the trained shallow fusion LM can do fine by itself for common words, and the utility of retrieval is most pronounced for rare words.
+
+\begin{table}[t]
+    \centering
+    \caption{DQA dataset WERs for named entities and common words.}
+    \begin{tabular}{lccccc}
+        \toprule
+        Datastore & S-F & \multicolumn{2}{c}{DQA-V} & \multicolumn{2}{c}{DQA-T}  \\
+        & & Entities & Others & Entities & Others \\
+        \midrule
+        None & \ding{55} & 25.8 & 10.0 & 27.1 & 9.8 \\
+        Fixed emb. & \ding{55} & 27.1 & 10.6 & 28.5 & 10.4 \\
+        Match & \ding{55} & \textbf{23.0} & \textbf{9.2} & \textbf{23.9} & \textbf{9.4} \\
+        All & \ding{55} & 24.1 & 9.7 & 24.9 & 9.8 \\
+        \midrule
+        None & \ding{51} & 24.6& \textbf{8.5} & 25.6  & \textbf{8.4} \\
+        Fixed emb. & \ding{51} & 25.2 & 9.5 & 26.7 & 9.2 \\
+        Match & \ding{51} & \textbf{21.4} & \textbf{8.5} & \textbf{22.4} & {8.6} \\
+        All & \ding{51} & 22.7 & 9.0 & 24.6 & 9.0 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:ne_results}
+\end{table}
+
+
+\subsection{Impact of number of retrieved neighbors}
+\begin{table}[t]
+    \setlength\tabcolsep{4.5pt}
+    \centering
+    \caption{WER obtained by retrieving from the mixed datastore as the number of retrieved neighbors is varied.}
+    \begin{tabular}{lcccccccc}
+    \toprule
+         Test set & - & 1 & 2 & 4 & 8 & 16 & 32 & 64  \\
+         \midrule
+         Squad-V & 15.8 & 16.2 & 15.1 & 13.4 & 12.7 & 12.3 & 12.2 & \textbf{12.0} \\
+         Squad-T & 15.2 & 16.3 & 14.8 & 13.3 & 12.4 & 11.9 & 11.6 & \textbf{11.5} \\
+         DQA-V & 14.0 & 17.0 & 15.0 & 14.1 & 13.7 & 13.3 & 13.1 & \textbf{12.9} \\
+         DQA-T & 13.8 & 16.4 & 14.9 & 13.8 & 13.5 & 13.3 & 13.2 & \textbf{13.0} \\
+         \bottomrule
+    \end{tabular}
+    \label{tab:knn_mix}
+\end{table}
+Table~\ref{tab:knn_mix} shows the WERs on the test sets as we vary $K$ while retrieving from the datastore of all datasets (``All").
+Note that we only vary $K$ at inference time; during training it is still fixed to 16.
+We observe that the WER improves--with diminishing returns--as $K$ increases.
+
+In experiments whose results we omit due to space constraints, we varied $K$ at training time and note that the higher we set $K$ at training time, the higher we can, and have to, set it during inference. To get improved the results with lower values of $K$ at inference, we need to train with low values of $K$.
+For instance, across test sets, the WERs obtained from setting $K=1$ for both training and testing fall between those obtained from setting $K=4$ and $K=8$ in Table~\ref{tab:knn_mix}.

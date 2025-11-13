@@ -10,9 +10,7 @@ import random
 
 # ...existing code...
 MISSING_TAILS = [
-    "08161","08163","08164","08182","08301","08302","08304","08306","08307",
-    "08308","08309","08310","08313","08314","08316","08318","08320","08321","08345"
-]
+    "12094", "12097"]
 MISSING_YM = "2303"  # year-month part for all these IDs
 
 def fetch_ids_worker(start_month, start_year, start_ID, end_month, end_year, end_ID, start_index, num_papers, id_queue):
