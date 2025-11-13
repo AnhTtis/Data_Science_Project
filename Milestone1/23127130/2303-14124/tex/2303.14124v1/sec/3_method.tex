@@ -1,0 +1,112 @@
+\vspace{-0.05in}
+\section{Method}
+\vspace{-0.05in}
+
+To effectively represent diverse videos by a single model, we propose \system.
+Figure~\ref{fig:model}(a) illustrates the overview of \system framework.
+Given each video clip, we decouple the clip-specific visual content from the motion information and model each of them by two main components of our \system.
+Specifically, we introduce a visual content encoder to encode the clip-specific visual content from the sampled key-frames and a motion-aware decoder to output video frames.
+We elaborate on the details of the visual content encoder (Sec.~\ref{sec:encoder}), the motion-aware decoder (Sec.~\ref{sec:decoder}), and the training process (Sec.~\ref{sec:train}) in the following sections.
+
+
+\vspace{-0.02in}
+\subsection{Visual Content Encoder}
+\label{sec:encoder}
+Different videos have various content information, \eg, the appearance and the background scene of each video vary greatly. 
+The first component of \system is a visual content encoder $\E$ to capture clip-specific visual content. 
+In contrast to existing works which memorize the content of diverse videos solely by the model itself~\cite{chen2021nerv,li2022nerv,rho2022neural,zhang2021implicit}, we propose to provide the network with the visual content via sampled key-frames.
+Intuitively, we divide each video into consecutive clips. For each video clip, we sample the start and end key-frames $(I_0, I_1)$, which are then fed into the content encoder $\E$ to extract visual content at multiple stages $\{I^l_0, I^l_1\}_{l=1}^{L} = \{\E(I_0), \E(I_1)\}$ ($L$ is the total number of stages).
+These extracted features are clip-specific and highly representative of video content.
+Specifically, the content encoder $\E$ consists of stacked convolution layers and gradually down-samples the key-frames.
+
+\subsection{Motion-aware Decoder}
+\label{sec:decoder}
+Although different videos have distinctive appearances or backgrounds, videos of the same action type can share similar motion information.
+Motivated by this observation, we propose to model the motion information by a shared implicit neural network based decoder. 
+With visual content from key-frames, the motion-aware decoder provides motion information to reconstruct the full video.
+While the standard implicit neural network only takes in the coordinates and outputs the corresponding signal values~\cite{sitzmann2020implicit,dupont2021coin,dupont2022coin++,chen2021nerv}, our motion-aware decoder takes in both the time coordinates and the content feature map. Then it predicts task-oriented flows as intermediate output, which are used to warp the generated content features. 
+Besides that, we propose a spatially-adaptive fusion module to fuse the content information into the decoder in a more effective manner.
+Finally, we equip the decoder with temporal modeling ability by the proposed global temporal MLP module.
+
+\vspace{0.05in}
+\noindent\textbf{Multi-scale Flow Estimation.}
+The first component is the multi-scale flow estimation network used for predicting the task-oriented flow at each time step. 
+At the first stage, given two content feature maps $I^1_0$ and $I^1_1$ from the encoder's output, we apply linear interpolation along the time axis to generate the feature map at every intermediate time step $I^1_t=\texttt{Interpolation}(I^1_0, I^1_1)(t)$.
+Then, following NeRV~\cite{chen2021nerv}, we map the input time index $t$ by the positional encoding function $\mathsf{PE}$ into a higher dimensional embedding space, which is then concatenated with the feature map $I^1_t$ before fed into the flow estimation module $\mathcal{G}$ at the first stage:
+\begin{equation}
+    M^1_t = \texttt{Concat}(I^1_t, \mathsf{PE}(t))
+\end{equation}
+Next, we compute the forward flow $F_{t\rightarrow 0}$ and backward flow $F_{t\rightarrow 1}$ at each time $t\in [0,1]$ simultaneously, where $F_{t\rightarrow 0}$ and $F_{t\rightarrow 1}$ represent the pixel displacement map from the current frame $t$ to the start and end key-frames.
+For the later stages, the input of the flow estimation module is the feature map $M^l_t$ generated from the previous decoder stage:
+\begin{equation}
+    F^l_{t\rightarrow 0}, F^l_{t\rightarrow 1} = \mathcal{G}^l(M^l_t), l \in \{1, \cdots, L\}
+\end{equation}
+where $\mathcal{G}$ is a stack of convolutions which calculates the per-pixel flow.
+In order to generate a high-quality content feature map for each timestep, we strategically propagate the visual content of key-frames \{$I^l_0,I^l_1$\} to the current frame index $t$ under the guidance of our estimated flows \{$F^l_{t\rightarrow 0}, F^l_{t\rightarrow 1}$\}. 
+Concretely, we first generate the forward (resp. backward) warped feature map $\hat{I}^l_{t\leftarrow 0}$ (resp. $\hat{I}^l_{t\leftarrow 1}$) at time index $t$ given the content features of key frame $I^l_0$ (resp. $I^l_1$) with its corresponding flow $F^l_{t\rightarrow 0}$ ($F^l_{t\rightarrow 1}$) by a bilinear warp operation $\mathcal{T}$:
+\begin{equation}
+    \hat{I}^l_{t\leftarrow 0} = \mathcal{T}\left(I^l_0, F^l_{t\rightarrow 0}\right), \hat{I}^l_{t\leftarrow 1} = \mathcal{T}\left(I^l_1, F^l_{t\rightarrow 1}\right)
+\end{equation}
+To fuse the forward and backward warped feature map in a reliable way, we devise a distance-aware confidence score to weighted sum the warped features and generate the fused warping feature $\hat{I}^l_t$:
+\begin{align}
+     \hat{I}^l_t &= (1-t) \cdot \hat{I}^l_{t\rightarrow 0} + t \cdot \hat{I}^l_{t\rightarrow 1}
+\end{align}
+
+
+
+
+
+\vspace{0.05in}
+\noindent\textbf{Spatially-adaptive Fusion (SAF). }
+The warped feature map $\hat{I}^l_t \in \mathbb{R}^{H^l\times W^l\times C}$ contains the clip-specific content information for each timestep.
+We further introduce the second module of our motion-aware decoder, a spatially-adaptive fusion module to fuse the clip-specific content information.
+This is motivated by the recent success of modulation layers~\cite{park2019semantic,huang2017arbitrary,karras2019style}.
+Specifically, we learn pixel-wise modulation parameters $\gamma^l_t, \beta^l_t$ by passing the content feature $\hat{I}^l_t$ into two fully-connected layers:
+\begin{equation}
+    \gamma^l_t = FC_1(\hat{I}^l_t), \beta^l_t = FC_2(\hat{I}^l_t)
+\end{equation}
+where $\gamma^l_t, \beta^l_t \in \mathbb{R}^{H^l\times W^l\times 1}$. Then we fuse $M^l_t$ as follows:
+\begin{equation}
+    J^l_t = \gamma^l_t M^l_t + \beta^l_t
+\end{equation}
+It introduces an additional inductive bias guided by the content feature $\hat{I}^l_t$, which integrates two feature maps in a more effective way than simple concatenation. 
+After the modulation operation, we adopt the same block architecture as NeRV~\cite{chen2021nerv}, which consists of one convolution layer, a GELU~\cite{hendrycks2016gaussian} activation layer, and a PixelShuffle layer~\cite{shi2016real} to gradually upsample the feature map as below:
+\begin{equation} 
+    O^l_t = \texttt{PixelShuffle}\left(\texttt{GELU}(\texttt{Conv}(J^l_t))\right)
+\end{equation}
+
+\vspace{0.05in}
+\noindent\textbf{Global Temporal MLP (GTMLP). }
+Recall that NeRV takes the time index as input and outputs the corresponding frame directly without considering the rich intrinsic temporal correlations across frames. 
+Inspired by the recent success of attention-based transformers~\cite{bertasius2021space,fan2021multiscale} and MLP-based models~\cite{tolstikhin2021mlp,touvron2021resmlp,he2020gta,lian2021mlp} in image and video recognition tasks, we introduce a global temporal MLP module to further exploit the temporal relationship of videos.
+Compared to transformers, MLP-based models are more lightweight and efficient, which only consist of highly optimized fully-connected layers.
+Motivated by this, we propose a global temporal MLP module to model the temporal relationship across different frames.
+Specifically, given the feature map of $T$ frames, $O^l \in \mathbb{R}^{C \times H\times W\times T}$, the fully connected layer with weight $W^l \in \mathbb{R}^{C \times T \times T}$ is applied for each channel along the time axis to model the global temporal dependencies, which then adds with the original feature map $O^l$ in a residual manner.
+\begin{equation}
+    M^{l+1} = O^l + \texttt{matmul}(O^l, W^l)
+\end{equation}
+
+\noindent\textbf{Final Stage.}
+To generate the final reconstructed frame $I'_t$ at time index $t$, we concatenate the decoder feature map $M^L_t$, the warped frame $\hat{I}_t$ as input, feeding it into a stack of two convolution layers for the final refinement.
+
+
+\subsection{Training}
+\label{sec:train}
+\vspace{-0.02in}
+
+
+
+We adopt a combination of L1 and SSIM loss as~\cite{wang2003multiscale} between the reconstructed frame $I'_t$ and the ground-truth frame $I_t$ for optimization same as NeRV, without any explicit supervision on flow estimation. 
+\begin{equation}
+    \mathcal{L}=\dfrac{1}{T} \sum_t \left\lVert I'_t - I_t \right\rVert_1 + \alpha \left(1 - \text{SSIM}(I'_t, I_t)\right)
+\end{equation}
+During training, we feed consecutive video clips over the entire dataset in a mini-batch manner and encode the selected key-frames with existing image compression algorithms.
+
+Once trained, each video clip can be reconstructed by feeding time indices and clip-specific key-frames into \system. Our decoupled model design and novel learning strategy open up possibilities for large-scale video training, which fundamentally differs from the existing INR-based work that either fits videos into separate models or requires concatenating all videos as input with one model.
+
+
+
+
+
+
+

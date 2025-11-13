@@ -1,0 +1,536 @@
+We now present \trak,
+a new data attribution method
+which is designed to be both effective and scalable in large-scale differentiable settings.
+(Recall from \cref{def:attribution} that a data attribution function is a function
+mapping examples $z$ to a vector of per-training example scores in $\mathbb{R}^n$.)
+
+
+As a warm-up,
+and to illustrate the core primitive behind \trak,
+we first study the simple case of logistic regression (\cref{ssec:logistic}).
+In this setting, data attribution is well-understood---in particular, there is
+a canonical attribution method \citep{pregibon1981logistic}
+that is both easy-to-compute and highly effective
+\citep{wojnowicz2016influence,koh2019accuracy}.
+In \cref{sec:estimator_algo}, using this canonical attribution method
+as a primitive, we derive our data attribution method
+$\tau_\trak(\cdot)$
+(Equation \eqref{eq:trak}, also summarized in \cref{alg:estimator_pseudo}
+in \cref{sec:pseudocode}) which operates by reducing
+complex models back to the logistic regression case.\footnote{
+    Note that we focus on logistic regression for simplicity---more generally
+    one can adapt \trak to any setting where the training loss is convex
+    in the model output; see \Cref{app:general_model_output}.
+}
+
+
+
+
+
+
+
+
+
+
+\subsection{Warmup: Data attribution for logistic regression}
+\label{ssec:logistic}
+Consider the case where the model being studied is
+(a generalized form of)
+binary logistic regression.
+In particular, adapting our notation from \cref{sec:prelim},
+we consider a training set of $n$ examples
+$$S = \{z_1, \ldots, z_n: z_i = (x_i \in \mathbb{R}^d,\, b_i \in \mathbb{R},\, y_i \in \{-1, 1\})\},$$
+where each example comprises an input $x_i \in \mathbb{R}^d$, a bias $b_i \in \mathbb{R}$,
+and a label $y_i \in \{-1, 1\}$.
+The final model parameters $\thetastar(S)$ then minimize the log-loss over the training set, i.e.,
+\begin{equation}
+    \label{eq:binary_loss}
+    \thetastar(S) \coloneqq \arg\min_{\theta}
+        \sum_{(x_i, y_i) \in S}\log\left[1 + \exp(-y_i \cdot (\theta^\top x_i + b_i))\right].
+\end{equation}
+(Note that when the bias terms $b_i$ are identically zero, we recover
+ordinary logistic regression.)
+The natural choice of {\em model output function} in this case is then the ``raw logit'' function:
+\begin{equation}
+    \label{eq:modelout_logistic}
+    \modeleval{z}{\theta} \coloneqq \theta^\top x + b, \qquad \text{ where } z = (x, b, y).
+\end{equation}
+Data attribution in this simple setting is a well-studied problem.
+In particular,
+the {\em one-step Newton approximation}
+\citep{pregibon1981logistic,wojnowicz2016influence,rad2018scalable,koh2019accuracy},
+which we present as a data attribution method $\tau_\text{NS}$ below,
+is a standard tool for analyzing and understanding logistic regression models
+in terms of their training data.
+(We present the theoretical basis for this method in
+\cref{app:theory_newton}.)
+\begin{definition}[One-step Newton approximation \citep{pregibon1981logistic}]
+    \label{lem:formal}
+    For logistic regression, we define the Newton step
+    data attribution method $\tau_\text{NS}$ as the
+    approximate leave-one-out influence \citep{pregibon1981logistic}
+    of training examples $z_i = (x_i, b_i, y_i)$
+    on the model output function \eqref{eq:modelout_logistic}. That is,
+    \begin{equation}
+        \label{eq:loo_infl}
+        \tau_\text{NS}(z)_i \coloneqq
+        \frac{x^\top (X^\top R X)^{-1} x_i}{1 - x_i^\top (X^\top R X)^{-1} x_i \cdot p_i^\star (1 - p_i^\star)} (1 - p_i^\star)
+        \approx \modeleval{z}{\thetastar(S)} - \modeleval{z}{\thetastar(S \setminus z_i)}
+    \end{equation}
+        where $X \in \mathbb{R}^{n \times k}$ is the matrix of stacked inputs $x_i$,
+        $p_i^\star \coloneqq (1 + \exp(-y_i \cdot \modeleval{z_i}{\thetastar}))^{-1}$
+        is the
+        predicted correct-class probability at $\thetastar$ and
+        $R$ is
+        a diagonal $n \times n$ matrix
+        with $R_{ii} = p_i^\star (1 - p_i^\star)$.
+\end{definition}
+If our model class of interest was binary logistic regression,
+we could simply apply \cref{lem:formal} to perform data attribution.
+As we discuss, however, our goal is precisely to scale
+data attribution {\em beyond} such convex settings.
+To this end, we next derive our data attribution method \trak
+(\spelledout)
+which leverages $\tau_\text{NS}$ (\cref{lem:formal})
+as a primitive.
+
+\subsection{\trak for binary (non-linear) classifiers}
+\label{sec:estimator_algo}
+We now present our method (\trak) for scaling data attribution to
+non-convex differentiable settings.
+More precisely, following \cref{def:attribution},
+we describe how to compute a function
+$\tau_\trak: \mathcal{Z} \to \mathbb{R}^n$
+that maps examples of interest $z$ to vectors
+of per-training example importance scores in $\mathbb{R}^n$.
+The key primitive here will be \cref{lem:formal} from above---in
+particular, we will show how to adapt our problem into one to which
+we can apply the approximation \eqref{eq:loo_infl}.
+
+
+For ease of exposition, we will first show how to compute
+$\tau_\trak$ in the context of binary
+classifiers trained with the negative log-likelihood loss.
+We later generalize \trak to other types of models (e.g.,
+to multi-class classifiers in \cref{ssec:multiclass},
+to contrastive models in \cref{sec:CLIP},
+and to language models in \cref{subsec:fact_trace}).
+In this setting, let the model output function $\modeleval{z}{\theta}$
+be the raw output (i.e., the logit)
+of a binary classifier with parameters $\theta$.\footnote{
+    Note that for the special case of binary classifiers,
+    the model output function that we define (i.e.,
+    $\modeleval{z}{\theta} = \modeleval{(x, y)}{\theta}$)
+    depends only on the input $x$, and not on the label $y$.
+    When we generalize \trak to more complex losses in
+    \cref{ssec:multiclass},
+    the model output function will involve both $x$ and $y$.
+}
+The final parameters of the model can thus be written as
+\begin{equation}
+    \label{eq:loss_min}
+    \thetastar(S) = \arg\min_\theta \sum_{(x_i, y_i) \in S} \log\left[
+        1 + \exp\lr{-y_i \cdot \modeleval{z_i}{\theta}}
+    \right].
+\end{equation}
+Note that unlike in \cref{ssec:logistic}, we do not assume that the model itself is
+linear---e.g., the model might be a deep neural network parameterized by
+weights $\theta$.
+
+We implement \trak as a sequence of five steps:
+\begin{enumerate}
+    \item Linearizing the model output function (via Taylor approximation),
+    which reduces the model of interest to a linear function in parameter space.
+    Prior work (around, e.g., the empirical neural tangent kernel)
+    suggests that this approximation
+    can be relatively accurate, especially for overparameterized neural networks
+    \citep{jacot2018neural,wei2022more,long2021properties,malladi2022kernel}.
+    \item Reducing the dimensionality of
+    the linearized model using random projections.
+    Specifically, we take advantage of the Johnson-Lindenstrauss lemma
+    \citep{johnson1984extensions},
+    which guarantees that this projection preserves the model-relevant information.
+    \item Estimating attribution scores by leveraging the attribution method
+    described in \cref{lem:formal}.
+    \item Ensembling results over several
+    models, each trained on a random subset of the original training
+    set $S$.
+    \item Sparsifying the attribution scores using soft-thresholding.
+\end{enumerate}
+
+
+\noindent We discuss these steps in more depth below.
+
+\paragraph{(Step 1) Linearizing the model.}
+Recall that our goal here is to apply the data attribution method $\tau_\text{NS}$
+from \cref{lem:formal}.
+The main roadblock to applying \cref{lem:formal} in our setting
+is that we are studying
+a {\em non-linear} model---that is, our model output function may not be a
+linear function of $\theta$.
+We address this issue by approximating $\modeleval{z}{\theta}$
+with its Taylor expansion centered
+around the final model parameters $\thetastar$.
+In particular, for any $\theta$,
+we replace $\modeleval{z}{\theta}$ with
+\begin{align}
+    \label{eq:taylor}
+    \approxmodeleval{z}{\theta} &\coloneqq
+    \modeleval{z}{\thetastar} +
+    \nabla_\theta \modeleval{z}{\thetastar}^\top (\theta - \thetastar).
+\end{align}
+This approximation
+suggests a change in perspective---rather than viewing
+$\modeleval{z}{\theta}$ as a non-linear model acting on
+inputs $x$, we can view it as a {\em linear} model
+acting on inputs $\nabla_\theta \modeleval{z}{\thetastar}$.
+In particular,
+rewriting the loss minimization \eqref{eq:loss_min} while
+replacing $\modeleval{z}{\theta}$ with $\approxmodeleval{z}{\theta}$
+yields
+\begin{equation}
+    \label{eq:rewritten_loss_min}
+    \thetastar(S) =
+    \arg\min_\theta \sum_{(x_i, y_i) \in S} \log\left[
+        1 + \exp\lr{-y_i \cdot
+        \lr{
+            \theta^\top \nabla_\theta \modeleval{z_i}{\thetastar}
+            + \modeleval{z_i}{\thetastar} - \nabla_\theta \modeleval{z_i}{\thetastar}^\top \thetastar
+        }}\right].
+\end{equation}
+Now, Equation \eqref{eq:rewritten_loss_min} should look familiar---specifically,
+if we define the variables $g_i \coloneqq \nabla_\theta \modeleval{z_i}{\thetastar}$
+and $b_i \coloneqq \modeleval{z_i}{\thetastar} - \nabla_\theta\modeleval{z_i}{\thetastar}^\top \thetastar$,
+then \eqref{eq:rewritten_loss_min} becomes
+\begin{equation}
+    \label{eq:rewritten_loss_min_2}
+    \thetastar(S) =
+    \arg\min_\theta \sum_{(g_i, b_i, y_i)} \log\left[
+        1 + \exp\lr{-y_i \cdot
+        \lr{ \theta^\top g_i + b_i }}\right].
+\end{equation}
+Comparing \eqref{eq:rewritten_loss_min_2}
+to \eqref{eq:binary_loss} (from \cref{ssec:logistic})
+makes it clear that we can view
+$\thetastar$ as the solution to a (generalized) logistic regression,
+in which the inputs $x_i$ are gradients
+$g_i \coloneqq \nabla_\theta \modeleval{z_i}{\thetastar}$ of the
+model,
+the bias terms are
+$b_i \coloneqq \modeleval{z_i}{\thetastar} - \nabla_\theta\modeleval{z_i}{\thetastar}^\top \thetastar$
+ and the labels $y_i$ remain the same.
+
+\medskip \noindent {\em \textbf{Note}:}
+In the context of neural networks, we can view
+Step 1 as replacing the binary classifier with its empirical neural tangent kernel
+(eNTK) approximation \citep{jacot2018neural,atanasov2022neural,wei2022more}.
+We discuss how \trak connects to the eNTK in more detail in \Cref{sec:related}.
+
+
+
+
+
+
+\paragraph{(Step 2) Reducing dimensionality with random projections.}
+The linear approximation from Step~1
+dramatically simplifies our model class of interest
+from a highly non-linear classifier to simple logistic regression.
+Still,
+the resulting logistic regression can be extremely high dimensional.
+In particular, the input dimension of the linear model \eqref{eq:taylor}
+is the number of {parameters} of the original model
+(which can be on the order of millions or billions),
+not the dimensionality of the inputs $x_i$.
+
+To reduce the dimensionality of this problem,
+we leverage a classic result of \citet{johnson1984extensions}.
+This result guarantees that multiplying each
+gradient $\grad_i = \nabla_\theta \modeleval{z_i}{\thetastar} \in \mathbb{R}^p$
+by a random matrix $\mathbf{P} \sim \mathcal{N}(0, 1)^{p \times k}$
+for $k \ll p$
+preserves inner products $g_i^\top g_j$ with high probability\footnote{
+In Appendix \ref{app:theory_jl} we discuss why preserving inner products
+suffices to preserve the structure of the logistic regression.}
+(while significantly reducing the dimension).
+Thus,
+we define the ``feature map''
+$\phi: \mathcal{Z} \to \mathbb{R}^k$ as
+\begin{equation}
+    \label{eq:featurizer}
+    \phi(z) \coloneqq \mathbf{P}^\top \nabla_\theta \modeleval{z}{\thetastar},
+\end{equation}
+i.e., a function taking an example $z$ to its corresponding projected gradient,
+and
+from now on
+replace $\grad_i$ with
+\begin{equation}
+    \label{eq:projgrad}
+    \projgrad_i \coloneqq \phi(z_i) = \mathbf{P}^\top \grad_i = \mathbf{P}^\top \nabla_\theta \modeleval{z_i}{\thetastar}.
+\end{equation}
+
+\paragraph{(Step 3) Estimating influences.}
+Now that we have simplified our original model of interest
+to a logistic regression problem of tractable dimension,
+we can finally adapt \cref{lem:formal}.
+
+
+To this end, recall that the training ``inputs'' are now the
+(projected) gradients $\projgrad_i$ (see \eqref{eq:projgrad}).
+We thus replace the matrix $X$ in \eqref{eq:loo_infl} with the matrix
+$\Phi \coloneqq [\phi_1; \ldots, \phi_n] \in \mathbb{R}^{n \times k}$ of stacked projected gradients.
+We also find empirically that both the denominator in \eqref{eq:loo_infl}
+and the diagonal matrix $R$ have little effect
+on the resulting estimates, and so we omit them from our adapted estimator.
+Our estimator for attribution scores for an example of interest $z$ thus becomes:
+\begin{equation}
+    \label{eq:single_model_trak}
+    \tau(z, S) \coloneqq \phi(z)^\top (\Phi^\top \Phi)^{-1} \Phi^\top \mathbf{Q},
+\end{equation}
+where we recall from \eqref{eq:featurizer} that $\phi(z) = \mathbf{P}^\top \nabla_\theta \modeleval{z}{\thetastar}$,
+and where we define
+\begin{equation}
+    \label{eq:q_mat}
+    \mathbf{Q}
+    \coloneqq \text{diag}(\{1-p_i^\star\})
+    = \text{diag}\left(
+        \left\{(1 + \exp(y_i \cdot \modeleval{z_i}{\thetastar}))^{-1}\right\}\right)
+\end{equation}
+to be the $n \times n$ diagonal matrix of ``one minus correct-class
+probability'' terms.\footnote{
+    Note that in our linearization \eqref{eq:rewritten_loss_min_2},
+    the predicted probability is also a function of the bias
+    terms $b_i$. We can avoid
+    having to compute these bias terms by simply using the
+    predicted probability from the true model
+    (i.e., the neural network) instead of the linearized one.
+}
+
+\medskip \noindent {\em \textbf{Remark.}} An alternative way to motivate our single-model estimator (\Cref{eq:single_model_trak})
+is to compute the influence function \cite{koh2017understanding} using the generalized Gauss-Newton approximation to the Hessian  \cite{sagun2017empirical,martens2020new,bae2022if}. As noted in prior works \cite{teso2021interactive,bae2022if}, this approximation is a more convenient choice than the full Hessian as it is guaranteed to be positive semi-definite.
+
+
+\paragraph{(Step 4) Ensembling over independently trained models.}
+So far, our analysis ignores the fact that in many modern settings,
+training is {non-deterministic}.
+That is, applying the same learning algorithm to the same training dataset
+(i.e., changing only the random seed)
+can yield models with (often significantly) differing behavior
+\citep{nguyen2021wide,damour2020underspecification}.
+Non-determinism poses a problem for data attribution because
+by definition, we cannot explain such seed-based differences in
+terms of the training data.
+
+To ``smooth out'' the impact of such seed-based differences,
+we aggregate the estimator \eqref{eq:single_model_trak}
+across multiple trained models
+(for computational efficiency, one can also use different checkpoints from
+the same model---see \Cref{app:proxies}).
+In particular, we adopt the natural idea of just averaging $\tau(z, S)$ from
+\eqref{eq:single_model_trak} directly, with two small modifications:
+\begin{itemize}
+    \item[(a)]
+    Rather than computing $M$ copies of \eqref{eq:single_model_trak}
+    and averaging the results, we separately compute and average $M$ copies of
+    $\mathbf{Q}$ (i.e., \eqref{eq:q_mat})
+    and $M$ copies of $\phi(z)^\top (\Phi^\top \Phi)^{-1} \Phi^\top$
+    (i.e., the remaining terms in \eqref{eq:single_model_trak}).
+    We then take the product of these averaged matrices.
+    \item[(b)]
+    Rather than training $M$ copies of the same model $\thetastar(S)$,
+    we sample $M$ random subsets of $S$ ($S_1,\ldots,S_M$),
+    and use the resulting models $\thetastar(S_1),\ldots,\thetastar(S_M)$
+    to compute attribution scores.
+\end{itemize}
+The first modification (a) is mainly for numerical stability, while the second
+modification (b) is meant to better handle duplicated training examples (and,
+more generally, features that are highly ``redundant'' in the training data). We
+study the effect of these modifications empirically in \cref{app:more_ablation}.
+At this point, our estimator is of the form:
+\begin{equation}
+    \label{eq:multi_model_trak}
+    \tau_M(z, S) \coloneqq
+    \left(\frac{1}{M} \sum_{i=1}^M \mathbf{Q}_m \right) \cdot
+    \left(\frac{1}{M} \sum_{i=1}^M \phi_m(z)^\top (\Phi_m^\top \Phi_m)^{-1} \Phi_m^\top \right),
+\end{equation}
+where $S_1,\ldots,S_M$ are $M$ randomly selected subsets of the training set $S$;
+$\Phi_m$ are the corresponding projected gradients from the model
+$\thetastar(S_m)$;
+$\phi_m(z)$ is the featurized example $z$ under model $\thetastar(S_m)$;
+and $\mathbf{Q}_m$ is the corresponding matrix of probabilities as defined in \Cref{eq:q_mat}.
+
+\paragraph{(Step 5) Inducing sparsity via soft-thresholding.}
+In the last step, we post-process the attribution scores from Step 4 via
+{\em soft thresholding},
+a common denoising method in statistics \cite{donoho1995noising}
+for when an underlying signal is known to be sparse.
+Within our particular context, \citet{ilyas2022datamodels} find that
+for neural networks
+attribution scores are often sparse---that is,
+each test example depends on only a few examples from the training set.
+Motivated by this observation, we apply the soft thresholding operator
+$S(\cdot; \lambda)$
+defined for any $\tau \in \mathbb{R}^n$ as:
+\begin{equation}
+    \mathcal{S}(\tau; \lambda) =
+        (\tau_i - \lambda) \cdot \bm{1}\{\tau_i > \lambda\}
+        + (\tau_i + \lambda) \cdot \bm{1}\{\tau_i < -\lambda\}.
+      \label{eqn:soft}
+\end{equation}
+We choose the soft threshold parameter $\lambda$ via cross-validation.
+That is, given a set of trained models,
+we first estimate attribution scores \eqref{eq:multi_model_trak},
+then sample a range of values for $\lambda$,
+compute corresponding attribution scores by applying \eqref{eqn:soft},
+and finally
+select the value of $\lambda$
+that yields that highest linear datamodeling score (\Cref{def:datamodeling}) on
+the set of trained models.
+After applying soft-thresholding,
+our final estimator becomes
+\begin{equation}\label{eq:trak}
+    \tau_\trak(z, S) \coloneqq
+    \mathcal{S}\lr{
+    \left(\frac{1}{M} \sum_{i=1}^M \mathbf{Q}_m \right) \cdot
+    \left(\frac{1}{M} \sum_{i=1}^M \phi_m(z)^\top (\Phi_m^\top \Phi_m)^{-1} \Phi_m^\top \right),
+    \widehat{\lambda}
+    }
+\end{equation}
+where, again, $\widehat{\lambda}$ is selected via cross-validation (see \Cref{app:trak_hparams} for details).
+
+
+
+\subsection{Extending to multi-class classification}
+\label{ssec:multiclass}
+In the previous section, we instantiated \trak for binary classifiers;
+we now show how to extend \trak to the multi-class setting.
+Recall that our key insight in the binary case was to
+linearize the model output function $\modeleval{z}{\theta}$ around the optimal parameters
+$\thetastar(S)$ (see \eqref{eq:taylor}).
+Our choice of output function
+(i.e., the raw logit of the classifier)
+allowed us to then cast the original (non-convex) learning problem of interest
+as an instance of binary logistic regression with inputs $\nabla_\theta
+\modeleval{z}{\thetastar}$. That is, we made the approximation
+\begin{equation}
+    \label{eq:binary_extending}
+    \thetastar(S) \approx \arg\min_\theta \sum_{z_i \in S} \log\left[1 + \exp\lr{-y_i \cdot
+    \lr{
+        \nabla_\theta \modeleval{z_i}{\thetastar}^\top \theta
+        + b_i
+    }
+    }\right],
+\end{equation}
+and then leveraged \cref{lem:formal}.
+
+To apply this same approach to the $c$-class setting (for $c > 2$), one possibility is
+to first transform the problem into $\smash{c^2}$ binary classification problems,
+then apply the approach from \cref{sec:estimator_algo} directly.
+(For example, \citet{malladi2022kernel} use this transformation to apply the neural
+tangent kernel to $c$-way classification problems.)
+In large-scale settings, however, it is often expensive or infeasible to study
+of all $c^2$ subproblems, e.g., ImageNet has $c = 1000$ classes.
+
+We thus take a different approach.
+In short, we leverage the fact that we always have labels available
+(even for test examples)
+to reduce the multi-class classification problem to a {\em single} logistic regression.
+More specifically, for an example $z = (x, y)$, we define the model output function
+\begin{equation}
+    \label{eq:modelout_mc}
+    \modeleval{z}{\theta} \coloneqq \log\left(\frac{p(z; \theta)}{1 - p(z; \theta)}\right),
+\end{equation}
+where $p(z;\theta)$ is the softmax probability assigned to the {\em correct} class.
+
+A crucial property of the model output function \eqref{eq:modelout_mc} is that
+it allows us to rewrite the loss function for $c$-way classification as
+\begin{align}
+    \loss{z} &= -\log(p(z;\theta)) \\
+             &= \log\left[1 + \exp\lr{-\modeleval{z}{\theta}}\right],
+    \label{eq:multi_to_binary}
+\end{align}
+where the first line is the definition of cross-entropy loss,
+and the second line comes from \eqref{eq:modelout_mc}.
+As a result,
+if we linearize $\modeleval{z}{\theta}$ as in
+Step 1 above (\cref{sec:estimator_algo}),
+we can make the approximation
+\[
+    \thetastar(S) \approx \arg\min_\theta \sum_{z_i \in S} \log\left[1 + \exp\lr{- \nabla_\theta \modeleval{z_i}{\thetastar}^\top \theta + b_i} \right].
+\]
+This approximation is identical to the one we made
+for the binary case (see \eqref{eq:binary_extending}).
+We can thus treat the multi-class problem as a single binary logistic regression
+with inputs $\nabla_\theta \modeleval{z_i}{\thetastar}$\footnote{
+    Note that the corresponding ``labels'' for this logistic regression
+    are actually identically equal to one---to see this, compare
+    \eqref{eq:multi_to_binary} to \eqref{eq:binary_extending}.
+    This does not change the resulting attributions, however, as
+    \cref{lem:formal} only depends on labels through its
+    dependence on the correct-class probability $p_i^*$.
+}
+and then apply Steps 2-5 from
+\cref{sec:estimator_algo} directly to this binary problem.
+
+
+\subsection{Implementing \trak}
+\label{sec:pseudocode}
+We summarize our final algorithm for computing the data attribution method
+$\tau_\trak$ in the general multi-class case (see also
+\cref{eq:trak}) in \cref{alg:estimator_pseudo}.
+The output of the algorithm is an attribution matrix $\mathbf{T}$, whose rows are given by $\tau_{\trak}(z,S)$.
+To make \cref{alg:estimator_pseudo} efficient even for very large models, we implemented a
+highly optimized random projector, which we discuss in \cref{app:impl}.
+\begin{algorithm}[H]
+\caption{\trak for multi-class classifiers (as implemented)}
+\label{alg:estimator_pseudo}
+\begin{algorithmic}[1]
+    \State {\bfseries Input:} Learning algorithm $\mathcal{A}$,
+    dataset $S$ of size $n$,
+    sampling fraction $\alpha \in (0,1]$,
+    correct-class likelihood function $p(z;\theta)$, projection dimension $k \in \mathbb{N}$
+    \State {\bfseries Output:} Matrix of attribution scores $\mathbf{T} \in \mathbb{R}^{n \times n}$
+    \State $\modeleval{z}{\theta} \coloneqq \log(\frac{p(z; \theta)}{1 - p(z; \theta)})$
+    \hfill$\triangleright$ Margin function $f_\theta$
+    \For{$m \in \{1,\ldots,M\}$}
+    \State Sample random $S' \subset S$ of size  $\alpha \cdot n$
+    \State $\thetastar_m \gets \mathcal{A}(S')$ \hfill$\triangleright$ Train a model on $S'$
+    \State $\mathbf{P} \sim \mathcal{N}(0, 1)^{p \times k}$ \hfill$\triangleright$ Sample projection matrix
+    \State $\mathbf{Q}^{(m)} \gets \bm{0}_{n \times n}$
+    \For{$i \in \{1,\ldots,n\}$}
+    \State $\phi_i \gets \mathbf{P}^\top\nabla_\theta \modeleval{z_i}{\thetastar_m}$ \hfill$\triangleright$ Compute gradient at $\thetastar_m$ and project to $k$ dimensions
+    \State $\mathbf{Q}^{(m)}_{ii} \gets 1 - p(z_i; \thetastar)$ \hfill$\triangleright$ Compute weighting term
+    \EndFor
+    \State $\Phi_m \gets [{\phi}_1; \cdots; {\phi}_n]^\top$
+    \EndFor
+    \State
+    $\mathbf{T} \gets \left[\frac{1}{m}\sum\limits_{m=1}^M
+    \Phi_m(\Phi_m^\top \Phi_m)^{-1} \Phi_m^\top
+     \right]\left[\frac{1}{m}\sum\limits_{m=1}^M\mathbf{Q}^{(m)}\right]$
+     \State \textbf{return} $\textsc{Soft-Threshold}(\mathbf{T})$
+\end{algorithmic}
+\end{algorithm}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

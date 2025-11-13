@@ -1,0 +1,165 @@
+\section{Method}
+\subsection{Overview}
+% In this section, we elaborate on details of our approach. 
+The framework of \ours is presented in Figure \ref{fig:framework}. 
+We adopt the dual encoder architecture for video-language pre-training, and there are three primary objectives used in the pre-training stage: (1) inter-clip spatial grounding, (2) intra-clip temporal grouping, and (3) global contrastive learning. 
+
+As shown in Figure \ref{fig:framework}, temporal changes are first artificially introduced into training examples through cut-and-paste.
+Then the pre-processed video together with learnable group tokens are fed into the video encoder. Specifically, 
+{group tokens aggregate semantically similar video tokens via grouping blocks and are then aligned with object concepts by spatial grounding. It promotes region-object groundingness, which indicates the alignment between a region in the video and an object in the caption, e.g., as illustrated in Inter-clip Spatial Grounding in Figure 1, the red region corresponds exactly to the word “pins” in red.}
+%
+In contrast to previous methods where regions are extracted with pre-trained object detectors~\citep{cai2022revitalize,li2022align,yan2021video}, these learnable group tokens can cluster and organize semantically similar regions in a self-supervised manner, which is more effective and reduces the artifacts of any detectors.
+%
+For the language branch, the original captions are tokenized into a sequence of text tokens, which are then fed into a text encoder to extract the corresponding representation from the preceding \texttt{[CLS]} token. 
+Noun tokens representing objects are extracted in the same way given a set of prompts. 
+
+To promote temporal awareness, we use masks derived from the cut-and-paste operations as the ground-truth for temporal grouping.
+%
+Furthermore, we model the interaction between region features and noun tokens using inter-clip spatial grounding loss.
+%
+Finally, a global contrastive loss is computed between the video and the caption representations to match the instance-level $\langle \textit{video, caption}\rangle$ pair.
+
+\begin{figure}[t]
+    \centering
+    \vspace{-1em}
+    % \includegraphics[width=1.\textwidth]{figures/framework-new.pdf}
+    \includegraphics[width=0.9\textwidth]{figures/framework-nocross.pdf}
+    % \vspace{-2em}
+    \caption{Illustration of \ours pre-training.
+    Three proposed training objectives promote structured video-language interaction: (1) temporal grouping learns temporal-aware features by distinguishing whether clips are from background or foreground; (2) spatial grounding focuses on local correspondences between regions and objects; (3) global contrastive learning matches instance-level $\langle \textit{video, caption}\rangle$ pairs.
+    }
+    \label{fig:framework}
+    % \vspace{-1em}
+\end{figure}
+
+\subsection{Intra-clip Temporal Grouping with Cut-and-Paste}
+\label{sec:temporal-grouping}
+Commonly-used video-language pre-training data usually consist of short video clips with repetitive scenes.
+To simulate scene shifts, we design a cut-and-paste operation inspired from image augmentations~\citep{yun2019cutmix,zhang2022unsupervised} to introduce temporal changes manually to further improve video representations. 
+
+Given a target video $v_i$ with $T$ frames as the foreground and a randomly sampled video $v_{p_i}$ with the index $p_i$ as the background from the same batch of size $B$,
+% (both $v_i, v_{p_i} \in \sR^{T\times H \times W \times 3}$),
+we divide each video into $N_t = T/t$ clips with the temporal window size $t$. 
+%
+{We then sample the start and end clip indices $s$ and $e$ from $(0, N_t)$, and paste the corresponding region from $v_i$ into the background video $v_{p_i}$ to form a blended video $\hat{v}_i$. 
+For the clip sampling procedure, we first uniformly sample the duration of the foreground video $d$ from $[N_t/2, N_t)$ to guarantee it is the majority of the blended video. Then we sample the start index $s$ from $[0, N_t-d)$, and the end index $e$ was computed naturally as $e = s + d$. We included this detail in our latest version.}
+We define the foreground-background mask as $
+    m_i \in \sR^{N_t} = \{ \mathbf{1}(j \in [s, e]) | j \in [0, N_t) \}$,
+where $\mathbf{1}(\cdot)$ is the indicator function. This operation is illustrated in Figure \ref{fig:framework}.
+
+A video is first flattened into $N$ non-overlapping voxels.
+After projected by a linear layer, these voxel tokens are fed into the transformer encoder to obtain transformed tokens $z_i^v \in \sR^{N \times d}$, where $d$ is the feature dimension.
+To obtain clip-level representations $z_i^{\text{clip}} \in R^{N_t \times d}$, we average-pool over $z_i^v$ along the spatial dimension after recovering the feature map's 3D shape.
+Two cluster centers, $z^b_i$ for the background and $z^f_i$ for the foreground, are further computed by averaging features from $z_i^v$ on the corresponding position based on the mask $m_i$.
+To assign each clip to either background or foreground,
+% obtain the group assignment $a_i$, i.e.,  
+we compute $a_i$ via {cosine similarity} with an element-wise softmax function applied on the last dimension, {where $\langle\cdot, \cdot\rangle$ is cosine similarity and $\tau$ is the temperature to scale logits}:
+\begin{equation}
+    {
+    a_i = \text{Softmax}(\langle z_i^\text{clip}, [z_i^b; z_i^f]^T\rangle / \tau)  \in \sR^{N_t \times 2}.
+    }
+\end{equation}
+Finally, the temporal grouping loss can be computed within a batch between $a_i$ and the ground-truth one-hot masking $m_i$ using mean squared error as
+\begin{equation}
+    \gL_\text{t} = \frac{1}{B}\sum_{i}^B \ell_\text{BCE}(a_i, \text{One-hot}(m_i)).
+\end{equation}
+{Note that we have also tried the binary cross entropy loss which performs comparably to MSE. Thus, we select a relatively simple MSE loss for temporal grouping.}
+%
+
+\subsection{Inter-clip Spatial Grounding with Group Tokens}
+\label{sec:grounding}
+Observing the correspondences between visual regions in a video and noun phrases (objects) in a caption, we model such fine-grained alignment for more expressive encoders. 
+%
+In practice, it is infeasible to pool tokens of interest as cluster centers since we do not have ground-truth segmentation. 
+%
+Thus, we adopt $M$ learnable group tokens to cluster {semantically} similar regions in a self-supervised manner.
+%
+Note that group tokens are randomly initialized and shared among different videos.
+The detailed structure of a grouping block is presented in Appendix \ref{appendix:detail} and multiple grouping blocks are placed at different layers of the video encoder to update group tokens progressively. 
+%
+The final group tokens denoted as
+% $\{h_i^m\}_{m=1}^{M}$
+$\mathcal{G} = \{g^m_i\}_{m=1}^{M}$
+% $\{f_i^{g_m}\}_{m=1}^{M}$ 
+aggregate semantically similar voxels and represent different regions in the video $v_i$.
+{Compared with using off-the-shelf region proposal networks, our design of token grouping is more computationally efficient, and can be adapted to the pre-training dataset without region annotations in a self-supervised manner dynamically and flexibly.}
+%
+For each caption $c_i$ of a video, we extract $K$ noun phrases using noun chunking in spaCy\footnote{\url{https://spacy.io/}} and  prompt each of them with a set of handcrafted sentence templates, e.g.,
+``\textit{A photo of a \{noun\}}''. 
+Such prompted noun phrases are fed into the text encoder to extract noun tokens $\{n_i^{k}\}_{k=1}^K$.
+
+We define the notation for softmax on a vector $\mathbf{x}$ at the $i$-th element as:
+% \begin{equation}
+    $\sigma(\mathbf{x})_i = \frac{\exp(x_i)/\tau}{\sum_j \exp(x_j)/\tau}$,
+% \end{equation}
+where $\tau$ is the temperature to scale logits. 
+The similarity of all group tokens $\mathcal{G}$ with respect to a noun token $n^k$ is defined as $s( \mathcal{G}, n^k)=[\langle g^1, n^k \rangle, \dots, \langle g^M, n^k \rangle] \in \sR^{M}$, where $\langle\cdot, \cdot \rangle$ is the cosine similarity.
+Since the ground-truth correspondences between regions and nouns are inaccessible, we compute the grounding similarity between all group and noun tokens by:
+\begin{equation}
+    G(v, c) = \frac{1}{K}\sum_{k=1}^K \left\langle n^k, \mathlarger{\sum_{m=1}^{M}} \sigma\left(s(\mathcal{G},n^k)\right)_m \cdot g^m \right \rangle.
+\end{equation} $G(v,c)$ encourages each noun to be grounded to one or a few regions and avoids penalizing regions that cannot find any relevant nouns. 
+
+Similarity scores over a batch of size $B$ are computed as: $G(\mathcal{V}, c_i)=[G(v_1, c_i), \dots, G(v_B, c_i)] \in \sR^{B}$ and  $G(v_i, \mathcal{C})=[G(v_i, c_1), \dots, G(v_i, c_B] \in \sR^{B}$, where $\mathcal{V}=\{v_i\}_{i=1}^B$ and $\mathcal{C}=\{c_i\}_{i=1}^B$ denote the set of videos and captions in a batch, respectively.
+%
+Inter-clip spatial grounding loss $\gL_\text{g}$ is then defined 
+% by replacing the original cosine similarity with our grounding similarity 
+to enable nouns to be matched with regions for each positive $\langle \textit{video, caption}\rangle$ pair:
+$\gL_\text{g} = \gL^{v\rightarrow c}_\text{g} + \gL^{c\rightarrow v}_\text{g}$ consists of a video-to-caption grounding loss and a caption-to-video grounding loss
+\begin{equation}
+   \gL^{v\rightarrow c}_\text{g} = -\frac{1}{B}\sum_{i=1}^B \log \sigma\left(G\left(v_i, \mathcal{C}\right)\right)_i,
+   \quad
+\gL^{c\rightarrow v}_\text{g} = -\frac{1}{B}\sum_{i=1}^B \log \sigma\left(G\left(\mathcal{V}, c_i\right)\right)_i.
+\end{equation}
+
+Recall that the cut-and-paste operation indicates that $\hat{v}_i$ has another positive caption $c_{p_i}$ besides its original $c_i$, and the loss weights of positive indices are $W^v\in \sR^{B\times B}=\{w^v_{i,j}\}$ which satisfy
+\begin{equation}
+    w^v_{i,j} = 
+    \begin{cases}
+    \beta_i, & j = i \\
+    1 - \beta_i, & j = p_i \\
+    0, & \text{otherwise}
+    \end{cases},
+\end{equation}
+where $\beta_i=(e-s)/N_t$ is the ratio of the foreground in the cut-and-paste video $\hat{v}_i$. 
+From the perspective of captions, we can obtain $W^c=(W^v)^\top$. 
+We can derive the augmented grounding loss $\gL_\text{g}$ with the video-to-caption loss and and the caption-to-video loss:
+\begin{equation}
+\resizebox{0.92\hsize}{!}{
+    $\gL^{v\rightarrow c}_\text{g} = -\frac{1}{B}\sum_{i=1}^B \sum_{j=1}^B w^v_{i,j}\log \sigma\left(G\left(\hat{v}_i, \mathcal{C}\right)\right)_j,
+    \quad
+    \gL^{c\rightarrow v}_\text{g} = -\frac{1}{B}\sum_{i=1}^B \sum_{j=1}^B w^c_{i,j}\log \sigma\left(G\left(\mathcal{\hat{V}}, c_i\right)\right)_j.$
+    }
+\end{equation}
+%  with $\mathcal{\hat{V}}=\{\hat{v}_i\}_{i=1}^B$ as
+% \begin{equation}
+%     \gL^{c\rightarrow v}_\text{g} = -\frac{1}{B}\sum_{i=1}^B \sum_{j=1}^B w^c_{i,j}\log \sigma\left(G\left(\mathcal{\hat{V}}, c_i\right)\right)_j.
+% \end{equation}
+
+
+\subsection{Overall Pre-training Objective}
+\label{sec:global}
+We include a global contrastive learning objective for instance-level alignment. $f_i^v$, the video representation of $\hat{v}_i$, is extracted from average-pooled group tokens and $f_i^c$, the caption representation $c_i$, is computed from the \texttt{[CLS]} token of the original caption.
+Instance similarity scores are defined as: $s(\mathcal{V}, c_i)=[\langle f^v_1, f^c_i\rangle, \dots, \langle f^v_B, f^c_i\rangle] \in \sR^{B}$ and $s(\hat{v}_i, \mathcal{C})=[\langle f^v_i, f^c_1\rangle, \dots, \langle f^v_i, f^c_B\rangle] \in \sR^{B}$.
+A global contrastive loss is defined as
+$    \gL_\text{contrast} = \gL^{v\rightarrow c}_\text{contrast} + \gL^{c\rightarrow v}_\text{contrast}$,
+a combination of the video-to-caption and the caption-to-video views:
+% \begin{equation}
+%     \gL_\text{c}^{v\rightarrow c} = -\frac{1}{B}\sum_{i=1}^B\sum_{p\in P_i^{v}}w_{i,p}^v\log\frac{\exp(f_i^v\cdot f_p^c/\tau)}{\sum_{j=1}^B\exp(f_i^v\cdot f_j^c/\tau)},
+% \end{equation}
+\begin{equation}
+\resizebox{0.92\hsize}{!}{
+    $\gL_\text{contrast}^{v\rightarrow c} = -\frac{1}{B}\sum_{i=1}^B\sum_{j=1}^B w_{i,j}^v\log \sigma(s(\hat{v}_i, \mathcal{C}))_j,
+    \quad
+    \gL_\text{contrast}^{c\rightarrow v} = -\frac{1}{B}\sum_{i=1}^B\sum_{j=1}^B w_{i,j}^c\log \sigma(s(\mathcal{V}, c_i))_j.$
+    }
+\end{equation}
+
+
+% \begin{equation}
+%     \gL_\text{contrast}^{c\rightarrow v} = -\frac{1}{B}\sum_{i=1}^B\sum_{j=1}^B w_{i,j}^c\log \sigma(s(\mathcal{V}, c_i))_j.
+% \end{equation}
+The overall pre-training objective is a weighted sum of grouping loss,  grounding loss, and global contrastive loss:
+% \begin{equation}
+   $\gL = \omega_1 \gL_\text{t} + \omega_2 \gL_\text{g} + \omega_3 \gL_\text{contrast}$.
+% \end{equation}
+We set three weights, $\omega_1$, $\omega_2$, and $\omega_3$, to be equal to one in our experiments for simplicity.

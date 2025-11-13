@@ -1,0 +1,194 @@
+
+\section{Method}
+\label{sec:method}
+
+
+Given a long-form movie $\mathcal{V}$ segmented into multiple short clips $\{ \mathbf{x}_1, \mathbf{x}_2, ..., \mathbf{x}_T \}$, our goal is to generate the audio description~(AD) in text form for every movie clip. 
+Note that each movie clip is cut from the raw movie based on the timestamp $[t_{\text{start}}, t_{\text{end}}]$ given by the AD annotation.
+Specifically, for the $i$-th movie clip consisting of multiple frames 
+$\mathbf{x}_i = \{ \mathcal{I}_1, \mathcal{I}_2, ..., \mathcal{I}_N \}$, we aim to produce text $\mathcal{T}_i$ that describes the visual elements in such a way that helps the visually impaired follow the storyline.
+To this purpose, an ideal AD generation system must be able to exploit the full contextual information leading up to the $i$-th movie clip. One method for this, which we adopt, is to use previous AD $\mathcal{T}_{t<i}$ and subtitles $\mathcal{S}_{t\leq i}$ to generate the text $\mathcal{T}_i$.
+In the following sections,
+we first give an overview of our visual captioning pipeline with prompt tuning (Sec.~\ref{sec:method:base}),
+followed by our contextual components (Sec.~\ref{sec:method:temporal}),
+and finally the pretraining methods with partial data (Sec.~\ref{sec:method:partialpt}).
+
+
+\subsection{Visual Captioning with Prompt Tuning}
+\label{sec:method:base}
+
+In order to describe our method, we first present the typical pipeline for an image captioning model, and then detail how we extend this to ingest multiple frames and additional text context.
+Given an image-caption pair $\{\mathcal{I}_i, \mathcal{C}_i\}$, where the caption consists of a sequence of language tokens $\mathcal{C}_i=\{c_1,c_2,...,c_k\}$,
+the standard objective of an image captioning model is
+to generate text tokens $\hat{\mathcal{C}}_i$ that are close to the target $\mathcal{C}_i$.
+Technically, the captioning models are trained to maximize
+the joint probability of predicting the ground-truth language tokens,
+or equivalently minimize the following negative log-likelihood (NLL) loss,
+\vspace{-2mm}
+\begin{align}\vspace{-2mm}
+    \mathcal{L}_{\text{NLL}}
+    &= - {\log{p_{\theta}{(\mathcal{C}_i | \mathbf{h}_{\mathcal{I}_i})}}}
+    = - {\log{p_{\theta}{(c_1,c_2,...,c_k | \mathbf{h}_{\mathcal{I}_i})}}} \nonumber 
+    \label{eq:nll}
+\vspace{-3mm}
+\end{align}
+where $\theta$ denotes the parameters of the model,
+and $\mathbf{h}_{\mathcal{I}_i}$ denotes the extracted image features of $\mathcal{I}_i$.
+Previous works like ClipCap~\cite{mokady2021clipcap} fit a powerful text generation model 
+and visual encoding model into this image captioning pipeline.
+Specifically, strong visual encoding models, such as CLIP~\cite{clip2021}, are used to
+extract the visual features from the input image
+$\mathbf{z}_i = f_{\text{CLIP}}(\mathcal{I}_i)$,
+then a visual mapping network $\mathcal{M}_{\text{V}}$ is trained to map the visual features to
+`prompt vectors' that adapt to the text generation model,
+$\mathbf{h}_{\mathcal{I}_i} = \mathcal{M}_{\text{V}}(\mathbf{z}_i)$.
+Finally these prompt vectors $\mathbf{h}_{\mathcal{I}_i}$ are fed to a pretrained text generation model, such as GPT~\cite{gpt2019}, for the captioning task.
+We adapt this visual captioning pipeline, which uses pretrained feature extractor CLIP and langauge model GPT, for movie AD generation and propose key components that support contextual understanding.
+
+
+
+
+\subsection{Benefiting from Temporal Context}
+\label{sec:method:temporal}
+
+
+Here, we describe how we extend this single-frame captioning model to include different forms of context, including multiple frames, previous AD text, and subtitles. 
+Compared to image captioning where the annotation describes `what is in the image', movie AD describes the visual happenings in the scene that are relevant to the broader story -- often centered around events, characters and the interactions between them.
+Factors like these cannot be accurately described from a static image alone and therefore a successful automatic AD system must utilize the context of prior events and character interactions.
+
+To tackle these temporal dependencies,
+we propose to include three components to incorporate the essential contextual information from movies:
+(i) immediate visual context in the current movie clip (multiple frames),
+(ii) the previous movie AD, and 
+(iii) the movie subtitles.
+The architecture of our model is shown in Fig.~\ref{fig:arch_context}.
+
+\vspace{3pt}
+\noindent \textbf{Multiple frames (immediate visual context).}
+In contrast to the image captioning method,
+the visual mapping network $\mathcal{M}_{\text{V}}$ takes as input multiple frame features from the
+current movie clip $\mathbf{x}_i$ rather than a single image feature, 
+and outputs prompt vectors for the movie clip,
+\vspace{-3mm}
+\begin{equation*}\vspace{-2mm}
+    \mathbf{h}_{\mathbf{x}_i} = \mathcal{M}_{\text{V}}(\{ \mathbf{z}_1, ..., \mathbf{z}_N \});
+\quad 
+\mathbf{z}_i = f_{\text{CLIP}}(\mathcal{I}_i).
+\vspace{-3pt}
+\end{equation*}
+In detail, the mapping network consists of a multi-layer transformer encoder that enables modelling 
+temporal relations among multiple frame features, as shown in Fig~\ref{fig:arch_context}.
+
+
+\vspace{3pt}
+\noindent \textbf{Previous AD text.}
+The sequence of events leading up to the present contain contextual information which are crucial for generating AD of current scene that helps the viewer follow the story. 
+%The past movie ADs contain contextual information critical for the consistency of the storyline.
+We input this contextual knowledge to our model in the form of the past ADs.
+Specifically, our model takes the past $K$ movie ADs $\{ \mathcal{T}_{i-K}, ..., \mathcal{T}_{i-1} \}$ to generate the AD for the current clip.
+The past movie ADs are a few sentences, which are first concatenated into a single paragraph,
+then tokenized and converted to a sequence of word embeddings.
+Inspired by the design of special tokens in language models,
+we wrap the context AD embeddings with \emph{learnable} special tokens to indicate 
+the beginning and end of the AD sequence. 
+Formally, the contextual AD embedding is a sequence,
+\vspace{-3mm}
+\begin{equation}\vspace{-2mm}
+    \mathbf{h}_{\text{AD}} = [
+\texttt{B}_{\text{AD}};
+\mathbf{h}_{\mathcal{T}_{i-K}}; ...; \mathbf{h}_{\mathcal{T}_{i-1}};
+\texttt{E}_{\text{AD}}]
+\label{eq:context_ad}
+\end{equation}
+
+\noindent where $\texttt{B}_{\text{AD}}$ and $\texttt{E}_{\text{AD}}$ 
+are the learnable special tokens indicating the beginning and end, 
+the symbol `;' denotes concatenation,
+and $\mathbf{h}_{\mathcal{T}_{j}} \in \mathbb{R}^{n \times C}$ denotes the word embedding of the $j$-th movie ADs.
+
+
+
+\vspace{3pt}
+\noindent \textbf{Previous subtitles.} Our model also takes the movie subtitles as additional contextual information, which can be sourced either from the official movie metadata or automatically transcribed with an ASR model.
+The character dialogues, contained with the subtitles, provide complementary information to movie description, including the character names, relationships and emotions.
+Similar to the context ADs,
+we concatenate multiple subtitle sentences into a single paragraph
+and wrap them with learnable special tokens.
+Practically, since the timing of movie AD does not overlap with the subtitles,
+we take the most recent $L$ subtitles within a certain time range as the context,
+\vspace{-2mm}
+\begin{equation*}\vspace{-2mm}
+\mathbf{h}_{\text{Sub}} = [
+\texttt{B}_{\text{Sub}};
+\mathbf{h}_{\mathcal{S}_{i-L}}; ...; \mathbf{h}_{\mathcal{S}_{i-1}};
+\texttt{E}_{\text{Sub}}]
+\end{equation*}
+Due to the weak correlation between the subtitles and the visual elements in the scene,
+we also experiment with a variant that only encodes the character names occurring in the recent subtitles.
+
+
+\vspace{3pt}
+\noindent \textbf{Summary.}
+Overall, the movie AD for the current movie clip $\mathcal{T}_{\mathbf{x}_i}$ is generated 
+by conditioning on all the previously described visual and contextual information using a pretrained GPT.
+The conditional information is fed to GPT as prompt vectors as shown in Fig.~\ref{fig:arch_context}.
+The model is trained with NLL loss,
+\vspace{-1mm}
+\begin{align}\vspace{-3mm}
+    \mathcal{L}_{\text{NLL}}
+    &= - {\log{p_{\Theta}{(
+        \mathcal{T}_{\mathbf{x}_i} | \mathbf{h}_{\mathbf{x}_i},\mathbf{h}_{\text{AD}},\mathbf{h}_{\text{Sub}} 
+        )}}}.
+    \label{eq:nll-ours}
+\end{align}
+
+\noindent During training, we input the ground-truth past AD.
+During inference, we experiment with two methods to incorporate the past AD:
+an \textbf{oracle} setting where the \emph{ground-truth} past ADs are used in Eq.~\ref{eq:nll-ours} to generate the current AD, and a
+\textbf{recurrent} setting where the \emph{predicted} past ADs are used instead.
+
+
+\input{table/mad_cleaning_qual}
+\subsection{Pretraining with Partial Data}
+\label{sec:method:partialpt}
+
+
+A major challenge for generating AD is the lack of training data,
+since the model requires the corresponding visual, textual and contextual data to all be jointly trained.
+However since our model is modular, components of it can be pretrained with \emph{partial data}
+-- when a certain type of data is missing, the remaining modules can still be trained.
+We experiment with partial-data pretraining under two settings:
+visual-only pretraining and AD-only pretraining.
+
+\vspace{3pt}
+\noindent \textbf{Visual-only Pretraining.}
+In the absence of contextual data,
+the visual mapping network can be pretrained with abundant
+image captioning or (short) video captioning datasets.
+In this case, the context modules (both contextual AD and subtitles) are deactivated.
+The training objective of Eq.~\ref{eq:nll-ours} is turned into 
+$\mathcal{L} = - {\log{p_{\Theta}{(
+    \mathcal{T}_{\mathbf{x}_i} | \mathbf{h}_{\mathbf{x}_i}
+    )}}}$
+for visual-only pretraining.
+Note that the language model is kept frozen here since 
+we find image/video captioning datasets have a clear domain gap
+with movie AD in both the vision and text modalities.
+
+\vspace{3pt}
+\noindent \textbf{AD-only Pretraining.}
+\label{sec:ad-pretrain}
+Movie AD datasets with corresponding visual information (\eg~frames or frame features)
+are limited at scale due to potential copyright issues.
+However, abundant \emph{text-only} movie ADs are available online as described in Sec.~\ref{sec:audiovault_textonly}.
+In the absence of visual data,
+the contextual AD module and the language model can still be pretrained.
+The training objective in this case becomes 
+$\mathcal{L} = - {\log{p_{\Theta}{(
+    \mathcal{T}_{\mathbf{x}_i} | \mathbf{h}_{\text{AD}}
+    )}}}$,
+which is similar to training a story completion objective~\cite{mostafazadeh2016corpus}
+by finetuning GPT on \emph{text-only} movie AD data but with a few additional special tokens.
+This text-only movie AD pretraining is also related to~\cite{gururangan2020don},
+which shows a second stage of language model pretraining on in-domain data improves downstream performance.
+

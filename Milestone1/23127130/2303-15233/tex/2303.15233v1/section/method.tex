@@ -1,0 +1,119 @@
+\section{Zero-Shot Classification using Imagen}
+\label{sec:method}
+In this section, we show how to convert the generation process of a text-to-image diffusion model into a zero-shot classifier to facilitate quantitative evaluation on downstream tasks.
+Figure~\ref{fig:imagen_zs} shows an overview of our method.
+
+\textbf{Imagen as a Generative Classifier:} 
+We begin with a dataset, $\big\{ (\bx^1, y^1), \ldots, (\bx^n, y^n) \big\} \subseteq \RR^{d_1 \times d_2} \times [\class_K]$ of $n$ images\footnote{For simplicity, we use $\bx$ in place of $\bx_0$ to refer to an image.} where each image belongs to one of $K$ classes $[\class_K] := \{\class_1, \class_2, \cdots, \class_K\}$.
+Given an image $\bx$, our goal is to predict the most probable class assignment
+\begin{align*}
+    \tilde{y} &= \argmax_{\class_k} p(y = \class_k | \bx) \\
+    &= \argmax_{\class_k} p(\bx|y=\class_k)\cdot p(y=\class_k) \\
+    %&=\argmax_{\class_k}~ \log p_\theta(\bx_i|y_i=\class_k) \frac{1}{k} 
+    &= \argmax_{\class_k}~ \log p(\bx|y=\class_k). % \approx \cL_{\mathsf{Diffusion}}
+\end{align*}
+where we assume a uniform prior %over classes
+$p(y_i=\class_k) = \frac{1}{k}$ that can be dropped from the $\argmax$.\footnote{We can't use a learned prior in the zero-shot setting.} A generative classifier \citep{ng2001discriminative} uses a conditional generative model with parameters $\theta$ 
+to estimate the likelihood as $p_\theta(\bx|y=\class_k)$.
+
+%A conditional generative model estimating $p(\bx |y = \class_k)$
+%The likelihood $p(\bx|y=\class_k)$$
+Using Imagen as a generative classifier requires two modifications.
+First, Imagen is conditioned on text prompts rather than class labels. Thus we convert each label, $\class_k$, to text using a mapping $\prompt$ with a dataset-specific template (e.g. $\class_k \to \mathsf{A~photo~of~a~}\class_k$).
+Second, diffusion models do not produce exact log-likelihoods (\ie we cannot compute $\log p_\theta(\bx|y=\class_k)$ directly).
+Our key idea for a solution is to use the $\mathsf{VLB}$ (more specifically $\cL_{\mathsf{Diffusion}}$ as Imagen is not trained with the other losses) as a proxy. Thus we have:
+\begin{align}
+   \label{eq:score}
+    \tilde{y} &= \argmax_{\class_k}~ \log p_\theta(\bx|y=\class_k) \nonumber \\
+    &\approx \argmin_{\class_k}~ \cL_{\mathsf{Diffusion}}(\bx, \class_k) \nonumber \\
+    &= \argmin _{\class_k \in [\class_K]} ~\bE_{\epsilon,t} \Big[ \vw_t \|\bx - \tilde{\bx}_{\vtheta}\big({\bx}_{t}, \prompt(\class_k), t \big)\|_2^2 \Big]
+\end{align}
+
+\paragraph{Estimating the Expectation:}
+
+We approximate the expectation in \cref{eq:score} using Monte-Carlo estimation. 
+At each step, we sample a $t \sim \cU([0,1])$ and then a $\bx_t$ according to the forward diffusion process (\cref{eq:fwd}): $\bx_t \sim q(\bx_t | \bx_0)$.
+Next, we denoise this noisy image using Imagen (\ie we use Imagen to predict $\bx$ from $\bx_t$), obtaining $\hat{\bx} = \tilde{\bx}_{\vtheta}\big({\bx}_{t}, \prompt(\class_k), t \big)$.
+We call the squared error of the prediction, $\|\bx - \hat{\bx}\|_2^2$, a {\it score} for $(\bx, \class_k)$.
+We score each class $N$ times, obtaining a $K \times N$ {\it scores matrix\footnote{Later we discuss how we can avoid computing the full matrix for efficiency.}} for the image. 
+Finally, we weight the scores according to the corresponding $\vw_t$ and take the mean, resulting in an estimate of $\cL_{\mathsf{Diffusion}}$ for each class.
+
+\paragraph{Prompt Ensembling:}
+Similar to the zero-shot classification setting for CLIP in \citet{radford2021learning}, we could also consider an ensemble of prompts in \Cref{eq:score} for classification instead of using a single prompt template (i.e, the expectation is also over different prompt templates).
+While this would boost classification accuracy, we generally use only a single prompt for the sake of simplicity and efficiency, as our goal is to better understand models rather than achieve state-of-the-art zero-shot performance. 
+
+\paragraph{Choice of Weighting Function:}
+%\label{subsec:weight-func}
+The choice of weighting function, $\vw_t$, in \Cref{eq:score} is critical to the overall performance of the classification algorithm. One option is learning an effective weighting function $\vw_t$. We do this by binning the times into 20 buckets and training a 20-features logistic regression model that learns weights for those buckets that maximize classification accuracy. However, using such a learned weighting is not truly zero-shot since it requires label information to learn. 
+
+We thus also handcrafted a weighting function that can be used across datasets. We designed $\vw_t$ by finding a simple function that looked close to our learned weighting function on CIFAR-100. In particular, we found that $\vw_t := \mathsf{exp}(-7t)$ works well across many datasets and used it for our experiments. 
+As it is monotonic, $\cL_{\mathsf{Diffusion}}$ with this weighting can still be viewed as a likelihood-based objective that maximizes-the variational lower bound under simple data augmentations \citep{kingma2023understanding}. 
+
+
+
+
+\subsection{Improving Efficiency}
+\label{subsec:efficiency}
+Computing $\tilde{y}$ with naive Monte-Carlo estimation can be expensive because $\cL_{\mathsf{Diffusion}}$ has fairly high variance. Here, we propose techniques that reduce the compute cost of estimating the $\argmin$ over classes. The key idea is to leverage the fact that we only need to compute the $\argmin$ and do not require good estimates of the actual expectations. 
+
+
+
+\begin{algorithm}
+\caption{Diffusion model classification with pruning.}
+\label{alg:efficient}
+\begin{algorithmic}
+%\STATE \textbf{Given} Image to classify $\bx$
+%\STATE \texttt{scores} = $[\class_K]$
+\STATE \textbf{given}: Example to classify $\bx$, diffusion model w/ params $\theta$, weighting function $\vw$, hyperparameters $\mathsf{min\_scores}$, $\mathsf{max\_scores}$, $\mathsf{cutoff\_pval}$.
+\vspace{1mm}
+\STATE \color{ForestGreen}{//Map from classes to weighted diffusion model scores.}\color{black}
+\STATE $\mathsf{scores} = \{\class_i: [] \text{ for } \class_i \in [\class_K]\}$
+\STATE $n = 0$
+\STATE \textbf{while} $|\mathsf{scores}| > 1$ \textbf{and} $n < \mathsf{max\_scores}$:
+\STATE \hspace{3mm} $n = n+1$
+\STATE \hspace{3mm}\color{ForestGreen}{//Noise the image}\color{black}
+\STATE \hspace{3mm} $t \sim \cU([0,1])$
+\STATE \hspace{3mm} $\bx_t \sim q(\bx_t | \bx)$
+\STATE \hspace{3mm}\color{ForestGreen}{//Score against the remaining classes.}\color{black}
+\STATE \hspace{3mm} \textbf{for} $\class_i \in \mathsf{scores}$:
+\STATE \hspace{6mm} add $\vw_t \|\bx - \tilde{\bx}_{\vtheta}\big(\bx_{t}, \prompt(\class_i), t \big)\|_2^2$ to $\mathsf{scores}[\class_i]$
+%\STATE \hspace{8mm} $\mathsf{scores}[y_i]$
+\STATE \hspace{3mm}\color{ForestGreen}{//Prune away implausible classes.}\color{black}
+\STATE \hspace{3mm} $\tilde{y} = \argmin_{\class_i} \mathsf{scores}[\class_i].\mathsf{mean}()$ 
+\STATE \hspace{3mm} \textbf{if} $n \geq \mathsf{min\_scores}$:
+\STATE \hspace{6mm} \textbf{for} $\class_i \in \mathsf{scores}$:
+\STATE \hspace{9mm} \textbf{if} $\mathsf{paired\_ttest\_pval}$(
+%\texttt{scores}[$\hat{y}$],
+\STATE \hspace{10mm} $\mathsf{scores}[\tilde{y}]$, $\mathsf{scores}[\class_i]) < \mathsf{cutoff\_pval}$:
+\STATE \hspace{12mm} remove $\class_i$ from $\mathsf{scores}$.
+\STATE \textbf{return} $\tilde{y}$
+%\STATE \KC{use symbols/more compact variable names}
+\end{algorithmic}
+\end{algorithm}
+
+
+
+\paragraph{Shared Noise:} Differences between individual Monte-Carlo samples from $\cL_{\mathsf{Diffusion}}$ can of course be due to different $t$ or forward diffusion samples from $q(\bx_t|\bx_{t - 1})$, whereas we are only interested in the effect of the text conditioning $\prompt(\class_k)$.
+We find far fewer samples are necessary when we use the {\it same} $t$ and ${\bx}_{t}$ across different classes, as shown in Figure~\ref{fig:imagen_zs}.
+In other words, after sampling a $t \sim \cU([0,1])$ and $\bx_t \sim q(\bx_t | \bx_0)$, we score all classes against this noised image instead of a single one.
+As a result, the differences between these estimates are only due to the different text conditioning signals.
+
+
+\paragraph{Candidate Class Pruning:}
+Rather than using the same amount of compute to estimate the expectation for each class, we can further improve efficiency by discarding implausible classes early and dynamically allocating more compute to plausible ones. 
+In particular, we maintain a set of candidate classes for the image being classified. After collecting a new set of scores for each candidate class, we discard classes that are unlikely to become the lowest-scoring (\ie predicted) class with more samples.
+Since we are collecting paired samples (with the same $t$ and $\hat{\bx}_{i, t}$), we use a paired student's t-test to identify classes that can be pruned. Our scores, of course, do not exactly follow the standard assumptions of a student's t-test (e.g. they are not normally distributed), so we use a small p-value ($2\mathsf{e}^{-3}$ in our experiments) and ensure each class is scored a minimum number of times (20 in our experiments) to minimize the chance of pruning the correct class. The full procedure is shown in Algorithm~\ref{alg:efficient}.
+
+
+\paragraph{Comparison:} Figure~\ref{fig:efficiency} compares the number of samples needed to accurately classify CIFAR-100 images for different methods. Using shared noise and pruning greatly improves efficiency, requiring up to 1000x less compute than na\"ive scoring. Nevertheless, classifying with a diffusion model still typically takes 10s of scores per class on average, making the diffusion classifier expensive to use for datasets with many classes. 
+
+
+\begin{figure}[tb!]
+\begin{center}
+\includegraphics[width=0.49\textwidth]{figs/efficiency.pdf}
+\end{center}
+\caption{
+Comparison of efficiency improvements on CIFAR-100. Shared noise improves sample efficiency by roughly 100x and pruning by an additional 8-10x. 
+}
+\label{fig:efficiency}
+\end{figure}

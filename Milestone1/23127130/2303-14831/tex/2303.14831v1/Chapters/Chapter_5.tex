@@ -1,0 +1,445 @@
+% Chapter 1
+
+\chapter{Performance Improvements} % Main chapter title
+
+\label{Chapter5} % For referencing the chapter elsewhere, use \ref{Chapter1} 
+
+%----------------------------------------------------------------------------------------
+
+%----------------------------------------------------------------------------------------
+
+Put together, the components outlined in the previous chapter already constitute a fully functional implementation of the progressive radiosity algorithm. In this chapter we expand it to include \textit{refinement} in addition to further performance enhancements and variations commonly seen in other implementations.
+
+\section{Refinement}
+
+In traditional radiosity, patches are assumed to have a uniform radiant exitance across their surface \cite{radiosity_og, progressive_refinement}. 
+Since ray-traces are of logarithmic complexity \cite{rtx_gems}, our doubly nested, pair-wise for-loop results in an altogether complexity of $O(n^2\log t)$ where $t$ is the number of primitives and $n$ is the amount of patches.
+This complexity suggests that lowering the amount of required samples (e.g. the "contributing" patches $n$) yields a far greater positive impact on performance than diminishing the value of $t$.
+
+There are several different approaches of accomplishing this goal, which were broadly categorized in section \ref{ProgressiveRefinementRadiosity}. In this chapter we primarily focus on methods based on \textit{h-refinement}, namely \textit{static undersampling} and \textit{adaptive subdivision}. Our approaches follow the precedent set by the implementation presented in the GPU Gems 2 \cite{gpu_gems_2005}, by separating the \textit{sampled} patches as a proper subset of the overall lightmap. Our different strategies of generating such a subset are depicted in fig. \ref{undersampling_strategies}.
+
+\subsection{Static Undersampling}
+\label{StaticUndersampling}
+
+A crude and simple method of sampling at a lower resolution than that of the lightmap is to simply do so through a static stride. The nature of UV unwrapping implies that neighbouring pixels on the lightmap likely also represent neighbouring patches in world space, thus increasing the viability of discarding samples belonging to these. Whilst no common name has been established for this method, we will refer to it as \textit{static undersampling}.
+
+In its simplest version, we simply discard all but the upper, left-most pixel of each consecutive square consisting of $m$ pixels (the \textit{sampling window}).
+
+This inherently degrades the algorithms' complexity to $O(\frac{n^2}{m}\log t)$, albeit the quality of the resulting lighting may likewise suffer in proportion to $m$. 
+The decreased amount of samples needs to be reflected in the lighting contribution values (as given in \ref{RTRad_Lighting}) as a factor of $m$, which is the amount of patches each sample represents:
+
+\begin{equation}
+    L(j \xrightarrow{} i) = m * lig_{in}(j) * mat(i) * \frac{\rho}{\pi} * F(i, j)
+\end{equation}
+
+\subsubsection{Monte-Carlo Undersampling}
+
+If the edges of a scene's UV map are aligned along one of the texture's axes, then the fixed-step nature of static undersampling may lead to certain colors or surfaces being grossly over-represented in the aggregate lighting contribution. This effect can be mitigated by selecting a \textit{randomized} pixel from each $\sqrt{m} \times \sqrt{m}$ square.
+
+Naturally, the employed randomization ought to be seeded on the patch-index of the contributor, not the shooter.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.57]{Figures/Undersampling.jpg}
+\caption[]{Different strategies for undersampling on a lightmap of $64\times64$ pixels. One sample is taken for each window of $4\times4$ pixels ($m=16$), with the sampled patches marked in yellow. Mipmapped takes averages and thus has the best coverage, whilst substructuring (e.g. adaptive subdivision) allocates more samples to areas of a high gradient.}
+\label{undersampling_strategies}
+\end{figure}
+
+\subsection{Mipmapped Undersampling}
+
+The information loss incurred by static undersampling can be placated by computing averages for each set of pixels. Some GPU implementations utilize \textit{mipmapping} as a fast and convenient tool to accomplish this \cite{gpu_gems_2005}.
+
+\textit{Mipmaps} are a sequence of pre-calculated, down-scaled versions of a given texture. With each \textit{level}, the image resolution is a factor of four smaller than the previous level. Their applications are primarily centered on \textit{texture filtering} with the intent to reduce aliasing artefacts at long render distances.
+
+The GPU employs a \textit{minification filter} to dictate how mipmaps are derived from the original texture. The most commonly used types are the \textit{nearest neighbour} and \textit{bilinear} filters \cite{VXCT, learnopengl}. Bilinear mipmaps are the functionally equivalent inverse of the bilinear \textit{magnification} filter which we touched on in section \ref{VITPass}: Each pixel in the minified image corresponds to the average of a $2\times2$ square in the level below (see fig. \ref{mipmaps}).
+
+Since generating mipmaps on a GPU is a near-instantaneous process, they can be used as a tool to sample texture areas for their average color values conveniently \cite{VXCT, Crassin, gpu_gems_2005}. Computing the average color of a $\sqrt{m} \times \sqrt{m}$ square simply corresponds to a texture lookup on the mipmap of level $\log_2(\sqrt{m})$. 
+
+Mipmapped undersampling ensures no vital patches (such as light-sources) are discarded, but can lead to colors leaking from one surface to another when sampled.
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.27]{Figures/Mipmaps.jpg}
+\decoRule
+\caption[]{Bilinear mipmaps of a lightmap (under a bilinear magnification filter). These are the lightmaps sampled by mipmapped undersampling with a value of $m=4$, $m=16$ and $m=64$ respectively.}
+\label{mipmaps}
+\end{figure}
+
+\subsection{Adaptive Subdivision}
+
+\textit{Adaptive subdivision} is a more sophisticated counterpart to static undersampling and is generally regarded as a core part of progressive refinement radiosity \cite{progressive_refinement}. Patches that have a high gradient across them, such as shadow boundaries and penumbras, are subdivided into finer grids, whilst low detail areas are represented by a single patch \cite{progressive_refinement, Weimar_radiosity} (see fig. \ref{quad_tree_shadowboundary}). 
+
+Our implementation of this concept in RTRad is loosely based on the hierarchical, quad-tree approach used by Willmott et al. \cite{empirical_comparison} as well as the "progressive accuracy" solution employed by Elias \cite{HugoElias_Radiosity}, whilst we somewhat diverge from other GPU implementations that map each patch to a specific scene polygon and maintain a quad-tree datastructure inside a static buffer \cite{gpu_gems_2005}.
+
+Given our emphasis on handling data directly within UV-wrapped textures, we opted to store meta-information on our quad-tree structure within the alpha-channel of the lightmap texture itself.
+This approach allows us to keep the algorithm shown in the previous chapter mostly intact, whilst letting us sample at a significantly lower rate.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.3]{Figures/quad-tree.jpg}
+\decoRule
+\caption[]{Quad-tree substructuring of a surface. More subdivisions are made in areas of high detail.}
+\label{quad_tree_shadowboundary}
+\end{figure}
+
+\subsubsection{Alpha-Embedded Substructuring}
+
+Section \ref{TextureGroup} briefly mentions that RTRad uses the alpha channel of the position-texture to mark patches that are not occupied by any geometry and thus have no respective surface in the scene.
+Our quad-tree employs a similar scheme in that the alpha value of each pixel equates to the amount of patches its color value represents in sampling.
+
+Before commencing a radiosity iteration, we run a fullscreen pixel shader on the input lighting texture that constructs the appropriate quad-tree inside the alpha channel.
+The tree is constructed bottom-up, with each pass of the shader processing a single level. For a maximum node size of $16\times16$ pixels, the required passes would thus be $\log_2(16) = 4$, equivalent to the height of a quad-tree that can represent $16\times16$ values under a single root.
+
+Each pass examines the gradient of every four neighbours and determines whether these are to be merged into a single node or not. If the colors hardly deviate, the upper left-most node is designated to represent the entire group, with its siblings being dropped from the sampling pool.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale = 0.46]{Figures/Quadtree-construction.jpg}
+\caption[]{A $64\times64$ RGB lightmap (a) and its alpha channel (b-e) after 0, 1, 2 and 3 substructuring passes respectively with a gradient threshold of $0.2$. }\label{fig:quad-tree-construction}
+\end{figure}
+
+\newpage
+The algorithm functions in accordance to the following pseudo-code:
+
+\begin{algorithm}[H]
+    \caption{Alpha - Substructuring}\label{Alpha_Substructure_pseudocode}
+    \begin{algorithmic}[1]
+        \For{each pixel $(x,y) \in lightmap$}\Comment{Initialize all alpha values as 1}
+            \State $alpha(x,y) \gets 1$
+        \EndFor
+        
+        \For{$step \in \{ 2, 4, 8 ... \}$}
+            \For{each pixel $(x,y) \in lightmap$}
+                \If{$x$ and $y$ are divisible by $step$}\Comment{For every $step\times step$ pixels}
+                    \State $child_1 \gets (x,y)$\Comment{Get 4 neighbouring child-nodes}
+                    \State $child_2 \gets (x+\frac{step}{2},y)$
+                    \State $child_3 \gets (x,y+\frac{step}{2})$
+                    \State $child_4 \gets (x+\frac{step}{2},y+\frac{step}{2})$
+                    
+                    \If{all child-nodes have $alpha(child_x) \geq (\frac{step}{2})^2$}\Comment{Only merge nodes that have no children of their own}
+                        \State $g \gets gradient(child_1, child_2, child_3, child_4)$\Comment{Calculate gradient}
+                        \If{$g < threshold$}\Comment{Merge children}
+                            \State $alpha(child_1) \gets \sum_{i=1}^{4} alpha(child_i)$
+                            \State $alpha(child_2) \gets 0$
+                            \State $alpha(child_4) \gets 0$
+                            \State $alpha(child_5) \gets 0$
+                        \EndIf
+                    \EndIf
+                    
+                \EndIf
+            \EndFor
+        \EndFor
+    \end{algorithmic}
+\end{algorithm}
+
+As shown in fig \ref{fig:quad-tree-construction}, all occupied geometry will commence with an alpha value of one, then each $2\times2$ square with a low gradient is merged by transferring the alpha value of all pixels inside the square into the its upper, left-most member. The same process is repeated for $4\times4$ and $8\times8$ squares respectively.
+
+Once the alpha-embedded quad-tree is constructed for the $lig_{in}$ texture, the RTLPass will loop over all other patches, but disregard those with alpha values of zero and multiply the lighting contribution of the rest by their alpha values. The following algorithm amends our original algorithm \ref{RTLPass_psuedocode} from the previous chapter:
+
+\begin{algorithm}[H]
+    \caption{RTLPass with Adaptive Subdivision}\label{RTLPass_substructuring}
+    \begin{algorithmic}[1]
+      \For{$i \in [0, n]$}
+        \State $L_{out}(i) \gets (0,0,0)$
+        \For{$j \in [0,n]$}
+            \If{$j \neq i$ and $alpha(j) > 0$}
+                \State Shoot a ray from $pos(i)$ to $pos(j)$
+                \If{no geometry is encountered along the way}
+                    \State Calculate view factor $F(i,j)$
+                    \State $L_{out}(i) \gets L_{out}(i) + alpha(j) * mat(i) * F(i,j) * L_{in}(j)$
+                \EndIf
+            \EndIf
+        \EndFor
+    \EndFor
+    \end{algorithmic}
+\end{algorithm}
+
+The alpha channel of a standard GPU texture can typically only hold 8 bits of information which, under our algorithm, limits the maximum size of a node to $\sqrt{2^8}^2 = 16\times16$ pixels, amounting to a maximum quad-tree height of four. Although this limitation is negligible, as one could simply store the logarithmic or fractional alpha value instead, the remainder of this thesis will work with an upper node limit of $16\times16$.
+
+\subsubsection{Gradient Calculation}
+
+Determining an approximate gradient for a lighting texture can be accomplished in a number of ways and can incorporate data such as color values to variations in normal vectors. We based our function largely on Willmott et al. \cite{empirical_comparison}, which uses the standard deviation of each patch's radiosity value. We additionally include deviation in normal vectors, to ensure the edges of cohesive surfaces are weighed more heavily in the gradient:
+
+\begin{equation}
+\begin{aligned}
+grad(a, b, c, d) = & \frac{1}{2}\lVert lig(a) - mean(lig(a), lig(b), lig(c), lig(d))\rVert \\
++ & \frac{1}{2}\lVert nrm(a) - mean(nrm(a), nrm(b), nrm(c), nrm(d))\rVert
+\end{aligned}
+\end{equation}
+
+where, in our case, $a$ is the upper left-most child or pixel.
+
+\begin{figure}[h]
+\centering
+\includegraphics[scale=0.5]{Figures/Quadtree-threshold.jpg}
+\caption[]{A $64\times64$ RGB lightmap (a) and its alpha-embedded quad-tree for different gradient thresholds (b-e) (black pixels are not sampled). A larger threshold will lead to more aggressive merging.}
+\label{quadtree_threshold}
+\end{figure}
+
+Adjusting the gradient threshold respectively leads to more or fewer samples taken (see fig. \ref{quadtree_threshold}). For small lightmaps, we found a value of $0.05$ to provide a decent balance between performance and accuracy. Given that each consecutive RTLPass iteration has a lesser effect on lighting than the previous, a reasonable approach would be to ramp this value up successively with each pass.
+
+\newpage
+\section{Visibility Caching}\label{Viscaching}
+
+In this section we describe a visibility caching method used to complement the RTRad algorithm. The resulting performance shows promise for smaller lightmaps and is analyzed in greater detail further ahead (see section \ref{viscaching_analysis}).
+
+\subsection{Memory Complexity}
+
+The required memory for all pairs of $n$ radiosity patches lies in $O(n^2)$. In a naive implementation, a modest lightmap of 256x256 pixels would thus require $256^4$ bits (approx. 0.5GB) of storage, which already borders a critical threshold of what lower grade GPUs can accommodate.
+
+Fortunately, not every pair of patches needs to be considered. Self-referencing pairs of the form $(0,0), (1,1) ... (n,n)$ as well as mirrored pairs ($(x,y)$ or $(y,x)$) can be discarded, bringing the required raw memory down to $\frac{1}{2}*n^2-n$ bits.
+Built-in compression algorithms are unlikely to alleviate this problem, as their intended use is centered on compression of geometry, textures or z-Buffers \cite{GPU_Compression}.
+
+Our implementation stores visibility information as an uncompressed, contiguous buffer of bits which we append to our existing texturegroup. We chose an upper limit of $2^{32}$ bytes, as common GPUs tend not to have more than 8GB of onboard memory, and Falcor disallows the allocation of larger buffers. Theoretically, a buffer of this size can provide full coverage of lightmaps with sizes up to $512\times512$.
+
+Figuring out which memory address (index) each patch pair is assigned in the visibility buffer, requires a bijective mapping function between unique pairs and respective indeces.
+
+\subsection{Cantor Pairing Function}
+
+\textit{Pairing functions} uniquely encode two natural numbers into a single one. There are a wide variety of them each with their own use cases and respective advantages \cite{elegant_pairing_function, Other_Pairing_Function}. For visibility caching we encode each unique pair of patches to an index in a cohesive memory sequence, which makes the \textit{Cantor pairing function} a good choice, as it traverses a 2D grid in a triangular shape which can be modified to exactly cover each unique pair and no more (see fig. \ref{pairing_functions}).
+
+A vanilla cantor pairing function for non-negative integers follows this formula \cite{Other_Pairing_Function}:
+
+\begin{equation}
+    Cantor(x,y) = \frac{x^2 + 3x + 2xy + y + y^2}{2} = x + \frac{(x+y) (x+y+1)}{2}
+\end{equation}
+
+We ensure pair uniqueness by sorting $x$ and $y$ in ascending order. We also mirror the x-axis to ensure that at a given cutoff point (namely $\frac{1}{2}*n^2-n$) only unique pairs have been covered:
+
+\begin{equation}
+    address(x,y) = Cantor(n_x - min(x,y), max(x,y))
+\end{equation}
+
+where $n_x$ is the lightmap resolution along the $x$ axis.
+
+In this memory-sequence function, the parameters (patches) are encoded as a single number, whilst on the lightmap they are given by two coordinates. Converting between each format is a trivial process:
+
+\begin{equation}
+    patch_{1D} = patch_{2D}.x + patch_{2D}.y * n_x
+\end{equation}
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.5]{Figures/Pairing_functions.jpg}
+\decoRule
+\caption[asd]{Vanilla Cantor pairing function (left) and our custom pairing function (right) on a $5\times5$ grid. The area marked in orange contains all unique, non self-referencing pairs. Up to the index of 10, our pairing function excludes both mirrored and self-referencing pairs, thus encompassing exactly this area.}
+\label{pairing_functions}
+\end{figure}
+
+\subsection{Visibility Buffer}
+
+Visibility data is stored inside a standard DirectX \textit{RWBuffer} of unsigned integers with a maximum size of $2^{32}$ bytes. The modified cantor pairing function defined above ascribes each pair of patches a corresponding index inside the buffer. If the result exceeds the maximum value of $8*2^{32}$, no cached data is available and the visibility will have to be computed on-the-fly through raytracing.
+
+Accessing the individual bits of a buffer directly is not possible in HLSL, so we employ equivalent bit-shifting functions that operate on 32-bit unsigned integers instead\footnote{Since 32bit integers are read and written to simultaneously, this leads to similar memory collision inaccuracies as in section \ref{memory_conflicts}. In our testing their effects were mostly negligible for the smaller lightmaps this algorithm functions on, though became noticeable on a $512\times512$ resolution.}.
+
+In theory this approach may also be used to \textit{partially} store visibility data on larger lightmaps, though based on our measurements, this only lead to performance degradation. The visibility data required by a lightmap of $1024^2$ pixels would require upwards of 500 billion bits, of which the entirety of our 4GB buffer would only cover less than 7\%. The cost of having to calculate the cantor-index for \textit{all} patch pairs heavily outweighs the advantage of being able to skip the raytraces for just 7\% of them.
+
+\section{Voxel Raymarching}\label{VoxelRaymarch}
+
+The primary mechanism behind Nvidia's RTX technology is the complete parallelization of BVH traversal, triangle intersecting and shading. Given the immense number of rays required for a full radiosity iteration, we can safely assume that the limited amount of RT cores still pose a meaningful bottleneck within this system.
+
+We devised a simple, low memory alternative for visibility calculations that can be executed on regular CUDA cores. The underlying idea consists of idle CUDA cores tapping into the unprocessed workload when all RT cores are otherwise busy.
+
+The aforementioned visibility alternative has its roots in voxel cone tracing (\cite{Crassin, VXCT}).
+
+\begin{figure}[h]
+\centering
+\includegraphics[scale = 0.3]{Figures/VoxelRaymarching.jpg}
+\caption[]{Raymarching through a voxelized 3D scene. On each of the sampled locations the respective value in the 3D texture is read. In this example the ray will be marked as obstructed (i.e. not visible), because one of the sampled locations contains a value larger than zero.}
+\label{voxel_raymarching}
+\end{figure}
+
+\subsection{Raymarching and 3D Textures}
+
+Intuitively, \textit{3D textures} function just like regular textures only with an additional depth dimension \cite{VXCT}. The pixel equivalents are aptly named \textit{voxels}, resulting from a combination of the words volume and pixel.
+
+\textit{Raymarching} is a technique usually employed when surface functions are not easily solvable. Unlike raytracing, this process "marches" forward along the ray direction in a series of steps, sampling each point along the way \cite{VXCT}. Raymarching has a wide range of variations such as sphere tracing or SDF ray marching, which require signed distance functions \cite{SDF_raymarching}.
+
+Storing a voxelized representation of a scene into a 3D texture and sampling that texture whilst marching along a ray serves as a crude approximation to a regular ray-trace (see fig. \ref{voxel_raymarching}).
+
+This approach is subject to a number of limitations mostly related to its geometric inaccuracies, yet the performance remains independent of a scene's triangle count and is instead tied to the overall size of the employed 3D texture \cite{VXCT}.
+
+\subsection{Scene Voxelization}\label{Voxelization}
+
+To voxelize a scene into a 3D texture we employ an algorithm virtually identical to the one described by Crassin et al. \cite{Crassin, crassin_voxelization2, VXCT}, which allows an entire scene to be voxelized in a single, lightweight rasterization pass.
+
+We run this pass as an extension to the CITPass, the \textit{CVMPass} (\textit{create-voxel-map-pass}), which consists of a unique vertex, geometry and pixel shader:
+
+\subsubsection{Vertex Shader}
+
+To ensure all surfaces are voxelized, the first step scales the scene to fit entirely into the rendered clipspace.
+The formula applied to each vertex simply follows from:
+
+\begin{equation}
+vert(v) = 2 \frac{v - P_{min}}{P_{max} - P_{min} - (1, 1, 1)}
+\end{equation}
+
+where $P_{min}$ and $P_{max}$ are the minimum and maximum world positions the scene encompasses. In essence, all scene vertices are linearly interpolated from a $[P_{min}, P_{max}]$ interval into the clipspace interval $[-1, 1]$.
+
+The viewport resolution is set to be equal to the width and height of the voxelmap which, when rendered, corresponds to each primitive being projected along a texture axis \cite{VXCT}. The process of choosing the ideal axis of projection is performed by the geometry shader.
+
+\subsubsection{Geometry Shader}
+
+Rasterizing all surfaces along a single axis may leave gaps in the resulting projection if a surface's normal vector subtends a steep angle with the axis of projection \cite{crassin_voxelization1, crassin_voxelization2, VXCT}. For instance, if the green cuboid in fig. \ref{DominantAxisSelection} were to be rasterized along a single axis, only one of the three surfaces would contain pixels.
+
+In order to ensure a voxelization that covers all surfaces fully, one can either repeat the process for each axis individually or, preferably, rotate each triangle so that the dominant component of its normal vector is aligned with the axis of projection \cite{Crassin, VXCT, takeshige}.
+
+This process is aptly named \textit{dominant axis selection}, and is easily performed in a geometry shader. The dominant axis of a triangle corresponds to the axis that its normal vector shares its largest component with. Commonly, rasterization applications project triangles along the z-axis, so a respective geometry shader would function like so:
+
+\begin{algorithm}[H]
+    \caption{Dominant Axis Selection (Adapted from VXCT \cite{VXCT})}
+    \begin{algorithmic}[1]
+    \Procedure{ProcessTriangle}{$v_1, v_2, v_3$}
+        \State $\harpoon n \gets \left| (v_2 - v_1) \times (v_3 - v_1) \right|$ \Comment{Calculate normal vector}
+        \For{$v \in \{ v_1, v_2, v_3 \}$}\Comment{Rotate each vertex to maximize z}
+            \If{$n.x = \max(n.x, n.y, n.z)$}
+                \State $v.xyz \gets v.zyx$
+            \ElsIf{$n.y = \max(n.x, n.y, n.z)$}
+                \State $v.xyz \gets v.xzy$
+            \Else{ $n.z = \max(n.x, n.y, n.z)$}
+                \State $v.xyz \gets v.xyz$
+            \EndIf
+        \EndFor
+    \EndProcedure
+    \end{algorithmic}
+\end{algorithm}
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.5]{Figures/Voxelization.png}
+\decoRule
+\caption[]{The individual steps of the GPU voxelization algorithm proposed by Crassin et al. Note that the geometry shader technically does not \textit{project} the geometry, but merely rotates it so that the dominant axis is aligned with the axis of projection.}\label{DominantAxisSelection}
+\end{figure}
+
+\subsubsection{Pixel Shader}
+
+The rasterization pipeline delivers the world position that each fragment had before the geometry shader's rotations took place. For each rendered pixel that position now corresponds to a coordinate within the 3D texture that is set to be a "solid" voxel (see fig. \ref{voxelmaps}).
+
+In voxel cone tracing, each voxel stores information on direct lighting calculated by the phong model \cite{VXCT}. For our purposes it is sufficient to simply store a 0 for empty space and 1 for geometry.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.3]{Figures/vox_resolutions.jpg}
+\decoRule
+\caption[]{Phong-model direct light values stored in voxelmaps of different resolutions, as depicted by Benjamin Kahl \cite{VXCT}.}
+\label{voxelmaps}
+\end{figure}
+
+We store the voxelmap alongside our other textures in the texturegroup. Marching through it along a ray until a voxel is solid becomes a trivial procedure that can be directly called instead of the RTX \verb|TraceRay| function.
+
+In RTRad, we allow the user to set a custom ratio of RTX ray-traces that are replaced by voxel-raymarches. We found that, for small voxelmaps, this could indeed lead to an improvement in pass-time but would significantly deprecate lighting quality. Nevertheless, raymarching does serve as a simple and lightweight fallback for graphics cards that do not support RTX. A more detailed account on our findings is listed in section \ref{VoxelRaymarch_Analysis}.
+
+\section{Directional Sampling}
+
+Some radiosity implementations rely on the hemicube approximation for visibility and do not calculate view factors explicitly \cite{gpu_gems_2005}. Instead, gathered intensity is estimated by generating samples on a hemicube and determining which patch a ray incoming from that direction would have originated on. The total gathered intensity can thus be estimated as the average for each of these directions. This process corresponds, in essence, to the same distribution that a classical raytracing program would sample for diffuse reflections. We broadly categorized this approach as "directional sampling" in section \ref{instant_radiosity_section}.
+
+To analyze the viability and performance of RTX in these types of implementations, we included a modified version of our algorithm that relies on direction-based sampling.
+
+For each patch, a number of rays are shot through a surrounding hemisphere. Whichever surfaces these encounter are sampled for their color and added into the final lighting sum. Instead of weighing lighting contribution by patch surface area, we compute a rudimentary average over the number of samples $|\Omega|$.
+
+Mathematically, this approach is described by the equation for raytracing, as given in (\ref{RenderingEquation_Raytracing}):
+
+\begin{equation}
+\begin{aligned}
+L_o(x, \harpoon\omega)
+= L_e(x, \harpoon\omega) + \frac{1}{|\Omega|}\sum_{\harpoon\omega_i \in \Omega} f_r(\harpoon\omega_i, \harpoon\omega, x)  L_o(I(x, \harpoon \omega_i), -\harpoon \omega) \frac{\harpoon \omega_i \cdot \harpoon {n_x}}{\lVert x - I(x, \harpoon \omega_i) \rVert^2}
+\end{aligned}
+\end{equation}
+
+Since radiosity is only concerned with diffuse reflections, the BRDF $f_r$ collapses into a generic diffuse BRDF of $\frac{\rho}{\pi}$:
+
+\begin{equation}
+\begin{aligned}
+L_o(x)
+= L_e(x) + \frac{\rho}{\pi|\Omega|}\sum_{\harpoon\omega_i \in \Omega} L_o(I(x, \harpoon \omega_i)) \frac{\harpoon \omega_i \cdot \harpoon {n_x}}{\lVert x - I(x, \harpoon \omega_i) \rVert^2}
+\end{aligned}
+\end{equation}
+
+The equation above can be adapted fairly easily into our existing architecture by using DXR's \textit{closest-hit} shader which, in essence, corresponds to our intersection function $I(x, \harpoon\omega)$.
+
+The closest-hit shader allows one to retrieve information on the closest intersection, including UV coordinates which lets us access all required data through our existing texturegroup.
+The lighting value sampled by each ray can be blurred by sampling a higher mipmap level in order to avoid sporadic illumination effects due to small texture details.
+
+Algorithm \ref{RTLPass_psuedocode_hemispheric} outlines the respectively modified RTLPass for this approach. 
+For the sake of brevity, we kept the exact operations (such as mipmap-sampling, accounting for patch-size, tangent-space transformation etc.) obfuscated, but the entire closest-hit shader can be viewed on the RTRad open source repository (see \cite{RTRad_Repository}).
+
+\begin{algorithm}[H]
+    \caption{RTLPass}\label{RTLPass_psuedocode_hemispheric}
+    \begin{algorithmic}[1]
+      \For{$i \in [0, n]$}\Comment{For each patch (executed in parallel)}
+        \State $L_{out}(i) \gets L_e(i)$\Comment{Set initial lighting value}
+        \For{$\harpoon \omega \in \Omega$}
+            \State $\harpoon \omega_t \gets$ $\harpoon \omega$ in tangent-space of patch $i$
+            \State Shoot a ray from $pos(i)$ in direction $\harpoon \omega_t$
+            \If{the ray hits another patch $j$}\Comment{Closest-hit shader}
+                \State $g \gets \frac{\harpoon \omega_i \cdot nrm(i)}{\lVert pos(i) - pos(j) \rVert^2}$\Comment{Geometric factor}
+                \State $L_{out}(i) \gets L_{out}(i) + g * mat(i) *  \frac{\rho}{\pi|\Omega|} * L_o(j)$\Comment{Add contribution}
+            \EndIf
+        \EndFor
+    \EndFor
+    \end{algorithmic}
+\end{algorithm}
+
+\subsection{Hemispheric Direction Generation}
+
+The algorithm above assumes that a set of directions $\Omega$ is given.
+To sample directions uniformly across a hemisphere, we utilize the same method that Laine et al. use in \textit{incremental instant radiosity} \cite{instant_radiosity_aalto} to distribute additional VPLs from a light-source.
+
+Laine et al. represent samples as 2D points inside a unit circle (rather than points on a hemisphere) \cite{instant_radiosity_aalto, instant_radiosity_2}, which can subsequently be projected onto a hemisphere using the following operation:
+
+\begin{equation}
+\begin{pmatrix}x\\y\end{pmatrix} \longrightarrow \begin{pmatrix}x\\y\\\sqrt{1 - (x^2 + y^2)}\end{pmatrix}
+\end{equation}
+
+As can be observed in fig. \ref{vpl_adding2}, evenly scattered points on a circle result in a lower density of vectors that strongly deviate from the surface's normal vector. This, in essence, induces the geometric cosine-term applied in sampling \footnote{Our implementation follows the pseudo-code listed in algorithm \ref{RTLPass_psuedocode_hemispheric}, meaning we apply the geometric cosine-term (dot product), \textit{despite} the projection onto a hemisphere already inducing the same effect. Leaving this factor out may produce different, potentially better, results. }.
+
+In incremental instant radiosity, the direction a new VPL is shot towards gets determined by finding the largest empty circle within the unit circle and placing a new sample at its center \cite{instant_radiosity_aalto}. This helps maintain an even distribution of VPLs, without prior knowledge on how many samples will be generated.
+
+Geometrically, the largest empty circle inside a sampled area must be centered at either
+
+\begin{itemize}
+    \item a vertex in the Voronoi diagram that touches connects three Voronoi regions, 
+    \item the intersection between an infinite Voronoi endge and the bounding polygon or
+    \item a vertex of the bounding polygon \cite{instant_radiosity_aalto}.
+\end{itemize}
+
+With last option being irrelevant when the boundary is a perfect unit circle \cite{instant_radiosity_aalto}.
+
+Our algorithm, which pre-computes a set of evenly distributed samples $\Omega$, is largely based on this principle by adhering to the steps listed in algorithm \ref{sample_generation_pseudocode}.
+
+\begin{algorithm}[H]
+    \caption{Directional Sample Generation}
+    \begin{algorithmic}[1]
+        \State $\Omega \gets $ 4 random points in a unit circle
+        \For{$n$ iterations}
+            \State Calculate the Voronoi diagram of $\Omega$
+            \State $V \gets $ Set of all Voronoi vertices inside the unit sphere as well as all intersections between Voronoi edges and the unit circle boundary.
+            \State Find the point in $V$ that has the largest distance to its nearest neighbour and add it as a new sample to $\Omega$.
+        \EndFor
+    \end{algorithmic}
+    \label{sample_generation_pseudocode}
+\end{algorithm}
+
+The results of this algorithm can be observed in fig. \ref{vpl_adding}, whilst fig. \ref{vpl_adding2} shows their respective 3D directions. Incremental instant radiosity is intended to maintain relatively even distributions under a growing sample count. We chose this method to ensure users can select the exact amount of samples to be used for radiosity, whilst not having to worry about those samples being unevenly distributed.
+
+In order to cut down on unnecessary computations during runtime, we use a separate program written in \textit{Python} (included in the RTRad repository \cite{RTRad_Repository}) to pre-compute a list of directions, which are then simply read by the RTLPass shader in the exact same order they were added to the set.
+
+Coding directions in this static manner allows us to omit the complexities of generating Voronoi diagrams during runtime, thus greatly increasing performance. The resulting downside is that the maximum amount of samples becomes restricted to the amount that was pre-generated, as well as the maximum DirectX array size. Our chosen upper limit was 1024, although much larger sets could theoretically be accommodated using GPU data-buffers.
+
+\begin{figure}[h]
+\centering
+\includegraphics[scale=0.5]{Figures/VPL_adding.jpg}
+\decoRule
+\caption[]{Unit circles with various amount of samples (blue) alongside their respective Voronoi diagrams (black/orange).}
+\label{vpl_adding}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[scale=0.6]{Figures/100_samples.jpg}
+\decoRule
+\caption[]{One hundred generated directions (top) and their corresponding Voronoi diagram projected onto a hemisphere (bottom).}
+\label{vpl_adding2}
+\end{figure}
+
+

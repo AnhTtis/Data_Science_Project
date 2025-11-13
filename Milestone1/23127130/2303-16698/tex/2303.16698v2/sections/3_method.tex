@@ -1,0 +1,75 @@
+\section{Probabilistic inverse optimal control}\label{sec:ioc}
+We consider an agent acting in a partially observable Markov decision process (POMDP) as introduced in \cref{sec:pomdps}. We assume that the agent acts at time $t$ based on their belief $\belief_{t}$ about the state of the system $\state_t$, which evolves according to $\belief_{t+1} = \beliefdynamics_t(\belief_t, \action_t, \obs_t)$. While the belief of the agent is defined commonly as a distribution over the true state, here we model $\belief_t$ as a finite-dimensional summary statistics of the distribution, i.e., $\belief_{t} \in \R^b$. The function
+$\beliefdynamics_t: \beliefset \times \R^u \times \R^m \to \beliefset$
+is called belief dynamics. We further assume that the agent follows a time-dependent policy $\policy_t: \beliefset \times \R^j \to \R^u$, i.e., $\action_t = \policy_t(\belief_t, \policynoise_t)$, which can be stochastic with  $\policynoise_{t} \sim \Normal(0, \Identity)$.
+
+In the inverse optimal control problem, the goal is to estimate parameters $\params \in \R^p$ of the agent's optimal control problem given the model and trajectory data. These parameters can include properties of the agent's cost function, the sensory and control systems of the agent, or the system's dynamics. 
+More precisely, we assume that we are given a parametric form of the system dynamics, belief dynamics, cost function, and initial belief of the agent, which all might depend on the unknown parameters that we aim to infer. Further we assume a set of state trajectories. Importantly, we do not assume knowledge of the agent’s belief.
+We follow a probabilistic approach to inverse optimal control,
+i.e., we consider the likelihood function 
+\begin{align}
+    p(\state_{1:T} \given \params) = p(\state_1 \given \params) \prod_{t=1}^{T-1} p(\state_{t+1} \given \state_{1:t}, \params), \label{eqn:likelihood}
+\end{align}
+describing the probability of the observed trajectory data $\state_{1:T} \defeq \{\state_1, \ldots, \state_T\}$ given the parameters. For a set of trajectories, we assume them to be independent given the parameters, so that the likelihood factorizes into single trajectory likelihoods of the form in \cref{eqn:likelihood}.
+In this equation, generally, each state $\state_{t+1}$ depends on all previous states $\state_1, \dots, \state_t$, because the agent's internal noisy observations and control signals are not accessible to the researcher (\cref{fig:setup}~B). Therefore, the Markov property does not hold from the researcher's perspective, rendering computation of the likelihood function intractable. To deal with this problem, we employ two key insights: First, the joint dynamical system of the states and the agent's belief is Markovian \citep{van2011lqg}. Second, by keeping track of the distribution over the agent's belief, i.e., by performing belief tracking \citep{schultheis2021inverse}, we can iteratively compute the individual factors of the likelihood function in \cref{eqn:likelihood}.
+In our IOC method, the goal is to maximize the likelihood w.r.t.\ the parameters $\params$. To do so, we use gradient-based optimization with automatic differentiation to differentiate through the likelihood for computing the optimal parameters (\cref{algo:likelihood}).
+An implementation of our algorithm is publicly available\footnote{\url{https://github.com/RothkopfLab/nioc-neurips}}.
+
+We first introduce a general formulation of the IOC likelihood involving marginalization over the agent's internal beliefs in \cref{sec:likelihood}. Then, we show how to make the computations tractable by local linearization in \cref{sec:linearization}. In \cref{sec:fixed_linearization}, we provide details for suitable linearization points, which enables us to evaluate the approximate likelihood within a single forward pass.
+
+
+\subsection{Likelihood formulation}\label{sec:likelihood}
+We start by defining a joint dynamical system of states and beliefs \citep{van2011lqg}, in which each depends only on the state and belief at the previous time step and the noises. For that, we insert the policy into the dynamics and
+the policy and observation function into the belief dynamics, yielding the equation
+\begin{align}
+    \label{eqn:joint-dynamics}
+    \begin{bmatrix} \state_{t+1} \\ \belief_{t+1} \end{bmatrix} 
+    &= \begin{bmatrix} \dynamics(\state_t, \policy_t(\belief_t, \policynoise_t), \statenoise_t) \\
+    \beliefdynamics_t(\belief_t, \policy_t(\belief_t, \policynoise_t), h(\state_t, \obsnoise_t))
+    \end{bmatrix}
+    \eqdef g(\state_t, \belief_t, \statenoise_t, \obsnoise_t, \policynoise_t).
+\end{align}
+For given values of $\state_t$ and $\belief_t$, this equation defines the distribution $p(\state_{t+1}, \belief_{t+1} \given \state_{t}, \belief_{t})$, as $\statenoise_t, \obsnoise_t, \policynoise_t$ are independent of $\state_{t+1}$ and $\belief_{t+1}$. Importantly, with this formulation, the control signals are only implicitly regarded through the policy, as we assume them to be latent for the researcher. In \cref{sec:linearization} we will introduce an approximation via linearization, which leads to a closed-form expression for $p(\state_{t+1}, \belief_{t+1} \given \state_{t}, \belief_{t})$. 
+
+One can use this Markovian joint dynamical system to compute the likelihood factors for each time step \citep{schultheis2021inverse}.
+To this end, we first rewrite the individual likelihood terms $p(\state_{t+1} \given \state_{1:t})$ of \cref{eqn:likelihood} by marginalizing over the agent's belief at each time step, i.e., 
+\begin{align}
+    p(\state_{t+1} \given \state_{1:t}) =  \int p(\state_{t+1}, \belief_{t+1} \given \state_{1:t}) \, \td \belief_{t+1}. \label{eqn:marginalization}
+\end{align}
+As the belief is an internal quantity of the agent and thus not observable to the researcher, we keep track of its distribution, $p(\belief_t \given \state_{1:t})$.
+For this, we rewrite
+\begin{align}
+    &p(\state_{t+1}, \belief_{t+1} \given \state_{1:t})
+    = \int p(\state_{t+1}, \belief_{t+1} \given \state_t, \belief_t) \, p(\belief_t \given \state_{1:t}) \, \td \belief_t, \label{eqn:propagation}
+\end{align}
+where we have exploited the fact that the joint dynamical system of states and beliefs is Markovian. The distribution $p(\belief_t \given \state_{1:t})$ acts as a summary of the past states and can be computed by conditioning on the current state, i.e.,
+\begin{align}
+    p(\belief_t \given \state_{1:t}) = \frac{p(\state_t, \belief_t \given \state_{1:t-1})}{p(\state_t \given \state_{1:t-1})}. \label{eqn:summary}
+\end{align}
+After determining $p(\belief_t \given \state_{1:t})$, we can propagate it through the joint dynamical system to arrive at the distribution $p(\state_{t+1}, \belief_{t+1} \given \state_{1:t})$. To obtain the belief distribution of the following time step, $p(\belief_{t+1} \given \state_{1:t+1})$, we condition on the observed state $\state_{t+1}$. To obtain the likelihood contribution, on the other hand, we marginalize out $\belief_{t+1}$.
+To summarize, starting with an initialization $p(\belief_0)$, we can compute the individual terms $p(\state_{t+1} | \state_{1:t})$ of the likelihood by executing \cref{algo:likelihood} (\cref{app:algorithm}).
+
+
+\subsection{Tractable likelihood via local linearization}\label{sec:linearization}
+While the marginalization and propagating operations in the previous section can be done in closed form for linear-Gaussian systems, this is no longer feasible for non-linear systems. Therefore, we follow the approach of local linearization used in iLQG (\cref{sec:ilqg}) and the EKF (\cref{sec:kalman}). For the belief statistics, we consider the mean of the agent's belief, i.e., $\belief_t = \E[\state_t \given \obs_1, \ldots, \obs_{t-1}]$ and
+initialize the distribution for the first time step as a Gaussian, $p(\belief_1) = \Normal(\mu_1^{(b)}, \Sigma_1^{(b)})$. We then approximate the distribution $p(\state_{t+1}, \belief_{t+1} \given \state_t, \belief_t)$ as a Gaussian by applying a first-order Taylor expansion of $g$.
+
+To obtain a closed-form expression for $g$, which we can linearize, we model the agent's policy using iLQG (\cref{sec:ilqg}) and the belief dynamics using the EKF (\cref{sec:kalman}).
+This choice leads to an affine control and belief given $\belief_t$, making linearization of $p(\state_{t+1}, \belief_{t+1} \given \state_t, \belief_t)$ straightforward. To allow for additional stochasticity in the agent's policy, we use the MCE formulation (\cref{sec:mcerl}). For linearized dynamics, the MCE policy is 
+given by a Gaussian distribution, so that $\policy_t(\belief_t, \policynoise_t) = \controlmatrix_t (\belief_t - \bar\state_{1:T}) + \controloffset_t + \bar\action_{1:T} - \tilde{\controlmatrixm}_t \policynoise_t$, with $\tilde{\controlmatrixm}_t$ the Cholesky decomposition of $\controlmatrixm_t$, and can be marginalized out in closed form.
+
+The approximations we have introduced allow us to solve the integral in \cref{eqn:propagation} in closed form by applying standard equations for linear transformations of Gaussians, resulting in 
+\begin{align}
+    p(\state_{t+1}, \belief_{t+1} \given \state_{1:t}) \approx \Normal\left(\mu_t, \Sigma_t  \right),
+\end{align}
+with
+$\mu_t = g(\state_t, \mu_t^{(b)}, 0, 0, 0)$ and $\Sigma_t = \mathbb{J}_\belief \Sigma_t^{(b)} \mathbb{J}_\belief^T + J_{\statenoise} \mathbb{J}_{\statenoise}^T + \mathbb{J}_{\obsnoise} \mathbb{J}_{\obsnoise}^T + \mathbb{J}_{\policynoise} \mathbb{J}_{\policynoise}^T$,
+where $\mathbb{J}_\bullet$ denotes the Jacobian of $g$ w.r.t.\ $\bullet$, evaluated at $(\state_t, \mu_t^{(b)}, 0, 0, 0)$. Under this Gaussian approximation, both remaining operations of \cref{algo:likelihood} (\cref{app:algorithm}) can also be performed in closed form. A more detailed derivation and representation of these formulas can be found in \cref{app:ioc_derivation}. If the agent has full observations of the system's state, the inverse optimal control problem is simplified significantly (see \cref{app:fullyobs}). Details about the implementation are provided in \cref{app:implementation}.
+
+
+\subsection{Data-based linearization}
+\label{sec:fixed_linearization}
+The forward optimal control problem is commonly solved by starting with a randomly initialized nominal trajectory and iterating between computing the locally optimal control law and linearization until convergence.
+To compute the likelihood in the inverse problem, we can take a more efficient approach by linearizing directly around the given trajectory $\state_{1:T}$.
+We then need to perform only one backward pass to compute an approximately optimal control law given the current parameters, and a forward pass to compute an approximately optimal filter. This, in particular, allows efficient computation of the gradient of the likelihood function for the optimization procedure. As we assume the controls to be unobservable, but they are needed for the linearization, we compute estimates of the controls by minimizing the squared difference of the noiseless predicted states and the actual states (see \cref{app:actions}). Note that these estimated controls are only used for the linearization, but are not used as observed controls in the IOC likelihood itself.
+In the case where the full state is not observable, we cannot linearize around the trajectory. For these cases, we propose two approaches to compute gradients based on implicit differentiation and differentiating only through the last iteration. As this setting is not the main focus of this paper, details of these approaches are provided in \cref{app:gradients_computation}.

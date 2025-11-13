@@ -1,0 +1,87 @@
+\section{Backward Optimization}
+\label{supp:sec:backward_optim}
+
+The goal of the backward optimization is to retrieve the shape code $\latentShape^{u}$ and joint code $\latentJoint^{u}$ of an unknown object. The object is given through sampled SDF values, in total $P$. We denote the set of all $P$ SDF-space coordinate tuples as $\allSdfValues^{u} = \{(\spaceCoordinate_{p}, \sdfValue_{p})_{p} \forall p \in P \}$ for this unknown object. The problem can then be formalized as 
+\begin{align}
+    \label{supp:eqn:backward_optim}
+    &\latentShape^{u}, \latentJoint^{u} = \\
+    &\quad \arg\min_{\latentShape^{u}, \latentJoint^{u}} 
+    \frac{1}{|\allSdfValues^{u}|} \sum_{(\spaceCoordinate_{p}, \sdfValue_{p}) \in \allSdfValues^{u}} \left| \geometryDecoder(\latentShape^{u}, \latentJoint^{u}, \spaceCoordinate_{p}) -  \sdfValue_{p} \right|, \nonumber
+\end{align}
+a minimization of the distance between the given SDF values and the one predicted by our geometry decoder (see \ifthenelse{\boolean{reftomain}}{\cref{subsubsec:geometry_decoder}}{Sec.~3.2.1}).
+
+\begin{algorithm*}
+    \caption{Backward Optimization: The goal is to retrieve shape and joint code for an unknown shape $\allSdfValues^{u}$ with $n$ hypotheses in parallel. Here, for clarity, we show the optimization for a single $i \in [1, \ldots, n]$. Eventually, from all returned code pairs the pair having the lowest distance error (see \cref{supp:eqn:backward_optim}) is returned. This procedure can be efficiently parallelized on a GPU.}
+    \label{supp:algo:backward_optimization}
+    \begin{algorithmic}[1] % The number tells where the line numbering should start
+        \Procedure{BackOptimSingle}{$\allSdfValues^{u}, \boldsymbol{Z}_{\text{j}}, i$}
+            \State $ \text{project}(\bullet), \text{reproject}(\bullet) \gets \text{SVD}(\boldsymbol{Z}_{\text{j}}) $
+                \Comment{Retrieve project (see \cref{supp:joint_code_projection}) and reproject (see \cref{supp:joint_code_reprojection}) function}
+            \State $\latentShape^{i} \gets \mathcal{N}( \boldsymbol{0}, \Sigma )$ 
+                \Comment{Initialize shape codes with $\boldsymbol{0} \in \realspace^{\dimensionsShapeSpace}, \Sigma = \text{diag}(0.5) \in \realspace^{\dimensionsShapeSpace \times \dimensionsShapeSpace}$ }
+            \State $\latentJoint^{i} \gets 
+            \begin{cases}
+                \bar{\boldsymbol{Z}}_{\text{j}}^{\text{prismatic}} & i \mod 2 = 0   \\ 
+                \bar{\boldsymbol{Z}}_{\text{j}}^{\text{revolute}}  & i \mod 2 = 1
+            \end{cases} $
+            \Comment{Initialize joint codes}
+            \State $\hat{\latentJoint}^{i} \gets \text{project} (\latentJoint^{i}) $
+            \Comment{Project joint codes}
+            \For{$\textit{step} \in [1, \ldots, 800$]}
+                \State $\begin{aligned} 
+                    \textit{loss}^{i} \gets &  \frac{1}{| \allSdfValues^{u} |} \sum_{(\spaceCoordinate_{p}, \sdfValue_{p}) \in \allSdfValues^{u}} \left| \geometryDecoder(\latentShape^{i}, \text{reproject}(\hat{\latentJoint}^{i}), \spaceCoordinate_{p}) -  \sdfValue_{p} \right|  
+                    \\ 
+                    & + 5 \cdot 10^{-3} ||\latentShape^{i}|| \\
+                    & + 10^{-2} \min( ||\text{reproject}(\hat{\latentJoint}^{i}) - \boldsymbol{Z}_{\text{j}}||)  
+                \end{aligned}$
+                \Comment{Sum distance loss and regularization terms}
+                \If{$\textit{step} \leq 600$}
+                    \State $\latentShape^{i}, \hat{\latentJoint}^{i} \gets \text{ADAM}(\textit{loss}^{i})  $
+                    \Comment{Update shape and joint code}
+                \ElsIf{$600 < \textit{step} \leq 700$}
+                    \State $\latentShape^{i} \gets \text{ADAM}(\textit{loss}^{i})  $
+                    \Comment{Update shape code}
+                \Else
+                    \State $\hat{\latentJoint}^{i} \gets \text{ADAM}(\textit{loss}^{i})  $
+                    \Comment{Update joint code}
+                \EndIf
+            \EndFor\label{optim}
+            \State \textbf{return} $ \latentShape^{i}, \text{reproject}(\hat{\latentJoint}^{i}) $
+        \EndProcedure
+    \end{algorithmic}
+\end{algorithm*}
+
+At the beginning of the optimization, we randomly sample a set of 16 random shape codes from a zero-mean Gaussian distribution with a variance of $0.5$ as well as a set of 16 corresponding joint codes. For the joint codes, we do not sample but rather take the mean from all final joint codes of the training set after training $\latentJoint^{\jointIndex} \forall \jointIndex \in N$. We split the joint codes, where one half is using the mean of all prismatic training joint codes and the other half uses the mean of all revolute training joint codes. To guide the optimization through our latent joint code space, we propose a projection of the space as well as bounding the joint code variables.
+
+{\noindent \textbf{SVD Projection}: To facilitate optimization along significant axes we will construct a projection based on the singular value decomposition of our training joint codes. To that end, we stack all training joint codes}
+\begin{equation}
+    \boldsymbol{Z}_{\text{j}} = \begin{bmatrix}
+        \vdots\\
+        {\latentJoint^{\jointIndex}}^\text{T}\\
+        \vdots
+    \end{bmatrix} \in \realspace^{\jointCount \times \dimensionsJointSpace}
+\end{equation}
+and do a singular value decomposition
+\begin{align}
+    &\boldsymbol{Z}_{\text{j}} - \bar{\boldsymbol{Z}_{\text{j}}} = \boldsymbol{U} \boldsymbol{\Sigma} \boldsymbol{V}^\text{T}, \\
+    &\boldsymbol{U} \in \realspace^{\jointCount \times \jointCount}, \boldsymbol{\Sigma} \in \realspace^{\jointCount \times \dimensionsJointSpace}, \boldsymbol{V}^\text{T} \in \realspace^{\dimensionsJointSpace \times \dimensionsJointSpace}.
+\end{align}
+We then use 
+\begin{equation}
+    \label{supp:joint_code_projection}
+    \hat{\latentJoint}^{u} = \left( \latentJoint^{u} - \bar{\boldsymbol{Z}_{\text{j}}} \right) \boldsymbol{V}
+\end{equation}
+to \textit{project} any joint code $\latentJoint^{u}$ and 
+\begin{equation}
+    \label{supp:joint_code_reprojection}
+    \latentJoint^{u} = \hat{\latentJoint}^{u}\boldsymbol{V}^\text{T} + \bar{\boldsymbol{Z}_{\text{j}}}
+\end{equation}
+to \textit{reproject} a joint code $\hat{\latentJoint}^{u}$. 
+
+We carry out the optimization from \cref{supp:eqn:backward_optim} in our projected space and thus, initially we project our joint codes using \cref{supp:joint_code_projection}. As well as in each optimization step, before inputting the joint code in our geometry decoder, we first reproject it using \cref{supp:joint_code_reprojection}. In initial testing, we found that this projection-reprojection step greatly helps navigate the high-dimensional space in which our joint codes reside in.
+
+{\noindent \textbf{Bound Joint Code Variables}: On top of the previously described projection procedure, we ensure that the joint code variable is close to final joint codes from the training examples $\boldsymbol{Z}_{\text{j}}$ through minimizing the minimum distance to any joint code in the training set:}
+\begin{equation}
+    \min( ||\latentJoint^{u} - \boldsymbol{Z}_{\text{j}}||),
+\end{equation}
+where $||\bullet||$ is the row-wise Euclidean norm and $\min(\bullet)$ is a differentiable operator returning the minimum of a vector. An outline of our full optimization is presented in \cref{supp:algo:backward_optimization}.

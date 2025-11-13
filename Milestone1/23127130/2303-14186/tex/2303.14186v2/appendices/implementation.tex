@@ -1,0 +1,40 @@
+We release an easy-to-use library, \texttt{trak},\footnote{\url{https://github.com/MadryLab/trak}}, which computes \trak scores using \Cref{alg:estimator_pseudo}.
+Computing \trak involves the following four steps:
+(i) training models (or alternatively, acquiring checkpoints), (ii) computing gradients, (iii) projecting gradients with a random projection matrix (Rademacher or Gaussian), and (iv) aggregating into the final estimator (\Cref{eq:multi_model_trak}).
+
+Step (i) is handled by the user, while steps (ii)-(iv) are handled automatically by our library. Step (ii) is implemented using the \texttt{functorch} library to compute per-example gradients. Step (iii) is either implemented using matrix multiplication on GPU or by a faster custom CUDA kernel, which is described below.
+Step (iv) just involves a few simple matrix operations.
+
+\subsection{Fast random projections on GPU}
+One of the most costly operation of \trak is the random projection of the
+gradients onto a smaller, more manageable vector space. While CPUs are not
+equipped to handle this task on large models (e.g., LLMs) at sufficient
+speed, at least on paper, GPUs have more than enough raw compute.
+
+In practice, however, challenges arise. First, storing the projection matrix
+entirely is highly impractical. For example, a matrix for a model with
+300 million weights and an output of 1024 dimensions would require in excess of
+1TB of storage. One solution is to generate the projection in blocks (across the output dimension). This solution is possible (and offered in our
+implementation) but is still radically inefficient. Indeed, even if the
+generation of the matrix is done by block it still has to be read and written
+once onto the GPU RAM. This severely limits the performance as memory throughput
+becomes the bottleneck.
+
+\paragraph{Our approach.}
+Our solution is to generate the coefficients of the projection as needed (in
+some situations more than once) and never store them. As a result, the
+bandwidth of the RAM is solely used to retrieve the values of the gradients and
+write the results at the end. This forces us to use pseudo-randomness but this is actually preferrable since a true random matrix would make experiments impossible to
+reproduce exactly.
+
+Our implementation is written in C++/CUDA and targets NVIDIA GPUs of compute
+capability above or equal 7.0 (V100 and newer). It supports (and achieve better
+performance) batches of multiple inputs, and either normally distributed
+coefficients or {-1, 1} with equal probabilities.
+
+\paragraph{Implementation details.}
+We decompose the input vectors into $K$ blocks, where each block is projected independently to increase parallelism. The final result is obtained by summing each partial projection. To reduce memory usage, we keep $K$ to roughly 100.
+
+We further increase parallelism by spawning a thread for each entry of the output blocks, but this comes at the cost of reading the input multiple times. To mitigate this issue, we use Shared Memory offered by GPUs to share and reduce the frequency of data being pulled from global memory. We also use Shared Memory to reduce the cost of generating random coefficients, which can be reused for all the inputs of a batch.
+
+Finally, we take advantage of Tensor Cores to maximize throughput and efficiency, as they were designed to excel at matrix multiplications. These interventions yield a fast and power-efficient implementation of random projection. On our hardware, we achieved speed-ups in excess of 200x compared to our ``block-by-block'' strategy.

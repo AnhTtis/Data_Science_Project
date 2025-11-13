@@ -1,0 +1,109 @@
+ \section{Approach}
+\vspace{-2mm}
+
+\newcommand{\XNoiseEq}[1]{\mathcal{D}_{\theta}(\alpha_t {#1} + \sigma_t \mathbf{\epsilon}, \mathbf{c}) - {#1}}
+\newcommand{\DiffNet}[0]{\hat{\mathcal{D}}_\theta}
+\newcommand{\pseudo}[0]{\gamma}
+
+\noindent \textbf{Problem setup.}
+
+The input to our approach forms a set of $k$ casual subject captures, each with $n$ pixels, $\{{I_i \in \mathbb{R}^{n \times 3}}\}$ ($i \in \{1,...,k\}$) and a text prompt $T$ for the contextualization or semantic variation (e.g., sleeping vs. standing dog). Our aim is to generate a 3D asset that captures the identity (geometry and appearance) of the given subject while also being faithful to the text prompt. We optimize 3D assets in the form of Neural Radiance Fields (NeRF)~\cite{nerf}, which consists of an MLP network $\mathcal{M}$ that encodes radiance fields in a 3D volume. Note that this problem is considerably more under-constrained and challenging compared to a typical 3D reconstruction setting that requires multi-view image captures. We build our technique on recent advances in T2I personalization and Text-to-3D optimization. Specifically, we use DreamFusion~\cite{poole2022dreamfusion} text-to-3D optimization and DreamBooth~\cite{dreambooth_cite} personalization in our framework, which we briefly review next. 
+
+
+
+\subsection{Preliminaries}
+
+\noindent \textbf{DreamBooth T2I Personalization.}
+T2I diffusion models such as Imagen~\cite{imagen}, StableDiffusion~\cite{ldm} and DALL-E 2~\cite{dalle2} generate images from any given text prompt. In particular, a T2I diffusion model $ \mathcal{D}_{\theta}(\mathbf{\epsilon}, \mathbf{c})$ takes as input an initial noise $\epsilon \sim \mathcal{N}(0,1)$ and a text embedding $\mathbf{c}=\Theta(T)$ for a given prompt $T$ with a text encoder $\Theta$ and generates an image that follows the description of the prompt. The images generated from these T2I models are usually consistent with the prompt, however, it is difficult to exert fine-grained control in the generated images. To that end, DreamBooth~\cite{dreambooth_cite} proposes a simple yet effective approach to personalize a T2I diffusion model by finetuning the network on a small set of casual captures $\{I_i\}$. 
+
+Briefly, DreamBooth uses the following diffusion loss function to finetune the T2I model:
+ \begin{equation}
+     \mathcal{L}_{d} = \mathbb{E}_{\epsilon, t}\!\left[ w_t \left\| \XNoiseEq{I_i} \right\|^2 \right] \, ,
+     \label{eqn:diff}
+ \end{equation}
+
+where $t \sim \mathcal{U}[0,1]$ denotes the time-step in the diffusion process and $w_t$, $\alpha_t$ and $\sigma_t$ are the corresponding scheduling parameters.
+Optionally, DreamBooth uses the class prior-preserving loss for improved diversity and to avoid language drift. Refer to~\cite{dreambooth_cite} for additional details.
+
+ 
+\begin{figure*}[h!]
+    \centering
+    \includegraphics[width=17.5cm]{figures/fig-3stage-approach.pdf}
+    \caption{\textbf{DreamBooth3D Overview}. In the stage-1 (left), we first partially train a DreamBooth and use the resulting model to optimize the initial NeRF. In stage-2 (middle), we render multi-view images along random viewpoints from the initial NeRF and then translate them into pseudo multi-view subject images using a fully-trained DreamBooth model. In the final stage-3 (right), we further fine-tune the partial DreamBooth using multi-view images and then use the resulting multi-view DreamBooth to optimize the final NeRF 3D asset using the SDS loss along with the multi-view reconstruction loss.}
+    \label{fig:approach}
+\end{figure*}
+ 
+
+\vspace{1mm}
+\noindent \textbf{DreamFusion} optimizes a volume represented as a NeRF $\mathcal{M}_\phi$ with parameters $\phi$ so that random views of the volume match a text prompt $T$ using a T2I diffusion model. The learned implicit network $\mathcal{M}_\phi$ maps from a 3D location to an albedo and density. The normals computed from the gradient of the density are used to randomly relight the model to improve geometric realism with Lambertian shading. Given a random view $v$, and random lighting direction, we perform volume rendering to output a shaded image $\hat{I}_v$. To optimize the parameters of the NeRF $\phi$ so that these images look like a text prompt $T$, DreamFusion introduced score distillation sampling (SDS) that pushes noisy versions of the rendered images to lower energy states of the T2I diffusion model:
+
+\begin{equation}
+    \nabla_\phi \mathcal{L}_\mathit{SDS} = \mathbb{E}_{\epsilon, t} \left[w_t\left( \XNoiseEq{\hat{I}_v} \right) \frac{\partial \hat{I}_v}{\partial \phi}\right].
+    \label{eqn:sds}
+\end{equation}
+By randomizing over views and backpropagating through the NeRF, it encourages the renderings to look like an image produced by T2I model $\mathcal{D}_\theta$ for a given text prompt. DreamFusion proposes to use coarse view-based prompting to optimize NeRF along multiple views. We follow the exact settings used in~\cite{poole2022dreamfusion} for all experiments.
+
+
+
+\subsection{Failure of Naive Dreambooth+Fusion}
+\label{sec:dreambooth_fusion}
+A straight-forward approach for subject-driven text-to-3D generation is first personalizing a T2I model and then use the resulting model for Text-to-3D optimization. For instance, doing DreamBooth optimization followed by DreamFusion. which we refer to as DreamBooth+Fusion.
+Similar baselines are also explored with preliminary experiments in some very recent works such as~\cite{latent-nerf,magic3d}.
+However, we find that naive DreamBooth+Fusion technique results in unsatisfactory results as shown in Fig.~\ref{fig:visual_comparisons}.
+A key issue we find is that DreamBooth tends to overfit to the subject views that are present in the training views, leading to reduced viewpoint diversity in the image generations.
+Subject likeness increases with more DreamBooth finetuning steps, while the generated viewpoints get close to that of input exemplar views.
+As a result, the SDS loss on such a DreamBooth model is not sufficient to obtain a coherent 3D NeRF asset. In general, we observe that the DreamBooth+Fusion NeRF models have
+same subject views (e.g., face of a dog) imprinted across different viewpoints, a failure mode denoted the ``Janus problem''~\cite{poole2022dreamfusion}.
+
+
+
+\subsection{Dreambooth3D Optimization}
+\label{sec:optim}
+
+To mitigate the aforementioned issues, we propose an effective multi-stage optimization scheme called \Method~for subject-driven text-to-3D generation. Fig.~\ref{fig:approach} illustrates the 3 stages in our approach, which we describe in detail next.
+
+\vspace{1mm}
+\noindent \textbf{Stage-1: 3D with Partial DreamBooth.}
+We first train a personalized DreamBooth model $\hat{\mathcal{D}}_\theta$ on the input subject images such as those shown in Fig.~\ref{fig:approach} (left).
+Our key observation is that the initial checkpoints of DreamBooth (partially finetuned) T2I models do not overfit to the given subject views. DreamFusion on such partially finetuned DreamBooth models can produce a more coherent 3D NeRF.
+Specifically, we refer to the partially trained DreamBooth model as $\hat{\mathcal{D}}_\theta^{partial}$ and use the SDS loss (Eq.~\ref{eqn:sds}) to optimize an initial NeRF asset for a given text prompt as illustrated in Fig.~\ref{fig:approach} (left).
+However, the partial DreamBooth model as well as the NeRF asset lack complete likeness to the input subject.
+We can see this \textit{initial} NeRF output in stage-1 to be a 3D model of the subject class that has partial likeness to the given subject while also being faithful to the given text prompt.
+
+
+\vspace{1mm}
+\noindent \textbf{Stage-2: Multi-view Data Generation.}
+This stage forms an important part of our approach, where we make use of 3D consistent initial NeRF together with the fully-trained DreamBooth to generate pseudo multi-view subject images.
+Specifically, we first render multiple images $\{\hat{I}_v\ \in \mathbb{R}^{n \times 3}\}$ along random viewpoints $\{v\}$ from the initial NeRF asset resulting in the multi-view renders as shown in Fig.~\ref{fig:approach} (middle).
+We then add a fixed amount of noise by running the forward diffusion process from each render to $t_\mathit{pseudo}$, and then run the reverse diffusion process to generate samples using the fully-trained DreamBooth model $\hat{\mathcal{D}}_\theta$ as in \cite{SDEdit}. This sampling process is run independently for each view, and results in images that represent the subject well, and cover a wide range of views due to the conditioning on the  noisy render of our initial NeRF asset. However, these images are not multi-view consistent as the reverse diffusion process can add different details to different views, so we call this collection of images {\em pseudo} multi-view images.
+
+Fig.~\ref{fig:approach}~(middle) shows sample resulting images from this image to image (Img2Img) translation. Some prior works such as~\cite{SDEdit} use such Img2Img translations for image editing applications. In contrast, we use the Img2Img translation in combination with DreamBooth and NeRF 3D asset to generate pseudo multi-view subject images.
+A key insight in this stage is that DreamBooth can effectively generate unseen views of the subject given that initial images are close to those unseen views. In addition, DreamBooth can effectively generate output images with more likeness to the given subject compared to input noisy images.
+Fig.~\ref{fig:approach}~(middle) shows sample outputs of Img2Img translation with the DreamBooth demonstrating more likeness to the subject images while also preserving the viewpoints of the input NeRF renders.
+
+\vspace{1mm}
+\noindent \textbf{Stage-3: Final NeRF with Multi-view DreamBooth.}
+The previous stage provides pseudo multi-view subject images $\{I_v^{\mathit{pseudo}}\}$ with \textit{near-accurate} camera viewpoints $\{v\}$.
+Both the viewpoints as well as the subject-likeness are only approximately accurate due to the stochastic nature of DreamBooth and Img2Img translation.
+We combine the generated multi-view images $\{I_v^{\mathit{pseudo}}\}$ along with the input subject images $\{I_i\}$ to create a combined data $\mathcal{I}^{aug}=\{{I}_v^{\mathit{pseudo}}\} \cup \{I_i\}$.
+We then use this data to optimize our final DreamBooth model followed by a final NeRF 3D asset.
+
+More concretely, we further finetune the partially trained DreamBooth $\hat{\mathcal{D}}_\theta^*$ from stage-1 using this augmented data resulting in a DreamBooth we refer to as Multi-view DreamBooth $\hat{\mathcal{D}}_\theta^\mathit{multi}$.
+We then use this $\hat{\mathcal{D}}_\theta^\mathit{multi}$ model to optimize NeRF 3D asset using the DreamFusion SDS loss (Eq.\ref{eqn:sds}).
+This results in a NeRF model with considerably better subject-identity as the multi-view DreamBooth has better view generalization and subject preservation compared to the partial DreamBooth from stage-1.
+
+In practice, we observe that the resulting NeRF asset, optimized only using SDS loss, usually has good geometry-likeness to the given subject but has some color saturation artifacts.
+To account for the color shift we introduce a novel weak reconstruction loss using our psuedo multi-view images $\{{I}_v^{\mathit{pseudo}}\}$. In particular, since we know the camera parameters $\{P_v\}$ from which these images were generated, we additionally regularize the training of the second NeRF MLP $\mathcal{F}_\gamma$, with $\gamma$ parameters with the reconstruction loss:
+\begin{equation}
+ \mathcal{L}_\mathit{recon} = \left\| \Gamma(\mathcal{F}_\gamma, P_v) - I_v^{\mathit{pseudo}} \right\|_p,
+\label{eqn:recon}
+\end{equation}
+Where $\Gamma(\mathcal{F}_\gamma, P_v)$ is the rendering function that renders an image from the NeRF $\mathcal{F}_\gamma$ along the camera viewpoint $P_v$.
+This loss serves the dual purpose of pulling the color distribution of the generated volume closer to those of the image exemplars and to improve subject likeness in unseen views.
+Fig.~\ref{fig:approach} (right) illustrate the optimization of final NeRF with SDS and multi-view reconstruction losses. 
+The final NeRF optimization objective is given as:
+\begin{equation}
+ \mathcal{L} =  \lambda_\mathit{recon} \mathcal{L}_\mathit{recon} + \lambda_\mathit{SDS} \mathcal{L}_\mathit{SDS} + \lambda_\mathit{nerf} \mathcal{L}_\mathit{nerf},
+\end{equation}
+where $\mathcal{L}_\mathit{nerf}$ denotes the additional NeRF regularizations used in Mip-NeRF360~\cite{Barron2021MipNeRF3U}. 
+See the supplementary material for additional details of the DreamBooth3D optimization.

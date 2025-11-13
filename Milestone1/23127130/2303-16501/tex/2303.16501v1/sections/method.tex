@@ -1,0 +1,105 @@
+% !TEX root = ../main.tex
+\begin{figure*}
+    \centering
+    \includegraphics[width=1\linewidth]{figures/architecture.pdf}
+    \caption{\textbf{Overall architecture and training procedure for \model.} Our architecture consists of a frozen Conformer encoder-decoder model~\cite{chiu2022self}, and a frozen CLIP~\cite{Radford2021CLIP} encoder (frozen layers shown in grey with a lock symbol), in conjunction with two lightweight trainable modules - (i) visual projection layer (orange) and bottleneck adapters (blue) to enable multi-modal domain adaptation. We propose a two-phase curriculum learning strategy - the adapters (blue) are first trained without any visual tokens, after which the visual projection layer (orange) are tuned while all the other parts are kept frozen.}
+    \label{fig:architecture}
+\end{figure*}
+
+\section{Method}
+\label{sec:method}
+Unlike previous AV-ASR works which test only on instructional videos~\cite{Miao2016OpenDomainAS,Gupta2017VisualFeatures,Palaskar2018EndtoendMS,Caglayan2019VAT,Srinivasan2020LookingEL}, our goal is \textit{zero-shot} generalization across multiple AV domains, while still maintaining good performance on traditional audio-only benchmarks. To do this, we start with an \textit{existing} state-of-the-art ASR model, and adapt it for unconstrained AV-ASR. Visual features are obtained from a strong pretrained visual model, and added to the model via the following two components - (i) we linearly project visual features into the audio token embedding space, and (ii) we inject lightweight adapters into the encoder of the frozen ASR model to allow domain adaptation.
+During training, we only tune these two sets of additional parameters, while both the ASR model and the visual feature extractor are~\textit{frozen} (see Figure~\ref{fig:architecture}). 
+
+We do this because there are two forms of adaption that are required here - (i) adapting to new video domains and (ii) adapting to multimodal input, both of which we would like to do \textit{without} catastrophic forgetting. 
+Because of the challenges with this setup, we also introduce a curriculum learning strategy to stabilize the learning process, without which the model fails to utilize the visual features effectively.
+In this section, we first describe the main components of our network architecture (Sec.~\ref{sec:model}) and then introduce our zero-shot curriculum learning strategy and training loss functions (Sec.~\ref{sec:curriculum}).
+
+% The overall architecture is given in Figure~\ref{fig:architecture}.
+% Only training the adapters and visual components, our method
+% is parameter efficient and naturally retains the audio-specific knowledge from the pre-trained ASR model. 
+
+% In this section we describe in details the four main components of our network: (i) the frozen pretrained ASR model, (ii) the pretrained visual encoder, (iii) the lightweight adapters that inject visual information, and (iv) the word-level autoregressive decoder.
+
+\subsection{Model Architecture} \label{sec:model}
+In this section we describe the key components of our architecture - (i) the frozen conformer encoder and decoder, (ii) the visual encoder and projection layers for visual feature extraction and projection, and (iii) additional adaptation layers in the backbone for audio-only domain adaptation. A diagram is show in Figure~\ref{fig:architecture}. 
+\subsubsection{Frozen Conformer ASR Model}
+We start with a frozen ASR model that achieves state-of-the-art performance on traditional ASR benchmarks~\cite{panayotov2015librispeech}. 
+Specifically, we use BEST-RQ~\cite{chiu2022self} that adopts a Conformer~\cite{gulati2020conformer} model with an RNN-Transducer (RNN-T)~\cite{graves2012sequence}.
+The model is pretrained on LibriLight~\cite{kahn2020libri} in a self-supervised manner using a random projection quantization technique, after which it is then finetuned for ASR on LibriSpeech~\cite{panayotov2015librispeech} using supervised training. The conformer consists of convolution-augmented transformer blocks (conformer blocks), which operate on audio token features that are extracted from a spectrogram via a stack of convolution and linear layers~\cite{gulati2020conformer}.
+BEST-RQ uses ConformerXL as a backbone, which has 0.6B parameters~\cite{zhang2020pushing} -- note that training such a large model end-to-end is extremely compute heavy -- and requires a large pretraining dataset (made possible by self-supervised learning on LibriLight). This self-supervised training also enables the model to generalize well across numerous domains. 
+After pretraining, an RNN-T decoder is added to  Conformer to generate text output for ASR with 1,024 WordPiece tokens~\cite{wu2016google}.
+The RNN-T decoder generates a sequence of tokens consisting of grapheme tokens or a special output token, which represents moving to the next input token (See Figure~\ref{fig:architecture}, right for a diagram of the decoder).
+
+Formally speaking, given the log-mel spectrogram $\mathbf{X}\in\mathbb{R}^{\hat{N}\times S}$ with $S$ mel spectrogram bins in a length of $\hat{N}$ converted from the input audio waveform, the tokenizer outputs a set of audio tokens $\{\mathbf{t}_i\}_1^N = h_\mathrm{tok}(\mathbf{X})$ where $D$ is the token embedding dimensionality and $N=\hat{N}/4$.
+The encoder then contextualizes the audio tokens through a series of conformer blocks, each of which is a stack of feed-forward, multi-head self-attention, convolution layers followed by another feed-forward layer. 
+The output of each layer is added with a residual connection.
+This process produces $N$ contextualized tokens $\hat{\mathbf t}_i\in\mathbb{R}^{D}$, \ie, $\{\hat{\mathbf t}_i\}_1^N = h_\mathrm{enc}(\{\mathbf{t}_i\}_1^N)$.
+The decoder finally generates the transcripts by predicting a sequence of $K$ graphemes from the contextualized audio tokens.
+Given a token $\hat{\mathbf t}_i$ and previously generated grapheme $w_{j-1}$, the decoder generates the next grapheme $w_{j} = h_{\mathrm{dec}}(\hat{\mathbf t}_i, w_{j-1})$ where $w_j \in \mathcal{V} \cup \{\epsilon\}$ with the vocabulary of the predefined graphemes $\mathcal{V}$ and a special blank token $\epsilon$ that represents moving to the next token $\hat{\mathbf t}_{i+1}$ in the generation process.
+The decoder $h_\mathrm{dec}$ is implemented as a two layer LSTM module with a grapheme classification head.
+Note that at a single audio token index $i$, multiple graphemes can be emitted (vertical arrows) until an $\epsilon$ is emitted (horizontal arrows) as depicted in Figure~\ref{fig:architecture}.
+
+\subsubsection{Lightweight Adapters}
+In order to enable domain adaption in the model, we interleave an adapter layer within each conformer block of the encoder. 
+Note that the BEST-RQ model has strong generalization capability, which we want to maintain. 
+Hence we design our adapters to be lightweight, to prevent drastic domain shift and catastrophic forgetting.
+Given $N$ audio tokens ${\mathbf t}_i$ and $M$ projected visual tokens $\mathbf{t}_j^{v}$ (which will be described next) at a certain layer $l$\footnote{The layer index $l$ is omitted for notational simplicity.}, we compute the adapted token features $\tilde{\mathbf t}_i$ and $\tilde{\mathbf{t}}_j^v$ using an adapter layer by $\{\tilde{\mathbf t}_i\} \cup \{\tilde{\mathbf{t}}_j^v\}=\mathrm{adapt}(\{{\mathbf t}_i\} \cup \{{\mathbf{t}}_j^v\};\phi)$ where $\mathrm{adapt}(\cdot)$ is an adapter layer parameterized by $\phi$.
+We introduce and experiment with the following two types of lightweight adapters: \\
+\noindent\textbf{Feed-forward Adapters (\textbf{FF}).}
+The simplest design is to independently project each token.
+To achieve this, we use a two-layered MLP with a residual connection as our adapter.
+To make the layer lightweight, we set the dimensionality of the hidden layer to $B$, where $B \ll D$. This allows the adaptor to effectively act as a bottleneck, and reduces total additional parameters. \\
+\noindent\textbf{Feed-foward Adapters with Self-Attention (FF+SA).}
+The feed-forward adapters described above operate independently for each token. We can perform an additional contextualization across the input tokens via a self-attention layer~\cite{vaswani2017attention}.
+To reduce additional parameters, we apply the same bottleneck projection technique as before, where each input token is transformed into a $B$ dimensional query, key and value for attention, after which the attended feature is projected back into the $D$ dimensional feature space. 
+For multi-head self-attention, each head projects features into $B/H$ dimensional spaces instead where $H$ stands for the number of heads.
+This module is used with a residual connection and a feed-forward module described above; the combination of these forms a transformer block with bottlenecks.
+While this (FF+SA) allows additional contextualization across tokens, it introduces four times more parameters than vanilla FF adapters.
+
+\subsubsection{Visual Feature Extraction and Projection}
+Given a sequence of $M$ video frames $\mathbf f_i$, we extract a $\hat{D}$ dimensional visual feature $\mathbf v_i = g(\mathbf f_i)$ per frame using a pretrained visual encoder $g$.
+Specifically, we use the CLIP encoder~\cite{radford2021learning} with ViT-L/14~\cite{dosovitskiy2020image} as our visual backbone, which is known to have strong zero-shot generalization capability~\cite{radford2021learning}.
+% CLIP is trained to put features of paired image and text close to each other within a common embedding space by a contrastive loss.
+% In particular, because our target task is \textit{unconstrained} AV-ASR where understanding diverse visual concepts is very crucial, we adopt CLIP that is trained at large scale and is known for its ability of capturing a wide range of visual concepts~\cite{}\phseo{references}.
+Because the CLIP encoder is frozen, we add a linear layer\footnote{We tested more complex MLP projectors and found that a single linear layer is sufficient for good performance as detailed in the appendix.} to project the visual features into the audio token embedding space, \ie, $\mathbf t^v_i = \mathrm{proj}(\mathbf v_i;{\theta})$ where $\mathbf t^v_i \in \mathbb{R}^{D}$ and $\theta$ is a set of the parameters in the projection layer.
+The projected visual tokens are fed to the Conformer encoder together with audio tokens ${\mathbf t}_i$. Note that these visual projection layers are essentially performing a type of prompt tuning~\cite{lester-etal-2021-power,mokady2021clipcap} since the rest of the ASR model is frozen.
+
+
+\subsection{Training Strategy} \label{sec:curriculum}
+It is a well-known that AV-ASR is an audio-dominant task, which is why previous works are forced to devise training strategies that prevent the audio stream from dominating training~\cite{gabeur2022avatar}.
+We observe a similar phenomenon while jointly training both sets of additional parameters (adapters and visual projections). The visual information is not used (similar performance with and without), and training is dominated by the model only adapting to the finetuning \textit{audio} domain. We hence introduce a curriculum training strategy. We first describe our finetuning data, the loss function, and then the curriculum in the next few paragraphs. \\
+\noindent\textbf{Zero-shot Training with Web Videos.}
+Our extended model has two sets of new parameters $\theta$ and $\phi$ introduced for the visual projection layer and the adapters respectively.
+Since it is labor-intensive and costly to collect new training benchmarks for AV-ASR, we train these new parameters without manually labeled data.
+We use unlabeled web videos online along with the outputs of an ASR model as pseudo ground truth.
+Our goal is to aid the pretrained ASR model with visual understanding capability using only these automatically collected transcripts; the trained model is then tested in a zero-shot setting on manually annotated public AV-ASR benchmarks.
+
+\noindent\textbf{Loss Function.}
+As the RNN-T decoder in the pretrained ASR model is kept frozen in \model, we adopt the same loss function that is used for ASR pretraining.
+With an RNN-T decoder, the probability of a transcript $W=\{w_1, w_2,\cdots, w_K\}$ is obtained by marginalizing the probabilities of all valid generation paths $y$ (\eg, the path with bold arrows in Figure~\ref{fig:architecture}), \ie,
+\begin{align}
+    P(W|X)=\sum_{y\in\mathcal{Y}}{\prod_{(i,j)\in y}}P(w_j|\hat{\mathbf{t}}_i,w_{0:j-1})
+\end{align}
+where $\mathcal{Y}$ is a set of all valid paths $y$ (paths on the grid from $(0,0)$ to $(N+1,K)$ in Figure~\ref{fig:architecture}) which is a sequence of pairs of token and output grapheme indices $(i, j)$, and $P(w_j|\hat{\mathbf{t}}_i,w_{0:j-1})$ is estimated by our decoder $h_\mathrm{dec}(\hat{\mathbf{t}}_i,w_{j-1})$.
+We train our model by minimizing the negative log-likelihood of the pseudo-GT transcripts $\hat{W}$ of input videos:
+\begin{align}
+    \mathcal{L}(\theta, \phi)=-\sum_i\log{P(\hat{W}_i|X_i; \theta,\phi)}.
+\end{align}
+
+\noindent\textbf{Curriculum Learning for Visual Processing.}
+% This is because closing the audio domain gap to the target AV-ASR benchmark is the dominant factor for decreasing the loss hiding the contribution of the visual inputs is hidden behind this dominating factor. 
+We discover empirically that with a naive first round of joint training, our model struggles to learn both the adapters and the visual projectors in one go (as shown in the experiments, the issue becomes more severe as more visual tokens are added).
+To mitigate this issue, we propose a two-phase curriculum learning strategy that decouples these two factors (domain adaption and visual feature integration) and trains the network in a sequential manner.
+In the first phase, the adapter parameters $\phi$ are optimized using $\argmax_{\phi}\mathcal{L}(\theta,\phi)$ as an objective.
+Note that at this phase, we do not feed visual tokens at all and thus $\theta$ is an empty set.
+Once $\phi$ is trained, we add the visual tokens and train the visual projection layers $\theta$ using $\argmax_{\theta}\mathcal{L}(\theta,\phi)$.
+During this second phase of training, $\phi$ is kept frozen.
+
+The first stage focuses on audio domain adaptation. By the second phase, the adapters are completely frozen and the visual projector must simply learn to generate visual prompts that project the visual tokens into the audio space. 
+In this way, our curriculum learning strategy allows the model to incorporate visual inputs as well as adapt to new audio domains in AV-ASR benchmarks.
+We apply each phase just once, as an iterative application of alternating phases leads to performance degradation. This is further discussed in the appendix.
+
+\noindent\textbf{Content Word Masking.}
+We adopt the content word masking from \cite{gabeur2022avatar} to encourage the models to further focus on visual understanding.
+We observe that the original zero-padded masking introduced in~\cite{gabeur2022avatar} causes instabilities and therefore we add Gaussian noise to the audio input corresponding to masked words, which stabilizes optimization.

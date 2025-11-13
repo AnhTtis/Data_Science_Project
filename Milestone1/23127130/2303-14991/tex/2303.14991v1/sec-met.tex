@@ -1,0 +1,139 @@
+\section{Preliminaries} \label{sec:background}
+
+In this section, we give a brief review of dense retrieval and re-ranking. The overviews of all methods are presented in Figure~\ref{fig:encoder}.
+
+\paratitle{Dual-Encoder.} Given a query $q$ and a large corpus $C$, the retrieval task aims to find the relevant passages for the query from a large corpus. Usually, a dense retrieval model employs two dense encoders~(\eg BERT) $E_Q(\cdot)$ and $E_P(\cdot)$. They encode queries and passages into dense embeddings, respectively. Then, the model uses a similarity function, often dot-product, to perform retrieval:
+\begin{equation} \label{eq:fde}
+    f_{de}(q, p) = E_Q(q) \cdot E_P(p),
+\end{equation}
+where $q$ and $p$ denote the query and the passage, respectively. During the inference stage, we apply the passage encoder $E_P(\cdot)$ to all the passages and index them using FAISS~\cite{johnson2019billion} which is an extremely efficient, open-source library for similarity search. Then given a query $q$, we derive its embedding by $\bm{v}_q = E_Q(q)$ and retrieve the top $k$ passages with embeddings closest to $\bm{v}_q$.
+
+\paratitle{Cross-Encoder Re-ranker.} Given a query $q$ and top $k$ retrieved passages $C$, the re-ranking task aims to reorder the passages as the relevant scores. Due to the limited size of the corpus, the re-ranking task usually employs a cross-encoder to perform interaction between words across queries and passages at the same time. These methods also introduce a special token \emph{[SEP]} to separate q and p, and then the hidden state of the \emph{[CLS] token} from the cross-encoder is fed into a fully-connected layer to output the relevant score:
+\begin{equation} \label{eq:fce}
+    f_{ce}(q, p) = \bm{W} \times E_C(q || p) + b,
+\end{equation}
+where ``$||$'' denotes concatenation with the \emph{[SEP] token}. During the inference stage, we apply the cross-encoder $E_C(\cdot)$ to all <q, p> pair and reorder the passages by the scores.
+
+\paratitle{Query Generator Re-ranker.} Similar to cross-encoder re-ranker, query generator re-ranker also aims to reorder the passages as the relevant scores. For the query generator re-ranker, we use the log-likelyhood of the query against the passage to measure the relevance:
+\begin{equation} \label{eq:fqg}
+    f_{qg}(q, p) = \log P(q|p) = \sum_{t=0} \log P(q_t | q_{<t}, p),
+\end{equation}
+where $q_{<t}$ denotes the previous tokens before $q_t$. The rest of settings are the same as the cross-encoder re-ranker and are omitted here.
+
+\paratitle{Training.} The goal of retrieval and re-ranking is to enlarge the relevant score between the query and the relevant passages~(\aka positive passages) and lessen the relevant score between the query and the irrelevant passages~(\aka negative passages). Let $\{q_i, p^{+}_{i}, p^{-}_{i,0}, p^{-}_{i,1}, \dots, p^{-}_{i,n}\}$ be the $i$-th training sample. It consists of a query, a positive passage, and $n$ negative passages. Then we can employ the contrastive loss function, called InfoNCE~\cite{oord2018representation}, to optimize the model:
+\begin{equation} \label{eq:contrastive}
+    \mathcal{L}_{R} = - \log \frac{e^{f(q_i, p^{+}_{i})}}{e^{f(q_i, p^{+}_{i})} + \sum_{j=0}^{n} e^{f(q_i, p^{-}_{i,j})}},
+\end{equation}
+where $f$ denotes the similarity function, \eg $f_{de}$ in Eq.~\eqref{eq:fde}, $f_{ce}$ in Eq.~\eqref{eq:fce}, or $f_{qg}$ in Eq.~\eqref{eq:fqg}.
+
+\paratitle{Cross-lingual Retrieval.} In the cross-lingual information retrieval task, passages and queries are in different languages. In this paper, we consider the passages are in English and the queries are in non-English languages. A sample consists of three components: a query in a non-English language, a positive passage in English, and a span answer in English. Given a non-English query, the task aims to retrieve relevant passages in English to answer the query. If a retrieved passage contains the given span answer, it is regarded as a positive passage, otherwise, it is a negative passage.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/overview.pdf}
+    \caption{Overview of the proposed \name.}
+    \label{fig:overview}
+\end{figure}
+
+\section{Methodology}
+
+In this section, we present the proposed \name. The overview of the proposed method is presented in Figure~\ref{fig:overview}. We start with the training of the query generator, then present how to perform distillation and alignment training for the dual-encoder, and we finally discuss the entire training process.
+
+\subsection{Training of Query Generator}
+
+In our method, we employ mT5~\cite{xue2020mt5} as the query generator. The query generator has two roles: teacher and generator. As a teacher, it aims to better re-rank the candidate passages with relevance and distill the knowledge to the dual-encoder. As a generator, it aims to generate synonymous queries in different languages.
+
+\paratitle{Input Format.}
+As we employ mT5, we design a prompt template for input sentences. Considering that most passages are long, we propose introducing the span answer as input to encourage the generator to focus on the same segment and generate parallel queries in different languages. As a result, we use \emph{``generate [language] query: answer: [span answer] content: [content]''} as the template. For a specific sample, we fill the three placeholders with the language of the target query, the span answer, and the passage content, respectively.
+
+\paratitle{Training.}
+Considering the two roles of the query generator, the entire training process for the query generator contains two stages: query generation training and re-ranking training.
+
+Firstly, we train the generator with the generation task, which takes the positive passage as input and aims to generate the query. The task can be formulated as maximizing the conditional probability:
+\begin{equation}
+    \begin{aligned}
+        \hat{q} &= \mathop{\arg\max}\limits_{q} P(q|p, a) \\
+        &= \mathop{\arg\max}\limits_{q} \prod_{t=0}P(q_t|p, a, q_{<t})
+    \end{aligned},
+\end{equation}
+where $q_t$ is the $t$-th token of the generated query, $a$ denotes the span answer, and $q_{<t}$ represents the previous decoded tokens. Then we can employ cross-entropy loss to optimize the model:
+\begin{equation} \label{eq:qg}
+    \mathcal{L}_{QG} = \frac{1}{T}\sum_{t=0}^{T}-\log P(q_t|p, a, q_{<t}),
+\end{equation}
+where $T$ denotes the number of the query tokens.
+
+Secondly, we train the generator with the re-ranking task, which takes a query and a passage as input and outputs the relevant score of the two sentences. The detailed training process is introduced in Section~\ref{sec:background} and is omitted here.
+
+\subsection{Distillation for Dual-Encoder}
+
+We then present how to distill knowledge from query generator to dual-encoder. Similar to previous methods~\cite{ren2021rocketqav2,zhang2021adver}, we employ KL-Divergence to perform distillation. Formally, given a query $q$ and a candidate passage set $C_q = \{p_i\}_{1 \le i \le n}$ which is retrieved by the dual-encoder, we compute relevant scores by query generator and dual-encoder, respectively. After that, we normalize the scores by softmax and compute the KL-Divergence as the loss:
+\begin{equation} \label{eq:distillation}
+    \begin{aligned}
+        s_{qg}(q, p) &= \frac{\exp(f_{qg}(q, p))}{\sum_{p' \in C_q}\exp(f_{qg}(q, p'))}, \\
+        s_{de}(q, p) &= \frac{\exp(f_{de}(q, p))}{\sum_{p' \in C_q}\exp(f_{de}(q, p'))}, \\
+        \mathcal{L}_{D} &= \sum_{p \in C_q} s_{qg}(q, p) \frac{s_{qg}(q, p)}{s_{de}(q, p)},
+    \end{aligned}
+\end{equation}
+where $f_{qg}$ and $f_{de}$ denote the relevant score given by the query generator and the dual-encoder which are presented in Section~\ref{sec:background}.
+
+\subsection{Alignment for Dual-Encoder}
+
+Alignment is a common topic in the cross-lingual setting, which can help the model better handle sentences in different languages. Previous works~\cite{zheng2021consistency,yang2022enhancing} usually use parallel data or translated data to perform alignment training among different languages. Here, we propose a novel method to align queries in different languages for cross-lingual retrieval, which does not need any parallel data. The core idea of our method is to leverage the query generator to generate synonymous queries in other languages to form parallel cases.
+
+\paratitle{Generation.} For each case in the training set, we generate a query in each target language~(\aka if there are seven target languages, we generate seven queries for the case). Then we use the confidence of the generator to filter the generated queries. Specially, we set filter thresholds to accept 50\% of generated queries. 
+
+\paratitle{Scheduled Sampling.} In this work, we select a generated query to form a pair-wise case with the source query. Considering the semantics of generated queries, we carefully design a scheduled sampling method to replace the random sampling. For a generated query $q'$, we first use the dual-encoder to retrieve passages for the source query $q$ and generated query $q'$, respectively, namely $C_{q}$ and $C_{q}'$. Then we calculate a coefficient for the generated query $q'$ as
+\begin{equation} \label{eq:thresh}
+    \begin{aligned}
+        c' &= \frac{|C_q \cap C_q'|}{\max(|C_q|, |C_q'|)}, \\
+        c' &= \begin{cases}
+            c' & \text{ if } c' \ge T,\\
+            0 & \text{ if } c' < T,
+        \end{cases}
+    \end{aligned}
+\end{equation}
+where threshold $T$ is a hyper-parameter and $|\cdot|$ denotes the size of the set. The basic idea is that the larger the union of retrieved passages, the more likely the queries are to be synonymous.
+When sampling the generated query, we first calculate coefficients $\{c_1', \dots, c_m'\}$ for all generated queries $\{q_1', \dots, q_m'\}$, then normalize them as the final sampling probability $p$:
+\begin{equation}
+    p_i = \frac{c_i'}{\sum_{j=0}^{m}c_i'},
+\end{equation}
+where $m$ denotes the number of generated queries. During the training stage, for each training case, we sample a generated query to form the pair-case with the source query $q$ based on the probabilities.
+
+\paratitle{Alignment Training.}
+After sampling a generated query, we present the how to align the source query and the generated query. Different to previous works~\cite{zheng2021consistency}, we employ asymmetric KL-Divergence rather than symmetric KL-Divergence due to the different quality of the source query and the generated query:
+\begin{equation} \label{eq:alignment}
+    \mathcal{L}_{A} = \sum_{p \in C_q \cup C_q'} c' s_{de}(q, p) \frac{s_{de}(q, p)}{s_{de}(q', p)},
+\end{equation}
+where $q$ denotes the query, $C_q$ denotes the set of retrieved passages, superscript ``$\prime$'' denotes the generated case, and $c'$ is the coefficient of the generated query. Note that $s_{de}$ in Eq.~\eqref{eq:alignment} are normalized across $C_q \cup C_q'$ instead of $C_q$ or $C_q'$ in Eq.~\eqref{eq:distillation}.
+
+\subsection{Training of Dual-Encoder}
+
+As shown in Figure~\ref{fig:overview}, we combine the distillation loss and the alignment loss as final loss:
+\begin{equation} \label{eq:final}
+    \mathcal{L} = \mathcal{L}_{D} + \mathcal{L}_{D}' + \alpha \times \mathcal{L}_{A},
+\end{equation}
+where $\mathcal{L}_{D}$ denotes the distillation loss for the source queries, $\mathcal{L}_{D}'$ denotes the distillation loss for the generated queries, $\mathcal{L}_{A}$ denotes the alignment loss, and $\alpha$ is a hyper-parameter to balance the loss. 
+
+Based on the training method of dual-encoder and query generator, we conduct an iterative procedure to improve the performance. We present the entire training procedure in Algorithm~\ref{alg:training}.
+
+\begin{algorithm}[t]
+    \caption{The training algorithm.}
+    \label{alg:training} 
+    \LinesNumbered
+    \KwIn{Dual-Encoder $R$, Query Generator $G$, Corpus $C$, and Training Set $D$.}
+    
+    Initialize $R$ and $G$ with pre-trained model\;
+    Train the warm-up $R$ with Eq.~\eqref{eq:contrastive} on $D$\;
+    Train the warm-up $G$ with Eq.~\eqref{eq:qg} on $D$\;
+    Generate queries for each sample in $D$\;
+    Build ANN index for $R$\;
+    Retrieve relevant passages on corpus $C$\;
+    Fine-tune the $G$ with Eq.~\eqref{eq:contrastive} on $D$ and retrieved negative passages.
+    
+    \While{models has not converged}{
+        Fine-tune the $R$ with Eq.~\eqref{eq:final} on $D$ and retrieved passages\;
+        Refresh ANN index for $R$\;
+        Retrieve relevant passages on corpus $C$\;
+        Fine-tune the $G$ with Eq.~\eqref{eq:contrastive} on $D$ and retrieved negative passages.
+    }
+\end{algorithm}

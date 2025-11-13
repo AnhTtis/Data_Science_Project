@@ -1,0 +1,181 @@
+\input{figures/pipeline}
+
+\section{Preliminaries}
+
+\subsection{Neural Radiance Fields}
+Neural Radiance Fields (NeRF)~\cite{nerf} is the state-of-the-art method for novel view synthesis. It represents a scene as a continuous volumetric field modeled by a multi-layer perceptron (MLP). For each spatial location $\bm{x}=(x,y,z)$ and viewing direction $\bm{d}=(\theta,\phi)$, the networks output the volume density $\sigma$ and view-dependent color $\bm{c}$:
+\begin{equation}
+\begin{split}
+    f_{\text{density}}&: \bm{x} \rightarrow \sigma\\
+    f_{\text{color}}&: (\bm{x},\bm{d}) \rightarrow \bm{c}
+\end{split}
+\end{equation}
+For each pixel to be rendered, the network is first evaluated on all sampled points $t_i$ along the camera ray $\bm{x}(t)=\bm{o}+t\bm{d}$ to get their densities and color. The pixel color $\hat{C}$ is estimated by the quadrature approximation of the volume rendering equation:
+\begin{equation}\label{eqn:volume-rendering}
+\begin{split}
+\hat{\bm{C}}(\bm{r};\Theta)&=\sum_{i}\omega_i\bm{c}_i=\sum_{i}T_i\alpha_i\bm{c}_i \\
+\alpha_i&=1-\text{exp}(-\sigma_i\delta_i) \\
+T_i&=\prod_{j<i}(1-\alpha_j)
+\end{split}
+\end{equation}
+where $\delta_i=t_{i+1}-t_i$. NeRF is optimized by minimizing the error between the rendered color $\hat{\bm{C}}$ and ground truth color $\bm{C}$:
+\begin{equation} \label{eqn:photometric-loss}
+\mathcal{L}=\sum_i||\hat{\bm{C}}_i-\bm{C}_i||_2
+\end{equation}
+
+\subsection{NeuS}
+NeuS~\cite{neus} is a surface reconstruction method based on neural implicit representation. It represents the surface of an object as the zero-level set of a signed distance field (SDF) modeled by an MLP $f_{\Theta}$:
+\begin{equation}
+    f_{\text{sdf}}: \bm{x} \rightarrow d
+\end{equation}
+To effectively train the SDF, NeuS derives an unbiased mapping in the first order of approximation from the signed distance value $d$ to an opaque density $\rho$, the counterpart of the volume density $\sigma$:
+\begin{equation} \label{eqn:opaque-density-neus}
+    \rho(\bm{x}(t)) = \max \left(\frac{-\frac{\mathrm{d} \Phi_s}{\mathrm{~d} t}(f_{\text{sdf}}(\bm{x}(t)))}{\Phi_s(f_{\text{sdf}}(\bm{x}(t)))}, 0\right)
+\end{equation}
+where $\Phi_s$ is the Sigmoid function
+\begin{equation} \label{eqn:sigmoid-neus}
+\Phi_s(x)=\left(1+e^{-s x}\right)^{-1}
+\end{equation}
+with $s$ as a scene-wise learnable parameter. $1/s$ could be viewed as the uncertainty of the surface, with $1/s=0$ being equivalent to performing surface rendering. The same volume rendering equation (\cref{eqn:volume-rendering}) can be applied to get the pixel color with a discretized version of volume opacity $\alpha_i$ given by:
+\begin{equation}
+    \alpha_i=\max\left (\frac{\Phi_s(d_i)-\Phi_s(d_{i+1})}{\Phi_s(d_i)}, 0\right)
+\end{equation}
+Apart from the photometric loss in \cref{eqn:photometric-loss}, NeuS also utilizes an Eikonal term to regularize the SDF:
+\begin{equation}
+    \mathcal{L}_{\text{eik}}=\sum_{i}(||\nabla f_{\text{sdf}}(\bm{x}(t_i))||-1)^2
+\end{equation}
+and an optional object mask loss:
+\begin{equation}
+    \mathcal{L}_{\text{mask}}=\text{BCE}(\hat{M}, M)
+\end{equation}
+where $\hat{M}=\sum_{i}\omega_i$ is the estimated opacity along a ray, $M$ is the ground truth mask, and BCE is binary cross entropy.
+
+
+\section{Hybrid Volume-Mesh (VMesh)}
+
+Our hybrid volume-mesh representation, or VMesh, depicts object geometry with a triangular mesh surface and a sparse volume. The two types of geometric representation share the same texture formulation and can be jointly rendered by raymarching. We propose to obtain such a representation from multi-view images of an object. To start with, we train a contiguous form of the representation (\cref{sec:contiguous-stage}), where the surface part is modeled by a neural signed distance field, and the volume part is modeled by a neural density field. Following NeuS, we first convert the signed distance value to volume opacity and naturally combine the two parts by volume rendering.
+Then we fix the learned signed distance field and extract a triangular mesh from it as a substitution to be rendered jointly with the neural density field (\cref{sec:mesh-optimization-stage}). We utilize differentiable isosurface and rasterization techniques to get high-quality meshes that align well with the implicit geometry. Lastly, we drop all the neural networks and perform discretization to get the final assets for efficient storage and rendering (\cref{sec:discretized-stage}). Concretely, the triangular mesh is simplified and UV-parametrized, and the neural density field is first voxelized and pruned to a sparse volume, which is then organized by perfect spatial hashing to support fast indexing and compact storage. The training pipeline is illustrated in \cref{fig:pipeline}. We further implement a WebGL2 renderer to enable real-time rendering in modern web browsers on various kinds of consumer-grade devices (\cref{sec:real-time-rendering}).
+
+
+\subsection{Contiguous Stage} \label{sec:contiguous-stage}
+We start from an implicit neural representation where each point in space holds two geometric properties, a signed distance value $d$ for the surface and a density value $\sigma$ for the volume. According to \cref{eqn:opaque-density-neus}, $d$ could be converted to volume opacity $\alpha$, allowing us to treat the surface part to be also a volume. To make the two parts work together, we could simply overlay the two volumes, summing up their densities:
+\begin{equation}
+    \sigma_{\text{hyb}} = \sigma_{\text{surf}} + \sigma_{\text{vol}}
+\end{equation}
+According to the definition of volume opacity $\alpha$, the above equation is equivalent to:
+\begin{equation} \label{eqn:hybrid-opacity}
+    \alpha_{\text{hyb}} = 1 - (1 - \alpha_{\text{surf}})(1 - \alpha_{\text{vol}})
+\end{equation}
+where $\alpha_{\text{surf}}$ and $\alpha_{\text{vol}}$ can be obtained from $d$ and $\sigma$ following \cref{eqn:opaque-density-neus} and \cref{eqn:volume-rendering} respectively. We use $\alpha_{\text{hyb}}$ to render the hybrid scene composed of both the surface and the volume and also use $\alpha_{\text{surf}}$ to render the surface only.
+
+Implicit neural scene representations often rely on a large MLP to model object appearances. Given the feature of a spatial location and a viewing direction, the MLP predicts the view-dependent color, which can be time-consuming. Existing real-time view synthesis methods improve the efficiency of color queries mainly by
+\begin{enumerate}
+    \item replacing the MLP with fixed basis functions, such as spherical harmonics or spherical gaussians~\cite{plenoctrees,physg}.
+    \item replacing the MLP with learned basis functions~\cite{fastnerf,nex}. The functions are also modeled by an MLP, but they can be discretized under acceptable memory consumption as they only depend on viewing directions.
+    \item applying deferred shading and using a tiny MLP~\cite{snerg,mobilenerf}. In this way, the MLP is only evaluated per pixel instead of per sample point.
+\end{enumerate}
+These solutions all have their disadvantages. Fixed basis functions (1) and learned basis functions (2) often require numerous coefficients to be stored at each point to achieve enough representational ability. For example, PlenOctrees~\cite{plenoctrees} adopts spherical harmonics up to degree 3, resulting in 16 coefficients per color channel, 48 in total; FastNeRF~\cite{fastnerf} models 8 basis functions, which corresponds to 8 coefficients per color channel, 24 in total. Tiny MLP (3) struggles to model high-frequency view-dependent effects due to its limited capacity and is much more computationally extensive than the other two. In this work, we present a new texture representation named RefBasis for real-time view synthesis that is both representative and efficient in storage. 
+We make the color depend on the reflected ray direction $\bm{\omega}_{r}$ instead of the incident ray direction, or viewing direction $\bm{\omega}_{o}$. This makes view-dependencies easier to model as demonstrated in Ref-NeRF~\cite{ref-nerf}. $\bm{\omega}_{r}$ can be computed as:
+\begin{equation} \label{eqn:reflection-direction}
+    \bm{\omega}_{r} = 2(\bm{\omega}_o\cdot\bm{n}) - \bm{\omega}_{o}
+\end{equation}
+where the normal direction $\bm{n}$ can be obtained as the gradient direction of the signed distance field by automatic differentiation:
+\begin{equation}
+    \bm{n} = \nabla f_{\text{sdf}}(\bm{x})
+\end{equation}
+We adopt a similar color formulation as Ref-NeRF, where the view-dependent color $\bm{c}$ is the composition of a diffuse color $\bm{c}_d$, and the multiplication of a specular tint $\bm{s}$ and a specular color $\bm{c}_s$. In Ref-NeRF, $\bm{c}_s$ is modeled by an MLP, taking $\bm{\omega}_{r}$ as input, as well as a per-point feature vector to bring additional degrees of freedom, and the incident angle to compensate for Fresnel effects. To enable real-time rendering, we instead model $\bm{c}_s$ as learned basis functions. Specifically, we predict a set of $N$ base specular colors $\{\bm{c}_{s}^1,\bm{c}_{s}^2,...,\bm{c}_{s}^{N}\}$ for each $\bm{\omega}_{r}$ and an N-dimensional weighting vector $(w_1,w_2,...,w_N)$ for each point. $\bm{c}_{s}$ is computed as the weighted summation of these base colors:
+\begin{equation}
+    \bm{c}_{s}(\bm{\omega}_r) = \sum_{i=1}^{N} w_i \bm{c}_{s}^{i}
+\end{equation}
+To explain Fresnel effects, we also predict an attenuation factor $\mathcal{A}$ from the incident angle $\theta$ and a per-point ``metallic" property $m$. The final color $c$ can be formulated as:
+\begin{equation}
+    \bm{c} = \gamma(\bm{c}_d + \bm{s} \odot \mathcal{A}(\theta,m)\bm{c}_s(\hat{\bm{\omega}}_r))
+\end{equation}
+where $\gamma$ is a fixed tone-mapping function and $\odot$ denotes element-wise multiplication. The base specular colors and the attenuation factor are modeled by MLPs and will be discretized as look-up tables in later stages.
+
+In practice, we also predict a normal direction for each location and use this normal to compute $\bm{\omega}_{r}$. By forcing the predicted normal $\hat{\bm{n}}$ to be close to the analytic normal $\bm{n}$, $\hat{\bm{n}}$ acts as a smoothness prior at the beginning of training and a low-pass filter to improve the normal quality:
+\begin{equation}
+    \mathcal{L}_{\text{norm}} = 1 - \hat{\bm{n}}\cdot\bm{n}
+\end{equation}
+
+Since our goal is to represent most parts of the scene with surfaces, and only to model the ``hard" areas with volumetric matters, we apply the photometric loss simultaneously on the hybrid rendered color $\hat{\bm{C}}_i^{\text{hyb}}$ with $\alpha_{\text{hyb}}$ in \cref{eqn:hybrid-opacity} and the color $\hat{\bm{C}}_i^{\text{surf}}$ rendered only from the surface model with $\alpha_{\text{surf}}$:
+\begin{equation} \label{eqn:photometric-loss-contiguous}
+    \mathcal{L}_{\text{pm}}=\sum_i\left(||\hat{\bm{C}}_i^{\text{hyb}}-\bm{C}_i||_2+||\hat{\bm{C}}_i^{\text{surf}}-\bm{C}_i||_2\right)
+\end{equation}
+This prioritizes the usage of surfaces over volume wherever possible. We also penalize for volume densities as in ~\cite{plenoctrees} to further encourage volume sparsity:
+\begin{equation} \label{eqn:volume-sparsity}
+    \mathcal{L}_{\text{sp}}=\sum_{i}|1-\text{exp}(-\lambda \sigma_i)|
+\end{equation}
+where ${\sigma_i}$ are volume densities at sampled locations, and $\lambda$ is a hyperparameter.
+
+We utilize an opaque loss which regularizes the rendered opacity of the surface model $\hat{M}^{\text{surf}}_i$ to be either 0 or 1:
+\begin{equation}
+    \mathcal{L}_{\text{opaque}} = \sum_i - \left(\hat{M}^{\text{surf}}_i log(\hat{M}^{\text{surf}}_i)+(1-\hat{M}^{\text{surf}}_i) log(1-\hat{M}^{\text{surf}}_i)\right)
+\end{equation}
+This encourages $s$ in \cref{eqn:sigmoid-neus} to be as large as possible, resulting in confident surfaces which benefit surface extraction in later stages.
+
+We optimize the weighted summation of these loss terms in the contiguous stage:
+\begin{equation}
+\begin{split}
+    \mathcal{L}_{\text{cont}} &= \lambda_{\text{pm}}\mathcal{L}_{\text{pm}} + \lambda_{\text{mask}}\mathcal{L}_{\text{mask}} + \lambda_{eik}\mathcal{L}_{\text{eik}} \\
+    &+ \lambda_{\text{norm}}\mathcal{L}_{\text{norm}} + \lambda_{\text{sp}}\mathcal{L}_{\text{sp}} + \lambda_{\text{opaque}}\mathcal{L}_{\text{opaque}}
+\end{split}
+\end{equation}
+
+\subsection{Mesh Optimization Stage} \label{sec:mesh-optimization-stage}
+Once the contiguous representation is trained, we move to a mesh optimization stage where we extract a triangular mesh from the signed distance field and render it jointly with the neural density field for optimization. A simple way to achieve this is to use isosurface techniques such as Marching Cubes~\cite{marching-cubes} to extract the mesh and directly use it for further optimizations. However, due to the limited marching resolution, the extracted mesh cannot perfectly align with the implicit geometry, causing missing structures and biased surfaces. Redundant volume would appear to compensate for the inaccuracies, bringing unnecessary storage overhead. We solve this problem by optimizing the geometry of the extracted mesh with Deep Marching Tetrahedra~\cite{dmtet} and differentiable rasterization~\cite{pytorch3d,nvdiffrast}. Specifically, we fix $f_{\text{sdf}}$ from the contiguous stage and initialize a new signed distance field $f_{\text{sdf}}^{'}$ from $f_{\text{sdf}}$. We apply Deep Marching Tetrahedra on a dense grid with learnable grid vertex potisions, and render the extracted mesh to get its silhouette and depth map using a differentiable rasterizer~\cite{nvdiffrast}. The silhouette and depth map are compared with the opacity and depth value rendered from $f_{\text{sdf}}$ to make the mesh geometry closer to the implicit surface. The constraints can be formulated as:
+\begin{equation}
+    \mathcal{L}_{\text{mesh}}=\sum_i\left(||\hat{M}_i^{\text{surf}}-\hat{M}_i^{\text{mesh}}||_1 + ||\hat{D}_i^{\text{surf}}-\hat{D}_i^{\text{mesh}}||_1\right)
+\end{equation}
+
+To render the extracted mesh jointly with the neural density field, we apply raymarching that terminates at the mesh surface. For each pixel to be rendered, if it is occupied by the mesh surface, we only sample points in front of the surface to accumulate densities and colors. Then we alpha-blend the volume-rendered color $\hat{\bm{C}}_{\text{vol}}$ with the rasterized pixel color $\hat{\bm{C}}_{\text{mesh}}$ regarding the mesh surface as totally opaque ($\alpha_{\text{mesh}}=1$):
+\begin{equation}
+    \hat{\bm{C}}_{\text{hyb}} = \hat{\bm{C}}_{\text{vol}} + (1 - \hat{M}_{\text{vol}})\hat{\bm{C}}_{\text{mesh}}
+\end{equation}
+where $\hat{M}_{\text{vol}}$ is the transparency of the volume, as is $\sum_i\omega_i$ in \cref{eqn:volume-rendering}.
+Note that till now we still rely on the MLPs to obtain the predicted normals and view-dependent colors. In this stage, we supervise on $\hat{\bm{C}}_{\text{hyb}}$ to optimize the appearance of this semi-contiguous representation:
+\begin{equation}
+    \mathcal{L}_{\text{pm}}=\sum_i||\hat{\bm{C}}_i^{\text{hyb}}-\bm{C}_i||_2
+\end{equation}
+
+The overall loss function is:
+\begin{equation}
+    \mathcal{L}_{\text{mo}} = \lambda_{\text{pm}}\mathcal{L}_{\text{pm}} + \lambda_{\text{mesh}}\mathcal{L}_{\text{mesh}} + \lambda_{\text{norm}}\mathcal{L}_{\text{norm}} + \lambda_{\text{sp}}\mathcal{L}_{\text{sp}}
+\end{equation}
+where $\mathcal{L}_{\text{norm}}$ and $\mathcal{L}_{\text{sp}}$ are the same as in the contiguous stage.
+
+\subsection{Discretization Stage} \label{sec:discretized-stage}
+In this stage, we convert all the neural representations to explicit assets for real-time rendering and efficient storage.
+\subsubsection{Texture Space Discretization}
+Earlier stages rely on MLPs to compute the specular color for each reflected ray direction and the corresponding attenuation factor. To enable fast color computation, we first densely sample all directions and convert the specular color MLP to a set of cube maps. We call these cube maps ``base environment maps" as they act like the environment map in image-based lighting techniques. For the attenuation factor MLP, we densely sample the $(\theta,m)$ space and convert it to a 2D look-up table.
+
+\subsubsection{Mesh Discretization}
+\paragraph{Simplification.} The mesh extracted from dense tetrahedron grids has an excess number of vertices and faces even in flat areas, which brings computation and storage overhead. To cope with this problem, we simplify the generated mesh by Quadric Edge Collapse Decimation~\cite{mesh-simplify}. Experiment results in \cref{tab:comparison-geometry} demonstrate that appropriate levels of mesh simplification do not undermine view synthesis quality but can, in fact, enhance it.
+\paragraph{Parametrization.} We perform UV unwrapping to get texture coordinates for the mesh vertices, and sample densely in the UV space to retrieve the 2D normal map and texture maps.
+
+\subsubsection{Volume Discretization}
+\paragraph{Voxelization.} We densely evaluate the volume density for an $N^3$ voxel grid, and then track the max contribution of each voxel by shooting rays from all pixels of the training images. The contribution is calculated as the weight $\omega$ in \cref{eqn:volume-rendering}. Voxels with contributions lower than a threshold are pruned. For the remaining voxels, we uniformly sample 64 points inside each voxel and evaluate their average density, normal, and textures as an anti-aliased estimation of the properties of the voxel.
+\paragraph{Hashing.} To enable efficient access to volume properties at arbitrary spatial locations while optimizing storage cost, existing works mainly adopt advanced data structures like octrees~\cite{plenoctrees}, or pack occupied voxels into smaller dense blocks~\cite{snerg}. Considering that the volume in our representation is very sparse (typically $<0.1\%$), we choose the latter approach and further utilize Perfect Spatial Hashing (PSH)~\cite{psh} for compact storage and efficient indexing. Denote the positions of occupied blocks as set $S$, with $|S|=N$, PSH constructs
+\begin{itemize}
+    \item a 3D hash table $H$ of size $m=\bar{m}^3 \approx N$ to store the volume data
+    \item a 3D offset table $\Phi$ of size $r=\bar{r}^3 = \sigma N$ where $1/6\le\sigma<1$
+\end{itemize}
+so that there exists a perfect spatial hash function $h(\bm{p})$ as an injective map when $\bm{p} \in S$, mapping $\bm{p}$ to a unique slot in the hash table $H$. The hash function $h$ is defined as
+\begin{equation} \label{eqn:perfect-spatial-hashing}
+    h(\bm{p}) = \left((\bm{p}\bmod{\bar{m}}) + (\Phi[\bm{p}]\bmod{\bar{r}})\right) \bmod{\bar{m}}
+\end{equation}
+In this way, we can access volume data at any arbitrary location in constant $\mathcal{O}(1)$ time while only requiring the extra storage of a much smaller offset table other than the data itself.
+
+\subsubsection{Fine-tuning}
+To mitigate the quality loss brought by the quantization process, especially the texture seams caused by the UV-parametrization and the aliasing caused by voxelization (see \cref{fig:ablation} for visual examples), we directly fine-tune the extracted assets. However, the optimization of explicit geometry and textures could easily fall into local minima as they are no longer constrained by the inductive bias or local smoothness of the neural networks. Therefore, we fix the mesh geometry and use the rendered normal and texture images from the mesh optimization stage as pseudo ground truth references. In addition to the pixel-wise MSE loss, we also adopt a VGG perceptual loss~\cite{perceptual-loss} to optimize for image quality. To further reduce storage costs, it is a common practice to re-scale and quantize the values in the assets to 8-bit integers and store them as images. Since the quantization operation is not differentiable, existing methods mainly make it a post-processing step, which may bring quality loss. We instead propose to optimize the assets with a differentiable quantization module, which gives the quantized value in the forward pass and keeps the gradient untouched during the backward pass. In this way, we can ensure the rendering outputs are the same during optimization and in the real-time renderer. After fine-tuning, we store the mesh as a .obj file compressed using Draco, and all other assets as PNG files including the normal map, texture maps, volume data in the hash table, and the offset table. For unconstrained access to the volume data, we also store the occupancy of the $N^3$ grid as an occupancy image, where the occupancy status of a voxel corresponds to a single bit in the image.
+
+\subsection{Real-Time Rendering} \label{sec:real-time-rendering}
+We implement the rendering process of VMesh assets in WebGL2 using the three.js library~\cite{threejs}. The full process requires four render passes:
+\begin{itemize}
+    \item In the first and second passes, we rasterize the font and back face of the object bounding box to get the valid interval for raymarching. This could also be done by ray-box intersection.
+    \item In the third pass, we rasterize the mesh to get the normal image, feature image, and depth image, and calculate the mesh rendering output based on the texture model.
+    \item In the final pass, we first determine the start and termination points for raymarching. The start point is the front face position from the first pass. The termination point is the closer one of the back face position from the second pass and the surface position from the third pass. Then we uniformly sample points in this interval to get the volume rendering output. The volume-rendered color is alpha-composited with the mesh color the get the final rendering result.
+\end{itemize}
+
+\subsection{Implementation Details} \label{sec:implementation-details}
+We implement the training process using the PyTorch~\cite{pytorch} framework.  In the contiguous and mesh optimization stage, we adopt the hash grid encoding and acceleration techniques proposed in Instant-NGP~\cite{ngp}. To stabilize training, we adopt a progressive training strategy to mask features from high-level hash grids in the early stage of training. We show in ~\cref{sec:exp-ablation} that this simple strategy could effectively alleviate shape-radiance ambiguity and improve geometry quality. We choose $N=4$ for the RefBasis texture. The contiguous stage is trained with a batch size of $8,192$ rays for $80,000$ iterations. We set $\lambda_{\text{pm}}=10$, $\lambda_{\text{mask}}=0.1$, $\lambda_{\text{eik}}=0.1$, $\lambda_{\text{norm}}=0.1$, linearly increase $\lambda_{\text{sp}}$ from 0.01 to 0.1, and only apply $\lambda_{\text{opaque}}=0.1$ after $50,000$ iterations. The mesh optimization stage is trained with a batch size of $8,192$ rays for $10,000$ iterations. The resolution of the dense grid for marching tetrahedra is set to 350. We set $\lambda_{\text{pm}}=10$, $\lambda_{\text{mesh}}=1$, $\lambda_{\text{norm}}=0.1$, and $\lambda_{\text{sp}}=0.1$ in this stage. In the discretization stage, we reduce the number of mesh faces to $1/4$, apply UV-parametrization using xatlas~\cite{xatlas} and render the normal and texture maps at $1024\times1024$. We store the base environment maps as cube maps of resolution $512\times512$, and create the look-up table at $256\times256$. We voxelize the volume part using a $512^3$ dense grid and implement a custom PyTorch C++ extension for the Perfect Spatial Hashing algorithm. It takes around 2 hours to optimize for a scene on a single RTX 3090.

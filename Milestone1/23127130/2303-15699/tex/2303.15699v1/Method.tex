@@ -1,0 +1,60 @@
+\subsection{Risk prediction}
+\input{figures/overview}
+
+Survival analysis is done to predict whether events will occur sometime in the future. The data comprises three main elements: features $x$, time of the event $t$, and the occurrence of the event $e$~\cite{katzman2018deepsurv}. For medical applications, $x$ typically represents patient information like age, family history, genetic makeup, and diagnostic test results (e.g., a mammogram). If the event has not yet occurred by the end of the study or observation period, the data is referred to as right-censored.
+
+We typically want to estimate the hazard function $h(t)$, which measures the rate at which patients experience the event of interest at time $t$, given that they have survived up to that point. The hazard function can be expressed formally as the limit of the conditional probability of an event occurring within a small time interval $[t, t+\Delta t)$, given that the time $t$ and has not yet experienced the event:
+
+\begin{equation}
+h(t) = \lim_{\Delta t \to 0} \frac{P(T \in [t, t+\Delta t) \mid T \geq t)}{\Delta t}
+\end{equation}
+The cumulative hazard function $H(t)$ is another commonly used function in survival analysis, which gives the accumulated probability of experiencing the event of interest up to time $t$. This function is obtained by integrating the hazard function over time from 0 to $t$: $ H(t) = \int_0^t h(s) ds $
+
+\subsection{Architecture Overview}
+We build on the current state-of-the art MIRAI \cite{yala2021toward} architecture, which is trained to predict the cumulative hazard function.
+% Similar to \cite{yala2021toward}, we make use of image features as a baseline hazard.
+
+We use an ImageNet pretrained ResNet-34 \cite{he2016deep} as the image feature backbone. The backbone network extracts features from the mammograms, and the fully connected layer produces the final feature vector $x$. We make use of two additional fully connected layers to calculate base hazard $\theta_{b}$ and time-dependent hazard $\theta_{u}$, respectively.
+
+The predicted cumulative hazard is obtained by adding the base hazard and time-dependent hazard, according to:
+\begin{equation}
+    \hat{H}(t|x) = \theta_{b}(x) + \sum_{\tau=1}^t \theta_{u_\tau}(x)
+\end{equation}
+
+When dealing with right-censored data, we use an indicator function $\delta_i(t)$ to determine whether the information for sample $i$ at time $t$ should be included in the loss calculation or not. This helps us exclude unknown periods and only use the available information. It is defined as follows:
+
+\begin{equation}
+    \delta_i(t) =
+    \begin{cases}
+        1, & \text{if the event of interest occurs for sample $i$ ($e_i=1$)} \\
+        1, & \text{if sample $i$ is right-censored at time $t$ ($e_i=0$ and $t<C_i$)} \\
+        0, & \text{otherwise}
+    \end{cases}
+\end{equation}
+
+Here, $e_i$ is a binary variable indicating whether the event of interest occurs for sample $i$ (i.e., $e_i=1$) or not (i.e., $e_i=0$), and $C_i$ is the censoring time for sample $i$, which is the last known time when the sample was cancer-free.
+
+We define the ground-truth $H$ is a binary vector of length $T$, where $T$ is the maximum observation period. Specifically, $H(t)$ is 1 if the patient is diagnosed with cancer within $t$ years and 0 otherwise. We use binary cross entropy to calculate the loss at time $t$ for sample $i$: $\ell_i(t) = -H_i(t) \log \hat{H}_{i}(t)-(1-H_i(t)) \log (1-\hat{H}_{i}(t))$.
+% The loss at time $t$ for sample $i$ is calculated as follows:
+% \begin{equation}
+%     \ell_i(t)=H_i(t) \log \hat{H}_{i}(t)+\left(1-H_i(t)\right) \log \left(1-\hat{H}_{i}(t)\right)
+% \end{equation}
+The total loss is defined as:
+
+\begin{equation}
+    L=\sum_{i=1}^N \sum_{t=1}^T \delta_i(t) \ell_i(t)
+\end{equation}
+
+% \begin{equation}
+%   L = -\frac{1}{N}\sum_{i=1}^N \sum_{t=1}^T H_{i}(t) \log \hat{H}_{i}(t) + (1 - H_{i}(t)) \log (1 - \hat{H}_{i}(t))
+%   \end{equation}
+
+Here, $N$ is the number of exams in the training set. The goal of training the model is to minimize this loss function, which encourages the model to make accurate predictions of the risk of developing breast cancer over time.
+
+
+\subsection{Incorporating Prior Mammograms}
+To improve the performance of the breast cancer risk prediction model, we incorporate information from prior mammograms taken with the same view, using a transformer decoder structure~\cite{vaswani2017attention}. This structure allows the current and prior mammogram features to interact with each other, similar to how radiologists check for changes between current and prior mammograms.
+
+During training, we randomly select one prior mammogram, regardless of when they were taken. This allows the model to generalize to varying time intervals. To pair each current mammogram during inference with the most relevant prior mammogram, we first select the prior mammogram taken at the time closest to the current time. This approach is based on research showing that radiologists often use the closest prior mammogram to aid in the detection of breast cancer~\cite{sumkin2003optimal}.
+
+Next, a shared backbone network is used to output the current feature $x_{curr}$ and the prior feature $x_{prior}$. These features are then flattened and fed as input to the transformer decoder, where multi-head attention is used to find information related to the current feature in the prior feature. The resulting output is concatenated and passed through a linear layer to produce the current-prior comparison feature $x_{CPC}$. The current-prior comparison feature and current feature are concatenated to produce the final feature $x^* = x_{CPC} \oplus x_{curr}$, which is then used by the base hazard network and time-dependent hazard network to predict the cumulative hazard function $\hat{H}$.

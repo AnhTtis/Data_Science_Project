@@ -1,0 +1,118 @@
+\section{VERN: Navigation in Dense Vegetation}
+We use occupancy grids/cost maps generated using 2D lidar scans to detect obstacles around the robot. Our cost map can be defined as,
+
+\vspace{-10pt}
+\begin{equation}
+    C_z(row, col) = \{p \,\, | \,\, p \in \{0, 100\}\}.
+\end{equation}
+
+\no Here, z is the height (along the robot's Z-axis) at which the 2D scan is recorded on a plane parallel to the ground. $p$ is a binary variable representing if an obstacle is present at $(row, col)$ of the cost map. In a densely vegetated environment, $C_{z}$ contains obstacles in all the locations where the lidar's scans have a finite proximity value. However, it does not account for the pliability of certain types of vegetation, which makes them passable and therefore not true obstacles. Therefore, we use the classification results, its confidence (Section \ref{sec:net-outputs}), and estimated vegetation height to augment our cost map prior to navigation.
+
+% However, $C_z$ does not account for the pliability of the entities viewed as obstacles. Therefore, we use the classification results in Section \ref{sec:net-outputs} to augment our cost map prior to navigation.
+
+% In the following sections, we explain how multiple cost maps are used to identify \textit{critical regions} with non-pliable obstacles, how our novel cost map clearing algorithm works, where we handle misclassifications in our model $\mathcal{F}$. Additionally, we explain our recovery mechanism to unstick the robot when it freezes or gets stuck physically. VERN's overall system architecture is shown in Fig. \ref{fig:sys-arch}. 
+
+\subsection{Multi-view Cost Maps}
+To estimate the height of the environmental obstacles, we use three cost maps of equal dimensions $C_{low}, C_{mid},$ and $C_{high}$ corresponding to 2D scans from three different heights in 3D lidar's point clouds. The cost maps correspond to a height lower, equal to, and higher than the height at which the robot's 3D lidar is mounted, respectively. $C_{low}$ contains obstacles of all heights around the robot. $C_{mid}$ and $C_{high}$ contain taller obstacles such as tall grass, trees, walls, humans, etc. Using only three views instead of projecting the entire point cloud onto a 2D plane reduces the computation burden. It also helps identify truly tall obstacles and avoids misclassifying overhanging leaves from trees as tall obstacles.
+
+We consider tall obstacles as \textit{critical obstacles} due to the high probability of them being solid obstacles such as trees and walls. To identify critical obstacles, we perform the element-wise sum operation as follows,
+\vspace{-7pt}
+\begin{gather}
+    % crit = \{ (row, col) \,\, | \,\, C_{crit}(row, col) > c_{thresh} \} \\
+    C_{crit} = C_{high} \bigoplus C_{mid} \bigoplus C_{low}.
+\end{gather}
+
+\no $C_{crit}(row, col) \in \{0, 100, 200, 300\}$, and regions with higher costs contain critical obstacles.
+
+% We also use crit as an indicator to cross-verify the classification results $\Tilde{v}_i$ to make our perception robust to errors (see Section \ref{sec:costmap-clearing}).
+
+
+\subsection{Vegetation-aware Cost Map} \label{sec:costmap-clearing}
+To combine $\Tilde{v}_i$, $\kappa_i$ and $C_{crit}$, we must correlate the regions viewed by quadrants $Q_{1,2,3,4}$ in $I^{RGB}_t$ with the corresponding regions in $C_{crit}$. 
+
+\subsubsection{Homography}
+To this end, we apply a homography transformation $H$ to project $I^{RGB}_t$ onto the cost map. Let $reg()$ denote a function that returns the real-world $(x, y)$ coordinates corresponding to a region of a cost map or image. We obtain the image quadrant relative to the cost map (see green/red rectangles in Fig. \ref{fig:costmap_comparisons} bottom) as,  
+\vspace{-3pt}
+\begin{equation}
+    Q^C_i = \{ (row, col) | reg(C(row, col)) = reg(H(Q_i)) \}.
+\end{equation}
+
+\subsubsection{Cost Map Clearing}
+% We utilize the classification results, and the confidence corresponding to the four quadrants of our RGB image along with vegetation height to clear/modify the costs of the grids in $C_{low}$. 
+
+We now use $\Tilde{v}_i$, $\kappa_i$, $C_{crit}$, and $Q^C_i$ to clear/modify the costs of the grids in $C_{low}$. We choose to modify and plan over $C_{low}$ since it detects obstacles of all heights. First, we calculate the normalized height measure (between 0 to $\pi/2$) of the obstacles in each quadrant $i$ using $C_{crit}$ as,
+\vspace{-10pt}
+\begin{equation}
+    h_i = mean(C_{crit}(Q^C_i))/c_{max} \cdot \frac{\pi}{2}, 
+\end{equation}
+
+\no where, $c_{max} = 300$ the maximum value in $C_{crit}$. Next, in each quadrant $Q^C_i$ of $C_{low}$ we modify the cost as,
+
+\vspace{-10pt}
+\begin{gather}
+    C_{VA}(Q^C_i) = C_{low}(Q^C_i) \cdot \frac{clear(\kappa_i, h_i)}{max(clear(\kappa_i, h_i))}\\
+    clear() = 
+    \begin{cases}
+    w_{s \,\text{or} \,d} \cdot (1 - \kappa_i) + \frac{2 \cdot h_i}{\pi} \,\, & \text{if} \, \Tilde{v}_i \, \text{is PV} \\
+    (w_{NPV} \cdot \kappa_i + b_{NPV}) + \sin(h_i) \,\, & \text{if} \, \Tilde{v}_i \, \text{is NPV}. \label{eqn:clearing}
+    \end{cases}
+\end{gather}
+\vspace{-10pt}
+
+\no Here, $C_{VA}$ is a vegetation-aware cost map, $w_s, w_d, w_{NPV}$, and $b_{NPV}$ are positive constants satisfying the condition $w_d > w_s$, and $b_{NPV} > w_d + 1$. The weights $w_s$ and $w_d$ are used when $\Tilde{v}_i$ is sparse and dense grass respectively. We incorporate $sin(.)$ for NPV to ensure that the significantly tall obstacles have higher costs and differentiable cost values from short obstacles. In contrast, we consider a linearly varying cost function w.r.t. the vegetation height for PV since the resistance to the robot from pliable tall objects is correlated with their height. We note that $\sin(h_i) \ge \frac{2 \cdot h_i}{\pi}$ for $h_i \in [0, \pi/2]$.
+
+For PV classifications, low confidence and tall vegetation lead to higher navigation costs. Intuitively, this leads to the robot preferring to navigate through high-confidence, and short pliable vegetation whenever possible. Conversely, for NPV classifications, high confidence, and tall vegetation lead to higher costs since such regions should definitely be avoided. Accounting for low-confidence classifications in the formulation helps handle misclassifications and assign costs accordingly.
+
+\begin{prop}
+The clear() function modifies $C_{low}$ such that traversability costs in PV regions are always lower than in NPV regions.  
+\end{prop}
+
+\begin{proof}
+The maximum cost for PV is $w_d + 1$ (when $\kappa_i \to 0$ and $h_i \to \pi/2$), and the minimum cost for NPV is $b_{NPV}$ (when $\kappa_i \to 0$ and $h_i \to 0$). Conditions $w_s < w_d$, and $b_{NPV} > w_d + 1 \implies$ max cost of PV $<$ min cost of NPV. Therefore, in the absence of free space, the robot always navigates through PV and avoids NPV regions. Therefore, regions with PV will always be preferred for navigation.
+\end{proof}
+
+%  TODO: Explain two modes of navigation: standard and cautious
+\subsection{Cautious Navigation}
+We adapt DWA (section \ref{sec:dwa}) to use our vegetation-aware cost map for robot navigation. We calculate the obstacle cost (obs(.)) associated with every $(v, \omega)$ pair by projecting its predicted trajectory $traj^C(v, \omega)$ relative to the cost map over $C_{VA}$ and summing as,
+\vspace{-3pt}
+\begin{equation}
+    obs(v, \omega) = \sum_{(row, col) \in traj^C(v, \omega)} C_{VA}(row, col).
+\end{equation}
+% \vspace{-5pt}
+\no Next, we compute the total cost $Q(v, \omega)$ (equation \ref{eq:dwa_obj_func}). The $(v, \omega)$ that minimizes this cost is used for navigation. In some cases, the robot might have to navigate a region with high traversability cost (represented say in $Q^C_i$) which typically occurs with NPV. To imbibe cautious navigation behaviors for such scenarios, we stunt the robot's complete velocity space as $V_s = [[0, \kappa_i \cdot v_{max}], \kappa_i \cdot [-\omega_{max}, \omega_{max}]]$. 
+
+\subsection{Recovery Behaviors}
+In highly dense vegetation or in regions with low confidence classifications, the robot could still freeze or get physically entrapped. We observe that Spot's high degrees of freedom and superior dynamics allows it to recover itself from such situations if it avoids rotational motions. Therefore, we propose holonomic recovery behaviors to recover Spot from such situations. To this end, the robot periodically stores $\textit{safe}^O$ locations relative to the odom frame whenever the conditions for freezing or entrapment (section \ref{sec:adverse-phen}) are not satisfied. If the conditions are satisfied, the robot stores its current location into an $\textit{unsafe}^O$ location list and chooses a safe location such that,
+
+% \begin{gather}
+%     \textbf{p}^O_{rec} = \underset{\textbf{p}^O \in safe}{\operatorname{argmin}} \left(dist(\textbf{g}^O, \textbf{p}^O) \right) \,\, s.t \,\,  (\textbf{P}^O - \textbf{P}^O_{rob}) \in Free^O \cap Grass^O, \\
+%     [v_x, v_y] = k_p \cdot [\textbf{p}_{rec} - \textbf{p}_{rob}].
+% \end{gather}
+\vspace{-15pt}
+\begin{gather}
+    unsafe^C = T^C_O \cdot unsafe^O, \\
+    C_{VA}(unsafe^C) = \infty,  
+\end{gather}
+\vspace{-15pt}
+\begin{multline}
+    \textbf{p}^O_{rec} = \underset{\textbf{p}^O \in safe}{\operatorname{argmin}} \left(dist(\textbf{g}^O, \textbf{p}^O) \right), \\
+    s.t \,\,  (\textbf{P}^O - \textbf{P}^O_{rob}) \in Free^O \cap Grass^O,
+    \label{eqn:recover-pt}
+\end{multline}
+\vspace{-15pt}
+\begin{equation}
+    [v_x, v_y] = k_p \cdot [\textbf{p}_{rec} - \textbf{p}_{rob}].
+\end{equation}
+
+\no Here, $\textbf{p}^O_{rec}$, $\textbf{g}^O$, and $\textbf{p}^O_{rob}$ are the safe location chosen to recover to, the robot's goal and current location. The condition in equation \ref{eqn:recover-pt} ensures that the line connecting the robot and the recovery point only lies in traversable regions. Once the robot recovers, it proceeds to its goal after marking the \textit{unsafe} location with high costs in $C_{VA}$ to circumvent it. 
+
+% Function $LOS^C(\textbf{p}, \textbf{p}_{rob})$ checks if the line connecting the points $\textbf{p}$ and $\textbf{p}_{rob}$ (transformed w.r.t cost map) intersects with any obstacle in $C_{VA}$.   
+
+
+% \begin{prop}
+% At any time instant, navigation using $C_{VA}$ leads to equal or lower deviations from the goal compared to using $C_{low}$.  
+% \end{prop}
+
+% \begin{proof}
+% Due to our cost map clearing, the quadrants $Q^C_{1,2,3,4}$ in $C_{VA}$ contain costs $\le$ the costs in the same quadrants in $C_{low}$ $\implies$ the obs() costs for all the trajectories calculated using $C_{VA} \le$ obs() costs for the trajectories using $C_{low}$ $\implies$ $\exists $
+% \end{proof}

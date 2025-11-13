@@ -1,0 +1,114 @@
+\section{Cost Estimation}
+\label{sec:cost-estimation}
+
+\begin{figure*}[t]
+\begin{center}
+\includegraphics[width=\linewidth]{figures/cost_model/mem.pdf}
+\end{center}
+\caption{The points represents the profiled peak memory use. The solid lines are the \tool predicted results with 20\% of profiled data.}
+\label{fig:cost_model_peak_mem}
+\end{figure*}
+
+\begin{figure*}[t]
+\begin{center}
+\includegraphics[width=\linewidth]{figures/cost_model/btime.pdf}
+\end{center}
+\caption{The points represents the profiled batch latency. The solid lines are the \tool predicted results with 20\% of profiled data.
+% \zhuohan{Missing legened for blue line}
+}
+\label{fig:cost_model_btime}
+\end{figure*}
+
+To aid practitioners in deciding which MOMs to apply for their workloads, we develop a new performance model called \tool. \tool predicts the performance of MOMs by estimating their effect on memory consumption and training throughput. In this section, we describe \tool by first discussing our cost models for the two components, followed by the evaluation of \tool's prediction accuracy.
+
+% To create an accurate performance model, we must first estimate the memory and execution cost. In this section, we describe cost models for predicting the peak memory consumption and training throughput under different batch sizes.
+
+\subsection{Performance Model}
+\label{sec:perf-model}
+As mentioned in Section~\ref{sec:eval-metric}, we use maximum throughput as the evaluation metric for MOMs. For MOM to speed up training, the maximum throughput of the MOM ($v_{mom}$) should be higher than that of the original training ($v_0$), which can be expressed as:
+\begin{equation}
+    \max(v_{mom}) \geq \max(v_0)
+\label{eq:perf_cond}
+\end{equation}
+Next, as training throughput is defined as the number of the records processed per second, it can be expressed as batch size divided by batch latency:
+\begin{equation}
+    v =  \frac{x}{t(x)}
+    \label{eq:tpt}
+\end{equation}
+Meanwhile, the peak memory consumption of both the original training and MOM cannot exceed the device limit $M$ when achieving the maximum throughput:
+\begin{align}    
+&\arg\max_x(v_0) = \arg\max_x \left\{\frac{x}{t_0(x)}\ \middle\vert\  m_0(x) \leq M\right\} \label{eq:mem-constraint}\\
+ &   \arg\max_x(v_{mom}) = \arg\max_x\left\{\frac{x}{t_{mom}(x)}\ \middle\vert\  m_{mom}(x) \leq M\right\} \nonumber
+\end{align}
+% \begin{equation}
+% \begin{aligned}
+%     argmax_x(v_0) = \frac{x}{t_0(x)},
+%     subject\:to: m_0(x) \leq M \\
+%     argmax_x(v_{mom}) = \frac{x}{t_{mom}(x)},
+%     subject\:to: m_{mom}(x) \leq M
+% \end{aligned}
+% \label{eq:mem-constraint}
+% \end{equation}
+To check if a MOM satisfies Inequality~\ref{eq:perf_cond} under the memory constraint, we need a good estimator for memory $m(x)$ and batch latency $t(x)$.
+
+\subsection{Memory Estimation}
+\label{sec:mem-est}
+Memory usage during training can be divided into two parts. The first part is the fixed memory consumption that is unrelated to batch size, which includes model parameters, optimizer states, and the framework overhead. The second part, such as activation and workspace memory, increases in proportion to batch size. As a result, a basic linear model, can be used to model the relationship between batch size and peak memory use:
+\begin{equation}
+    m(x) = \alpha x + \beta
+\end{equation}
+Here, the incremental memory cost of increasing batch size is represented by $\alpha$, and the fixed memory consumption is represented by $\beta$. Depending on the amount of memory saved, different MOMs have different $\alpha$'s. 
+If the incremental memory cost is $\alpha_0$ for the original and $\alpha_{mom}$ for the memory optimization approach, the incremental memory reduction is $\alpha_{0} - \alpha_{mom}$ for the given MOM, and a smaller $\alpha_{mom}$ indicates higher memory reduction.
+% On the other hand, once the model, framework, and hardware configurations are fixed, $\beta$ should be similar across the original and different memory saving strategies.
+
+
+\textbf{Memory model validation.} Figure~\ref{fig:cost_model_peak_mem} shows an example of our memory model fit to measured peak memory values for a range of models and batch sizes. Each deep learning task is implemented using PyTorch~\cite{Paszke_PyTorch_An_Imperative_2019} and the peak memory is calculated with the \texttt{max\_memory\_allocated} API during each iteration. 
+Overall, we find that our model matches the observed data of both the original training and multiple MOMs closely while varying the batch sizes on different models, with an $R$ score of over 0.97. 
+% \lily{TODO Additionally, for a given model, every training instance displays a comparable intercept, confirming that the fixed memory usage is comparable between MOMs and the initial training.}
+With one exception, the peak memory of DTR (gradient checkpointing in ResNet-50 and Wide-ResNet-50) is not adequately modeled using our linear model.
+%\zhuohan{Which line in Figure 7 represents DTR?} 
+This is because DTR uses a dynamic checkpointing method that evicts different activations under different batch sizes.
+% \phlip{, which are affected by the batch sizes.} 
+Since the batch size is the only parameter used in our linear model, it is assumed that the rematerialization approach is the same for all batch sizes. Therefore, the linear model cannot accurately fit the peak memory of DTR.
+% \alvin{i don't get how `it is assumed that the rematerialization approach is the same for all batch sizes' leads to non linearity; }\philip{ batch size affects mem constrainsts which change rematerialization approach in DTR}
+
+Lastly, due to memory fragmentation, there is a discrepancy between peak memory and device memory (16 GB) for both the original and MOMs. A large batch size means that a large chunk of contiguous memory is requested all at once, which increases the likelihood that memory fragmentation ultimately causes the out of memory error.
+Main memory capacity is another factor that contributes to the discrepancy between the peak and device memory for swapping. For instance, as the offloaded memory is too large to fit in main memory, applying swapping on ResNet-50 and Wide-ResNet-50 uses nearly all of main memory despite peak GPU memory usage is still very low (5.8G for ResNet-50 and 5.3G for Wide-ResNet-50).
+
+\subsection{Throughput Estimation}
+\label{sec:tpt-est}
+Similarly, we use a linear model for the relationship between batch size and training latency to train one batch:
+\begin{equation}
+\label{eq:batch-time}
+    t(x) = \gamma x + \delta
+\end{equation}
+
+Meanwhile, the incremental execution cost of increasing batch size is $\gamma$, while the fixed execution cost is $\delta$, which includes time spent on updating the weights, framework overhead, etc. If the incremental cost is $\gamma_0$ for the original and $\gamma_{ms}$ for the memory optimization approach, the incremental overhead is $\gamma_{ms} - \gamma_0$ for the given memory optimization strategy, and a smaller $\gamma_{ms}$ indicates lower overhead.
+
+We recognize that this may not be perfect as the execution latency is not a linear function of batch size when the GPU is underutilized. When the GPU is underutilized, increasing the batch size will increase GPU utilization instead of introducing more computation time, resulting in a sub-linear batch latency. However, as shown in Figure~\ref{fig:cost_model_btime}, such non-linearity only happens when the batch size is very small, which is not the regime of most of the experiments in the paper.
+
+
+\textbf{Batch latency model validation.} Figure~\ref{fig:cost_model_btime} shows the batch latency across different batch sizes for the original training on a variety of training tasks. % We also measure the GPU utilization in the time dimension, as the percentage of GPU busy time against total training time. We run the experiments on a single V100 GPU and check the GPU idleness every 0.2s.
+% As shown in Figure~\ref{fig:cost_model_btime}, 
+For transformer-based models, the batch latency displays non-linearity when the batch size is small. And after the batch size reaches a certain value (e.g., 16 for Bert-Large), the linear model fits the batch latency closely.
+% GPU utilization shows a similar pattern, where it increases dramatically at small batch size and reaches a plateau after a fixed point.
+% Additionally, the turning points of the utilization and the batch latency happen around the same batch size, which shows that the idle time of GPU (i.e., low utilization) causes the non-linearity.
+% and confirms the linearity for batch sizes beyond the turning point. 
+Furthermore, for all evaluated models, the batch latency establishes linearity at a small batch size. Thus, we only need to avoid a small under-utilized range of batch sizes when sampling to make the prediction of our performance model accurate and robust. 
+%\zhuohan{@Lily I removed all the discussion on GPU utilization here since we removed the gpu utilization line in figure 8}
+% In the big model training setting, GPU reaches the utilization plateau when batch size is small. 
+% Therefore, the non-linear part has little effect on the performance prediction and is even hard to observe.
+
+
+Next, we substitute $t(x)$ into Equation~\ref{eq:tpt} and get a simplified expression for throughput:
+\begin{equation}
+    v =  \frac{x}{\gamma x + \delta} = \frac{1}{\gamma + {\delta}/{x}}
+    \label{eq:simplified-tpt}
+\end{equation}
+% As shown in Figure~\ref{fig:org_ips} and Figure~\ref{fig:q_ips}, Equation~\ref{eq:simplified-tpt} fits the throughput accurately for both the original and quantization. 
+As shown in Equation~\ref{eq:simplified-tpt}, throughput is a monotonic function of batch size and a larger batch size leads to higher throughput. Moreover, the increased throughput comes from the reduction of amortized fixed execution cost ($\frac{\delta}{x}$) as we increase the batch size. If we take the derivative of Equation~\ref{eq:simplified-tpt}, we get:
+\begin{equation}
+    v' = \frac{\delta}{(\gamma x + \delta)^2}
+    \label{eq:tpt-deriv}
+\end{equation}
+Equation~\ref{eq:tpt-deriv} shows a diminishing return as batch size is increased, where the throughput growth rate decreases quadratically with the batch size. This also partially explains why all those MOMs discussed earlier fail to outperform the original throughput: the benefits of memory reduction (which is demonstrated by the increased batch size) wear off too quickly before they provide any throughput increase.

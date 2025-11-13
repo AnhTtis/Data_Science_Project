@@ -1,0 +1,234 @@
+\vspace{\vspacebeforesection}
+\section{Method}
+\vspace{\vspaceaftersection}
+
+\begin{figure*}[t!]
+\centering
+   \includegraphics[width=1.0\textwidth]{./figures/EFEM_method2_comp.png}
+   \\\vspace{-.7em}
+    \caption{
+    \textbf{Overview}: \textbf{Left top}: the single object SDF Encoder-Decoder (Sec.~\ref{sec:shape_prior}) is trained on the shape collection. Once trained, the network's weights are frozen.
+    \textbf{Top right} Single EM step on scene observations (Sec.~\ref{sec:single_alg}): given the last estimation of the object mask $W_{t-1}$, a set of points is sampled from the full scene point cloud and then passed to the shape encoder $\Phi$ to produce the current estimation of the shape embedding $\latent$. Based on the $\latent$, all the scene points are queried again through the decoder $\Psi$ to generate a new assignment mask $W_t$.
+    \textbf{Bottom} Object segmentation pipeline: starting from random crop initializations from the left, the above EM step is applied to each proposal (each row) in parallel to refine their masks. In the early steps (Phase-1 Sec.~\ref{sec:single_alg}), all the proposals run independently but in the second phase, multiple proposals can be jointly optimized (Sec.~\ref{sec:full_alg}). Note that we eliminate the duplicated (the second) or unreasonably sized (the fourth) proposals during optimization. Finally, the remaining proposals and their confidences are output. 
+    \vspace{-1em}
+    }
+    \label{fig:method}
+\end{figure*}
+
+Now we introduce our method for unsupervised object segmentation in 3D scenes.
+At the training stage, we learn an object-level shape prior (Sec.~\ref{sec:shape_prior}, Fig.~\ref{fig:method} top left) utilizing a collection of synthetic models from an object category (e.g. all chairs in ShapeNet~\cite{chang2015shapenet}).
+At inference time, we are given a scene point cloud $X_{N \times 6}$ of $N$ points with coordinates as well as normal vectors with an unknown number of novel instances from the object category, and our task is to predict their instance segmentation masks.
+We will introduce a simple and novel iterative algorithm for predicting instance segmentation masks,
+starting from a single-object proposal phase (Sec.~\ref{sec:single_alg}, Fig.~\ref{fig:method} top right) 
+and followed by a multiple-object joint proposal phase (Sec.~\ref{sec:full_alg}, Fig.~\ref{fig:method} bottom).
+As by-products, our model also outputs implicit surface reconstructions, poses, and bounding boxes.
+
+
+
+\vspace{\vspacebeforesection}
+\subsection{SIM(3) Equivariant Shape Priors}
+\label{sec:shape_prior}
+\vspace{\vspaceaftersection}
+Most synthetic datasets have their objects manually aligned to canonical poses and unit scales, yet the SIM(3) transformations (translations, rotations, and scales) must be considered when applying the shape priors to real-world scenes.
+To this end, we constructed a SIM(3)-equivariant SDF encoder-decoder following the paradigms of prior work~\cite{onet,deng2021vector} (Fig.~\ref{fig:method} left top).
+
+\paragraph{Point cloud encoder}
+Given an object point cloud $\pc_{N_O\times 3}$ with $N_O$ points, it is first encoded by a SIM(3)-equivariant encoder $\Phi$ (yellow block Fig.~\ref{fig:method} left) constructed with Vector Neurons (VN)~\cite{deng2021vector,assaad2022vn,chen2022equivariant} into a latent embedding $\latent = \Phi(P)$ (orange block Fig.~\ref{fig:method} middle).
+More concretely, the input point cloud $\pc$ is first subtracted by its centroid $\pcCentroid$ for translation equivariance, followed by a backbone network providing a global vector-channeled embedding $F$, which is scale- and rotation-equivariant and translation invariant. 
+$F$ is then mapped to the shape implict code $\latent$ comprising four components $(\latentR, \latentinv, \latentcenter, \latentscale)$.
+The backbone network is a rotation-equivariant VN Point-Transformer~\cite{assaad2022vn} with additional scale equivariance enforced by channel-wise normalizations as in \cite{chen2022equivariant}. We denote the modified linear layer with scale invariance \cite{chen2022equivariant} as $\VNLN$.
+The four components of $\Theta$ are computed from $F$ with four heads separately:
+\begin{enumerate} %[topsep=0pt,itemsep=-1ex]
+    \itemsep0em 
+    \item A vector-channeled rotation equivariant latent code $\latentR=\VNLN_R(F)$.
+    \item A scalar-channeled invariant latent code $\latentinv=\langle \VNLN_I(F), \latentR \rangle$ computed with inner product.
+    \item A scalar $\latentscale$ by taking the average of $F$'s per-channel norm which explicitly encodes the object scale.
+    \item A centroid correction vector predicting the offset between the centroid of points and the actual object center, which could be different due to the partiality and noises of the point could: $\latentcenter=\VNL_C(F) + \pcCentroid$, where $\VNL_C$ has $1$ output vector channel.
+\end{enumerate}
+Network architecture details can be found in the supplementary.
+For any transformation $g=(s,R,t) \in \mathrm{SIM}(3)$ with scale $s$, rotation $R$, and translation $t$, its action on $\latent$ and the equivariance of the encoder $\Phi$ can be written as:
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    g \circ \latent = 
+    (\latentR R, \latentinv, s\latentcenter R+t, s \latentscale)
+    = \Phi(s P R + t).
+    \vspace{\vspaceafterequation}
+\end{equation}
+
+\paragraph{SDF decoder}
+Give a query position $x \in \mathbb{R}^3$, its SDF value $\hat{v}(x)$ is predicted as
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    \hat{v}(x) = \Psi(x; \latent) =\Psi(\latentinv, \langle \latentR, \Tilde{x}\rangle),
+    \vspace{\vspaceafterequation}
+\end{equation}
+where $\Tilde{x}=(x-\latentcenter)/\latentscale$ is the canonicalized coordinate of $x$ with center $\latentcenter$ and scale $\latentscale$, and $\Psi$ is an MLP as in \cite{deng2021vector} that decodes the concatenation of the invariant feature $\latentinv$ and the channel-wise inner product between $\latentR$ and $\Tilde{x}$.
+
+\paragraph{Training}
+The implicit shape prior is trained with the standard L2 loss for the query points sampled around each object. 
+To avoid arbitrary prediction of $\latentcenter$ and $\latentscale$ that may make training unstable in early epochs, we regularize $\latentcenter$ to stay around zero and $\latentscale$ to stay around one.
+To help the network's generalization to real-world scenarios with partial observations, clutters, and sensor noises, we further augment the input object point clouds with partial depths and content-wise augmentations. 
+Additional details of these augmentations are provided in the supplementary. 
+We will next introduce how to exploit this learned shape-prior network which only takes instance-level inputs in scene-level point cloud segmentation.
+
+\subsection{Iterative Algorithm for Single Proposal}
+\label{sec:single_alg}
+\begin{algorithm}[H]
+ \KwData{ Scene Point Cloud $X_{N\times 6}$; trained encoder $\Phi$ and decoder $\Psi$ with frozen weight}
+ Initialize $W_0$\;
+ 
+ \While{not reach max step}{
+  
+  M-step: Sample $P_t$ by Eq.~\ref{eq:sample} from $W_{t-1}$ and forward encoder $\Phi$ to update $\latent_t$. \;
+  
+  E-step: Evaluate decoder $\Psi$ and update $W_t$ by Eq.~\ref{eq:w_update}.
+ }
+
+ Extract mesh and compute absolute pose as a byproduct.
+ 
+ Compute confidence $C$ in Eq.~\ref{eq:confidence} and output mask.
+  
+ \caption{Single Proposal Estimation}
+ \label{alg:single}
+\end{algorithm}
+
+
+As shown in Fig~\ref{fig:method}, the key component of our full algorithm is the single proposal processing (right top) since the full algorithm is constructed by many single proposals being processed in parallel.
+Each proposal is represented by a soft assignment mask $W$ over all scene points, where the continuous value on each point $W[i]\in [0,1]$ indicates how likely this point belongs to the object that the proposal is representing.
+In the early single proposal iteration steps (Phase-1), each proposal aims to fit its $W$ to one object independently. In later iterations, we optimize the proposals jointly, as discussed in Section~\ref{sec:full_alg}.
+
+
+
+
+
+\paragraph{Initialization}
+The single proposal algorithm starts from the initial assignment $W_0$ which is drawn from a random ball or cylinder cropping of the scene. The radius of the crop is set to be similar to the average size of the target class. All points inside the crop are set to have $W[i]=1.0$ while all other points are set to have $W[i]=0.0$. 
+
+
+
+
+
+\paragraph{M-Step: Estimating shape embeddings}
+We treat the learned decoder with fixed weight as a parametric model of shape categories driven by the parameter $\latent$.
+In each iteration of our algorithm, a new $\latent_t$ is estimated from the last assignment $W_{t-1}$.
+Note that the learned shape prior encoder $\Phi$ only accepts a fixed number $N_O$ of points as input, which is always far less than the number of points in the scene observation. Therefore at each iteration, we first sample a fixed number $N_O$ of points from the scene point cloud $X_{N\times 6}$ based on the last assignment estimation $W_{t-1}$
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    P_{t} = \mathcal M(W_{t-1}, X_{N\times 6}), \label{eq:sample}
+    \vspace{\vspaceafterequation}
+\end{equation}
+where the sampling operations $\mathcal M$ contain two steps. 
+First, a sample is drawn from a Bernoulli distribution with positive probability $W_{t-1}[i]$ to determine if the point $X[i]$ belongs to the object's foreground.
+Second, for all points that are marked as foreground, we globally apply multinomial sampling based on their $W[i]$ to find $N_O$ sampled points. 
+Finally, we produce the new shape estimation by passing the sampled point cloud through $\Phi$ so $\latent_t=\Phi(P_t)$. 
+This method of updating the shape parameter can be interpreted as the M-step of an EM algorithm, which computes better distribution parameters based on the last assignment via weighted maximum likelihood. 
+
+\paragraph{Fitting error}
+Given the $\latent$ estimation, the fitting error of one observed point $\mathbf{x}=[x_\text{obs}, n_\text{obs}]$ ($x_\text{obs}$ denotes position and $n_\text{obs}$ denotes normal) in the scene point cloud $X_{N\times 6}$ is:
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    e_{D}(\mathbf{x}, \latent) = |\Psi(x_\text{obs}; \latent)|
+    \label{eq:error_dist}
+    \vspace{\vspaceafterequation}
+\end{equation}
+\vspace{-1em}
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    e_{N}(\mathbf{x}, \latent) = \text{acos} \left( \frac{n_\text{obs}^T \nabla_x \Psi(x_\text{obs}; \latent)}{\|\nabla_x \Psi(x_\text{obs}; \latent)\|} \right)
+    \label{eq:error_normal}
+    \vspace{\vspaceafterequation}
+\end{equation}
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    E(\mathbf{x}, \latent) = \alpha_D e_{D}(\mathbf{x}, \latent) + \alpha_N e_{N}(\mathbf{x}, \latent)
+    \label{eq:error}
+\end{equation}
+which measures the observed point distance to the zero level set of the SDF and the normal consistency between the observed point and the decoded SDF gradient. 
+The hyperparameters $\alpha_D$ and $\alpha_N$ control the importance of the distance and angle terms respectively.
+
+\paragraph{E-Step: Updating point assignments}
+After updating the shape parameters $\latent_t$, we update the assignment weight $W_t$ by querying the decoder $\Psi$ for all the points in the scene point cloud $X$ and computing the error in Eq.~\ref{eq:error}. The new assignment is designed to be updated as:
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    W_t[i] = \frac{e^{-E(X[i], \latent_t)}}{e^{-E(X[i], \latent_t)} + \Omega},\label{eq:w_update}
+    \vspace{\vspaceafterequation}
+\end{equation}
+where $\Omega$ is a constant hyperparameter that gives every point some probability to be in the background. This step can be interpreted as the E-step in an EM algorithm.
+
+\paragraph{Termination and confidence score}
+When the initialization is not near an object instance of the target class, the shape prior tends to never fit the input observations, so that the error $E$ is large everywhere and the weight $W$ is always small. 
+We terminate the proposals that have less than a predefined threshold of small-error points at each iteration.
+After the last iteration, we use Marching Cubes to extract a mesh $(\mathcal{V}, \mathcal{E})$ for each proposal and the mesh serves as the byproduct of our method. 
+Our algorithm also produces a pose estimation with respect to the training shape collection via Procrustes registration~\cite{zhu2022correspondence} on $\latent_{SO3}$ between the observed objects and the member of the training set with the most similar $\latent$ (see Supp.).  
+We also remove proposals with meshes outside a predefined reasonable range of scales.
+
+One advantage of utilizing our shape prior is that we can explicitly compute the confidence score from the shape reconstruction.
+Specifically, we compute two scores by measuring the fitting errors: 
+(1.) \textbf{Observation fitting score}: a good fitting should have all the encoder input points located on the decoded SDF zero level set. 
+We measure the proportion of the encoder input point cloud which has a small distance and angle error:
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    S_1 = \frac{1}{N_O} \left|\left\{\mathbf{x}\in P_T
+    \left| \begin{array}{c}
+         e_{D}(\mathbf{x}, \latent)<\delta_D,  \\
+         e_{N}(\mathbf{x}, \latent) < \delta_N 
+    \end{array} \right.
+    \right\}\right|,
+    \label{eq:fitting_score}
+    \vspace{\vspaceafterequation}
+\end{equation}
+where the $\delta_D,\delta_N$ are the thresholds.
+(2.) \textbf{Reconstruction coverage score}: 
+Since we recognize objects by their shapes, we should be less confident in detections where the observed points only cover a small portion of the extracted mesh.
+For every vertex $\mathbf{v}=[x_\text{recon}, n_\text{recon}]$ from the extracted mesh, 
+we find its nearest neighbour $\mathbf{x}=[x_\text{obs}, n_\text{obs}]$ in the observed scene point cloud $X_{N\times 6}$ and measure their distance error as $e'_{D}(\mathbf{v})=\|x_\text{obs}-x_\text{recon}\|_2$ and their orientation error as $e'_{N}(\mathbf{v})=\text{acos}(n_\text{obs}^Tn_\text{recon})$. This gives a combined coverage score of:
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    S_2 = \frac{1}{|\mathcal{V}|} \left|\left\{
+    \mathbf{v}\in \mathcal{V} | e'_{D}(\mathbf{v})<\delta_D, e'_{N}(\mathbf{v}) < \delta_N
+    \right\}\right|.
+    \label{eq:coverage_score}
+    \vspace{\vspaceafterequation}
+\end{equation}
+We use $S_1$ as the main confidence measurement and $S_2$ for avoiding poorly observed cases, so the final confidence score $C$ is:
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    C = S_1 * \max(1.0, S_2 / \delta_C),
+    \label{eq:confidence}
+    \vspace{\vspaceafterequation}
+\end{equation}
+where $\delta_C\in [0.0,1.0]$ is a threshold controlling the importance of the coverage score.
+Note how the above confidence values evaluate the quality of the output shown on the right in Fig.~\ref{fig:method}, which enables the user to select the balance between recall and precision during inference.
+
+Finally, for each point in the scene point cloud $X_{N\times 6}$, we check whether the distance error in Eq.~\ref{eq:error_dist} and Eq.~\ref{eq:error_normal} is smaller than the output threshold
+and mark points with small errors as in the foreground. Note that since the observation is noisy and the learned shape prior is not perfect, the output error thresholds can be larger than the ones used in Eq.~\ref{eq:fitting_score} and Eq.\ref{eq:coverage_score}.
+
+
+
+
+
+
+
+
+\subsection{Multiple Proposals}
+\label{sec:full_alg}
+Since the EM algorithm outputs can be affected by its initialization and we do not know the number of objects in the scene,
+we initialize a large number of proposals randomly spread across the entire scene to cover all possible objects.
+We observe that many proposals will quickly converge to similar positions during the early iterations. Therefore, at each iteration, we remove duplicated proposals and only keep the one with the highest fitting score $S_1$ defined in Eq.~\ref{eq:fitting_score}.
+Duplication is determined by computing the overlap of $W$ between different proposals (see Supp. for details). 
+
+As shown in Fig.~\ref{fig:method}, we further divide the iterations into two phases. 
+In the first phase, since the early shape estimation is not converged to a reasonable place, we let each proposal run fully independently.
+When we enter the second phase, mesh extraction and pose estimation will be first applied to remove proposals with unreasonable scales. Then, we optimize all proposals globally by updating the joint assignment weight with:
+\begin{equation}
+    \vspace{\vspacebeforeequation}
+    \vspace{\vspacebeforeequation}
+    W^{(k)}_t[i] = \frac{S_1^{(k)}e^{-E(X[i], \latent^{(k)}_t)}}{\sum_{j}S_1^{(j)}e^{-E(X[i], \latent^{(j)}_t)} + \Omega},\label{eq:w_update_joint}
+    \vspace{\vspaceafterequation}
+    \vspace{\vspaceafterequation}
+\end{equation}
+where $k$ is the index of current active proposals and $S_1^{(k)}$ is the current fitting score in Eq.~\ref{eq:fitting_score}, which increases the assignment weight for more confident proposals.
+During the last iterations in Phase-2, we also remove the proposals that are largely contained by other proposals to simplify the decomposition of the scene, following a similar methodology to duplication removal. 
+Additional details of this process are available in the supplemental.
+
+

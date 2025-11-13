@@ -1,0 +1,282 @@
+\section{Efficient and safe space-sharing}
+\label{sec:space-sharing}
+The goal of \sysname is to guarantee the performance and safety of online workloads, and improve the efficiency of offline workloads.
+In this section, we introduce how to provide efficient and safe space-sharing in each local executor.
+We first describe how we protect the performance of online workloads with a two-level protection mechanism.
+Then we introduce how we protect the safety of online workloads with a mixed error-handling mechanism.
+We end with the dynamic SM allocation mechanism for offline efficiency improvement.
+
+\subsection{Two-level performance protection}
+\begin{figure*}[t!]
+	\subfigure[\bytecuda]{
+        \begin{minipage}{0.6\linewidth}
+        \centerline{\includegraphics[width=0.9\linewidth]{figures/Design_bytecuda.pdf}}
+        % \vspace{-0.1in}
+        \label{fig:design_bytecuda}
+        \end{minipage}
+    }
+	\subfigure[The state machine of \sysprobe]{
+    \begin{minipage}{0.3\linewidth}
+        \centerline{\includegraphics[width=\linewidth]{figures/Design_sysprobe.pdf}}
+        % \vspace{-0.1in}
+        \label{fig:design_sysprobe}
+     \end{minipage}}
+     \vspace{-0.2in}
+     \caption{Two-level performance protection for online workloads. \bytecuda and \sysprobe protect the performance of online workloads from workload level and GPU level, respectively.}
+     \vspace{-0.1in}
+    \label{fig:design_two-level}
+\end{figure*}
+
+MPS provides an environment variable to control the SM percentage used by a workload.\footnote{$CUDA\_MPS\_ACTIVE\_THREAD\_PERCENTAGE$ configures the active thread percentage at the client process level and limits the SM percentage used by the client process.} 
+We can roughly limit the offline workload with this environment variable and reduce the slowdown of online workloads indirectly.
+However, in production clusters, we need rigorous protection mechanisms for online workloads.
+\sysname employs a two-level protection mechanism as shown in Figure~\ref{fig:design_two-level}.
+Specifically, \sysname controls offline workloads to protect online workloads at the workload level by \bytecuda and the GPU level by \sysprobe.
+
+First of all, we need GPU metrics to make decisions on how to control the offline workloads.
+In the local executor, the GPU monitor collects real-time GPU metrics periodically.
+The collection interval is in the millisecond level for timely control.
+The metrics include GPU resource utilization (e.g., GPU utilization, SM activity, and GPU memory usage), and GPU device status (e.g., SM clocks, power, and temperature).
+The GPU monitor stores the metrics for only several minutes because old data not only consume storage but also are useless for timely workload management.
+
+\parabf{Workload level.} 
+\bytecuda is built in the offline container to control the GPU memory and computing power used by offline workloads, as shown in Figure~\ref{fig:design_bytecuda}.
+In the aspect of memory, \bytecuda can keep track of the GPU memory usage and make sure that the memory used by the offline workload does not exceed the GPU memory quota.
+Specifically, whenever the DL framework, e.g., TensorFlow~\cite{abadi2016tensorflow} and PyTorch~\cite{paszke2019pytorch}, applies for GPU memory by calling the related CUDA API, the call will be checked by \bytecuda first.
+
+In terms of computing power, we aim to guarantee the performance of online workloads and improve GPU computing utilization.
+\revise{
+For NVIDIA GPUs, the SM clock represents how fast the SMs execute instructions.
+The performance of online workloads is greatly affected by the SM clock, and the SM clock will decrease when the GPU load is high.
+The decrease in SM clock is especially noteworthy for NVIDIA GPU for inference, e.g., T4.
+}
+Thus, our goal is equivalent to attaining both high SM clock and high GPU utilization.
+When the SM clock is low, we can delay the kernel launches of the offline workloads to reduce the GPU load and improve the SM clock.
+When the GPU utilization is low, we can launch more kernels to improve it.
+Formally, we define $U_{SM}$ as the SM activity and $a_C$ as a clock factor that is negatively correlated with the SM clock.
+We use the GPU load $U_{GPU}$ to quantify our goal, which can be calculated by,
+\begin{equation}
+\label{equ:gpu_load}
+U_{GPU} = U_{SM} \times a_C .
+\end{equation}
+
+\revise{
+However, the SM clock and GPU utilization are conflicting in practice because the SM clock is negatively correlated to the GPU load, while the GPU utilization is positively correlated to the GPU load.
+Note that when sharing online and offline workloads, it is enough to get an SM clock which is similar to the SM clock when the online workload runs separately.
+Consequently, \bytecuda sets an SM clock threshold for these two goals.
+When the SM clock is below the threshold, \bytecuda tends to improve the SM clock.
+When the SM clock is over the threshold, \bytecuda tends to improve the GPU utilization.
+The factor $a_C$ can be calculated by,
+}
+\begin{equation}
+a_C =
+\begin{cases}
+1 + a_L*\frac{T_{SM}-C_{SM}}{T_{SM}} & C_{SM} < T_{SM} \\ 
+1 - a_H*\frac{C_{SM}-T_{SM}}{C_{H}-T_{SM}} & C_{SM} \ge T_{SM} ,
+\end{cases}
+\label{equ:clock_factor}
+\end{equation}
+where $a_L$ is a parameter for low SM clock, $a_H$ is a parameter for high SM clock, $C_{SM}$ is the SM clock, $T_{SM}$ is a SM clock threshold, and $C_{H}$ is the highest SM clock.
+\revise{
+$a_L$ is much larger than $a_H$ to show the preference of increasing the SM clock when it is below the threshold.
+}
+With the GPU load $U_{GPU}$, \bytecuda will delay the kernel when $U_{GPU}$ is high and launch the kernel when $U_{GPU}$ is low.
+% We can adjust the parameters to control how much the online workloads slow down.
+Additionally, as the GPU load $U_{GPU}$ may change rapidly, \bytecuda leverages the PID algorithm~\cite{johnson2005pid} to provide more stable and robust controlling.
+
+\parabf{GPU level.}
+\bytecuda constrains offline workloads and provides indirect performance protection for online workloads.
+However, it cannot reply to changes caused by online workloads in time.
+For example, when the GPU memory usage of the online workload bursts, \bytecuda cannot dynamically adjust the GPU memory quota for offline workloads.
+Thus, at the GPU level, \sysname uses \sysprobe to monitor the GPU device status with a state machine.
+Figure~\ref{fig:design_sysprobe} shows the state machine of \sysprobe.
+The state machine has five states and each state has a set of metric thresholds for GPU utilization, SM activity, SM clock, and GPU memory usage.
+The threshold values are empirically selected.
+\revise{
+Note that offline workloads can only be scheduled to \textit{Healthy} GPUs.
+}
+
+The five states of \sysprobe are as follows:
+(1) \textit{Init state} represents that the GPU is being initialized. When the initialization finishes, the Init state will transit to the Healthy state.
+(2)\textit{Healthy state} represents that the GPU is healthy and is able to execute offline workloads. 
+The metric thresholds of this state guarantee that the online workload is not influenced by the offline workloads.
+Once one metric reaches the Unhealthy threshold, the state will transit to the Unhealthy state.
+Furthermore, once one metric exceeds the Overlimit threshold, the state will directly transit to the Overlimit state.
+(3)\textit{Unhealthy state} represents that one GPU metric is in the Unhealthy state and none is in the Overlimit state.
+Intuitively, this state means that the online workloads may be influenced.
+The offline workloads are forbidden to be scheduled to the GPU in this state.
+Once one metric exceeds the Overlimit threshold, the state will transit to the Overlimit state.
+Oppositely, if all metrics are below the Healthy threshold, the state will transit to the Healthy state.
+(4) \textit{Overlimit state} represents that the GPU device is overloaded.
+In this state, the offline workloads are evicted.
+When all metrics are below the Overlimit threshold after a period, the state will transit to the Unhealthy state.
+To avoid frequent eviction, the period is set to be the exponent of the times going into the Overlimit state during the last two hours.
+(5)\textit{Disabled state} represents that the GPU device is unavailable and no workload runs on it.
+
+\begin{figure}[t]
+        \centerline{\includegraphics[width=\linewidth]{figures/Design_error.pdf}}
+        \vspace{-0.15in}
+        \caption{Propagated errors in a production cluster.}
+        \vspace{-0.1in}
+        \label{fig:design_error}
+\end{figure}
+
+\subsection{Safety protection}
+% \todo{elaborate}
+MPS has a serious error propagation problem, i.e., one workload's error may impact other workloads sharing the same GPU.
+The error propagation problem is dangerous in large-scale clusters, especially for online workloads.
+For example, if one offline workload is canceled by SIGINT signal, the MPS context may hang and the shared online workload cannot serve requests.
+We summarize propagated errors in one production cluster with MPS enabled as shown in Figure~\ref{fig:design_error}, and propose a mixed error-handling mechanism.
+
+We find that $99\%$ of such propagated errors are caused by SIGINT/SIGTERM.
+To handle the dominant error type, we use \bytecuda to intercept SIGINT and SIGTERM signals and exit gracefully.
+Specifically, when \bytecuda gets these signals, it will freeze all kernel launches and release CUDA context actively.
+Other errors only count to $1\%$, e.g., MPS server crash (caused by program bugs), XID31 event (GPU memory page fault), and MPS hangs caused by other reasons.
+For these errors, we summarize their error patterns.
+An automated detector monitors GPUs and alerts when the error patterns are satisfied.
+Once \bytecuda gets the alert, it will reset the CUDA context and MPS server.
+
+\begin{figure*}[t]
+	\subfigure[Online workloads only]{
+        \begin{minipage}{0.3\linewidth}
+        \centerline{\includegraphics[width=0.75\linewidth]{figures/Design_dynamic_sm_0.pdf}}
+        % \vspace{-0.1in}
+        \label{fig:design_dynamic_sm_0}
+        \end{minipage}
+    }
+	\subfigure[Sharing with fixed SM percentage]{
+        \begin{minipage}{0.3\linewidth}
+        \centerline{\includegraphics[width=0.9\linewidth]{figures/Design_dynamic_sm_1.pdf}}
+        % \vspace{-0.1in}
+        \label{fig:design_dynamic_sm_1}
+        \end{minipage}
+    }
+	\subfigure[Sharing with dynamic SM percentage]{
+        \begin{minipage}{0.3\linewidth}
+        \centerline{\includegraphics[width=0.9\linewidth]{figures/Design_dynamic_sm_2.pdf}}
+        % \vspace{-0.1in}
+        \label{fig:design_dynamic_sm_2}
+        \end{minipage}
+    }
+     \vspace{-0.15in}
+     \caption{Dynamic SM allocation. A and B are two online workloads. C and D are two offline workloads. (b) The SM percentages for offline workloads are fixed at $40\%$. (c) The SM percentages for offline workloads are dynamically adjusted. }
+     \vspace{-0.1in}
+    \label{fig:design_dynamic_sm}
+\end{figure*}
+
+\subsection{Dynamic SM allocation}
+In Figure~\ref{fig:motiv_cmatp}, we illustrate that the SM percentage assigned to offline workloads can influence the speed of shared workloads dramatically.
+In other words, we can balance the speed of the online workload and that of the offline workload by changing the SM allocation.
+Our goal is to maximize the efficiency of offline workloads with an acceptable slowdown of the online workloads.
+As SM is the computing unit of GPU, maximizing the efficiency of offline workloads is approximately equal to maximizing the percentage of SMs assigned to offline workloads.
+Apparently, fixed SM allocation is not a panacea for all sharing cases.
+We use the example in Figure~\ref{fig:design_dynamic_sm} to illustrate the drawbacks of fixed SM allocation.
+A and B are online workloads, and C and D are offline workloads.
+Assume that the SM percentage is set to $40\%$ for offline workloads.
+The online workload A only uses $20\%$ SMs and leaves more than $40\%$ SMs.
+If we fix the SM percentage for offline workloads to $40\%$, there will be $40\%$ idle SM and the computing power is wasted.
+The online workload B uses $80\%$ SMs when running alone and the left SMs are less $40\%$.
+With the fixed SM allocation, the offline workload D will occupy B's SM and slow the online workload B down.
+
+To provide efficient space-sharing, we propose the dynamic SM allocation mechanism by selecting the proper SM percentage for offline workloads.
+A natural idea is to assign the SM percentage according to the SM activity of online workloads, as shown in Figure~\ref{fig:design_dynamic_sm_2}.
+For example, we can set the SM percentage for the offline workload C to $80\%$ and D to $20\%$.
+In this way, the computing units, i.e., SMs, are used up and the shared workloads do not contend for SMs.
+
+
+\begin{figure}[t]
+        \centerline{\includegraphics[width=\linewidth]{figures/Design_matching.pdf}}
+        \vspace{-0.1in}
+        \caption{Scheduling plans are computed with maximum weighted bipartite matching. The edge weights represent the normalized throughput of offline workloads. }
+        \vspace{-0.1in}
+        \label{fig:design_matching}
+\end{figure}
+
+\section{Matching-based scheduling}
+\label{sec:schedule}
+
+Note that one offline workload has diverse throughput when sharing with different online workloads.
+We next consider scheduling submitted workloads to achieve high overall throughput for offline workloads.
+The method of scheduling and deploying online workloads is orthogonal to the scheduling algorithm of offline workloads.
+For online workloads, we reuse the scheduling and deployment strategy of the exclusive inference cluster at \company.
+The details of the strategy are beyond the scope of this paper.
+For offline workloads, the scheduling algorithm needs to solve two problems.
+
+The first problem is to capture the overall throughput for all offline workloads.
+It is unfair and meaningless to simply sum up the throughput of every offline workload because different kinds of workloads vary in throughput when running separately.
+Thus, we use the normalized throughput, which is defined as the throughput when sharing divided by the throughput when running separately.
+We can get the throughput of separate execution by profiling the offline workloads when it is submitted.
+However, the shared throughput is difficult to get because a production cluster usually has thousands of online workloads and it is impossible to profile all sharing pairs.
+Fortunately, getting the shared throughput can be seen as a regression problem, which can be solved by DL.
+We can use the profiled separate execution features of online and offline workloads as input, and employ a DL model to get shared throughput.
+Specifically, we choose highly related execution features, e.g., GPU utilization, SM activity, SM occupancy, separate execution time, and assigned SM percentage, as input.
+We employ the multi-layer perceptron (MLP) as the speed predictor to get the shared throughput.
+Because different GPU types perform diversely, we train multiple MLPs for each GPU type.
+
+The second problem is to select the best sharing plan from all potential sharing plans.
+For a production cluster with thousands of online and offline workloads, there is an enormous number of combinations to share workloads.
+Formally, given $n$ online workloads and $m$ offline workloads, we pair the workloads to maximize the normalized throughput of the entire sharing plan.
+This problem can be transformed to a maximum weighted bipartite matching problem.
+Figure~\ref{fig:design_matching} shows how we model this problem.
+We build a bipartite graph $G(V, E)$, where each node $v\in V$ represents a workload.
+Every node belongs to one of the two node sets, i.e., the online workload set and the offline workload set.
+The edge $(u,v)\in E$ represents sharing online workload $u$ and offline workload $v$ with the normalized throughput of $v$ as the edge weight.
+A matching of $G$ is a set of disjoint edges and it corresponds to a feasible sharing plan.
+Finding the sharing plan with maximum overall throughput is converted to finding the maximum weighted matching of the corresponding bipartite graph.
+We leverage the Kuhn-Munkres (KM) algorithm~\cite{kuhn1955hungarian,munkres1957algorithms} for this well-studied problem.
+The KM algorithm can find the optimal maximum weighted bipartite matching in $O(|V|^3)$.
+
+\revise{
+We use an example in Figure~\ref{fig:design_matching} to illustrate the matching problem.
+There are two online workloads (A and B) and three offline workloads (C, D, and E).
+The number on the edge represents the normalized throughput of the offline workload when sharing with the online workload.
+For example, when sharing C with A, the normalized throughput of C is $0.3$.
+We compare two matching plans.
+Plan 1 shares A with D and B with C.
+The overall throughput of offline workloads is $0.8+0.8=1.6$.
+Plan 2 shares A with C and B with E.
+The overall throughput of offline workloads is $0.3+0.4=0.7$.
+Apparently, plan 1 has higher overall throughput and is more efficient in the efficiency of offline workloads.
+}
+
+Algorithm~\ref{alg:scheduling} shows the pseudocode of the matching-based scheduling.
+Given online workloads $W_{on}$ and offline workloads $W_{off}$, we initialize the bipartite graph $G$ where online workloads $W_{on}$ and offline workloads $W_{off}$ are two disjoint sets of $G$ (Line 1-4).
+For each pair of nodes, we get the SM percentage for the offline workload by dynamic SM allocation mechanism (Line 5-6).
+The edge weights are calculated by the speed predictor $P$ (Line 7-8).
+Then we get the maximum weighted bipartite matching $M$ by the KM algorithm (Line 9-10).
+Edge $(u,v)$ in matching $M$ represents that the offline workload $v$ should be shared with the online workload $u$.
+
+
+\begin{algorithm}[t]
+\caption{Scheduling algorithm of \sysname}
+\begin{algorithmic}[1]
+\begin{small}
+\Statex \textbf{Input:} Online workloads $W_{on}$; offline workloads $W_{off}$; speed predictor $P$.
+
+\Statex \textbf{Main routine:}
+\begin{algorithmic}[1]
+    \State \textbf{// Initialize}
+    \State $G.Init()$
+    \State $G.AddNodes(W_{on})$
+    \State $G.AddNodes(W_{off})$
+    \For{each pair $(u,v)$, where $u\in W_{on}, v\in W_{off}$}
+        \State $sm \gets DynamicSM(u,v)$
+        \State $weight \gets P.CalcNormTput(u, v, sm)$
+        \State $G.AddEdge(u,v,weight)$
+    \EndFor
+    \State \textbf{// Find optimal matching with the KM algorithm}
+    \State $M \gets G.GetMatching()$
+\end{algorithmic}
+
+\Statex \textbf{Subroutines:}
+\Statex \textbullet~$G.Init()$: Initialize an empty bipartite graph.
+\Statex \textbullet~$G.AddNodes(W)$: Add every workload $w\in W$ as a node to graph $G$.
+\Statex \textbullet~$G.AddEdge(u,v,c)$: Add an edge $(u,v)$ with edge weight $c$ to graph $G$.
+\Statex \textbullet~$G.GetMatching()$: Calculate the maximum weighted bipartite matching of graph $G$ by the KM algorithm.
+\Statex \textbullet~$DynamicSM(u,v)$: Use dynamic SM allocation mechanism to get the proper SM percentage for offline workload $v$.
+\Statex \textbullet~$P.CalcNormTput(u,v,sm)$: Calculate the normalized throughput of $v$ by the speed predictor $P$.
+
+\end{small}
+\end{algorithmic}
+\label{alg:scheduling}
+\end{algorithm}

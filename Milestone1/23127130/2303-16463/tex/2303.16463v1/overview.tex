@@ -1,0 +1,472 @@
+\section{Threat model} 
+
+We assume that an attacker has physical access to the machine and
+unrestricted privileges on the software and firmware executing on the 
+host machine, i.e., firmware, hypervisor and virtualization stack, and 
+the host operating system. 
+%
+However, the memory of the confidential VM is protected by the AMD SEV 
+technology, i.e., encrypted with a key only known to the AMD secure processor~(AMD-SP).
+%
+We trust the AMD hardware and the implementation of \snp{} and \svsm{}.
+%
+
+Ciphertext side channel attacks~\cite{sev-attack:cipherleaks,
+sev-attack:cipherleaks-2} on the \sev{} encrypted VM (by building a
+dictionary of plaintext-ciphertext pairs) are out of scope.
+%
+Attacks against the integrity measurement architecture~(IMA) such as
+TOCTOU~\cite{ima:subverting-ima}, other measurement gaps such as code
+injected by extended berkeley packet filter~(eBPF) are out of scope.
+%
+Also, runtime attacks exploiting stack or heap overflows such as
+return-oriented programming on the guest VM are out of scope as IMA
+measures only the persistent files.
+
+\begin{figure}
+  \centering
+  \includegraphics[scale=0.65]{figures/arch.pdf}
+  \caption{\svtpm{} architecture and its components}
+  \label{fig:arch}
+  \vspace{-4mm}
+\end{figure}
+
+
+
+\section{TPM virtualization with \svsm{}}
+\svtpm{} is a secure virtual \tpm{} designed to enable remote attestation and
+runtime integrity measurement in a provider-controlled confidential computing
+environment backed by an AMD SEV hardware. 
+%
+Specifically, we do not trust any software on the host machine. 
+%
+To achieve strong isolation from the host, we leverage unique capabilities of
+AMD SEV environment and execute a virtual TPM instance along with the guest
+system inside a hardware-protected TEE enclave (\autoref{fig:arch}).
+%
+The entire \snp{} \cvm{} memory is encrypted by the AMD-SP.
+%
+\svtpm{} runs inside the VM privilege level 0 (\vmpl{0}), which allows us to both isolate
+it from the rest of the guest system and provide secure communication between
+the guest and the TPM. 
+%
+Specifically, we load a minimal baremetal execution environment in VMPL0 when a
+new confidential VM is created.
+%
+Finally, we completely eliminate the burden of TPM state management such as
+preserving the state, injecting it to the correct \cvm{} during boot-up,
+and also prevent a whole class of attacks based on exfiltration of the TPM
+state with a novel idea of an ephemeral TPM -- our TPM instances have no
+persistent to save or guard against.
+
+\subsection{Isolation}
+
+As \vtpm{} offers a virtual root-of-trust for the virtual machine, it has to be
+hosted in an environment that provides strong isolation of its state and is 
+designed to minimize the attack surface for a potential attacker.
+%
+Arguably, two design flaws undermine the security of existing \vtpm{}s to
+be used in a confidential computing environment.
+
+First, until recently, the cloud provider was a de facto part of the trust
+domain.
+%
+\vtpm{}s were often managed and implemented as a
+component inside the hypervisor~\cite{vtpm:berger} or as a part of the
+virtualization stack~\cite{vtpm:xen-doma, vtpm:xen-domb, vtpm:xen-libos}.
+%
+To reduce the attack surface on the component hosting the \vtpm{}, several
+alternative \vtpm{} architectures were proposed. 
+%
+Triglav \vtpm{} utilized dynamic root of trust~(DRTM) as a mechanism to ensure
+the integrity of the hypervisor~\cite{triglav}. 
+%
+Another \vtpm{} solution utilized x86 system management mode~(SMM) for
+isolation and protection of the TPM~\cite{vtpm:smm}.
+%
+Though such designs offer some form of protection against a non-malicious
+cloud environment, they do not satisfy the requirements of confidential
+computing where the entire host environment is untrusted.
+%
+Recent TEE-based \vtpm{}s run the \vtpm{} manager and several instances in
+a hardware isolated TEE such as SGX~\cite{eTPM, svtpm, vtpm-for-cloud}, AMD
+SEV \cvm{}~\cite{cocotpm} or in ARM Trustzone~\cite{fTPM}.
+
+Second, historically, virtualization of TPM relied on a centralized
+architecture.
+%
+The core part of the \vtpm{}, a \vtpm{} manager, responsible for instantiating
+a TPM, multiplexing the communication between multiple VMs and \vtpm{}s, and
+saving the TPM state in a secure location was shared across all \vtpm{}
+instances~\cite{vtpm:berger, vtpm:xen-libos, vtpm:xen-doma, vtpm:xen-domb,
+cocotpm}.
+%
+As the manager handles the lifecycle of all \vtpm{}s on a machine and has
+access to the physical TPM hardware, it naturally becomes a central point for
+attack.
+%
+A malicious VM can launch attacks ranging from a simple denial-of-service to
+sophisticated attacks trying to exfiltrate the secrets by exploiting the
+vulnerabilities in a centralized the software component of the \vtpm{} manager.
+%
+If exploited, the security of all the \vtpm{}s handled by the manager is
+compromised.
+%
+\begin{figure}
+  \centering
+  \includegraphics[scale=0.6]{figures/attestation.pdf}
+  \caption{Generating \snp{} attestation report inside \svtpm{}}
+  \label{fig:attestation}
+  \vspace{-4mm}
+\end{figure}
+
+\paragraph{Private, isolated TPMs}
+
+Instead of relying on a central \vtpm{} manager that manages several instances
+of \vtpm{} in an untrusted environment, we base our design on two insights.
+%
+First, to provide strong isolation of the \vtpm{} code, we leverage the
+architectural support offered by AMD \sev{}.
+%
+Second, to avoid centralized management, we rely on \svsm{} specification
+that offers a way to implement secure services inside the guest VM.
+
+Specifically, to ensure isolation, we leverage the VM privilege levels
+inside the \cvm{} address space provided by the \svsm{} specification as
+part of the \snp{} architecture.
+%
+In our architecture, every \cvm{} has its own private \vtpm{} that runs at
+a higher privilege level (i.e., \vmpl{0}) inside each \cvm{} and is
+encrypted by AMD-SP and has the same isolation guarantees of an encrypted
+VM.
+
+By running our \vtpm{} within an isolated privilege level within the guest
+address space, we eliminate all the attacks that could be mounted on the
+component that runs the \vtpm{}.
+%
+%
+Additionally, operating at the \vmpl{0} offers additional protection that
+it cannot be interfered by the guest or the host OS.
+
+We use Qemu/KVM environment for running the \cvm{}.
+%
+\autoref{fig:attestation} shows how a \cvm{} is launched.
+A user provides the boot-time binaries~(typically \svsm{} and OVMF) to be
+loaded as part of the guest image~(\circlednum{1}).
+%
+Qemu communicates with the KVM which communicates with the \sev{} firmware
+running inside the AMD-SP through an API interface to create a
+\cvm{}~(\circlednum{2}).
+%
+The \svsm{} firmware is placed in \vmpl{0} and the OVMF firmware and the
+rest of the guest environment~(i.e., the kernel and initrd in case of
+direct boot) is placed at \vmpl{1}.
+
+Unlike a regular programming environment that provides operating system
+abstractions~(e.g., syscalls, timers, etc) and feature-rich libraries,
+\svsm{} firmware runs on a restrictive bare-metal environment without
+access to such features.
+%
+Enclave environments often come with such restrictions, for instance, one
+would need a sophisticated library OS~\cite{sgx:graphene} to run unmodified
+applications inside SGX.
+%
+However, in a bare-metal environment such as \svsm{}, one do no have
+operating system abstractions such as timers/clocks, availability of crypto
+libraries, etc.
+%
+However, a \vtpm{} needs to have access to timers, random numbers, and
+cryptographic libraries for realizing a software TPM module.
+%
+We manually port the necessary libraries to satisfy the dependencies of the
+TPM module.
+%
+Due to the encrypted code pages and the lack of interfaces between the
+debugger and Qemu to install breakpoints inside the encrypted pages, 
+we had to rely on print statements during development for debugging.
+
+
+\subsection{Secure communication between VM and \vtpm{}}
+The communication channel between a VM and a corresponding \vtpm{} is a potential 
+target for a range of security attacks, e.g., by altering the TPM command
+requests and response buffers it is possible to subvert measured boot and runtime
+attestation protocols~\cite{tpm-genie}. 
+% 
+One way to mitigate such attacks is to secure the communication channel by 
+implementing standards such as TPM HMAC and encryption~\cite{spec:tpm2.0} or 
+DMTF secure protocol and data model~(SPDM) specification~\cite{spec:spdm}.
+%
+Though the TPM specification describes encryption and HMAC security layers,
+there are very few TPM implementations that support them.
+%
+Developing a complex secure communication protocol such as
+SPDM requires a large engineering effort. 
+%
+Recent \vtpm{} designs that rely on a hardware-protected TEEs implement
+secure communication channel using transport layer security (TLS)
+protocol~\cite{gh:openssl}.
+%
+Unfortunately, even a standard TLS protocol negatively affects the TCB size
+of the TPM.
+
+\paragraph{Secure communication}
+Instead of implementing a secure communication protocol,  we rely on the 
+mechanism provided by AMD SEV and its ability to pass execution between virtual 
+machine privilege levels. 
+%
+While the transition between \vmpl{1} and \vmpl{0} triggers an exit into an
+untrusted hypervisor controlled by the cloud provider, the internals of the
+message remain protected inside the hardware-encrypted memory. 
+%
+Moreover, AMD SEV specification ensures that the hypervisor can only resume
+execution of the VM at a corresponding privilege level, i.e., \vmpl{0}, if the
+guest system triggers a transition to the TPM.
+%
+Hence, the hypervisor is unable to suppress messages unless the whole VM is
+halted.
+
+To implement the communication protocol, we developed a modified version of the
+Qemu emulator and the guest Linux kernel to interact with our \svtpm{} operating
+at \vmpl{0}.
+%
+Qemu exports the TPM space as a memory-mapped IO~(MMIO) region and traps
+all guest accesses to this region to forward the TPM commands to the
+appropriate backend implementation - i.e., a passthrough device or an
+emulator (\lstinline{swtpm}).
+%
+We cannot utilize the existing Qemu TPM interfaces for communicating with
+the \svtpm{} as MMIO region of the TPM remains unencrypted.
+%
+A malicious hypervisor could alter the commands and perform a
+man-in-the-middle (MITM) attack~\cite{tpm-genie}.
+%
+One could possibly implement a secure communication channel using secure
+protocol and data model (SPDM) protocol to prevent such attacks.
+%
+However, it is much simpler to implement a new TPM interface for Qemu.
+
+We created a new Qemu TPM interface based on the command response buffer
+(CRB) specification~\cite{spec:tpm-crb} in which the exported MMIO region
+is part of the guest memory and is encrypted and accessible only to the
+\cvm{}.
+%
+However, with this mechanism the accesses to this MMIO region are not
+trapped anymore and the hypervisor is no longer aware on when to invoke the
+TPM backend interface.
+%
+Moreover, with \snp{}, the TPM region is marked as private to the guest
+\cvm{} in the reverse mapping table and a hypervisor cannot perform a page
+remapping attack.
+
+We modify the Linux CRB driver in the guest kernel to trigger an exit into
+the hypervisor, after every write to the TPM MMIO region.
+%
+Upon re-entry, the hypervisor puts the vCPU in \vmpl{0} where \svtpm{}
+handler looks for TPM command ready flag and inturn invokes
+the appropriate TPM command API to formulate the response buffer.
+%
+Then, the vCPU exits into \vmpl{1} and continues with the execution
+of the guest VM.
+%
+We also make modifications to the TPM driver in OVMF to interact with our
+\svtpm{}.
+
+\subsection{\vtpm{} state}
+
+A discrete physical TPM stores all the persistent state of the module inside
+the chip's non-volatile (NV) store which holds the seeds for generation of
+endorsement key (EK), storage root key (SRK) and also retains other values such
+as NV Index values, objects made persisted by the TPM user, and state saved
+when TPM is shutdown.
+%
+The TCG specification requires a TPM implementation to have some amount of
+non-volatile storage for the operation of the TPM~\cite{spec:tpm2.0}.
+%
+
+As opposed to a physical TPM where the state of the TPM is securely stored
+inside the TPM hardware chip inside a non-volatile RAM (NVRAM), a \vtpm{}
+must manage its state in software.
+%
+Software \vtpm{}s typically implement the NV store in a disk-backed
+file~\cite{vtpm:berger, vtpm:xen-libos, vtpm:xen-doma, vtpm:xen-domb, fTPM,
+svtpm, cocotpm}.
+Along with the software that implements the \vtpm{}, this NVRAM file is
+part of the trusted computing base.
+%
+When a \vtpm{} is first initialized, the state file has to be created
+on-the-fly or loaded from a file that is pre-created.
+
+However, the state stored in the file needs to be secured against tampering and
+rollback attacks~\cite{tpm:nvram-rollback}.
+%
+This could be achieved by encrypting the NV store file such that it could
+be decrypted only by the \vtpm{} module.
+%
+This design calls for securely storing the secret key used to
+encrypt/decrypt the NV state and inject it as a secret during the boot-up
+of \vtpm{} module.
+%
+This brings in several complexities in the context of confidential
+computing as the secret could only be injected during the launch phase.
+%
+First the user has to verify the pre-attestation report of the load-time
+components~(i.e., firmware, OVMF, etc.) before delivering the encrypted TPM
+state along with the key to decrypt the TPM state.
+%
+The booting of the platform is blocked, waiting for the user to inject the
+secret.
+%
+Additional care has to be taken to not give up the state to a \cvm{} that
+is under the control of an attacker.
+
+\paragraph{Ephemeral \vtpm{}}
+
+Instead, our design choice of using an ephemeral \vtpm{} is much more
+simplistic and pragmatic.
+%
+The \vtpm{} goes through the manufacturing process to generate a fresh set
+of seeds, keys on every boot.
+%
+We avoid all the problems of handling persistent state, injecting it on
+every boot, and guarding the encrypted state file by designing an ephemeral
+\vtpm{} with no state.
+%
+First, ephemeral \vtpm{} is simple to implement: the NV storage becomes a
+volatile storage and does not preserve any values across power cycles.
+%
+Second, it does not require any form of secrets to boot-up the \vtpm{} and the
+platform.
+%
+Though there are downsides to this design such as: secrets cannot be
+preserved across reboots, this offers much more flexibility as there is no
+secret to guard against the aforementioned attacks.
+%
+Moreover, the programming environment for \svsm{} is extremely constrained in
+terms of capabilities.
+%
+To save the TPM state on shutdown and to load the state on a reboot, the
+\svsm{} should implement additional software to encrypt and decrypt the
+state file.
+
+\subsection{\svtpm{} provisioning}  \label{subsec:vtpm-provisioning}
+After launching the \cvm{}, the hypervisor first loads and executes the
+\svsm{} binary in \vmpl{0}.
+%
+Our modified \svsm{} follows the standard manufacturing process of
+instantiating a \vtpm{} instance as specified by the TPM2.0
+specification~\cite{spec:tpm2.0}.
+%
+First, we create a new endorsement key (EK) pair $EK_{pub}$ and
+$EK_{priv}$ from random seeds.
+%
+However, we do not create an endorsement key certificate ($EK_{cert}$) or a
+platform certificate, as there is no entity to sign these certificates.
+
+A significant, and much under discussed problem in Confidential
+Computing is seeding the random number generator.
+%
+A VM when it boots has no natural sources of entropy that are not under the
+control of the untrusted host.
+%
+In an ordinary VM, the x86 instructions \lstinline{RDRAND} and
+\lstinline{RDSEED} cause \lstinline{VMEXIT}s; however, in \cvm{}s, these
+instructions are guaranteed to provide direct access to the CPU hardware
+random number in a way that the host cannot influence.
+%
+We use these instructions as the initial random number entropy source for
+generating the random seeds.
+
+\subsection{Adding vTPM to the trust chain}
+Since our \svtpm{} module is instantiated with random seeds and does not
+come with a manufacturer's certificate to verify the identity of the TPM,
+we need to ensure the following security properties:
+%
+\begin{enumerate}[label=\textbf{S\arabic*}, nosep, labelindent=\parindent, leftmargin=*]
+  \item Certify that the \svtpm{} is running in a real \cvm{} on genuine AMD hardware
+  \item Certify that the \vtpm{} module is not tampered with.
+  \item Communicate $EK_{pub}$ in a secure, tamper-proof way.
+\end{enumerate}
+%
+To ensure these security properties, we rely on the attestation report from
+the AMD-SP hardware.
+
+\paragraph{\snp{} attestation report}
+Software running at any \vmpl{} level can request an attestation report by
+sending a message to the \sev{} firmware running inside the AMD-SP.
+%
+The request structure contains the \vmpl{} level and 512-bits of space for
+user-provided data which would be included as part of the
+attestation report signed by the AMD hardware.
+%
+
+\autoref{fig:attestation} shows the steps involved in getting an
+attestation report.
+%
+On receiving a request to launch a VM, the platform loads the image and
+cryptographically measures the contents of the image (\circlednum{1}).
+%
+Once the guest image is launched, the hypervisor
+puts the vCPU in \vmpl{0} mode passing control to the \svsm{}
+firmware~(after \circlednum{2}).
+%
+The \svsm{} firmware initializes the guest CPU, memory and sets up a
+pagetable for execution and finally instantiates a \vtpm{}.
+%
+The \vtpm{} is provisioned as described
+in~\autoref{subsec:vtpm-provisioning}.
+%
+Then, the \vtpm{} module requests an attestation report by sending a
+\lstinline{SNP_REPORT_REQ} message to the AMD-SP hardware
+(\circlednum{3}).
+%
+We place the digest of the public part of the generated endorsement
+key~(i.e., $EK_{pub}$) in the user-data field of the request to communicate
+the identity of the TPM to the guest VM.
+%
+The request message is encrypted with the appropriate VM platform
+communication key (VMPCK) for that \vmpl{} level and prepended with a
+message header which is integrity protected with authenticated
+encryption~(AEAD).
+%
+The AMD-SP hardware decrypts the message, verifies the integrity and
+responds with an attestation report(\circlednum{4}) that contains the
+\emph{pre-attestation} measurements, vmpl level and the user-data (i.e.,
+$digest\left(EK_{pub}\right)$).
+%
+We write this report into the NVIndex where the TPM would normally place
+its EK certificate.
+%
+We can retrieve the saved attestation report at any point in time
+(\circlednum{5}) as long as the guest VM is operational.
+%
+If needed, the guest VM can also place a report request to the AMD-SP
+hardware from other \vmpl{} levels to generate a new attestation report.
+
+\paragraph{Ensuring \textbf{S1}}
+We can easily verify \textbf{S1} because the attestation report is generated
+by the AMD-SP processor and signed using AMD's private keys. Verifying that
+the attestation report is genuine implicitly guarantee that we obtained it from
+a genuine AMD processor, within a \cvm{}.
+
+\paragraph*{Ensuring \textbf{S2}}
+Before launching the \cvm{}, the AMD-SP hardware measures all the load-time
+binaries as part of the \emph{pre-attestation}. This includes the \svsm{}
+and our \svtpm{} code.
+%
+By verifying these measurements that are included as part of the
+attestation report, we can ensure that our \svtpm{} binary, and anything
+else running in \vmpl{0}, has not been tampered.
+
+\paragraph{Ensuring \textbf{S3}}
+By verifying that the report request originated from \vmpl{0}, we can
+confirm that the report was requested by a legitimate \svtpm{}, based on
+\textbf{S2}.
+%
+By including the $digest(EK_{pub})$ as part of the attestation report~(via
+user-data field), we offer a tamper-proof way to communicate the identify
+of the TPM~($EK_{pub}$) to the entities interacting with this specific
+\vtpm{}.
+Since $EK_{pub}$ and $EK_{priv}$ are generated from random seeds provided
+by the hardware~(i.e., \lstinline{RDRAND} and \lstinline{RDSEED}), as long
+as the generator is tamper-proof, no entity can recreate $EK_{priv}$ and
+impersonate this \vtpm{}.

@@ -1,0 +1,179 @@
+\section{Model}\label{sec:model}
+
+\begin{figure*}[htbp]
+\centering
+\subfigure[Pre-training phase]{
+\includegraphics[width=0.45\textwidth]{img/model_pre}
+\label{fig:model_pre}
+}
+\subfigure[Retokenizing phase]{
+\includegraphics[width=0.45\textwidth]{img/model_retokenizing}
+\label{fig:model_column_align}
+}
+\subfigure[Fine-tuning phase]{
+\includegraphics[width=0.45\textwidth]{img/model_fine}
+\label{fig:model_fine}
+}
+\caption{Schematic view of our model and training phases. (a): Pre-training phase trains all modules by reconstructing masked features. (b) Retokenizing phase trains the modules corresponding to newly added columns. In this figure, the $0$-th to $(i-1)$-th columns are removed, and the $(n+1)$-th to $m$-th columns are added. Feature Tokenizer $\FT_j$, Positional Embedding $\pos_j$, and Projector $\proj_j$ are trained for $j=n+1,\ldots, m$. (c): Fine-tuning phase freezes all parameters trained in the pre-training and retokenizing phases and trains the positional embedding and Projector for the target variable ($\pos_t$ and $\proj_t$ in the figure, respectively). }
+\label{fig:model_abs}
+\end{figure*}
+
+\subsection{Architecture}\label{sec:architecture}
+
+\subsubsection{Overview}
+
+This section describes the architecture of our proposed model TabRet.
+TabRet consists of Feature Tokenizer, Alignment Layer, Random Masking, Encoder, Post-Encoder, and Projector.
+Feature Tokenizer converts each feature into a token. Alignment Layer normalizes the set of tokens and adjusts the tokens' dimensionality.
+Random Masking masks some tokens and feeds the remaining tokens to Encoder.
+Masked tokens are replaced with the mask token $[\mask]$ before Post-Encoder.
+Finally, Projector sends back tokens to the input domains.
+Figure~\ref{fig:model_abs} shows the schematic view of our model.
+
+\subsubsection{Feature Tokenizer}
+
+Feature Tokenizer module converts an input $\vx$ to an embedding $T^{\FT}$, whose dimensions will be determined later.
+We assume that each column is either numerical or categorical. 
+Since the order of the feature does not matter, as we see in this section, we write the input as $\vx=(x_1^{\num}, \ldots, x_{k^{\num}}^{\num}, x_1^{\cat}, \ldots, x_{k^{\cat}}^{\cat})$.
+Here, $k^{\num}$ and $k^{\cat}$ are the number of numerical and categorical features, respectively.
+$x_j^{\num}\in \R$ is the $j$-th numerical feature and $x_j^{\cat} \in [C_j]$ is the $j$-th categorical feature, where $C_j$ is the number of categories of $j$-th categorical feature.
+
+Feature Tokenizer embeds numerical features using the weight matrix $W^{\num}\in \R^{k\times d_{\FT}}$ and the bias vector $b^{\num}\in \R^d$ as follows:
+\[
+    T_j^{\num} = x_j^{\num}W_j^{\num} + b_j^{\num} \in \RR^{d_{\FT}}.
+\]
+For categorical features, Feature Tokenizer converts the input $x_j^{\cat}$ to a one-hot vector $e_j^{\cat} \in \{0, 1\}^{C_{j}}$ and embeds it using the lookup table $W^{\cat} \in \RR^{C_j \times d_{\FT}}$ and bias $b^{\cat} \in \RR^{d_{\FT}}$:
+\[
+    T_j^{\cat} = e_j^\top W_j^{\cat} + b_j^{\cat} \in \mathbb{R}^{d_{\FT}}.
+\]
+$W^{\num}$, $b^{\num}$, $W^{\cat}$, $b^{\cat}$ are learnable parameters.
+Then, embeddings are concatenated for further processing:
+\[
+    T^{\FT} = \concat(T_1^{\mathrm{num}}, \ldots, T_{k^{\mathrm{num}}}^{\mathrm{num}}, T_1^{\mathrm{cat}}, \ldots, T_{k^{\mathrm{cat}}}^{\mathrm{cat}}) \in \RR^{k\times d_{\FT}},
+\]
+where $k = k^{\num} + k^{\cat}$.
+
+\subsubsection{Alignment Layer}
+
+We employed different dimensions for Feature Tokenizer and Encoder for the model's flexibility.
+Alignment Layer changes the token dimensions to adjust Encoder using a linear layer.
+Alignment Layer also normalizes the scale of tokens using Layer Normalization~\cite{ba2016layer}:
+\[
+    T^{\AL} = \linear(\LN(T^{\FT})) \in \RR^{k\times d_{\AL}},
+\]
+where $d_{\AL}$ is the dimension of tokens that Alignment Layer outputs.
+
+\subsubsection{Random Masking}
+
+Random Masking behaves differently depending on training phases (see Appendices~\ref{sec:pretext-task} and~\ref{sec:downstream-task} for the definition of the phases.)
+In the pre-training and retokenizing phases, Random Masking masks some tokens randomly.
+More specifically, we set the mask ratio $\alpha$, chose $m'=\lfloor \alpha k \rfloor$ tokens uniformly randomly from the set of tokens for each data point and dropped the chosen tokens.
+If $m'=0$, we overrode the value of $m'$ by $1$. That is, Random Masking removes one token uniformly randomly.
+Consequently, the feature size becomes from $T^{\AL}\in \RR^{k\times d_{\AL}}$ to $T^{\RM}\in \RR^{m\times d_{\AL}}$, where $m = k-m'$ is the number of tokens that are not dropped.
+In the fine-tuning phase, Random Masking does nothing, that is, $T^{\RM} = T^{\AL}$.
+
+\subsubsection{Encoder}
+
+Encoder is an $N$-layer Transformer.
+We use the Pre-Norm variant, which is reportedly easy for optimization~\cite{1906.01787}.
+In addition, we add one Layer Normalization after the final Transformer block.
+Mathematically, the computation of Encoder can be described as follows:
+\begin{align*}
+    T_0 &= T^{\RM},\\
+    T_i &= F_i(T_{i-1}) \quad \text{$i = 1, \ldots N$},\\
+    T^{\enc} &= \LN(T_N),
+\end{align*}
+where $F_i$ is the $i$-th Transformer block.
+The output $T^{\enc}$ of Post-Encoder is the $m$-tuple of $d_{\enc}$-dimensional tokens: $T^{\enc} = (T^{\enc}_1, \ldots, T^{\enc}_m)\in \RR^{m\times d_{\enc}}$.
+
+\subsubsection{Post-Encoder}
+
+Post-Encoder first applies a linear layer to project embeddings to the Post-Encoder's input dimension $d_{\PE}$.
+Then, a mask token $[\mask]$, which is a $\RR^{d_{\PE}}$-dimensional learnable vector, is inserted into each position where Random Masking removes the encoder token.
+Additionally, Post-Encoder adds learnable positional embedding $[\pos] = ([\pos]_1, \ldots, [\pos]_k)\in \RR^{k\times d_{\PE}}$ to the embeddings, which are expected to learn column-specific information.
+Finally, the embeddings are transformed by a one-layer Transformer block $F$.
+In summary, the architecture of Post-Encoder is as follows:
+\begin{align*}
+    T_1 &= \linear(T^{\enc}),\\
+    T_2 &= \mathrm{AddMaskToken}(T_1, \mathrm{[\mask]}),\\
+    T_3 &= T_2 + [\pos],\\
+    T_4 &= F(T_3),\\
+    T^{\PE} &= \LN(T_4).
+\end{align*}
+Similarly to Encoder, the output $T^{\PE}$ of Post-Encoder is the $k$-tuple of $d_{\PE}$-dimensional tokens: $T^{\PE} \in \RR^{k\times d_{\PE}}$.
+
+\subsubsection{Projector}
+
+Projector sends back the tokens to column feature spaces using linear layers.
+We prepare one projector per column since each column has different scales and dimension.
+Specifically, let $T^{\dec} = (T^{\num}_1, \ldots, T^{\num}_{k_\num}, T^{\cat}_1, \ldots, T^{\cat}_{k_\cat})\in \RR^{k\times d_{\PE}}$ be the Post-Encoder's output.
+Then, the output of the $j$-th projector is as follows:
+\[
+    \hat{\vx}^{\ast}_j = \linear(T_j^{\mathrm{\ast}}),
+\]
+where $\ast \in \{\num, \cat\}$.
+The dimensionality of $\hat{x}^{\num}_j$ is $1$ for numerical features for all $j=1, \ldots, k^{\num}$, and $\hat{x}^{\cat}_j$ is $C_j$ for the $j$-th categorical feature for $j=1, \ldots, k^{\cat}$.
+
+We can think of our model as an encoder-decoder model by interpreting the pair of Post-Encoder and Projector as a decoder.
+While the original masked autoencoder in~\citet{He_2022_CVPR} uses its decoder only in the pretext task and removes it in the downstream task, our model uses the decoder trained on the pretext task in the downstream tasks.
+This architectural difference comes from the modality of data.
+In~\citet{He_2022_CVPR}, whose modality of interest is images, models have to solve qualitatively different problems as the pretext and downstream tasks -- for example, image inpainting for the pretext task object classification for the downstream task.
+On the other hand, in tabular learning settings, both pretext and downstream tasks are supervised learning tasks on columns.
+We expect the decoder is more likely to learn the knowledge beneficial for the downstream task in the fine-tuning phase.
+Therefore, we design our model to reuse the same decoder in the fine-tuning phases.
+
+\subsection{Training}
+
+\subsubsection{Pretext Task}\label{sec:pretext-task}
+
+The pretext task consists of a single phase, namely, the pre-training phase (Figure~\ref{fig:model_pre}).
+
+\paragraph{Shuffle Augmentation}
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=0.3\textwidth]{img/column_shuffle}
+    \caption{Schematic view of shuffle augmentation. Shuffle augmentation applies column-wise permutation within a minibatch to a randomly chosen subset of columns. This figure shows the shuffle ratio $\beta=0.4$, and the first and fourth columns out of five are shuffled.}
+    \label{fig:column_shuffle}
+\end{figure}
+
+In the pre-training phase, we apply shuffle augmentation (Figure~\ref{fig:column_shuffle}) to the input minibatches.
+We set the shuffle ratio $\beta \in (0, 1)$.
+Given a minibatch $\vx$, we choose $\ell = \lfloor \beta k \rfloor$ features uniformly randomly.
+For each chosen column, we permute the features in the minibatch as described in Section~\ref{sec:shuffle-augmentation}.
+
+\subsubsection{Downstream Task}\label{sec:downstream-task}
+We considered two types of downstream tasks.
+The first one was the independently-and-identically-distributed (IID) transfer learning (Appendix~\ref{sec:additional_experiment}), where pretext and downstream tasks have the same column sets.
+In the IID transfer learning setting, the downstream task has a single phase, namely, the fine-tuning phase (Figure~\ref{fig:model_fine}). The task is equivalent to the usual supervised learning task in the IID case.
+The other type was the out-of-distribution (OOD) transfer learning (Section~\ref{sec:experiments}), where column sets of pretext and downstream tasks could be different.
+The downstream task in the OOD transfer learning additionally has the retokenizing phase (Figure~\ref{fig:model_column_align}) before the fine-tuning phase.
+
+\paragraph{Retokenizing Phase}
+
+TabRet has Feature Tokenizer, Positional Embedding, and Projector for each column, as explained in Appendix~\ref{sec:architecture}.
+Therefore, we needed to learn these modules for columns unseen in the pretext task.
+In the retokenizing phase, we freeze all parameters except these modules for columns unseen in the pretext task.
+We employ the same masked modeling training as the pretext task.
+We treat the unseen columns as masked and feed the frozen mask tokens $[\mask]$ as the input to Post-Encoder corresponding to the columns.
+
+\paragraph{Fine-tuning Phase}
+The target value $y$ of the downstream task is treated as a masked entry in the newly added column during the fine-tuning phase. All parameters learned during the pre-training and retokenizing phases are frozen. The Positional Embedding and Projector are then trained for the target value column, similarly to the retokenizing phase. By doing so, this approach significantly reduces the number of learning parameters, which in turn reduces the required sample size of the training dataset for the downstream task. Furthermore, we note that our model does not use the [\texttt{cls}] token, unlike the approach by~\citet{He_2022_CVPR}. 
+
+\subsubsection{Loss Function}
+
+For pre-training and retokenizing phases, we define the loss value $L(\vx)$ of the data point $\vx$ as the sum of losses for those features that are masked by Random Masking and are not shuffled by the shuffle augmentation:
+\begin{equation*}
+    L(\vx) = \sum_{j = 1}^{k^{\num}} \ell^{\num}(x_j^{\num}, \hat{x}_j^{\num}) + \sum_{j = 1}^{k^{\cat}} \ell^{\cat}(x_j^{\cat}, \hat{x}_j^{\cat}).
+\end{equation*}
+For fine-tuning phase, we compute the loss value $L(\vx, y)$ of a data point $(\vx, y)$ as the loss for its target value:
+\begin{equation*}
+    L(\vx, y) =
+    \begin{cases}
+        \ell^{\num}(y, \hat{y}) & \text{if $y$ is numerical,}\\
+        \ell^{\cat}(y, \hat{y}) & \text{if $y$ is categorical,}
+    \end{cases}
+\end{equation*}
+where $\hat{y}$ is the output of Projector corresponding to the target feature when the input is $\vx$.
+The loss function $\ell^{\num}$ for numerical features is the mean squared loss, and the loss function $\ell^{\cat}$ for categorical features is the cross-entropy loss.
+The training objective is the sum of the loss values for all instances in the training dataset.

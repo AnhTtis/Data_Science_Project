@@ -1,0 +1,195 @@
+% Motivation 1 page.
+% Current .5 page.
+% Must equal 100 Lines
+
+\subsection{Limitations of Data Parallelism}
+\label{sec:background-limitations}
+
+In data parallelism, micro-batches often overlap, resulting in redundant data loading and computation.
+Suppose that the mini-batch of Figure~\ref{fig:minibatch} is the union of two micro-batches, one for each of the target vertices.
+The two micro-batches are associated with two different GPUs.
+The triangle in the Figure shows overlaps in the k-hop sample of different target vertices.
+The input features of the layer-$0$ vertices in the overlap need to be loaded by both GPUs.
+Similarly, the hidden features of the layer-$1$ vertex in the overlap need to be computed by both GPUs.
+We now discuss the overheads resulting from these redundancies  in detail.
+
+
+\mypar{Issue 1: Redundant data loading} 
+% \hui{be consistent with "data loading", "data transfer", and “feature gathering"; avoid the word gather here because "gather" is also used in the message passing framework}
+Data loading transfers training data (including the micro-batch graph structures and the involved input vertex features) to GPUs for computation at each iteration. 
+Data-parallel training systems cache input vertex features on GPUs to mitigate the data loading bottleneck.
+Some work, such a PaGraph~\cite{pagraph} or GNNLab~\cite{gnnlab} focus on configurations where GPUs are connected with each other through the same bus as the CPU (the PCIe bus).
+These systems keep independent per-GPU caches.
+To decide which vertices to cache on each GPU, they logically partition the training vertices across GPUs.
+They then construct a subgraph for each partition as the union of the k-hop neighborhoods of the training vertices.
+Finally, they cache at each GPU a subset of the vertices in each partition. 
+Because the k-hop subgraphs have large overlaps, the caches of each GPU also overlap.
+
+High-end multi-GPU systems have fast GPU-GPU buses such as NVLink~\cite{NVLink}, which are faster than CPU-GPU buses like PCIe.
+Quiver is a recent GNN training system that leverages these hardware features to partition cached input features across multiple GPUs~\cite{quiver}.
+Whenever a GPU needs to load the features of a vertex that is not cached locally, it loads it from the cache of another GPU if possible, and loads from the CPU memory otherwise.
+This strategy ensures that caches have no overlaps.
+
+Both strategies make data loading cheaper, but they still suffer from significant data loading costs by redundantly loading the same features on multiple GPUs.
+Table~\ref{tab:overlap-features} quantifies the data transfer volume and epoch time overhead in prior data-parallel systems.
+% and compares them to \name, our \tadj training system that performs no redundant data loads. \hui{the table doesn't have \tadj ?}
+The experiments consider single-server systems with 4 GPUs connected with a PCIe bus for PaGraph and NVLink for Quiver (see Section~\ref{sec:eval} for the detailed experimental setup).
+The Table considers different cache sizes, expressed as the fraction of the input features that are stored in the cache by each GPU.
+In Quiver, GPUs cache non-overlapping sets of vertex features.
+These systems can cache the input features for the entire graph using a per-GPU cache size of 25\%, so we consider that as the maximum cache size in this experiment.
+
+The size of unique input features in an average mini-batch represents the minimal amount of data transferred without using caching.
+PaGraph and Quiver load much more data than that, even with caching, because in data parallelism, different GPUs must load the same input features redundantly.
+When comparing the two systems for the same cache size in Table~\ref{tab:overlap-features}, caching is more beneficial in Quiver because it uses a distributed cache, whereas PaGraph keeps independent per-GPU caches.
+%When no in-GPU caches are used, a \tadj system like \name sends each feature vector to only one GPU, so there is no redundant data transfer.
+As the size of the cache grows, Quiver transfers less data from CPU than PaGraph.
+Quiver, however, still 
+needs to perform redundant loads from the CPU, and some of the CPU-GPU data transfers are replaced by GPU-GPU transfers due to cache misses.
+Inter-GPU transfers are faster but not free and still make up a high fraction of the epoch time.
+%\name, by contrast, does not need to perform any GPU-GPU data loads.
+%Its GPU-GPU data transfers are due to cooperative training.
+
+These results show that redundant data loading is a fundamental problem in data parallelism, even when using a distributed cache and fast GPU-GPU buses.
+\Tname eliminates this problem by design.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{|l|l||r|r|r|}
+\hline
+\textbf{System} & \textbf{Cache \%} & \textbf{0\%} & \textbf{10\%} & \textbf{25\%} \\ \hline\hline
+\multirow{3}{*}{ PaGraph } & CPU-GPU & \multicolumn{1}{r|}{13682} & \multicolumn{1}{r|}{10829} & 7404 \\ 
+& GPU-GPU  & 0 & 0 & 0 \\ 
+& \% load/epoch & \multicolumn{1}{r|}{79\%} & \multicolumn{1}{r|}{78\%}  & 68\% \\ \hline
+\multirow{3}{*}{ Quiver } & CPU-GPU  & \multicolumn{1}{r|}{19267} & \multicolumn{1}{r|}{6334} & 0 \\  
+& GPU-GPU & \multicolumn{1}{r|}{0} & \multicolumn{1}{r|}{9698} & 14448 \\ 
+ & \% load/epoch & \multicolumn{1}{r|}{95\%} & \multicolumn{1}{r|}{71\%} & 38\% \\ \hline
+% \multirow{3}{*}{ GSplit } & CPU-GPU & 8650 & 4361 & 0 \\ 
+% & GPU-GPU& 955  & 955 & 955 \\ 
+% & \% load/epoch &  \multicolumn{1}{r|}{27\%} &  \multicolumn{1}{r|}{17\%} & 0\% \\ \hline 
+\end{tabular}
+\caption{\textbf{Redundant data loading.} Averaged data volume in MB loaded by all GPUs per iteration and percentage of loading time over epoch time.
+(Dataset: ogbn-products. Model: GraphSage. Mini-batch size: 4096.)}
+% \ms{then why is GPU-GPU > 0 for GSplit?}
+    \label{tab:overlap-features}
+\end{table}
+
+\input{sections/results/compute_redundancy.tex}
+
+% \begin{table}[t]
+% \begin{tabular}{|l||l|rrr|}
+% \hline
+% System & Cache \% & \multicolumn{1}{r|}{0} & \multicolumn{1}{r|}{0.1} & 0.25 \\ \hline\hline
+% \multirow{3}{*}{PaGraph} & CPU-GPU & \multicolumn{1}{r|}{18152} & \multicolumn{1}{r|}{13882} & 9443 \\ \cline{2-5} 
+%  & GPU-GPU & \multicolumn{3}{r|}{0} \\ \cline{2-5} 
+%  & \% of epoch time & \multicolumn{1}{l|}{} & \multicolumn{1}{l|}{} & \multicolumn{1}{l|}{} \\ \hline
+% \multirow{3}{*}{Quiver} & CPU-GPU & \multicolumn{1}{r|}{19286} & \multicolumn{1}{r|}{10344} & 0 \\ \cline{2-5} 
+%  & GPU-GPU & \multicolumn{1}{r|}{0} & \multicolumn{1}{r|}{6707} & 14465 \\ \cline{2-5} 
+%  & \% of epoch time & \multicolumn{1}{r|}{95\%} & \multicolumn{1}{r|}{91\%} & \multicolumn{1}{l|}{} \\ \hline
+% \multirow{3}{*}{GSplit} & CPU-GPU & \multicolumn{1}{r|}{8308} & \multicolumn{1}{r|}{4025} & 0 \\ \cline{2-5} 
+%  & GPU-GPU & \multicolumn{3}{r|}{208} \\ \cline{2-5} 
+%  & \% of epoch time & \multicolumn{1}{l|}{} & \multicolumn{1}{l|}{} & \multicolumn{1}{l|}{} \\ \hline
+% \end{tabular}
+% \caption{Total data volume in MB transferred to a GPU for training. (Dataset: ogbn-products) \hui{need to fill in the epoch time percentage }} \ms{All experiments consider that each GPU can cache 10\% of the vertex features.} \ms{Why does GSplit have a non-zero GPU-GPU loading cost? Do we load from other GPUs as well?} \Sandeep{Exeperiments vary cache percentage in the top column. GSplit has non-zero GPU-GPU as we show data shuffled during training stage. } 
+%     \label{tab:overlap-features}
+% \end{table}
+
+
+% \TODO{Here we have a figure measuring redundant feature gathering in PaGraph, which does not rely on NVLink, and Quiver, which does rely on NVLink. For both systems, the X axis has different cache sizes, ranging from 0\% to 25\%. The Y1 axis reports (data transfer volume with redundancy)/(data transfer volume without redundancy). The Y2 axis reports the \% of epoch time spent transferring data. We have one plot for PaGraph and one for Quiver. Only one dataset. The model should not matter. We can mix numbers from different systems since we only report data volumes and relative performances.}
+
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=0.9\columnwidth]{figures/motivation1.png}
+%   \caption{Impact of redundancy on time}
+%   \label{fig:reduntant-features}
+% \end{figure}
+
+
+
+% \begin{center}
+% \begin{tabular}{|c|c|} \hline
+% Graph & avg\_fract\_nodes \\ \hline
+% ogbn-arxiv & 76.14\% \\ \hline
+% ogbn-products & 88.18\% \\ \hline
+% ogbn-papers100M & 57.93\% \\ \hline
+% \end{tabular}
+% \end{center}
+
+% \begin{center}
+% \begin{tabular}{|c|c|} \hline
+% Graph & slow\_down   \\ \hline
+% ogbn-arxiv &  **     \\ \hline
+% ogbn-products & **   \\ \hline
+% ogbn-papers100M & ** \\ \hline
+% \end{tabular}
+% \end{center}
+% \TODO{numbers can be filled from pagraph experiments}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.9\textwidth]{figures/gpu-resident.pdf}
+    \caption{Example of a Training Iteration in Split Parallel Training (GraphSage).}
+    \label{fig:overview}
+\end{figure*}
+
+\mypar{Issue 2: Redundant computation}
+%\TODO{explain how redundant computation can be a problem, for example by quantifying the overlap between micro-batches in the same mini-batch} 
+After loading all the input features of a micro-batch, each GPU runs the GNN model to compute the hidden features of the vertices in the upper layers.
+The overlaps among micro-batches create computation overheads at this stage.
+The target vertices of the micro-batches for the same iteration are non-overlapping sets.
+However, the samples of the k-hop neighborhood of those vertices can have large overlaps.
+For this reason, the hidden features of the same vertex at the same layer can be computed by multiple GPUs, resulting in redundant computation.
+Note that this computational overhead is additional to the data transfer overhead discussed previously.
+
+% \TODO{Table reporting (number of vertices processed across all GPUs with redundant computation)/(number of vertices processed across all GPUs without redundant computation). The numerator is taken from the PaGraph experiments. The denominator is taken from Groot experiments. We report this number for different datasets.}
+
+% \begin{table}[ht]
+% \centering 
+% \tabcolsep=0.08cm
+% \begin{tabular}{|l|c|c|c|}
+% \hline 
+% Dataset & Micro-batches & 1 Mini-batch & Ratio \\ \hline\hline 
+% ogbn-products & 208.8M & 200.5M & 1.04 \\ \hline 
+% papers100M & 208.5M & 30.7M & 6.8 \\ \hline 
+% amazon & 473.5M & \TODO{581.1M} & 0.82 \\ \hline 
+% \end{tabular}
+% \caption{The total number of edges computed over one epoch when each mini-batch is sampled as 4 micro-batches vs. one single mini-batch.}
+% \label{tab:edges} 
+% \end{table}
+
+Table~\ref{tab:overlap-edges} evaluates the degree of computational redundancy in data-parallel training in terms of total number of edges processed during an iteration.
+With 4 GPUs, data parallelism creates 4 separate micro-batches, which have the total number of edges reported in the Table.
+Instead of creating multiple independent and overlapping micro-batches, \tname generates a single mini-batch for all the target vertices and splits it without overlaps, avoiding redundant computation.
+The total number of edges to process with this approach is between one to two orders of magnitude lower.
+
+% \TODO{Redundant computation is not only a training overhead but also a sampling overhead.}
+
+% Unlike DNN, where intermediate computation of training data between GPUs is fully independent. 
+% In GNN, while we partition a set of training nodes, there is still a potential for a high overlap between the K-Hop of training nodes. 
+% PaGraph partitions the training nodes to maximize the data locality of the required input features of training nodes. 
+% While PaGraph splits training nodes equally between partitions, we measure the required input node data for each of these partitions as a fraction of total nodes in the graph.
+% As we can see from table 2 each pagraph partition requires much more than 25\% of the graph . 
+% Sometimes, covering the entire graph. 
+% This renders the per-gpu cache not only ineffective but also allows redundant computation.
+% A fraction higher 25\% indicates high overlap between partitions. 
+% Especially in products dataset we see massive overlap. 
+% Thus increasing the potential for inner node computation. 
+% \ms{These numbers show overlap of input vertices, which is not exactly measuring redundant computation,}
+
+% \begin{center}
+% \begin{tabular}{|c|c|} \hline
+% Graph & avg\_fract\_nodes \\ \hline
+% ogbn-arxiv & 76.14\% \\ \hline
+% ogbn-products & 88.18\% \\ \hline
+% ogbn-papers100M & 57.93\% \\ \hline
+% \end{tabular}
+% \end{center}
+
+%\TODO{This is one way we can show presence of redundant computation. Another approach is to run a simulation and measure percentage of redundant computations in an epoch. Which ever seems better.}
+
+
+% P3 does not consider GPU caching and only supports bounded staleness, due to its use of pipelining, rather than synchronous training.
+% By contrast, our work focuses on synchronous multi-GPU training.
+% It does not partition the input graph by feature, as P3 does, but by vertex.
+% We evaluated a P3-inspired multi-GPU training approach and found that it shuffles a much larger volume of data than our technique.~\TODO{Remove last sentence if no P3 numbers.}
+
+

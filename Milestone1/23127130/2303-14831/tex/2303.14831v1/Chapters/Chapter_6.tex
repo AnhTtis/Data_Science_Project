@@ -1,0 +1,480 @@
+% Chapter 1
+
+\chapter{Evaluation} % Main chapter title
+
+\label{Chapter6} % For referencing the chapter elsewhere, use \ref{Chapter1} 
+
+%----------------------------------------------------------------------------------------
+
+% Define some commands to keep the formatting separated from the content
+
+%----------------------------------------------------------------------------------------
+
+The advent of the Nvidia RTX platform allows us to offload the costly visibility computations of radiosity onto RT cores. By combining RTX and progressive refinement radiosity we seek to provide a competitively fast algorithm that does not compromise on visual fidelity.
+
+This chapter aims to determine if and to what degree RTX can accelerate existing GPU radiosity implementations, as well as which quirks and enhancements are most beneficial.
+We will discuss our findings and assessments of the presented implementation and compare its performance with other industry-standard lightmap generators.
+
+\section{RTRad Overview}
+
+In chapter \ref{Chapter4} we presented our implementation of an RTX-based progressive radiosity lightmap generator, which was subsequently expanded upon in chapter \ref{Chapter5}.
+
+The proposed algorithm operates entirely on textures with a series of swift pre- and post-processing rasterization passes that translate the scene into a usable format, generate meta-information on refinement quad-trees and ameliorate leaks on UV seams, as shown in fig. \ref{RTLPass_flow_simple}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.38]{Figures/RTRad_flow_simple.jpg}
+\decoRule
+\caption[]{Simplified overview of the RTRad rendering passes. For a more detailed overview refer to fig. \ref{RTRad_flow}.}
+\label{RTLPass_flow_simple}
+\end{figure}
+
+The most important component of our pipeline is the \textit{RTLPass}, which is executed for each patch and uses the \verb|TraceRay| function to test for visibility of other patches. A single-sample Monte-Carlo approximation of the view factors provides the lighting contribution for any patch that passes the test. Once completed, the input and output lighting textures are swapped for the next pass.
+
+The RTLPass can be configured in manifold ways, including visibility caching, directional sampling and various methods for reducing sample counts. Fig. \ref{RTLPass_overview} shows an overview of these various configurations. 
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.5]{Figures/RTLPass_FlowDiagram.png}
+\decoRule
+\caption[]{Flow-diagram of the RTLPass. Most condition branches are implemented using preprocessor directives and do not cost computation time.}
+\label{RTLPass_overview}
+\end{figure}
+
+\section{Evaluation Method}
+
+The measurements we exhibit in this chapter were exclusively performed with the built-in Falcor profiler, which uses the most accurate available CPU and GPU timers to measure given functions as an event hierarchy \cite{falcor}.
+
+Our benchmarking system consists of an AMD Ryzen 3900X CPU and an RTX 2070 Super graphics card\footnote{The 2070S contains a total of 40 RT Cores. Higher end RTX GPUs contain up to 82 and would perform respectively faster. We expect that lower end cards, which start at 30 RT cores, would still provide comparable results.} running on Windows 10.0.19044 with Nvidias GeForce Driver version 516.40.
+
+\subsection{Pass-Time}
+
+Our primary reference for performance is the \textit{pass-time}, which constitutes the total of GPU time utilized by the RTLPass for all batches of a pass. 
+
+Our application automatically extracts this information from the profiler and outputs it at the end of a pass. We generally deemed pass-times of under a second to be suitable for real-time applications.
+
+\subsection{DFPR}
+
+To assess general lighting quality, this chapter provides images at the primary points of contention. In addition, we employ a self-conceived unit for \textit{deviation from pure radiosity}, henceforth shortened as \textit{DFPR}. This value measures how close the results of an optimized radiosity variant are to its un-optimized counterpart:
+
+\begin{equation}
+    dfpr(L) = \frac{1}{n} \sum_{i=0}^{n} \lVert L(i) - P(i) \rVert
+\end{equation}
+
+where $L$ is the lightmap in question and $P$ is a lightmap of the same size, generated with pure, progressive radiosity for the same scene.
+
+The DFPR of an image is computed as its euclidean distance from a correspondingly large lightmap computed with pure radiosity, averaged across all pixels.
+A "perfect" DFPR of zero would equate to the image being an exact copy, whilst a theoretical worst DFPR would be $\sqrt{3}$ (the average RGB distance between a completely white and a completely black image).
+
+We found that a DFPR value of 0.025 served as a very conservative threshold at which differences became noticeable to a human observer.
+
+Fig. \ref{DFPR_concept} illustrates this concept with a number of examples: Optimized radiosity algorithms run significantly faster, but also deviate from the results of pure radiosity. This deviation is given by the DFPR and serves as a measurement for visual fidelity under a given lightmap resolution.
+
+Theoretically, dividing the DFPR by the corresponding pass-time could serve as a general measure for quality per cost, but we found that this did not accurately reflect empirical results.
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.75]{Figures/DFPR_example.png}
+\decoRule
+\caption[]{Examples of how the DFPR is calculated on lightmaps of varying quality.\protect\footnotemark The DFPR of a lightmap results from the average magnitude of all pixels in the subtraction of the lightmap itself and a corresponding "pure" lightmap.} 
+\label{DFPR_concept}
+\end{figure}
+
+\footnotetext{The lightmaps in this image are all of the size $128\times128$. The optimized variants are generated using Monte-Carlo undersampling with sampling windows of $2\times2$, $4\times4$, $8\times8$ and $16\times16$ respectively.}
+
+\subsection{Scenes}
+
+We employed a total of six different scenes for testing our algorithm and analyzing its performance, all of which are rendered through RTRad in fig. \ref{Testing_scenes_fig}.
+Three of these are based on the \textit{Cornell box} and are meant to directly demonstrate the system's capabilities in realistic global illumination. A further three scenes are significantly more complex and are meant to simulate a realistic use-case workload:
+
+\begin{itemize}
+    \item \textbf{CornellLucy}: Consists of a simplified version\footnote{The same version that was used by Benjamin Kahl in VXCT \cite{VXCT}.} of the "Lucy" statue from the \textit{Stanford 3D scanning repository} \cite{stanford} inside a Cornell box with a large light-source above. Used to test indirect light on a high-detail 3D model with abundant light.
+\end{itemize}
+    
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.55]{Figures/TestingScenes.jpg}
+\decoRule
+\caption[]{Our employed testing scenes rendered through RTRad with a lightmap of $1024^2$ pixels.}
+\label{Testing_scenes_fig}
+\end{figure}
+
+\begin{itemize}
+    \item \textbf{CornellGeom}: Consists of a series of simple geometric shapes inside a Cornell box with a narrow light-source. Used to test inter-reflection in low-light environments and hard shadows.
+    \item \textbf{CornellLayers}: A modified Cornell box that is split down the middle with a wedge. Used to ensure no color leaks from one section to the other as well as to test soft shadows.
+    \item \textbf{SponzaScene}: A commonly employed graphics benchmarking scene created by \textit{CryTek} \cite{SponzaScene}. To ensure compatibility with lower resolution lightmaps our version is somewhat simplified and texture-less, but still consists of over 150 thousand triangles.
+    \item \textbf{NvidiaScene}: A reconstruction of the scene employed by Pharr et al. in the 2005 \textit{GPU Gems 2} book \cite{gpu_gems_2005}. It works well for testing small-scale light-sources as well as a general point of comparison to the GPU-based progressive refinement solution presented by Nvidia in the aforementioned book.
+    \item \textbf{TextureScene}: A custom-built scene that consists of several colored light-sources inside an octagonal room with a (simplified) dragon statue from the Stanford repository \cite{stanford}. This scene is, uniquely, covered with detailed color-textures.
+\end{itemize}
+
+The overall triangle counts of these scenes range from from 60 (CornellLayers) to over 150 thousand (Sponza). Further scenes (with an adequate UV map) can be brought into RTRad quite easily in the form of FBX-formatted 3D models.
+
+Based on Falcor's scene information, all acceleration structures consisted of a single TLAS, but were subdivided into multiple opaque BLAS geometries.
+
+\section{Results}
+
+\subsection{Pure Progressive Radiosity}
+
+The core algorithm provided in chapter \ref{Chapter4} constitutes an instance of progressive radiosity in of itself. This is a very crude, brute-force approach that does not compromise on realism but comes at a respectively high computational cost. A humbly sized lightmap of $256\times256$ pixels, for instance, would involve up to $256^4$ visibility tests, resulting in well over 4 billion rays being traced. 
+
+This quadratic growth is clearly reflected in our measurements depicted in fig. \ref{data1}. The approximate 4 billion rays are processed in approx. 2 seconds.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.63]{Figures/data_1.png}
+\decoRule
+\caption[]{Average pass-time across three measurements of the same progressive radiosity workload for different lightmap sizes. The underlying scene (CornellLucy) has a UV mapping with a coverage of approx. 86\%. The chosen batchsize is $64\times64$.} 
+\label{data1}
+\end{figure}
+
+The pass-times required for low resolution lightmaps lie well within the leniencies of real-time applications, despite the costly nature of pure progressive radiosity.
+
+Inevitably, the exponential cost overwhelms the leeway enabled by parallelization as resolutions reach the $512\times512$ mark\footnote{The largest measurement we took for pure progressive radiosity was a lightmap of $768\times768$ pixels, which took 867 seconds to complete.}, which is equivalent to an $n$ of 260.000 (70+ billion visibility tests).
+
+\subsection{Undersampling}\label{Undersampling_Analysis}
+
+Although the scalability of quadradically complex algorithms can never be fully nullified, the cost of higher resolution lightmaps can be ameliorated by lowering the samples performed for each patch.
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.7]{Figures/Undersampling_Results.png}
+\decoRule
+\caption[]{Results of Monte-Carlo undersampling after two passes for different combinations of texture resolution and sampling window. Anomalies only become noticeable when the sampling window is very large in relation to the lightmap size (towards the lower left corner).} 
+\label{undersampling_results}
+\end{figure}
+
+
+Undersampling, as layed out in chapter \ref{Chapter5}, has an enormous positive impact on pass-times.
+Under the correct parameters, even larger lightmaps, such as $1024\times1024$, can be fully computed in under five seconds without any noticeable differences to their pure radiosity counterpart (DFPR < 0.025).
+
+All three undersampling methods have near identical pass-times, except for Monte-Carlo undersampling, which requires 5 to 10 percent longer, presumably due to the large amount of pseudo-random number generation.
+
+Differences in visual fidelity only become noticeable under extreme parameters where the sampling window is large in relation to the lightmap resolution (see fig. \ref{undersampling_results} and fig. \ref{DFPR_Undersampling}). For smaller sampling windows the pass-time benefits massively whilst only producing minimal, indistinguishable differences in the final yield.
+
+We found particular success with a ratio of $\frac{1}{128}$ between lightmap texture and sampling window, which produces adequate pass-times and DFPRs for most lightmap resolutions.
+In table \ref{recommended_stettings} we list our measurements under these recommended settings.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.6]{Figures/Deviation.png}
+\decoRule
+\caption[]{DFPR of Monte-Carlo undersampling for different resolutions and sampling windows (lower is better). Differences become noticeable at a threshold between 0.025 and 0.1, depending on the scene.}
+\label{DFPR_Undersampling}
+\end{figure}
+
+\begin{table}[H]
+    \centering
+    \centerline{
+    \begin{tcolorbox}[tablestyle_main,tabularx={X||Y|Y|Y}]
+         \hline
+         \rowcolor{gray!50!black}
+         \textcolor{white}{Lightmap Size} & \textcolor{white}{Sampling Window} & \textcolor{white}{DFPR} & \textcolor{white}{Pass-Time} \\ [0.5ex] 
+         \hline\hline
+         $128\times128$ & $1\times1$ & 0.0000 & 0.151s \\ 
+         \hline
+         $256\times256$ & $2\times2$ & 0.0063 & 0.163s \\
+         \hline
+         $512\times512$ & $4\times4$ & 0.0069 & 0.977s \\
+         \hline
+         $1024\times1024$ & $8\times8$ & <0.0196\footnoteref{note1} & 4.267s \\
+         \hline
+         $2048\times2048$ & $16\times16$ & <0.0345\footnotemark & 16.480s \\ [1ex] 
+         \hline
+    \end{tcolorbox}
+    }
+    \caption{Pass-time and DFPR with Monte-Carlo undersampling using our recommended ratio of $\frac{1}{128}$.}
+    \label{recommended_stettings}
+\end{table}
+
+\footnotetext{We used a $512\times512$ lightmap as the pure reference to calculate this DFPR, which \textit{overestimates} the value.\label{note1}}
+
+\subsubsection{Undersampling Method Differences}
+
+Despite being somewhat more costly, Monte-Carlo produces the highest quality lighting of the three undersampling methods. Whilst the differences are not substantial in most scenes, lightsources with small UV geometry can produce uneven shadows when lit with one of the alternatives.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.9]{Figures/CascadingShadows.png}
+\decoRule
+\caption[]{Uneven shadows produced by mipmapped or static-stride undersampling (left) as opposed to Monte-Carlo undersampling (right) in low-light environments.} 
+\label{cascadingshadows}
+\end{figure}
+
+The uneven shadows seen in fig. \ref{cascadingshadows} are spread out by the randomization of Monte-Carlo undersampling which instead produces a minimal amount of noise (see fig. \ref{Monte-Carlo-U-Noise}), unnoticeable under most circumstances.
+
+We found that most other types of artifacts (such as unnatural highlights along corners) prominent in the latter two can almost entirely be eliminated by clamping the lighting contribution of any one patch to a maximum magnitude of 0.05.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.43]{Figures/Rand_Undersampling_Noise.png}
+\decoRule
+\caption[]{A single wall in CornellGeom lit with pure radiosity (left), Monte-Carlo undersampling (middle). To the right is the difference between the two textures, with its brightness multiplied by 50 to make the noise visible.} 
+\label{Monte-Carlo-U-Noise}
+\end{figure}
+
+\newpage
+
+\subsection{Adaptive Subdivision}
+
+Unlike undersampling, adaptive subdivision does not produce noise and is less prone to the cascading shadow effect highlighted in fig. \ref{cascadingshadows}.
+
+The gains made in pass-time, however, largely depend on the gradient threshold that is chosen (see fig. \ref{AS_DFPR_PT}).
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.7]{Figures/AdaptiveSubdiv_DFPR_PT.png}
+\decoRule
+\caption[]{DFPR and average pass-time for different gradient thresholds in adaptive subdivision. Lightmap resolution is $512\times512$, max-node size $8\times8$ and batch-size $64\times64$.} 
+\label{AS_DFPR_PT}
+\end{figure}
+
+Undersampling does not require the storage or retrieval of quad-tree metadata, and as such runs significantly faster in most cases.
+Rudimentary undersampling is simpler and its parameters are scene-independent, which makes the results more predictable. With adaptive subdivision even minor changes in the chosen gradient threshold can manifest themselves in significant differences in pass-times.
+
+It is noteworthy that our approach is entirely contained within a textures alpha-channel, which allows for a simple implementation and visualization, but may offer worse performance than a quad-tree contained in a memory buffer or a separately generated sampling texture.
+
+In general we found that adaptive subdivision, although offering vastly reduced pass-times over pure radiosity, gets frequently outclassed by the swifter pass-times offered by Monte-Carlo undersampling (see fig. \ref{general_comparison}).
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=1.2]{Figures/Comparison.png}
+\decoRule
+\caption[]{Avg. pass-time and visual comparison between different sampling techniques on a $256\times256$ lightmap. Lighting quality is worse with directional sampling, but pass-time scale linearly. Undersampling can exaggerate ambient occlusion, but is generally faster than adaptive subdivision.} 
+\label{general_comparison}
+\end{figure}
+
+\subsection{Scene Complexity}
+
+Measuring performance relative to a scene's triangle count is difficult to do accurately, as the cost incurred by BVH traversal can highly vary depending on the specific arrangement and concentration of these triangles.
+
+Nevertheless, our results are roughly indicative of the logarithmic scaling that the underlying theory would predict.
+
+Fig. \ref{TriangleScaling} depicts the pass-time for each of our scenes under the same pass parameters. The curve generally follows a logarithmic pattern, apart from our largest scene (SponzaScene) being significantly faster than our second largest (CornellLucy).
+
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.7]{Figures/TriangleScaling.png}
+\decoRule
+\caption[]{Average pass-time (across five passes) for each of our testing scenes. Parameters: $256\times256$, pure radiosity, batch-size of $64\times64$.} 
+\label{TriangleScaling}
+\end{figure}
+
+The underlying cause for this anomaly is likely the specific arrangement of the geometry in these scenes. CornellLucy has the vast majority of its triangles at its center, with the surrounding walls consisting of a large number of radiosity patches. Correspondingly, most rays cross this center area and will likewise be traced against large portions of the BVH.
+
+SponzaScene on the other hand has its triangles spread out and segregated into smaller sub-volumes. Given that our rays are only as long as they need to be, it stands to reason that such an arrangement would induce a swifter BVH traversal per ray. Furthermore, RTX's ray-grouping technique \cite{RTX_examination} may contribute to this phenomenon as well.
+
+\section{Extensions}
+
+Below we disclose the impact provided by the implemented extensions that go beyond the scope of progressive refinement radiosity, such as visibility caching, raymarching and directional sampling.
+
+\subsection{Visibility Caching}\label{viscaching_analysis}
+
+Visibility data can be stored in its entirety for lightmaps smaller or equal to $512\times512$ pixels. Correspondingly, all lightmaps of this size demonstrate a significant speedup for all passes beyond the first (see fig. \ref{Viscache_Stats}). The first pass, in contrast, is slowed down by $10\%$ to $20\%$, due to the necessity to compute the cantor-index and store the visibility bit.
+
+Smaller lightmaps benefit less from this increase in speed, but the maximum size remains capped at $512\times512$.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.7]{Figures/Viscache_stats.png}
+\decoRule
+\caption[]{Percentage change in pass-time after enabling visibility caching for the first and subsequent passes. A value of 50\% would equate to the pass running twice as fast, 200\% twice as slow etc. (CornellLucy scene with maximum batch-size).} 
+\label{Viscache_Stats}
+\end{figure}
+
+The overall computation speed is greatly improved for resolutions between $256\times256$ and $512\times512$. Unfortunately, higher resolutions cannot viably be covered by our method due to the respective buffer index exceeding the maximum value of an unsigned, 32bit memory pointer.
+
+The unfortunate conclusion is thus that visibility caching is only \textit{possible} for lower resolutions, which least require it.
+Although the approach may find itself useful for real-time lightmapping on small to medium sized lightmaps, the results demonstrate why GPU-based radiosity implementations generally refrain from caching visibility data: The available memory is unable to harbour the exponential amount demanded by larger lightmaps. 
+
+\subsection{Voxel Raymarching}\label{VoxelRaymarch_Analysis}
+
+Visibility estimation through voxel-raymarching is inherently less accurate than RTX. 
+Fig. \ref{VXRM_Accuracy} shows the precision of visibility estimation for a single patch, which is \textit{favourable} to raymarching. Patches located in non-flat, detailed environments are likely to degrade accuracy even further, because all the detail within the vicinity gets simplified into a single voxel. This deterioration in quality can clearly be observed in fig. \ref{VXRM_Screenshots}, where complex geometry, or geometry miss-aligned with the voxelmap produces unrealistic shadows.
+
+\begin{figure}[H]
+\centering
+\makebox[\textwidth][c]{\includegraphics[scale=0.8]{Figures/Accuracy_VXRM.png}}
+\decoRule
+\caption[]{The red patch (highlighed by a circle) is visible to the white patches. Visibility accuracy of RTX compared with voxel raymarching on differently sized voxelmaps.} 
+\label{VXRM_Accuracy}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\makebox[\textwidth][c]{\includegraphics[scale=0.8]{Figures/VXRM_PT_DFPR.png}}
+\decoRule
+\caption[]{Pass-time and DFPR with regular RTX (left) and voxel raymarching on voxelmaps of different sizes. Pass-times only become worthwhile for very small voxelmaps, whereupon the quality degrades too much to remain viable.} 
+\label{VXRM_Screenshots}
+\end{figure}
+
+In addition, voxel raymarches do not run on dedicated hardware and, as such, will not benefit from RT-core parallelization.
+In our testing, voxel raymarching was consistently slower than RTX-based raytracing, except for very small voxelmaps, which are less suited to complex scenes and provide unsatisfactory lighting quality.
+
+In chapter \ref{Chapter5} we postulated the idea of complementing our RTX-based algorithm with regular voxel raymarches to relieve pressure on the limited amount of RT cores.
+
+Unfortunately, this concept did not materialize and ended largely in failure.
+The only instance for which interleaving ray-traces and raymarches demonstrated improved pass-times was when the voxel-maps were so small that raymarches were inherently faster.
+
+However, using larger voxelmaps does provide accurate visibility and may serve as a fallback method for graphics cards that are not RTX compatible or in scenes that contain an exorbitant amount of triangles.
+
+If nothing else, it is still serves as an indicative testament to RTX's impressive performance.
+
+\subsection{Directional Sampling}
+
+Employing a directional sampling approach as opposed to a rudimentary, patch-pair approach led to a dramatic improvement in performance for large lightmaps, even though the overall performance \textit{per ray} suffered, due to rays traversing further into the BVH than previously.
+
+This method is of linear complexity $O(n)$ relative to the amount of patches, as the number of rays fired per patch is constant, which makes it is highly adequate for very large lightmaps. We were able to fully compute lightmaps of $2048^2$ pixels in under two seconds, with 1024 samples taken per patch.
+
+\begin{figure}[h]
+\centering
+\includegraphics[scale=0.45]{Figures/Directional_Sampling_Vis.png}
+\decoRule
+\caption[]{Directional sampling with different amount of samples on a lightmap of $128\times128$ pixels. The white patches are sampled to compute the lighting value of the red patch (highlighted by a circle).} 
+\label{directional_sampling_vis}
+\end{figure}
+
+Visual fidelity is comparable with that of undersampling techniques, but significantly deteriorates in scenes with small light-sources, as seen in fig. \ref{Directional_sampling_noise}.
+
+Our implementation employs pre-computed directions that are hard-coded into the shader, which is very beneficial towards performance, but limits the maximum amount of samples to that of the pre-generated set. Examples of which patches our pre-generated sets sample can be seen in fig. \ref{directional_sampling_vis}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[scale=1.0]{Figures/Directional_Sampling_Noise.png}
+\decoRule
+\caption[]{Directional sampling in environments with small light-sources. Because the chance of a ray hitting the light-source is low, noisy shadows are produced on the walls. The noise becomes less pronounced with each subsequent pass.} 
+\label{Directional_sampling_noise}
+\end{figure}
+
+We recommend using directional sampling for large lightmaps in scenes with large light-sources, but suggest falling back to Monte-Carlo undersampling in other instances. Alternatively, a hybrid approach that utilizes directional sampling in conjunction with discrete sampling of important patches (such as light-sources) may provide an ideal middle-ground.
+
+\begin{figure}[h]
+\centering
+\includegraphics[scale=0.48]{Figures/overall_self_comp.jpg}
+\decoRule
+\caption[]{Overall comparison of RTRad performance enhancements. Note that a different implementation of sub-structuring could yield results more comparable to undersampling.} 
+\label{Overall_Comp}
+\end{figure}
+
+\section{Comparison}
+
+In \textit{GPU Gems 2}\footnote{\textit{GPU Gems 2} was published in 2005. Given the advancements in hardware since then, it is safe to assume that their system would run significantly faster on modern hardware.}, Pharr et al. claim to achieve 2 frames per second on a scene with 10.000 patches using their GPU-based progressive refinement radiosity, with Coombe et al. achieving comparable results in their own implementation \cite{gpu_gems_2005, RadiosityOnGPUs_Coombe}. 
+
+In contrast, RTRad manages similar framerates with lightmaps of 60.000-100.000 patches. Fig. \ref{nvidia_scene_comparison} provides a side-by-side comparison for visual differences between the two programs.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.85]{Figures/NVidiaScene_comparison.png}
+\decoRule
+\caption[]{Scene with one million elements as shown in \textit{GPU Gems 2} \cite{gpu_gems_2005} (left) and our reconstruction rendered with RTRad (right).} 
+\label{nvidia_scene_comparison}
+\end{figure}
+
+\subsection{Unity and Unreal Engine}
+
+Two of the most prolific rendering engines in the domains of video games, research and filmmaking, are \textit{Unity} and \textit{Unreal Engine} \cite{Render_Engines_Overview1, Render_Engines_Overview2}.
+
+Both of these have their own built-in CPU lightmap generation system: Unity in its \textit{Progressive Lightmapper} and Unreal in its \textit{Lightmass} system. Either system can also be set up for GPU execution\footnote{Unity's Progressive GPU Lightmapper and Unreal's GPU Lightmass are both preview/beta features that, whilst usable, have not yet been officially released.}.
+
+Fig. \ref{Comparison_graph} shows a performance comparison between each application
+, with a detailed account of this data listed in table \ref{Comparison_Table}. Despite being a purely research-oriented application that was developed with limited time and resources, RTRad competes impressively well with these well-established industrial solutions.
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=1.15]{Figures/Comparison_Quality.png}
+\decoRule
+\caption[]{Lightmap of $1024\times1024$ pixels for the same scene computed with different lightmapping tools.} 
+\label{Comparison_side-by-side}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.6]{Figures/Comparison_Measurements.png}
+\decoRule
+\caption[]{Total bake time of the CornellLucy scene for two bounces of light with different applications and lightmap sizes.} 
+\label{Comparison_graph}
+\end{figure}
+
+\begin{table}[H]
+    \centering
+    \centerline{
+    \begin{tcolorbox}[tablestyle_main,tabularx={l|l|X||r}]
+        \rowcolor{gray!50!black}
+        \textcolor{white}{Lightmap Size} & \textcolor{white}{Device} & \textcolor{white}{Engine} & \textcolor{white}{Bake Time} \\ \hline
+        \hline
+        \rowcolor[RGB]{236,236,245}
+        $256^2$ & CPU & Unity 2020.3.21 & 4.1s \\ \hline
+        \rowcolor[RGB]{226,226,245}
+        $256^2$ & GPU & Unity 2020.3.21 & 4.2s \\ \hline
+        \rowcolor[RGB]{236,245,236}
+        $256^2$ & CPU & Unreal Engine 5.0.3 & 6.5s \\ \hline
+        \rowcolor[RGB]{226,245,226}
+        $256^2$ & GPU & Unreal Engine 5.0.3 & 3.36s \\ \hline
+        \rowcolor[RGB]{245,236,236}
+        $256^2$ & GPU & RTRad (Undersampling) & 0.5s \\ \hline
+        \rowcolor[RGB]{245,226,226}
+        $256^2$ & GPU & RTRad (Directional) & 0.12s \\ \hline
+        \hline
+        \rowcolor[RGB]{236,236,245}
+        $512^2$ & CPU & Unity 2020.3.21 & 16.3s \\ \hline
+        \rowcolor[RGB]{226,226,245}
+        $512^2$ & GPU & Unity 2020.3.21 & 5.4s \\ \hline
+        \rowcolor[RGB]{236,245,236}
+        $512^2$ & CPU & Unreal Engine 5.0.3 & 16.4s \\ \hline
+        \rowcolor[RGB]{226,245,226}
+        $512^2$ & GPU & Unreal Engine 5.0.3 & 57.91s \\ \hline
+        \rowcolor[RGB]{245,236,236}
+        $512^2$ & GPU & RTRad (Undersampling) & 2.49s \\ \hline
+        \rowcolor[RGB]{245,226,226}
+        $512^2$ & GPU & RTRad (Directional) & 0.42s \\ \hline
+        \hline
+        \rowcolor[RGB]{236,236,245}
+        $1024^2$ & CPU & Unity 2020.3.21 & 58.5s \\ \hline
+        \rowcolor[RGB]{226,226,245}
+        $1024^2$ & GPU & Unity 2020.3.21 & 13.4s \\ \hline
+        \rowcolor[RGB]{236,245,236}
+        $1024^2$ & CPU & Unreal Engine 5.0.3 & 50.4s \\ \hline
+        \rowcolor[RGB]{226,245,226}
+        $1024^2$ & GPU & Unreal Engine 5.0.3 & 27.3s \\ \hline
+        \rowcolor[RGB]{245,236,236}
+        $1024^2$ & GPU & RTRad (Undersampling) & 8.59s \\ \hline
+        \rowcolor[RGB]{245,226,226}
+        $1024^2$ & GPU & RTRad (Directional) & 0.70s \\ \hline
+        \hline
+        \rowcolor[RGB]{236,236,245}
+        $2048^2$ & CPU & Unity 2020.3.21 & 214.2s \\ \hline
+        \rowcolor[RGB]{226,226,245}
+        $2048^2$ & GPU & Unity 2020.3.21 & 31.1s \\ \hline
+        \rowcolor[RGB]{236,245,236}
+        $2048^2$ & CPU & Unreal Engine 5.0.3 & 179.2s \\ \hline
+        \rowcolor[RGB]{226,245,226}
+        $2048^2$ & GPU & Unreal Engine 5.0.3 & 102.3s \\ \hline
+        \rowcolor[RGB]{245,236,236}
+        $2048^2$ & GPU & RTRad (Undersampling) & 33.17s \\ \hline
+        \rowcolor[RGB]{245,226,226}
+        $2048^2$ & GPU & RTRad (Directional) & 2.96s \\ \hline
+    \end{tcolorbox}
+    }
+    \caption{Expanded data corresponding to fig. \ref{Comparison_graph}.}
+    \label{Comparison_Table}
+\end{table}
+
+To create comparable results (see fig. \ref{Comparison_side-by-side}), each configuration was given its own custom settings, which we list below:
+
+\begin{itemize}
+    \item \textit{Unity Engine (CPU and GPU)}: Shadowmask, medium quality.
+    \item \textit{Unreal Engine (CPU)}: High quality preset.
+    \item \textit{Unreal Engine (GPU)}: 512 GI samples, no irradiance caching.
+    \item \textit{RTRad (Undersampling)}: Monte-Carlo undersampling in line with our recommended settings from table \ref{recommended_stettings} and maximum batchsize.
+    \item \textit{RTRad (Directional)}: 1024 samples with maximum batchsize.
+\end{itemize}
+
+The exhibited measurements are naturally not all-conclusive, as Unity and Unreal are both powerful game engines made for far more than just lightmapping \cite{UnrealDocu, unity_docs}. Each algorithm employs diverging techniques and operates on entirely different parameters in addition to potential differences in their approach for time measurement.
+
+We can, however, establish a clear trend in that leveraging RTX for radiosity is not only competitive, but highly advantageous in most circumstances.
+
+\section{Specular Reflections}
+
+A limitation inherent to radiosity as a whole is that only diffuse reflections are accounted for. RTRad does contain any non-diffuse functionality itself, but allows generated lightmaps to be exported as textures. 
+These can then be brought into a different rendering pipeline to be complemented with specular reflections, as we did in fig. \ref{Gallery} with Unity.
+

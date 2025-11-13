@@ -1,0 +1,99 @@
+\section{Remote Attestation}
+\label{sec:remote_attestation}
+The attestation of a \ac{TD} consists of generating a local attestation report, which can be verified on the platform and then extending this report with digital signatures and certificates to enable remote attestation of the \ac{TD} off the platform. We first describe the overall process of generating and extending a local \ac{TD} \spec{report} in \S\ref{ssec:attestation_process}. Then we review the setup and the configuration of the host \ac{TDX} platform to enable remote attestation in \S\ref{ssec:setup}.  Finally, we provide details on using remote attestation for establishing a secure channel and encrypted boot in \S\ref{ssec:secure_channel}.
+
+\subsection{Attestation Process}
+\label{ssec:attestation_process}
+Several steps are involved when generating and extending a local \spec{report} of a \ac{TD} to enable remote attestation. The first step is to take measurements of the loaded software during the build-time and runtime of the \ac{TD}. The next step is to retrieve the \ac{TD}'s measurements and platform \ac{TCB} information, \ie generating a \ac{TD} \spec{report}. The final step is to derive a \spec{quote} from the \ac{TD} \spec{report}. A third party can use the \spec{quote} to verify whether the \ac{TD} runs on a genuine \ac{TDX} platform with the expected \ac{TCB} versions and software measurements.
+
+\nip{Taking Measurements.} \ac{TDX} provides two types of measurement registers for each TD: a build-time measurement register called \ac{MRTD} and four \acp{RTMR}. These measurement registers are comparable to the \ac{TPM}'s \acp{PCR}, see Table~\ref{tdx-tpm-table} derived from~\cite{tdxvirtualfw} showing the mapping between \ac{TDX} measurement registers and \ac{TPM} \acp{PCR}.
+
+\begin{table}[t!]
+\caption{Mapping of \ac{TDX} Measurement Registers and \ac{TPM} PCRs}
+\label{tdx-tpm-table}
+\small
+\begin{tabular}{l|l|l} 
+ \hline
+ \textbf{\ac{TDX} Measurement Registers}  & \textbf{\ac{TPM} \acp{PCR}} & \textbf{Usage} \\ 
+ \hline
+ \ac{MRTD}   & \ac{PCR}[0]  & Virtual firmware  \\
+ \hline
+ \ac{RTMR} [0] & \ac{PCR}[1,7] & Virtual firmware data + configuration \\
+ \hline
+ \ac{RTMR} [1] & \ac{PCR}[2-5] & OS kernel + \spec{initrd} + boot parameters \\ 
+ \hline
+ \ac{RTMR} [2] & \ac{PCR}[8-15] & OS application \\
+ \hline
+ \ac{RTMR} [3] & N/A & Reserved \\
+ \hline
+\end{tabular}
+\end{table}
+
+
+The \ac{MRTD} contains a measurement of the \ac{TD} build process.  At the \ac{TD} creation, when the hypervisor adds initial memory pages to the \ac{TD}, it extends the \ac{MRTD} in the \ac{TDCS} with measurements of these pages. The hypervisor calls \code{SEAMCALL[TDH.MEM.PAGE.ADD]}  to add a page to the TD's memory and to initiate the measurement of the page. It first calculates a \spec{SHA384} update over the ASCII string ``MEM.PAGE.ADD'' and the \ac{GPA} of the page. Then it extends the \ac{MRTD} with the hash value. Once the page is copied into the \ac{TD}’s memory, \ie mapped and available in the \ac{SEPT}, the hypervisor calls \code{SEAMCALL[TDH.MR.EXTEND]} multiple times to measure the content of the page. The page is measured in blocks of 256\,B. For each block, the extension operation first calculates a \spec{SHA384} update over the ASCII string ``MR.EXTEND'' and the \ac{GPA} of the block. Second, it calculates another \spec{SHA384} update over the content of this block. Both hash values extend the \ac{MRTD}. These initial pages contain the \ac{TD}'s virtual firmware. The \ac{MRTD}'s measurement does not include pages containing control structures, \ie \ac{TDR}, \ac{TDCS}, and \ac{TDVPS}, nor the \ac{SEPT}. After the initial set of pages are added, the hypervisor finalizes the \ac{MRTD} measurement using the \code{SEAMCALL[TDH.MR.FINALIZE]}. This disables future operations to extend the \ac{MRTD}. For example, when initializing a \ac{TD}, KVM, as a Linux hypervisor, measures the TDVF~\cite{tdvf} (virtual firmware of a \ac{TD}) code into the \ac{MRTD}. 
+
+\acp{RTMR} are general measurement registers labeled $0$ through $3$ for \ac{TD}'s runtime measurements. A \ac{TD} can use these registers to provide a measured boot, \ie measuring all software loaded after booting. These measurement registers are initialized to zero. The TD calls \code{TDCALL[TDG.MR.RTMR.EXTEND]} to extend the content of a \ac{RTMR}. The arguments of this call consist of an index to the measurement register and an 64\,B-aligned physical address of the 48\,B extension buffer containing the value. This call calculates a \spec{SHA384} hash over the current value of the given index measurement register concatenated with the value in the extension buffer, as follows \code{\ac{RTMR}[index] = SHA384(\ac{RTMR}[index] || value)}. For example, TDVF measures the static/dynamic configuration data into the \code{\ac{RTMR}[0]} and the OS kernel, boot parameters, and \spec{initrd} into the \code{\ac{RTMR}[1]}. 
+
+\nip{Generating a TD Report.} A TD \spec{report} is generated inside a TD. The TD calls \code{TDCALL[TDG.MR.REPORT]}, which is the \ac{TDX} Module's report function, with a newly initialized report structure and some user report data, named \code{REPORTDATA}. The \code{REPORTDATA} is 64\,B and it can be used as a \spec{nonce} to verify freshness of the TD \spec{report}. To service the call, the \ac{TDX} Module invokes the newly added \code{SEAMOPS[SEAMRERPORT]} instruction with the \ac{TD}'s measurements and \code{REPORTDATA}. The CPU adds \ac{TCB} information related to the \ac{SEAM} and returns a \ac{TD} \spec{report}. This \ac{TD} \spec{report} is integrity protected using an HMAC key maintained by the CPU. The HMAC key is only available to the CPU. The \ac{TDX} Module returns this \spec{report} to the TD. Using the \code{EVERIFYREPORT2} instruction, an enclave can verify the \spec{report} on the same platform but not off the platform.
+
+\begin{figure}[t!]
+\centerline{\includegraphics[width=0.7\textwidth]{figures/td_report.pdf}}
+\caption{TD Report Structure}
+\label{fig:td_report}
+\end{figure}
+
+\autoref{fig:td_report} illustrates the \ac{TD} \spec{report} consisting of three components: \code{REPORTMACSTRUCT}, \code{TEE\_TCB\_INFO}, and \code{TD\_INFO}. The \code{REPORTMACSTRUCT} structure contains header information specifying the structure type as \ac{TDX} and has fields for CPU \ac{SVN} and hashes of the \code{TEE\_TCB\_INFO} and \code{TD\_INFO} components. It also includes the \code{REPORTDATA} provided as the input to the \code{TDCALL[TDG.MR.REPORT]} function.  Finally, there is an HMAC over the entire header that protects \code{TEE\_TCB\_INFO} and \code{TD\_INFO} components. The \code{TEE\_TCB\_INFO} structure contains information about the \ac{SVN} and measurements of the \ac{TDX} Module. The \code{TD\_INFO} contains TD attestable properties. Examples of these properties include the initial \ac{TD} configuration and values of the measurement registers. 
+
+\nip{Deriving a Quote.} To enable verification off the platform by a third party, the \ac{TD} \spec{report} must be converted into a \spec{quote}. \ac{TDX} tends to reuse the remote attestation mechanism of \ac{SGX}. 
+A TD makes a call to request the \acf{QE} running on the host platform to sign the \ac{TD} \spec{report}. This call can be implemented over a \spec{VSOCK} or a \code{TDCALL[TDG.VP.VMCALL]}, depending on how the quoting service is provided on the platform. The \ac{QE} calls the \code{EVERIFYREPORT2} instruction to verify the TD \spec{report}'s HMAC. If this call is successful, the \ac{QE} signs the TD \spec{report} using its certified attestation key to generate a \spec{quote}. This operation basically replaces the MAC integrity protection of the TD \spec{report} with the digital signature protection, allowing any party to verify the provenance and integrity of the \spec{quote} using public key certificates. Section~\S\ref{ssec:setup} describes the operations for enabling the local attestation infrastructure on the platform to support remote attestation.
+
+\subsection{Platform Setup}
+\label{ssec:setup}
+Configuring the attestation infrastructure involves registering the platform with the Intel \ac{PCS}, running architectural enclaves for generating \spec{quotes}, and retrieving certificates required for verifying \spec{quotes}. Intel extends the existing \ac{DCAP}~\cite{dcapwhitepaper} to support remote attestation for \ac{TDX}.
+
+\nip{Registration.}
+On multiple-package platforms, platform keys are derived at platform assembly time. 
+These keys are shared between CPU-packages and are encrypted by the CPU's unique hardware key. \acfp{PCK} are derived from the platform keys and used for certifying (signing) attestation keys. Since \acp{PCK} are not recognized by the attestation infrastructure, they must be registered with Intel \ac{PCS}.
+
+To register a platform, we need to run the \spec{\ac{PCK} Cert ID Retrieval Tool} to extract a manifest from the platform. This manifest contains information on CPU packages, \eg CPU ID (128-bit), \ac{SVN}, and hardware \ac{TCB} information. When the Intel \ac{PCS} gets the register server request, it checks whether CPUs and \ac{TCB} are in good standing before issuing a \ac{PCK} certificate. The manifest is signed with keys derived from the CPU package’s hardware keys and the Intel \ac{PCS} checks whether these signatures are valid.  If registration succeeds, the Intel \ac{PCS} returns an Intel-issued certificate for the \ac{PCK}.
+
+Typically in \ac{DCAP}, a \ac{PCCS} runs on the host platform to facilitate \ac{PCK} certificate retrieval. This service can run anywhere. It forwards the \ac{PCK} requests from the \spec{\ac{PCK} Cert ID Retrieval Tool} to the Intel \ac{PCS} and caches the returned \ac{PCK} certificates locally. The Intel \ac{PCS} also provides certificates and revocation lists for \acp{PCK} in all genuine Intel platforms. \ac{PCCS} maintains local caches of these artifacts as well. 
+
+Before registering, a platform must have the appropriate UEFI/BIOS settings and access to the Intel \ac{PCS}. Both \ac{TDX} and \ac{SGX} must be enabled in the UEFI/BIOS on the host platform.  An Intel account is required for retrieving API keys for registering a platform with the Intel \ac{PCS}. If the \ac{PCCS} is utilized, it must be configured with the API keys and Intel \ac{PCS} server's address.
+
+\begin{figure}[t!]
+\centerline{\includegraphics[width=0.50\textwidth]{figures/quote_cert_chain.pdf}}
+\caption{Quote Certificate Chain}
+\label{fig:quote_chain}
+\end{figure}
+\nip{Architectural Enclaves.}
+To enable \spec{quote} generation on the platform. Intel provides two architectural enclaves: \ac{PCE} and \acf{QE}. The \ac{PCE} acts as a local certification authority for the \ac{QE}. In its initialization process, the \ac{QE} generates an attestation key pair. It sends the public part to the \ac{PCE}. The \ac{PCE} authenticates that this is a legitimate \ac{QE} on the platform and then signs the attestation public key certificate with the \ac{PCK}. This signature creates a \spec{quote} certificate chain from an Intel-issued \ac{PCK} certificate to the \ac{QE} attestation public key. \autoref{fig:quote_chain} illustrates the \spec{quote}'s certificate chain. The \ac{PCK} certificate is used for verifying the \ac{QE} attestation public key certificate, and the \ac{QE} attestation public key in turn for verifying the signature on the \spec{quote}. 	
+
+\begin{figure}[t!]
+\centerline{\includegraphics[width=0.8\textwidth]{figures/remote_attestation_flow.pdf}}
+\caption{A Remote Attestation Flow}
+\label{fig:ra_flow}
+\end{figure}
+\nip{Remote Attestation Flow.}
+\autoref{fig:ra_flow} shows a remote third party performing attestation with an attestation agent running on a \ac{TD}. The remote party sends an attestation request providing a nonce to the attestation agent (Step 1). The nonce provides freshness to the request and prevents replay attacks. The attestation agent retrieves a \ac{TD} \spec{report} from the \ac{TDX} Module providing the nonce as the \code{REPORTDATA} (Step 2) and then subsequently requests the \ac{QE} to sign the \ac{TD} \spec{report} using its attestation key (Step 3).  The \ac{QE} verifies that the \ac{TD} \spec{report} is generated on the platform before signing with its attestation key. The attestation agent then returns the \spec{quote} to the remote party (Step 4). 
+
+The remote party requires the platform's \ac{PCK} certificate to verify the \spec{quote}, so it may download the \ac{PCK} certificate from a \ac{PCCS} (Step 5) or retrieve directly from the Intel \ac{PCS} (Step 6). The party then proceeds to validate the \spec{quote} (Step 7). It checks for the nonce in the \spec{quote} and verifies the integrity of the signature chain from the Intel-issued \ac{PCK} certificate to the signed \spec{quote}, walking the certificate chain to determine whether the \spec{quote} has a valid signature. The party also checks that no keys in the chain have been revoked and whether the \ac{TCB} is up-to-date. Finally, the party checks if the measurements, \ie values in \ac{MRTD} and \acp{RTMR}, in the \spec{quote} match a set of reference values. If it successfully validates the \spec{quote}, the remote party can trust that the \ac{TD} has been properly instantiated on a \ac{TDX} platform. 
+
+\subsection{Use Cases}
+\label{ssec:secure_channel}
+\nip{Secure Channel Establishment.} 
+Remote attestation can be integrated with establishing a secure channel~\cite{knauthsgx}, linking channel setup with the endpoint's TEE identity, state, and configuration. This integration prevents relay
+attacks since an attacker cannot forward a challenger's attestation request from a compromised system to a trusted system to service the request.
+
+In a typical scenario when a client negotiates a secure channel with a server running in a \ac{TEE}, it wants to ensure a connection with a properly instantiated server. The server, serving as an attester, generates an ephemeral public and private key pair. It computes the hash of the public key and then creates a \ac{TD} \spec{report} providing this hash as the \code{REPORTDATA}. The server requests a \spec{quote} of the \spec{report} and generates a self-signed certificate with the \spec{quote} embedded in the certificate. It provides this self-signed certificate as the server certificate in the \ac{TLS} handshake protocol. When the client, serving as the challenger, receives the server certificate, it verifies signatures on the certificate and validates the embedded \spec{quote} in the certificate, including the measurements. It also checks if the \spec{quote} includes the hash of the public key since this links the key to the \ac{TEE}. When establishing a secure channel, both client and server can assume the roles of attester and verifier. This allows endpoints running in \acp{TEE} to mutually authenticate each other by validating \acp{TEE}.
+
+\begin{figure}[t!]
+\centerline{\includegraphics[width=0.8\textwidth]{figures/encrypted_boot.pdf}}
+\caption{Encrypted Boot Flow}
+\label{fig:eb_flow}
+\end{figure}
+\nip{Encrypted Boot.}
+Using remote attestation, we can launch a \ac{TD} with an encrypted partition image and let the tenant control the release of the partition decryption key. \autoref{fig:eb_flow} illustrates the execution flow of an encrypted boot of a \ac{TD}. An attestation agent is placed within the \ac{TD}'s \spec{initrd} and starts when a \ac{TD} is launched. The agent retrieves the \ac{TD}'s \spec{quote}, which contains the \ac{TCB} measurements (from the \ac{TDX} platform up to the \spec{initrd}), and is signed by Intel's \ac{QE}. The \spec{quote} is sent over a secure channel to an attestation server controlled by the tenant for verification. Once a \spec{quote} is verified with the expected measurements, the attestation server provides the decryption key for the partition to the attestation agent. The agent then uses this key to decrypt and mount the encrypted partition that contains the secrets. This ensures that secrets can only be loaded into encrypted memory and are not visible to the host. 
+
+Tenants also have the flexibility to integrate the attestation agent in the virtual BIOS and wrap the entire \ac{VM} workload within an encrypted image. In this case, the virtual BIOS needs to be extended to support the functionalities of retrieving the \spec{quote} and fetching the key for mounting the encrypted disk image.
+

@@ -1,0 +1,421 @@
+% \subsection{Split-Parallel Online Scheduling}
+% Online scheduling splits the training operations of a mini-batch across multiple partitions.
+% It runs online at each iteration on a different mini-batch.
+% \ms{Goal: split the computation graph. We do that in two steps. Split the sample first, then design split-aware operators that minimize communication cost and maximize data access locality.}
+
+% The scheduling algorithm maximizes local data processing and minimize communication across GPUs by leveraging the semantics of the message-passing primitives of GNN models and the properties of GNN sampling algorithms.
+% The algorithm first split the mini-batch sample into multiple \emph{local splits}, one per GPU.
+% It then uses these splits to schedule \emph{cooperative training}, where all GPUs operate on the same mini-batch, maximizing data access locality.
+% We discuss these two steps in the following
+
+
+\subsection{Split-Parallel Online Scheduling}
+\label{sec:scheduling}
+
+\Tadj online scheduling splits a mini-batch into per-GPU local splits by assigning each vertex of a mini-batch sample to one local split. 
+The scheduling algorithm needs to meet the following two requirements:
+\begin{enumerate}
+\item It should not become a performance bottleneck of the end-to-end training pipeline.
+\item it should minimize the number of edge cuts in order to reduce the inter-GPU communication during forward and backward computation. 
+\end{enumerate}
+  
+% 
+% In \tadj training, it is very important to keep the splitting overhead low.
+The cheapest possible sampling algorithm would be to randomly assign each vertex in a mini-batch to a split.
+Besides, a uniform random distribution would ensure that all splits are perfectly balanced.
+However, this would produce a bad edge cut, since the probability that two endpoint vertices of an edge are in the same split is only $1/g$, where $g$ is the number of splits.
+A large edge cut increases the communication cost of cooperative training. On the other hand,  min-cut graph partitioning algorithms such as Metis~\cite{karypis1997metis} could meet the second requirement, but applying them for every mini-batch is very time-consuming. 
+
+
+To meet both requirements, we propose a two-step procedure that combines online splitting with offline partitioning and caching.
+The first step, offline partitioning, applies min-cut graph partitioning algorithms to the full input graph. 
+The output is a vertex partitioning map, which assigns each vertex of the entire input graph to one GPU and per-GPU cache sets, which specifies the set of vertices that are cached by that GPU, if caches are used. 
+The second step online splitting slices each mini-batch into local splits by looking up the vertex partitioning map and the per-GPU cache sets. The lookup operation is much more lightweight than applying a min-cut graph partitioning algorithm. 
+
+Specifically, the online splitting algorithm assigns vertices of the mini-batch to GPUs by looking up the vertex partitioning map.  
+All the vertices assigned to a specific GPU and their induced computation graph is a local split for that GPU. 
+GPUs are responsible for the computation only in their local splits. 
+If the destination vertex $v$ belongs to a different split than the source vertex $u$, the algorithm adds a special \emph{reference vertex} for $v$ to the split of $u$.
+The online splitting algorithm also looks up the caching set to determine which layer $0$ vertices must be loaded. 
+If a layer-$0$ vertex is assigned to a GPU but its feature is not cached, its features are loaded only by that GPU at the beginning of the iteration.
+
+% The online splitting algorithm takes two data structures as input when training starts: a vertex partitioning map, which maps each vertex of the entire input graph to one GPU, and a caching set per GPU, which specifies the set vertices that are cached by that GPU, if caches are used.
+% Splitting the vertices at the layer $0$ of the mini-batch sample determines which GPU is responsible for caching or loading the input features of those vertices.
+% The splitting algorithm looks up the vertex partitioning map to assign the layer-$0$ vertices of the mini-batch to local splits.
+% It then looks up the caching set to determine which layer $0$ vertices must be loaded. 
+% If a layer-$0$ vertex is assigned to a split but it is not cached by the corresponding GPU, its features are loaded only by that GPU at the beginning of the iteration.
+
+% To avoid redundant computation, it is then necessary to split the vertices at the layer $l>0$ of the mini-batch.
+% The splits determine which GPU is responsible for calculating the hidden feature of these vertices. 
+% The scheduler looks up the vertex partitioning map to map each layer-$l$ vertex to only one split.
+% After splitting the vertices at a layer $l$, the algorithm maps each edge $e=(u,v)$ across layers $l-1$ and $l$ to the split containing the source vertex $u$.
+% If the destination edge $v$ belongs to a different split than $u$, the algorithm adds a special \emph{reference vertex} for $v$ to the split of $u$.
+
+In the example of Figure~\ref{fig:overview}, the mini-batch sample is split into two local splits $S_1$ and $S_2$ in Step~1. 
+Vertex $v_1$ is included in $S_2$ as a reference vertex, since it belongs to $S_1$ but it has an incoming edge from a source vertex in $S_2$.
+Similarly, $v_2$ is included in $S_1$ as a reference vertex.
+
+
+Using full-graph partitions to split mini-batches, which are subgraphs of the input graph, does not necessarily result in as balanced splits and low edge cut as running graph partitioning on each mini-batch.
+However, it is a good compromise to keep both the scheduling time and the training time low, as we show in our evaluation.
+
+% \mypar{Rationale}
+% Reference vertices require coordination across GPUs, so the splitting algorithm should assign the endpoints of each edge to the same local split as much as possible.
+% % The algorithm should also balance the load across splits as much as possible.
+% Running a min-cut graph partitioning algorithm on the mini-batch at each iteration would achieve these goals, but it would introduce an additional end-to-end overhead to the training pipeline, which already includes expensive pre-processing steps such as sampling and loading.
+% Our two-step offline/online splitting algorithm relies on offline partitions of the full input graph to avoid this online scheduling cost.
+% Using full-graph partitions to split mini-batches, which are subgraphs of the input graph, does not necessarily result in as balanced splits and as low edge cut as running graph partitioning on each mini-batch.
+% However, it is a good compromise to keep both the scheduling time and the training time low, as we show in our evaluation.
+
+% It is worth noting that each mini-batch (and micro-batch) sample includes multiple vertices for the same input graph vertices at different layers.
+% Given a vertex $v$ in the input graph, each vertex $v^{(l)}$ in a sample is connected via a self-edge to a vertex $v^{(l-1)}$, for each layer $l>0$.
+% Our partitioning ensures that all $v^{(l)}$ are assigned to the same partition.
+% This property of local splits is called \emph{flattening} and it improves data locality, as we will show.
+
+
+\begin{figure*}[ht]
+    \centering
+    \includegraphics[width=0.9\textwidth]{figures/SAGA-dest.pdf}
+    \caption{A SAGA computing the hidden features of vertex $v$ at layer $l$ over two GPUs using {\em source-to-destination} scatter.}
+    \label{fig:saga-dest}
+\end{figure*}
+
+% \begin{figure*}[ht]
+%     \centering
+%     \includegraphics[width=0.9\textwidth]{figures/SAGA-source.pdf}
+%     \caption{A SAGA computing the hidden features of vertex $v$ at layer $l$ over two GPUs using {\em destination-to-source} scatter. \hui{need to use the legend from source-to-destination scatter.}}
+%     \label{fig:saga-source}
+% \end{figure*}
+
+
+\subsection{Cooperative Training}
+\label{sec:training}
+Splitting a mini-batch into non-overlapping local splits results in edge cuts across splits, which requires coordination across GPUs in each training iteration.
+
+In this paper, we present the first implementation and experimental evaluation of cooperative training for mini-batch GNN training.
+We transparently support GNN models specified using existing message passing primitives used by practitioners to implement GNN models (see Section~\ref{sec:gnn-background}).
+Each GNN layer runs of one or more SAGAs.
+Two of the message passing functions, scatter and gather, operate on edges and thus need to be aware of edges that connect vertices across different local splits. 
+
+\subsubsection{Split-Aware Scatter and Gather}
+There are two possible approaches to make scatter and gather split-aware. 
+Recall that scatter builds an edge tensor by combining the source and destination vectors of each edge while the gather operator aggregates all messages to each destination vertex. 
+The first approach can implement a source-to-destination scatter which sends the source vertices' features to the destination of each edge. 
+In the backward pass, gradients flow in the opposite direction. 
+The advantage of this approach is that all the subsequent SAGA operators can be executed locally until the end of the forward pass. 
+% In the backward pass, gradients flow in the opposite direction.
+This is also the default approach adopted in full-graph training systems~\cite{neugraph}. 
+
+The second approach can implement a destination-to-source scatter, which builds the edge tensor by sending the destination vertex vector to the source vertices.
+It can significantly reduce communication volume in mini-batch training since the total amount of destination vertices are usually much less than the source vertices. However, it requires a second shuffle for the gather operator since the gather function requires aggregating data by destination. 
+Our empirical observation shows that more rounds of shuffles with less data are usually more costly than the a one-time shuffle with more data. Therefore, \tname implements the source-to-destination scatter in order to minimize the number of shuffles.    
+
+
+% The source-to-destination scatter sends the vectors of the source vertices of each edge to the destination of the edge.
+% This generates an edge tensor where edges are \emph{partitioned by the destination vertex}.
+% After this shuffle step, all subsequent SAGA operators can be executed locally until the end of the forward pass.
+% In the backward pass, gradients flow in the opposite direction.
+
+% Cooperative training preserves the semantics of the existing message passing primitives used by practitioners to implement GNN models (see Section~\ref{sec:gnn-background}).
+% Two of the message passing functions, scatter and gather, operate on edges and thus need to be aware of edges that connect vertices across different local splits.
+% We introduce split-aware implementations of these two functions for cooperative training.
+% In data-parallel training, these functions execute on local inputs and produce local outputs.
+% In contrast, their execution in \tname is distributed and so is their output.
+
+% Each GNN layer runs of one or more SAGAs.
+% Inspired by previous work on full-graph training, we implement a SAGA using source-to-destination scatter. 
+% We consider two possible schedules to implement a SAGA: source-to-destination, which is inspired by previous work on full-graph training, and destination-to-source scatter, which we introduce to optimize mini-batch training.
+% \mypar{Source-to-destination scatter}
+% The scatter operator builds an edge tensor by combining the source and destination vectors of each edge.
+% The source-to-destination scatter sends the vectors of the source vertices of each edge to the destination of the edge.
+% This generates an edge tensor where edges are \emph{partitioned by the destination vertex}.
+% After this shuffle step, all subsequent SAGA operators can be executed locally until the end of the forward pass.
+% In the backward pass, gradients flow in the opposite direction.
+
+
+An example using the source-to-destination scatter schedule is shown in Figure~\ref{fig:saga-dest}.
+At the beginning of a GNN layer $l$, \tname has partitioned the hidden feature tensor $H^{(l-1)}$ by vertex across GPUs based on the splits.
+In this example, we compute the hidden features of a vertex $v$ at layer $l$.
+Vertex $v$ is in the split of GPU 1, but some of its neighbors are in GPU 2, so it is added to the split of GPU 2 as a reference vertex.
+The scatter operation builds an edge tensor that combines source and destination features for each edge.
+The tensor is partitioned by destination vertex: the scatter sends the source vertex features for all incoming edges incident to $v$ at layer $l$ to GPU 1, which is responsible for $v$.
+The edge-wise message function computes all messages to $v$ locally to GPU 1, so the gather function only aggregates local messages.
+Finally, the update function computes the new hidden feature vector of $v$.
+It is possible to optimize this schedule for models that do not need to build a full edge tensor to obtain messages, as we discuss shortly when considering GraphSage.
+
+\begin{comment}
+\mypar{Destination-to-source scatter}
+We propose a destination-to-source scatter schedule, which builds the edge tensor by sending the destination vertex vector to the source vertices.
+The resulting edge tensor is \emph{partitioned by the source vertex}.
+This schedule requires a second shuffle to complete the forward pass of a SAGA, since the gather function requires aggregating data by destination.
+However, it can significantly reduce communication volume in mini-batch training.
+
+Figure~\ref{fig:saga-source} shows a destination-to-source schedule in the same example as Figure~\ref{fig:saga-dest}.
+The scatter sends the feature vector of $v$ to all GPUs having a reference vertex for it in their slice at layer $l$.
+It builds an edge tensor that is partitioned by source, since all outgoing edges incident in the same source vertex are sent to its same GPU.
+The messages to $v$ are now computed by multiple GPUs and aggregated locally.
+Finally, the gather operation performs a shuffle to collect all partially aggregated messages at the split of their destination vertex, and the update operation computes the new hidden features for $v$.
+
+\mypar{Rationale}
+% The source-to-destination scatter schedule partitions the edge tensor by destination vertex and requires only a single shuffle per SAGA.
+% Variants of this general edge tensor partitioning approach are used in full-graph training systems such as NeuGraph~\cite{neugraph}, Roc~\cite{roc}, and DistGNN~\cite{md2021distgnn}.
+% The drawback of this schedule is the data transfer cost, since it sends the vector of each source vertex vector having an edge to a destination vertex in a different split (for example, $v$ in Figure~\ref{fig:saga-dest}).
+% Mini-batches are commonly built by sampling several source vertices at layer $l-1$ for each  each destination vertex at layer $l$.
+% Sending all remote source vertex vectors to the destination vertex can thus result in a large data transfer size.
+% This cost could be amortized if a source vertex has multiple destination vertices in the same remote split.
+% However, this is not often the case: it is not guaranteed that a source vertex at layer $l-1$ has more than one outgoing edges to destination vertices at layer $l$.
+We introduce the destination-to-source scatter schedule to reduce the data transfer size in mini-batch training.  
+The schedule can amortize the cost of sending the vector of the destination vertex to other GPUs.
+In the example of Figure~\ref{fig:saga-source}, it only sends one vector for all incoming remote edges to $v$ rather than sending one vector per remote edge.
+The cost of the additional shuffle caused by the gather operator is mitigated by partial aggregation: remote GPUs perform local partial gathering to reduce their messages to a single one, and then send this aggregated message to the split of the destination vertex for the final aggregation.   
+Our evaluation shows that even if this schedule requires an additional shuffle per SAGA, it reduces overall data transfers and thus the iteration time.
+
+
+% \mypar{Schedules for simpler models}
+Some simpler GNN models, such as GraphSage, do not need to run a full SAGA and build edge tables combining source and destination features to compute messages.
+For these models, it is common to first perform a local aggregation, then shuffle, and finally perform a global aggregation.
+This optimization, however, cannot be applied to state-of-the-art GNN models that require edge information, such as Graph Attention Networks (GAT).
+\hui{add example in Figure 4 to show that, for GraphSage, we can do local aggregation first and then shuffle.}
+We discuss these two models in Section~\ref{sec:example-GNN}.
+
+\end{comment}  
+
+
+\begin{comment}
+\subsection{Executing Split-Aware Operators}
+The schedules we discussed require split-aware versions of the scatter and gather operators.
+Their behavior (which data is sent and received) is based on the splits.
+Each scatter and gather operation is executed in parallel by all GPUs, since all GPUs hold a replica of the GNN model parameters, using a shuffle.
+If a GPU has no information to send or receive during these operations, it directly proceeds to the next operation.
+
+The operators use direct GPU-GPU coordination across the entire iteration without  materializing intermediate data on the CPU host memory.
+They use fast direct GPU-GPU buses such as NVLink if available in the system or the PCIe bus otherwise.
+Shuffles use data coalescing to have a GPU send at most one message to each other GPU.
+We require that vertices in the same partition have contiguous ids, so that the online scheduling algorithm and our split-aware operators can find the local split of a vertex using a simple range check.
+
+\end{comment}
+
+\begin{comment}
+\subsection{Cooperative Training - REMOVE?}
+\label{sec:training}
+
+
+
+
+Cooperative training performs forward and backward propagation and GNN model updates.
+% Its computation graph is produced by the online scheduler, based on the local splits, to support tightly integrated cross-GPU coordination.
+It preserves the semantics of the existing message passing primitives used by practitioners to implement GNN models.
+It implements these primitives in a split-aware manner to maximize local computation and minimize communication volume.
+
+% GNN models are specified using four message-passing functions, which are defined over the structure of a single sample and are unaware of the local splits we described (see Section~\ref{sec:gnn-background}).
+% Regular data-parallel training creates separate micro-batch samples that are entirely local to one GPU, so the functions always process local data.
+
+% In cooperative training, multiple GPUs run the message-passing functions also on edges across local splits, shuffling data during both forward and backward propagation.
+% The scheduling algorithm must determine how to perform these shuffles.
+% \mypar{Local splits and data locality}
+
+
+% Cooperative training leverages the semantics of the message-passing functions used to specify GNN models.
+Specifically, two of the message passing functions, scatter and gather, operate on edges and thus need to be aware of edges that connect vertices across different local splits.
+We introduce split-aware implementations of these two functions for cooperative training.
+
+\mypar{Principles}
+The principle for designing split-aware scatter and gather is to reduce the amount of GPU-GPU communication. 
+In the following, we only describe the forward pass.
+In the backward pass, gradients for the hidden features flow in the opposite direction.
+During the forward propagation, the two source of communications are: 
+(1) when scatter, a vertex needs to send its vertex feature to its neighbors on other GPUs, and (2) when gather, a vertex needs to fetch the messages from its neighbors on other GPUs. 
+To minimize the communication, split-aware {scatter} makes the vertex send its vertex features only once to other GPUs and offload the scatter function to those GPUs. 
+Similarly, split-aware gather can first make the other GPUs perform partial gathering locally to reduce the messages to a single one and then send the partially-aggregated message to the destination vertex.   
+
+
+% outputs edge tensors on the split of the \emph{source} vertex each edge.
+% Any subsequent \emph{message} function does not need to be split-aware, since it is applied to each edge tensor separately.
+% The function can operate in parallel at all partitions.
+% Split-aware \emph{gather} outputs per-vertex aggregated messages and partitions them based on the local split of the \emph{destination} vertex. \hui{same here, partition them?}
+% Any subsequent \emph{update} function operates does not need to be split-aware, since it is applied to a each aggregated message separately.
+
+
+% This strategy optimizes for the case where a destination vertex has multiple incoming edges, which is common in many GNN models.
+% For example, the standard node-wise sampling algorithm used by GraphSage starts sampling from the target vertices, which are the last layer, selects a fixed number of neighbors of each vertex to form the previous layer in the sample, and then iterates the sampling process at that layer.
+% Each vertex $v$ in layer $l>0$ has thus multiple edges $e=(u,v)$ to vertices $u$ in layer $l-1$. 
+
+
+\mypar{Split-aware message passing}
+We now discuss in detail how to implement split-aware scatter and gather based on the aforementioned principles.
+Each scatter and gather operation is executed in parallel by all GPUs, since all GPUs hold a replica of the GNN model parameters.
+If a GPU has no information to send or receive during these operations, it directly proceeds to the next operation.
+
+
+The split-aware implementation of the scatter function $\sigma^{(l)}$ produces edge tensors by performing the following steps at each GPU.
+We use $V^{(l)}$ to denote the set of all destination vertices in $E^{(l)}$, which is the set of edges between vertices of layer $l-1$ and $l$ in the mini-batch sample.
+
+\begin{enumerate}
+    \item \emph{Shuffle}.
+    For each $v \in V^{(l)}$ in the local split: (i) if $v$ is a regular vertex in the local split, then send the feature vector $h_v^{(l-1)}$ to all GPUs having a reference vertex for $v$ in their local split; (ii)
+    if $v$ is a reference vertex in the local split, then wait for $h_v^{(l-1)}$ from another GPU. 
+    \item \emph{Local scatter}. 
+    After receiving the $h_v^{(l-1)}$ for all reference destination vertices $v$ in the local split, build an edge tensor for each $e \in E^{(l)}$ in the local split.
+\end{enumerate}
+
+The split-aware implementation of the gather function $\oplus^{(l)}$ produces aggregate messages by performing the following steps at each GPU.
+
+\begin{enumerate}
+    \item \emph{Local aggregation}. 
+    For each edge $e(u,v) \in E^{(l)}$ in the local split, compute the aggregate message $m_v^{(l)} = \oplus^{(l)}_e(m_e^{(l)})$. 
+    \item \emph{Shuffle}. 
+    For each $v \in V^{(l)}$ in the local split: (i) if $v$ is a reference vertex, then send the partial aggregate message $\hat{m}_v^{(l)}$ to the GPU having the regular vertex $v$ in its local split; (ii) if $v$ is a regular vertex, then wait for all $\hat{m}_v^{(l)}$ sent by all GPUs having a reference vertex $v$ in their local splits.
+    \item \emph{Global aggregation}. 
+    For each regular vertex $v \in V^{(l)}$ in the local split, execute $\oplus^{(l)}$ on all received $\hat{m}_v^{(l)}$ to produce the final aggregated message $m_v^{(l)}$.
+\end{enumerate}
+
+
+\mypar{Example}
+To see how the design favors local computation, consider the example of Figure~\ref{fig:chain}.
+The example shows the operations required to compute the hidden feature of vertex $v$ at layer $l$, i.e., $h_v^{(l)}$, across two splits, which correspond to GPU~1 and~2.
+The destination vertex $v$ is a regular vertex in the left split and a reference vertex in the right split.
+Note that in a mini-batch (or micro-batch) sample, a vertex at a layer $l$ appears also at all layers $<l$, and consecutive versions of a vertex a connected by a self-edge.
+
+
+Computing $h_v^{(l)}$ requires operating on edges in both splits.
+The split-aware scatter operation builds edge tensors for all incoming edges to $v$.
+Building an edge tensor requires the hidden features of both vertices incident on the edge.
+Split-aware scatter makes GPU 1 sends the hidden features $h_v^{(l-1)}$ to GPU 2.
+The reference vertex $v$ in GPU 2 can then locally scatter the hidden features to the two neighbors $j, k$.
+GPU~1 and~2 locally build the edge tensors and invoke the message function to build a message on each edge.
+
+Next, the split-aware gather function at both GPU~1 and~2 partially aggregates messages locally, since the previous scatter operation made it possible to compute the messages locally at GPU~2.
+The result is a single local partial aggregate message $\hat{m}{(l)}_v$ per GPU.
+After local gathering is completed, split-aware gather sends the aggregated messages to the split of the destination vertex.
+GPU 2 sends its $\hat{m}{(l)}_v$ to GPU 1, which computes the final global aggregation $m{(l)}_v$.
+GPU 1 can now run the update function and compute $h_v^{(l)}$.
+
+\end{comment}
+
+\subsubsection{Cooperative Training Examples}
+\label{sec:example-GNN}
+We now discuss implementations of \tadj training considering two popular and diverse GNN models: GraphSage~\cite{graphsage} and Graph Attention Networks (GAT)~\cite{velivckovic2017graph}.
+\Tname runs the two models unmodified: it simply replaces local implementations of scatter with the split-aware implementation described previously. 
+% \hui{modify the content assuming the implementation is based on source to destination scatter.}
+
+\mypar{GraphSage}
+% GraphSage is a popular model based on graph convolution.
+% In one GraphSage layer, the message function of GraphSage simply outputs the features of the source vertex as a message and does not require the features of the destination vertex or the edge weights.
+% GraphSage uses gather to aggregate all the messages and then updates the hidden features of the destination vertex.
+A GraphSage layer builds messages directly from the input features of the source vertices of the edges.
+Its simplicity in the message function allows us to pre-aggregate feature vectors before the scatter operation in order to reduce the communication volume. 
+
+Figure~\ref{fig:overview} shows an example of cooperative training using a GraphSage model~\cite{graphsage} with two layer.
+In the first layer, vertex $v_1$ is in split $S_1$ but has incoming edges from vertices in split $S_2$. 
+GPU~2 computes the partial aggregated message $\hat{m}_{v_1}^{(1)}$ and then executes a shuffle (i.e., source-to-destination scatter) to send $\hat{m}_{v_1}^{(1)}$ to GPU~1 (see Step~3.1). 
+GPU~1 computes the final aggregation to compute the hidden features of $v_1$ at layer $1$.   
+GPU~1 also locally compute the hidden features $h_{v_2}^{(1)}$. 
+In the second layer, $h_{v_2}^{(1)}$ on GPU~1 is scattered to GPU~2 to compute messages for $v_3$ (see Step~3.2). 
+At the end of layer 2, the GNN computes the loss and starts the backward propagation.
+The GPUs need to send the gradients for the activations they received back to the sender.
+In the example of Figure~\ref{fig:overview}, GPU~1 sends $d \hat{m}_{v_1}^{(1)}$ and GPU~2 sends $d h_{v_2}^{(1)}$ (see Steps~3.3-4 in Figure~\ref{fig:overview}).
+
+% , which are local to each split by construction.
+% It requires a shuffle is required for the gather function in layer 1, since vertex $v_1$ is in split $S_1$ but has incoming edges from vertices in split $S_2$ (see Step~3.1 in Figure~\ref{fig:overview}).
+% This gather first performs a local aggregation at GPU~2 to compute the partial aggregated message $\hat{m}_{v_1}^{(1)}$, then it executes a shuffle to send $\hat{m}_{v_1}^{(1)}$ to GPU~1, and finally executes the final global aggregation at GPU~1.
+% Next, the update function computes the hidden features of $v_1$ at layer $1$, which is denoted as $h_{v_1}^{(1)}$.
+% The hidden features $h_{v_2}^{(1)}$ can be computed locally by GPU~1. 
+
+% In layer 2 of GraphSage, GPU~2 must gather the incoming messages for $v_3$.
+% These include $h_{v_2}^{(1)}$, the hidden features of $v_2$ computed at layer 1 by GPU~1. 
+% As in the previous layer, we perform a partial gather at GPU~1, which in this case simply returns the hidden feature $h_{v_2}^{(1)}$ (see Step~3.2 in Figure~\ref{fig:overview}).
+
+% At the end of layer 2, the GNN computes the loss and starts the backward propagation.
+% The GPUs need to send the gradients for the activations they received back to the sender.
+% In the example of Figure~\ref{fig:overview}, GPU~1 sends $d \hat{m}_{v_1}^{(1)}$ and GPU~2 sends $d h_{v_2}^{(1)}$ (see Steps~3.3-4 in Figure~\ref{fig:overview}).
+
+% In summary, GraphSage performs up to two shuffles per layer, one in the forward and one in the backward pass.
+
+\mypar{GAT}
+The GAT model computes attention scores for each edge before computing the messages.
+The attention score of an edge $e(u,v)$ at layer $l$ is computed as:
+$$
+    \alpha^{(l)}_{(u,v)} = \exp(e^{(l-1)}_{(u,v)})/\sum_{(u',v)\in E^{(l)}} \exp(e^{(l-1)}_{(u',v)}).
+$$
+where $e^{(l)}_e$ is an attention coefficient for the edge, computed using an attention function $a$ over the features of the source and destination, $h^{(l-1)}_u$ and $h^{(l-1)}_v$.
+
+
+A GAT layer $l$ can be implemented using two SAGA operations. 
+The first SAGA operation computes the denominator of $\alpha^{(l)}_{(u,v)}$ for all the incoming edges of each vertex $v$ at layer $l$. 
+It requires a shuffle operation using split-aware scattering.  
+The second SAGA computes the features of destination vertices and is completely local. 
+Specifically, in the first SAGA, a split-aware scatter first collects the source and destination features for all incoming edges for $v$, which requires a shuffle.
+The message function then computes the sum of the denominator over the local edges.
+Next, a gather aggregates the messages for each destination vertex to compute the denominator of $\alpha^{(l)}_{(u,v)}$.
+The GAT layer then proceeds with the second SAGA to compute the feature of each destination vertex $v$.
+A local scatter builds edge tensors that include the features of the source and destination and the denominator of $\alpha^{(l)}_{(u,v)}$.
+The message function calculates $\alpha^{(l)}_{(u,v)}$ for each edge, then computes the edges' attention score using the function $a$, and obtains the message.
+Finally, a gather aggregates the messages and the update function computes the hidden features of the vertices in layer $l$.
+
+% In summary, one layer of the GAT model uses two SAGAs, for a total of up to eight shuffles per layer: four in the forward and four in the backward pass.
+% The cost of these shuffles is compensated by the gains of avoiding redundant communication and computation and by the benefits of the destination-to-source scatter schedule, as shown in the evaluation.
+
+In summary, both GraphSage and GAT perform up to two shuffles per layer, one in the forward and one in the backward propagation.
+
+
+\begin{comment}
+\subsection{Old text}
+\TODO{Here we discuss the splitting algorithm. It relies on the API to perform local and global scatter and gather. This part takes the workload assignment and storage assignment as input. Then the next section describes why we use Metis for both.}
+We first define the necessary data structures for split parallelism. 
+We create new function calls to use this data structure to express Graph operators.
+Further we define the cost function of our approach and derive a partitioning which optimizes for it. 
+
+\paragraph{APIs}
+\TODO{This is the part to put the high-level AP} 
+While current frameworks work on gpu independent bipartite graphs, which do not communicate with each other. 
+We create a new data structure GPU Local Bipartite Graph which contains meta data required for intermediate computation. 
+Current frameworks describe graph operators as functions of these bipartite graphs. 
+We extend these operators for our new data structure of independent graphs. 
+A key challenge in zero redundancy is data placement and computation placement which has to decrease both communication and be a simple on the fly algorithm. 
+These challenges are addressed below. 
+We need to extend complicated GCN computation to span multiple GPUs while taking advantage of intermediate computation. 
+We provide the following api constructs to express traditional neural networks. 
+(1) slice owned nodes: Not all nodes owned in a bipartite graph proceed to the next layer. 
+(2) Shuffle scatter and reduce. As intermediate nodes must be gathered from multiple GPUs. Similarly in attention computation, the src node values must be scatter to remote GPUs. 
+
+\subsection{Local Bipartite Graph}
+
+\TODO{Define a local bp from global sample graph}
+We continue our formulation from the sample expressed in the background. 
+Given a sampled computation graph $G(V,E)$ we aim to derive a gpu specific computation graph $G_{g}(V_g, E_g)$.
+The key component of our formulation is the partitioning function $P$ which maps every node in the sample to a gpu.
+This partition function allows us to extract edges to construct the gpu specific information. 
+The nodes in a layer are further marked into owned nodes $O^l_g$ and remote nodes $R^l$.
+The owned nodes represent the final resting value (i.e final accumulated value for a node) while the remote nodes represent locations of partial aggregations. 
+To facilitate interchange of data , we create 2 functions per gpu, which are used to represent data flowing in and out of a gpu.
+The $to$ function is used to extract node data from remote gpu and send it to the owner gpu.
+
+\begin{align*} 
+    P &= \{V \to gpu\} \\
+   E^l_g &= \{e(u,v): u \in V^{l-1} \land v \in V^{l} \land P[u] = g\} \\
+   V^l_g &= \{v: e(u,v) \in E^l_g\}    
+\end{align*}
+The set of $V^l_g$ can be further classified into owned nodes and remote nodes. 
+\begin{align*}
+    O^l_g &= \{v: v \in V^l_g \land P[v] = g\}  \\
+    R^l_g &= \{v: v \in V^l_g \land p[v] \neq g\} \\
+    to_{src_{gpu}} &= \{dest_{gpu} \to v: v \in R^l_{src_{gpu}} \land v \in O^l_{dest_{gpu}} \} \\
+    from_{dest_{{gpu}}} &= \{src_{gpu} \to v: v \in O^l_{dest_{{gpu}}} \land v \in R^l_{src_{gpu}} \} \\
+\end{align*}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[scale=0.3 ]{figures/sample.png}
+    \caption{Sample}
+    \label{fig:sample}
+\end{figure}
+
+
+\begin{figure}[H]
+  \includegraphics[width=0.3\textwidth]{figures/gpu_local.png}
+  \caption{local bipartite graphs}
+  \label{fig:local}
+\end{figure}
+
+\TODO{Should I explain the diagram with this notation. }
+\end{comment}

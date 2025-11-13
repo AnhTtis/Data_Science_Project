@@ -1,0 +1,267 @@
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.98\textwidth]{num_FLOPs_256_aacc/num_FLOPs-crop}
+\caption{Number of ERIs per quartet ($n_{\text{ERIQ}}$, vertical bars), number of floating-point operations per quartet ($n_{\text{FLOPQ}}$) for the individual stages (dotted lines), and total $n_{\text{FLOPQ}}$ (solid red line) for 256 \emph{generic} ERI quartet classes.
+55 \emph{canonical} quartet classes are highlighted in green bars.
+Only the \emph{canonical} ERI quartet classes of form $[aa|cc]$ are explicitly labeled for clarity.}
+\label{fig:num_FLOPs_256}
+\end{figure*}
+
+In this section, we present how the introduced algorithm is realized on FPGA. Fig.~\ref{fig:fpga_design} is complemented with an overview of the loop structure in Fig.~\ref{fig:fpga_algorithm}.
+The perspective herein is often presented in terms of loop structures.
+This view is a guide for the high-level synthesis tools to generate efficient hardware structures, in particular parallel and pipelined datapaths and matching layouts of local memory resources.
+Based on the general structure in Fig.~\ref{fig:fpga_design} and Fig.~\ref{fig:fpga_algorithm}, a customized design is created for each ERI quartet class. %
+Single-precision floating-point arithmetic is utilized in the FPGA implementation because of numerical stability of the Rys quadrature.
+Before discussing the detailed design choices, we analyze the computational requirements of different quartet classes.
+
+
+\subsection{Analysis of ERI Quartet Classes}
+\label{subsec:function_template}
+
+Since each shell in $[ab|cd]$ may be any one of $s$, $p$, $d$, and $f$ GTOs (Section \ref{subsec:gto}), there are $4^4=256$ \emph{generic} ERI quartet classes that possess dramatically different computation characteristics regarding the number of floating-point operations per quartet and the number of required intermediates.
+Fig.~\ref{fig:num_FLOPs_256} presents an overview of the number of ERIs per quartet ($n_{\text{ERIQ}}$) together with the number of required FLOPs ($n_{\text{FLOPQ}}$), individually for the four stages indicated in Fig.~\ref{fig:fpga_design} and~\ref{fig:fpga_algorithm}, i.e.\ \emph{setup}, \emph{recurrence relation loops}, \emph{quadrature loops}, and \emph{compress-store loops}, as well as summed up as total $n_{\text{FLOPQ}}$ for the 256 \emph{generic} quartet classes, which are sorted by means of ascending $n_{\text{ERIQ}}$ from left to right, e.g.\ starting from $[ss|ss]$ with merely 1 ERI per quartet, to the rightmost $[ff|ff]$ with $n_{\text{ERIQ}} = 10000$.
+$n_{\text{FLOPQ}}$ is obtained by counting the addition, multiplication, and division operations for each $[ab|cd]$ quartet.\footnote{%
+There are 6 - 18 division operations in the setup stage and 1 division while computing $\epsilon^{-1}$ for ERI compression.
+By considering the fact that total $n_{\text{FLOPQ}}$ is dominated by $10^2$ - $10^5$ addition and multiplication operations, division is counted as one operation for simplicity.}
+The total $n_{\text{FLOPQ}}$ (solid red line in Fig.~\ref{fig:num_FLOPs_256}) increases drastically in line with $n_{\text{ERIQ}}$, e.g.\ from 80 for $[ss|ss]$ ($n_{\text{ERIQ}} = 1$) to $2.5 \times 10^{5}$ for $[ff|ff]$ ($n_{\text{ERIQ}} = 10^{4}$).
+The workload ratios of the four algorithmic stages also differ a lot between different $[ab|cd]$ quartet classes, with a few small quartet classes being dominated by the setup stage, intermediate classes requiring most work in the recurrence relation and quadrature stages, and for the larger classes quadrature requiring far more operations than other stages. Adaptation to this imbalance, along with requirements regarding local memory layout and data dependencies, is a central reason for creating customized designs for each quartet class.
+
+
+
+
+\subsection{Templated FPGA Kernel Architecture}\label{subsec:kernel_architecture}
+
+To create designs customized for different quartet classes we leverage C++ function template parameters that are supported by the Intel FPGA Add-on for oneAPI Base Toolkit~\cite{FPGAOpt4oneAPI} %
+and by the SYCL standard it builds upon. %
+The orbital angular momenta in the shells of an $[ab|cd]$ quartet class, $L_a$, $L_b$, $L_c$, and $L_d$, are passed as template parameters to the FPGA kernels.
+Other derived parameters, $n_{g_a}$, $n_{g_b}$, $n_{g_c}$, $n_{g_d}$, and $n_{\text{Rys}}$, are used as constants evaluated at compile-time. Thereafter, customized designs for 256 ERI quartet classes were synthesized separately into individual bitstreams to assess the best performance for each quartet class.
+
+
+The benefits of the template parameters are the customization of local memory sizes, which allows to create parallel data paths from loops with trip counts known at compile-time via unrolling annotations.
+Such unrolling is indicated in Fig.~\ref{fig:fpga_algorithm} with \textbf{for all} statements in lines \ref{lst:line:forall_rr} and \ref{lst:line:forall_quad} for the \emph{recurrence relation} and \emph{quadrature loops}, but also performed within \emph{setup} and inner blocks of the \emph{compress-store loops} (not elaborated in Fig.~\ref{fig:fpga_algorithm}). However, the customization based on the template parameters goes further in two regards. Firstly, based on a model of expected throughput, further loops can be unrolled when they would otherwise become a performance bottleneck. Secondly, the layout of intermediates in local memory is adapted to match the loop parallelism. In practice, the optimization strategy combines an analytic performance model with empirically found heuristics for resource consumption and routability of different design points.
+In the following subsections, we present this strategy for optimizing the throughput for an individual quartet as governed by the trip counts of the four stages. Note that to realize the full potential of the design, these stages also need to overlap during the computation of multiple different quartets within the same class (Fig.~\ref{fig:fpga_algorithm} line~\ref{lst:line:quartets}), which will be discussed in Sec.~\ref{subsec:quartet_loop}.
+
+\begin{figure}[tbh]
+\begin{algorithmic}[1]
+\REQUIRE $G_{abcd}$, $R_{\text{Rys}}$
+\ENSURE compressed\_quartets $[ab|cd]_{n\text{-bit}}$, $\epsilon$
+  \STATE \emph{$[ab|cd]$ quartets loop}:\label{lst:line:quartets}
+  \FOR{$quartet \in$ quartet class $[ab|cd]$}
+  \STATE \emph{Setup}:
+  \STATE build auxiliary arrays $\vb{B_{\text{FF}}}$ and $\vb{C_{\text{FF}}}$
+  \STATE \emph{Recurrence relation loops}:
+  \FOR{Cartesian axis $\xi \in \{x, y, z\}$}
+    \FOR{$\mu$-th Rys polynomial $\in [1, n_\text{Rys}]$}
+      \STATE calculate $I_{\text{FF}}(i, 0, k, 0)$ via VRRs\label{lst:line:vrr}
+      \STATE calculate $I_{\text{FF}}(i, j, k, l)$ via HRRs\label{lst:line:hrr}
+      \FOR{$l \in [1, L_d]$}\label{lst:line:for_rr}
+        \FORALL{$k \in [1, L_c]$, $j \in [1, L_b]$, $i \in [1, L_a]$}\label{lst:line:forall_rr}
+            \STATE $I(i, j, k, l, \mu, \xi) \leftarrow I_{\text{FF}}(i, j, k, l)$
+        \ENDFOR
+      \ENDFOR
+    \ENDFOR
+  \ENDFOR
+  \STATE \emph{Quadrature loops}:
+  \FOR{GTOs in shell $d \in [1, n_{g_d}]$}\label{lst:line:for_quad}
+    \FOR{GTOs in shell $c \in [1, n_{g_c}]$}
+        \FORALL{$b \in [1, n_{g_b}]$, $a \in [1, n_{g_a}]$}\label{lst:line:forall_quad}
+            \STATE calculate $[ab|cd]$ integral
+            \STATE $b_{\text{max}} \leftarrow \max(b_{\text{max}}, \abs{[ab|cd]})$
+        \ENDFOR
+    \ENDFOR
+  \ENDFOR
+  \STATE $\epsilon \leftarrow b_{\text{max}} \cdot ({2^{n - 1} - 1})^{-1}$
+  \STATE \emph{Compress-store loops}:\label{lst:line:csloop}
+  \STATE $\vb{Y}_{\text{FF}}^{\text{rem}} \leftarrow {0}$
+  \FOR{$chunk \in [1, n_{\text{CS}}]$}
+    \IF{content($\vb{Y}_{\text{FF}}^{\text{rem}}$) $<$ 512-bit}
+        \STATE $\vb{X}_{\text{FF}}^{ab} \leftarrow \text{ANINT}([**|cd]\cdot\epsilon^{-1})$
+    \ENDIF
+    \STATE $\vb{Z}_{\text{FF}}^{\text{512-bit}} \leftarrow \vb{X}_{\text{FF}}^{ab} \text{ and/or } \vb{Y}_{\text{FF}}^{\text{rem}}$
+    \STATE compressed\_quartets[$chunk$] $\leftarrow \vb{Z}_{\text{FF}}^{\text{512-bit}}$
+    \STATE $\vb{Y}_{\text{FF}}^{\text{rem}} \leftarrow \text{remainder of } \vb{X}_{\text{FF}}^{ab}$
+  \ENDFOR
+  \ENDFOR
+\end{algorithmic}
+\caption{Loop structure of FPGA kernels. \textbf{for all} loops are fully unrolled for all designs, \textbf{for} loops can be pipelined loops or fully unrolled loops depending on the quartet class.}
+\label{fig:fpga_algorithm}
+\end{figure}
+
+\subsection{General Optimization and Local Memory Layout}\label{sec:general_optimization}
+
+Conceptually, the throughput optimization starts from the constraints imposed by the external memory interface. The Intel Stratix 10 GX 2800 FPGA in a Bittware 520N card has four physical DDR4 memory channels. Here, these memory channels are used in interleaved mode, creating a 512-bit memory interface to the kernels that can supply data at kernel clock rates (as opposed to a 300 MHz throughput limit without interleaving).
+The input data consist of $G_{abcd}$ (Eq.~\ref{eq:input_g_abcd}) and $R_{\text{Rys}}$ (Eq.~\ref{eq:input_r_rys}, which are encoded in two 512-bit words for every quartet, such that asymptotically two cycles per quartet will be spent on the inputs. Similarly, a constant size for global memory write per quartet is needed for the quantum value, $\epsilon$ (32 bits).
+Consequently, for all but the smallest quartet classes, the off-chip memory access is dominated by the output of $[ab|cd]_{n\text{-bit}}$, the compressed ERIs represented by $n$-bit signed integer. In 16-bit compression format, $512/16=32$ ERIs can be written out per 512-bit word, or more generally in $n$-bit format $\lfloor512/n\rfloor$ ERIs per chunk after padding can be written out in 
+$n_{\text{CS}} = \left\lceil \frac{n_{\text{ERIQ}}}{\left\lfloor 512/n \right\rfloor} \right\rceil$ 
+cycles. These values define the target throughput of the phases before the \emph{compress-store loops}. Unless explicitly stated otherwise, in the remainder of the text, we use the 16-bit encoding and 32 ERIs per cycle target for illustrative purposes, whereas in the actual implementation, these are part of the compile-time optimizations based on template parameters.
+To match the throughput of the \emph{compress-store loops}, the trip counts of iterative pipelined loops of the preceeding phases should not exceed $n_{\text{CS}}$. Now discussing the phases in their normal sequence, we approached this goal as follows:
+
+
+
+
+\subsubsection{Setup}\label{paragraph:default:setup}
+
+The \emph{setup} stage builds two auxiliary arrays $\vb{B} \in \mathbb{R}^{3 \times n_{\text{Rys}}}$ and $\vb{C} \in \mathbb{R}^{6 \times n_{\text{Rys}}}$.
+With $n_{\text{Rys}} \in [1, 8)$, depending on the $[ab|cd]$ quartet, both arrays are small and thus fit into FPGA registers (denoted as $\vb{B}_{\text{FF}}$ and $\vb{C}_{\text{FF}}$ in Fig.~\ref{fig:fpga_algorithm}).
+Since all involved loops have low trip counts, i.e.\ 3 for Cartesian axes and $n_{\text{Rys}}$, for simplicity all loops are fully unrolled. %
+
+\subsubsection{Recurrence Relation Loops}\label{paragraph:default:rrloops}
+
+\begin{table*}
+\renewcommand{\arraystretch}{1.3}
+\caption{Default layout for $I(i, j, k, l, \mu, \xi)$ in FPGA local memory. Note that actual dimensions always depend on the template parameters.}
+\label{tab:intermediate_I}
+\centering
+\begin{tabular}{c|c|c|c|>{\centering\arraybackslash\hspace{0pt}}m{3.5cm}|>{\centering\arraybackslash\hspace{0pt}}m{3.5cm}}
+\hline
+Index & Interval & Padded length$^{1}$ & Memory layout &
+Write for $ijk$-unrolled recurrence relation loops & Read for $\xi\mu ab$-unrolled quadrature loops \\
+\hline
+$\mu$ & $[1, n_{\text{Rys}}]$ & $\lceil n_{\text{Rys}}\rceil_{\text{pow2}}$ & bank width & sequential & parallel   \\
+$\xi$ & $[1, 3]$              & $4$                                         & banks      & sequential & parallel   \\
+$i$   & $[0, L_a + L_b]$      & $\lceil L_a + L_b + 1 \rceil_{\text{pow2}}$ & banks      & parallel   & parallel   \\
+$j$   & $[0, L_b      ]$      & $\lceil L_b +       1 \rceil_{\text{pow2}}$ & banks      & parallel   & parallel   \\
+$k$   & $[0, L_c + L_d]$      & $\lceil L_c + L_d + 1 \rceil_{\text{pow2}}$ & banks      & parallel   & sequential \\
+$l$   & $[0, L_d      ]$      & not padded                                  & -          & sequential & sequential \\
+\hline
+\multicolumn{6}{l}{\footnotesize$^1\,\lceil n \rceil_{\text{pow2}}$ returns the smallest integer of power of 2 and also $\ge n$.}
+\end{tabular}
+\end{table*}
+
+In this phase, first, a small buffer that fits into FPGA registers, $I_{\text{FF}}(i, j, k, l)$ in Fig.~\ref{fig:fpga_algorithm}, is employed for the computations of VRRs and HRRs (lines~\ref{lst:line:vrr}, \ref{lst:line:hrr}) and the involved loops are fully unrolled.
+This allows the compiler tools to resolve the inherent data dependencies by creating a sufficiently deep datapath that computes a full $I_{\text{FF}}(i, j, k, l)$ set per cycle, albeit with a certain latency.
+$\xi \times \mu $ sets $I_{\text{FF}}(i, j, k, l)$ are computed in this way and buffered in $I(i, j, k, l, \mu, \xi)$ to form the input required by the next phase. In the default configuration as depicted in Fig.~\ref{fig:fpga_algorithm}, this is in parallel for the inner $ijk$ loops that are unrolled, but sequential for the $\xi$, $\mu$, and $l$ loops. Such approach is often fast enough for the overall throughput goal and helps to find a suitable local memory layout for $I(i, j, k, l, \mu, \xi)$ that works for all quartet classes.
+
+The size of $I(i, j, k, l, \mu, \xi)$ is larger than $I_{\text{FF}}(i, j, k, l)$ and it grows steeply with angular momenta of $[ab|cd]$, e.g.\ only 3 for $[ss|ss]$, but 5376 for $[ff|ff]$.
+Thus, except for small quartet classes, such a buffer is generally best implemented in on-chip memory resources, i.e.\ block RAMs or MLABs.
+In order to achieve stall-free local memory access to $I(i, j, k, l, \mu, \xi)$, the bank layout of FPGA local memory must be consistent with the corresponding unrolled loop structure both of the writing \emph{recurrence relation loops} and of the using \emph{quadrature loops}, which requires parallel access into the $\mu\xi$ dimensions, as already visible in Eq.~\ref{eq:gauq}.
+The default layout
+for $I(i, j, k, l, \mu, \xi)$ that fulfills both requirements is illustrated in Table~\ref{tab:intermediate_I} along with the access patterns from both loops.
+The bank width of local memory is configured in the $\mu$ dimension with padded length of $n_{\text{Rys}}$ to the power of 2.
+The number of memory banks is defined by the multiplied padded lengths of $\xi ijk$ dimensions.
+This leaves only the last dimension $l$ as memory depth with sequential access.
+With this customized banking geometry and $ijk$-unrolled \emph{recurrence relation loops}, the stores from $I_{\text{FF}}(i, j, k, l)$ to the $I(i, j, k, l, \mu, \xi)$ array are stall-free and parallel in $ijk$ dimensions.
+The write operations in other dimensions, however, are sequential with a trip count of $n_{\text{RR}} = 3 n_{\text{Rys}} (L_d + 1)$. %
+Lastly, these nested sequential loops are coalesced by compiler directive to reduce the FPGA area overhead.
+
+\subsubsection{Quadrature Loops}\label{paragraph:default:gqloops}
+
+\begin{table*}
+\renewcommand{\arraystretch}{1.3}
+\caption{Default layout for $[ab|cd]$ in FPGA local memory.}
+\label{tab:intermediate_abcd}
+\centering
+\begin{tabular}{c|c|c|c|>{\centering\arraybackslash\hspace{0pt}}m{3.0cm}|>{\centering\arraybackslash\hspace{0pt}}m{3.7cm}}
+\hline
+Indices & Interval & Padded length$^{1}$ & Memory layout &
+Write for $\xi\mu ab$-unrolled quadrature loops & Read for $ab$-unrolled compress-store loop \\
+\hline
+$a$ and $b$ & $a \in [1, n_{g_a}]$ and $b \in [1, n_{g_b}]$ & $\lceil n_{g_a} n_{g_b}\rceil_{\text{pow2}}$ & banks & parallel   & parallel \\
+$c$ and $d$ & $c \in [1, n_{g_c}]$ and $d \in [1, n_{g_d}]$ & not padded & - & sequential & sequential \\
+\hline
+\multicolumn{6}{l}{\footnotesize$^1\,\lceil n \rceil_{\text{pow2}}$ returns the smallest integer of power of 2 and also $\ge n$.}
+\end{tabular}
+\end{table*}
+
+The \emph{quadrature loops} read $I(i, j, k, l, \mu, \xi)$ from the preceding phase and calculate all ERIs of an $[ab|cd]$ quartet as output.%
+The quadrature stage is composed of 6-fold nested loops, in which the 4 outer loops run over each dimension of $[ab|cd]$ and 2 inner loops perform the multiplications and additions for $\xi$ and $\mu$, respectively (Eq.~\ref{eq:gauq}), which are always unrolled without data dependencies.
+With the further parallel execution in the $a$ and $b$ dimensions as indicated in Fig.~\ref{fig:fpga_algorithm} and Tab.~\ref{tab:intermediate_I}, the remaining sequential loops have a trip count of $n_{\text{GQ}} = n_{g_d} n_{g_c}$.
+
+
+
+With this structure, $n_{g_a} n_{g_b}$ ERIs, denoted as $[**|cd]$ in Fig.~\ref{fig:fpga_algorithm}, are generated as output of the \emph{quadrature loops} in every clock cycle and stored in the local memory.
+In the FPGA kernels, the $[ab|cd]$ quartet intermediate is implemented as 2-D array using local memory.
+As for this buffer, the loop patterns of the producing and the consuming loops could be matched, the memory layout as presented in Tab.~\ref{tab:intermediate_abcd} directly fits for both sides.
+The $ab$ dimensions in the $[ab|cd]$ quartet buffer are fused into a single dimension with padded length of power of 2 for $n_{g_a} n_{g_b}$ as local memory banks for parallel access.
+The $cd$ dimensions are also fused into the memory depth and the related nested loops of the quadrature phase are coalesced via compiler directive.
+At last, the \emph{quadrature loops} also identify $b_{\text{max}}$ per quartet that is used for scaling in the next phase. This involves a parallel reduction over the unrolled loops.
+
+\subsubsection{Compress-Store Loops}\label{paragraph:default::csloops}
+
+The \emph{compress-store loops} (Fig.~\ref{fig:fpga_algorithm} lines~\ref{lst:line:csloop}) load $[ab|cd]$ from 
+the intermediate buffer, scale individual ERIs as $n$-bit signed integer multiples of $\epsilon$, and store the compressed $[ab|cd]_{n\text{-bit}}$ into FPGA global memory, which are transferred to the host memory via PCIe in the end.
+
+The main implementation idea of the \emph{compress-store loops} also revolves around the data layout adaption from ERIs available in parallel $a$ and $b$ dimensions (Tab.~\ref{tab:intermediate_abcd}) from the previous phase, to the output in chunks of 512 bits. The sequential part of these loops iterates over the chunks that have to be written. Since the overall sequence of ERIs computed and written is identical, the layout transformation mainly relies on a small buffer in registers $\vb{Y}_{\text{FF}}^{\text{rem}}$, that retains the ERIs that didn't fit into the previous chunk for writing them out first in the next chunk.
+Initially, after loading $[**|cd]$ via local memory banks, the fetched ERIs are compressed through unrolled loops in parallel and the results are stored in $\vb{X}_{\text{FF}}^{ab}$.
+When $\vb{X}_{\text{FF}}^{ab} \ge$ 512-bit, a first complete 512-bit chunk is copied to $\vb{Z}_{\text{FF}}^{\text{512-bit}}$, which has a fixed size of 512-bit.
+As essential operation for each iteration of the iterative \emph{compress-store loop}, the contents in $\vb{Z}_{\text{FF}}^{\text{512-bit}}$ are written to the output $[**|cd]_{n\text{-bit}}$ in FPGA global memory.
+The remaining compressed bits in $\vb{X}_{\text{FF}}^{ab}$ moved to $\vb{Y}_{\text{FF}}^{\text{rem}}$ for the next iteration.
+Repeated iterations of the loop can produce an output without loading new inputs to $\vb{X}_{\text{FF}}^{ab}$
+until the remainder in $\vb{X}_{\text{FF}}^{ab}$ is less than 512-bit, or until the last (possibly incomplete) 512-bit chunk is written.
+
+\subsubsection{Initial Performance Model}\label{paragraph:default::initial_perf}
+
+\begin{table}[tbh]
+\renewcommand{\arraystretch}{1.3}
+\caption{Throughput model of selected quartet classes after general optimization (left, Sec.~\ref{sec:general_optimization}) and applying further unrolling (right, Sec.~\ref{sec:further_unrolling}). Bold numbers highlight bottlenecks.}
+\label{tab:initial_perf}
+\centering
+\begin{tabular}{c|rrr|rrr}
+\hline
+ & \multicolumn{3}{c|}{General Optimization}  & \multicolumn{3}{c}{Further Unrolling} \\
+Quartet & $n_{\text{RR}}$ & $n_{\text{GQ}}$ & $n_{\text{CS}}$ & $n_{\text{RR}}$ & $n_{\text{GQ}}$ & $n_{\text{CS}}$ \\
+\hline
+$[ss|ss]$ & \textbf{3} & 1 & 1 & 1 & 1 & 1\\
+$[pp|pp]$ & \textbf{18} & 9 & 3 & 3 & 3 & 3\\
+$[dd|ps]$ & \textbf{9} & 3 & 4 & 3 & 3 & 4\\
+$[dd|dd]$ & \textbf{45} & 36 & 41 & \textbf{45} & 36 & 41\\
+$[ff|fd]$ & 54 & 60 & \textbf{188} & 54 & 60 & \textbf{188}\\
+$[ff|ff]$ & 84 & 100 & \textbf{313} & 84 & 100 & \textbf{313}\\
+\hline
+\end{tabular}
+\end{table}
+
+A first performance model, based on the trip counts of sequential loops as discussed in this section is shown for a few selected quartet classes in Tab.~\ref{tab:initial_perf}. It shows that for classes with high angular momentum and lots of parallelism in the dimensions that are already unrolled, the \emph{compress-store loops} already form the expected bottleneck. However, for smaller quartet classes, the parallelism is not sufficient to saturate the memory interface.
+Additionally, from a computational perspective, ERI compression with lower bitwidth (not illustrated in Tab.~\ref{tab:initial_perf}) can allow for even higher throughput, even though in practice the trade-off between numerical accuracy and performance eventually becomes critical. In any case, it can be seen that there is a demand to increase the parallelism particularly for smaller quartet classes, which we discuss next.
+
+
+\subsection{Parameter Guided Further Unrolling at Compile-Time}\label{sec:further_unrolling}
+
+When the throughput of the \emph{recurrence relation loops} becomes the bottleneck, as for the first four examples in Tab.~\ref{tab:initial_perf}, additional parallelism can be obtained by additionally unrolling the previously sequential loops over $l$, $\mu$, and $\xi$. Based on a model for the expected trip counts that is embedded into the source code and evaluated at compile-time in the form of \texttt{constexpr} statements, such additional unrolling is performed automatically. Tab.~\ref{tab:unroll_rr_loop} (upper half) shows how this process improves the trip count of this phase up to a fully parallel datapath. Along with the changes, the storage for $I(i, j, k, l, \mu, \xi)$ needs to be switched from BRAM to registers at the indicated transition point. An additional empirically found constraint is evaluated at compile-time to limit the basic size of intermediates in registers to 108 elements, as we saw routing or timing problems otherwise.
+\begin{table}[tbh]
+\renewcommand{\arraystretch}{1.3}
+\caption{Strategy for further loop unrolling.}
+\label{tab:unroll_rr_loop}
+\centering
+\begin{tabular}{ccc}
+\hline
+\multicolumn{3}{c}{\emph{recurrence relation loops}} \\
+\hline
+$I(i, j, k, l, \mu, \xi)$ & Unrolled indices & $n_{\text{RR}}$ [cycles] \\
+\hline
+BRAMs & $ijk$        & $3n_{\text{Rys}}(L_d + 1)$ \\
+BRAMs & $ijkl$       & $3n_{\text{Rys}}$          \\
+Registers     & $ijkl\mu$    & $3$                        \\
+Registers     & $ijkl\mu\xi$ & $1$                        \\
+\hline
+\multicolumn{3}{c}{\emph{quadrature loops}} \\
+\hline
+$[ab|cd]$ & Unrolled indices & $n_{\text{GQ}}$ [cycles] \\
+\hline
+BRAMs & $\xi\mu ab$   & $n_{g_d}n_{g_c}$ \\
+Registers     & $\xi\mu abc$  & $n_{g_d}$        \\
+Registers     & $\xi\mu abcd$ & $1$              \\
+\hline
+\end{tabular}
+\end{table}
+
+
+
+
+After removing the $n_{\text{RR}}$ bottleneck for $[pp|pp]$ in Tab.~\ref{tab:initial_perf} -- and for other quartets already in the general case -- the \emph{quadrature loops} can also be the throughput bottleneck in the same way. Consequently, the same compile-time strategy for additional parallelism is applied here, as added in the lower half of Tab.~\ref{tab:unroll_rr_loop}. There are 12 possible combinations of the unrolling patterns of the \emph{recurrence relation} and \emph{quadrature} phases. %
+Out of these, 7 are actually chosen during the compile-time optimization process as best parallelism structure for at least one quartet class. The right side of Tab.~\ref{tab:initial_perf} illustrates selected outcomes of this further unrolling, with $[dd|dd]$ representing an example where local memory implementation constraints prevent the design from matching the throughput target of the \emph{compress-store loops}.
+
+
+
+
+\subsection{Concurrency in Outer Loop over Multiple Quartets}\label{subsec:quartet_loop}
+
+Returning to a high-level perspective on the kernel architecture, it is composed of two layers of nested loops: the outermost \emph{$[ab|cd]$ quartets loop} and all other loops comprising the four stages for computing the compressed $[ab|cd]_{n\text{-bit}}$ quartet.
+After the optimizations described so far, the throughput of the four individual stages is optimized. However, since each of them still has a latency that can exceed the trip count of its sequential part by far, pipelining over the outermost loop is crucial for overall good occupancy of the design. To this end, the intermediate buffers $I(i, j, k, l, \mu, \xi)$ and $[ab|cd]$ implemented in BRAM need additional capacity to hold the values for different quartets that are currently in the pipeline of the outer loop. In the Intel FPGA reports, these extra slots in the buffers are denoted as \emph{private copies} and can be generated via a $\mathtt{max\_concurrency}$ attribute. When the depth of the local memory without private copies is below the 512 entry depth typically required to fill a single RAM block, additional private copies can be obtained virtually for free, until the 512 entry threshold is reached. This is possible as no additional access ports are required, because each pipeline slot in the datapath of the inner loops can be occupied by exactly one quartet instance from the outer loop at a time.
+
+In the general layout of local memory as presented in Tab.~\ref{tab:intermediate_I} and~\ref{tab:intermediate_abcd}, the original depths is typically low, corresponding to only one or two dimensions with small compile-time determined indices. Therefore, a high number of private copies is feasible for these designs.
+As the default heuristics of the compilation tools generate far fewer private copies than required for the presented designs, we explicitly set the $\mathtt{max\_concurrency(}c_{\text{max}}\mathtt{)}$ for the entire \emph{$[ab|cd]$ quartets loop}.
+The optimal value $c_{\text{max}}$ is determined empirically for each quartet class by starting from a small value, i.e.\ $c_{\text{max}} = 8$ and doubling till the measured performance saturates.
+
+

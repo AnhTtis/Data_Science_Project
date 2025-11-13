@@ -1,0 +1,612 @@
+\documentclass{midl} % Include author names
+
+% The following packages will be automatically loaded:
+% jmlr, amsmath, amssymb, natbib, graphicx, url, algorithm2e
+% ifoddpage, relsize and probably more
+% make sure they are installed with your latex distribution
+% packages I loaded myself
+\usepackage{todonotes}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{colortbl}
+\usepackage{makecell}
+
+\usepackage{mwe} % to get dummy images
+\jmlrvolume{-- nnn}
+\jmlryear{2024}
+\jmlrworkshop{Full Paper -- MIDL 2024}
+\editors{Accepted for publication at MIDL 2024}
+
+\title{Medical diffusion on a budget: Textual Inversion for medical image generation}
+
+\midlauthor{\Name{Bram {de Wilde}} \Email{contact@bramdewilde.com}\\
+\Name{Anindo Saha \Email{anindya.shaha@radboudumc.nl}}\\
+\Name{Maarten {de Rooij \Email{maarten.derooij@radboudumc.nl}}}\\
+\Name{Henkjan Huisman \Email{henkjan.huisman@radboudumc.nl}}\\
+\Name{Geert Litjens \Email{geert.litjens@radboudumc.nl}}\\
+\addr Department of Medical Imaging, Radboud University Medical Center, Nijmegen, the Netherlands}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Diffusion models for text-to-image generation, known for their efficiency, accessibility, and quality, have gained popularity. While inference with these systems on consumer-grade GPUs is increasingly feasible, training from scratch requires large captioned datasets and significant computational resources. In medical image generation, the limited availability of large, publicly accessible datasets with text reports poses challenges due to legal and ethical concerns. This work shows that adapting pre-trained Stable Diffusion models to medical imaging modalities is achievable by training text embeddings using Textual Inversion.
+In this study, we experimented with small medical datasets (100 samples each from three modalities) and trained within hours to generate diagnostically accurate images, as judged by an expert radiologist. Experiments with Textual Inversion training and inference parameters reveal the necessity of larger embeddings and more examples in the medical domain. Classification experiments show an increase in diagnostic accuracy (AUC) for detecting prostate cancer on MRI, from 0.78 to 0.80. Further experiments demonstrate embedding flexibility through disease interpolation, combining pathologies, and inpainting for precise disease appearance control. The trained embeddings are compact (less than 1 MB), enabling easy data sharing with reduced privacy concerns.
+\end{abstract}
+
+\begin{keywords}
+%% Keywords
+Diffusion models, Generative imaging, Low-resource, Prostate MRI, Chest X-ray, Histopathology
+\end{keywords}
+
+\section{Introduction}
+
+\begin{figure}[t]
+\begin{center}
+   \includegraphics[width=0.95\linewidth]{figures/general_overview.pdf}
+\end{center}
+   \caption{The Textual Inversion fine-tuning process for diffusion models trains a text conditioning embedding for a new token using a small set of images while keeping the rest of the architecture frozen. We show that this allows the adaption of latent diffusion models to a variety of medical imaging modalities, using only 100 examples and a single consumer-grade GPU.}
+\label{fig:overview}
+\end{figure}
+
+Image generation has increasingly captured the attention
+of many researchers, spurring an impressive progression in text-to-image
+generation.
+In particular, diffusion models have gained enormous popularity
+through their ability to generate high-quality and diverse images, conditioned
+on a text prompt \cite{hoDenoisingDiffusionProbabilistic2020, dhariwalDiffusionModelsBeat2021, rameshZeroShotTexttoImageGeneration2021, rameshHierarchicalTextConditionalImage2022, sahariaPhotorealisticTexttoImageDiffusion2022}.
+Among various text-to-image model implementations, Stable Diffusion has arguably generated
+the biggest impact in terms of users, owing to the fact that it is both
+released under a permissive license and operable using a single GPU \cite{rombachHighResolutionImageSynthesis2022}.
+%The unprecedented availability and performance of Stable Diffusion is perhaps
+%best demonstrated by artists ringing the alarm bell,
+%for fear of AI systems replicating their work or style without their consent, 
+%seemingly even leading to a lawsuit against the Stable Diffusion team \cite{vincentGettyImagesSuing2023}.
+%Whatever your stance in this debate, it shows that humans are starting to
+%have difficulty distinguishing AI-generated art from human art.
+
+When applied to art or photorealistic images, generative models may exhibit some degree of error.
+On the other hand, the medical imaging field places a higher bar on generation quality \cite{yiGenerativeAdversarialNetwork2019,skandaraniGANsMedicalImage2021}.
+Images need to be not only anatomically correct but diagnostically correct as well.
+Training a model like Stable Diffusion for medical imaging requires a large, varied, and ideally public dataset of images with captions, similar to those used for training on natural images \cite{schuhmannLAION5BOpenLargescale2022}.
+However, practical challenges, such as ethical and legal impediments to sharing medical data, particularly for unstructured radiology reports, complicate this endeavor \cite{scheibnerRevolutionizingMedicalData2021,bovenbergHowFixGDPR2020}.
+For one of the few public datasets of this caliber that exists, MIMIC-CXR, Chambon et al. have demonstrated that it is possible to train a latent diffusion model capable of generating chest X-ray images with high fidelity and diversity through free text prompts \cite{johnsonMIMICCXRDeidentifiedPublicly2019, chambonRoentGenVisionLanguageFoundation2022}.
+They trained the system using up to 170,000 images on 64 A100 GPUs.
+
+On top of data sharing issues, some modalities and pathologies are inherently scarce: certain types of scans can be expensive or experimental and some diseases are rare or tied to specific demographics.
+For these reasons, especially in the medical domain, it is essential to have computationally feasible methods that can fine-tune existing models towards a smaller set of a specific modality or disease.
+In this paper, we pick one such method, Textual Inversion, and rigorously explore its capacities for adapting Stable Diffusion to medical imaging, 
+with all experiments performed on a single RTX2070 GPU \cite{galImageWorthOne2022}. Code and trained embeddings are shared online.\footnote{\href{https://github.com/brambozz/medical-diffusion-on-a-budget}{https://github.com/brambozz/medical-diffusion-on-a-budget}}
+
+% In particular, we explore training and inference parameters for optimal image quality, illustrate the practical efficacy of our approach by enhancing cancer classification models in low-data scenarios using synthetic data. Moreover, we illustrate the versatility of the trained embeddings through (1) demonstrating interpolation between healthy and diseased states, (2) utilizing inpainting for precise control over disease appearance, and (3) combining multiple embeddings to generate images featuring multiple pathologies.
+
+
+% \todo[inline]{this whole bit optional? I could also summarize with a single sentence maybe...}
+% We summarize our contributions as follows:
+
+% \begin{enumerate}
+%     \item We show, through careful tuning and experiments, that a diffusion
+% model trained on natural images can be adapted to produce a wide variety
+% of realistic medical images.
+%     \item We demonstrate the practical value of our approach, by improving cancer
+% classification models in the low-data regime, using synthetic data.
+%     \item We demonstrate that the trained embeddings are highly flexible, by showing (1) interpolation between healthy and diseased state, (2) inpainting for fine control of disease appearance and (3) that multiple embeddings can be combined to generate images with multiple pathologies.
+% \end{enumerate}
+
+\section{Related work}
+
+% Since our study explores a specific fine-tuning method for diffusion models applied to medical image generation, we briefly review popular fine-tuning methods for diffusion in general and cover studies applying diffusion models in the medical domain.
+
+% \subsection{Fine-tuning diffusion models}
+
+% Various methods have different computational requirements and output files of different sizes. We review three popular methods in decreasing order of compute and output size.
+
+% In \cite{ruizDreamBoothFineTuning2022} Ruiz et al. fine-tune the denoising U-net component of a diffusion model, using a handful of images for introducing a new concept.
+% This method is typically employed on 24 GB GPUs and results in checkpoints of several GB when fine-tuning Stable Diffusion models.
+
+% LoRA was introduced as a method to fine-tune large language models, which freezes original model weights and introduces rank decomposition matrices into the Transformer architecture \cite{huLoRALowRankAdaptation2021}.
+% Recently, this fine-tuning method was incorporated into the populare \textit{diffusers} library. 
+% It can be deployed on a 11 GB GPU and results in shareable files of under 5 MB for a fully fine-tuned latent diffusion model \cite{vonplatenDiffusersStateoftheartDiffusion2023, UsingLoRAEfficient}.
+
+% In \cite{galImageWorthOne2022}, Gal et al. introduce Textual Inversion, which fine-tunes a diffusion model by finding a new word embedding for newly introduced concepts, resulting in extremely small files of under 1 MB. Like LoRA, this method is deployable on a 11 GB GPU.
+% In this study, we adopt Textual Inversion as fine-tuning method, because it has low computational requirements and the smallest file output, but we have no reason to expect our results to be limited to this fine-tuning method.
+
+% \subsection{Medical image generation}
+
+Several papers have applied diffusion to medical imaging, with a wide range of applications including anomaly detection, segmentation, registration, and modality transfer with image-to-image translation \cite{kazerouniDiffusionModelsMedical2022}.
+Specifically for medical image generation, several recent works have trained diffusion models for image generation.
+Pre-trained models are often trained on 2D RGB datasets, but many medical imaging modalities are 3D.
+Recently, studies such as \citet{khaderMedicalDiffusionDenoising2023} and \citet{pinayaBrainImagingGeneration2022a} have trained diffusion models from scratch on 3D data or even on 4D data \cite{kimDiffusionDeformableModel2022}, and \citet{han2023medgen3d} use diffusion models conditioned on anatomical masks to generate labeled images for segmentation.
+Several other works studied text-to-image latent diffusion models for medical imaging \cite{chambonRoentGenVisionLanguageFoundation2022, akroutDiffusionbasedDataAugmentation2023}.
+Closest to our work is \cite{chambonAdaptingPretrainedVisionLanguage2022}, where the authors explore various methods to adapt a pre-trained Stable Diffusion model to chest X-ray generation.
+They performed experiments with both Textual Inversion and fine-tuning the U-net component of Stable Diffusion, similar to \cite{ruizDreamBoothFineTuning2022}.
+They find that Textual Inversion works, but fine-tuning the U-net is more effective, especially with more complex prompts.
+They fine-tune using 5 examples per class.
+
+Our work builds on this by deeply exploring Textual Inversion by training with more examples and bigger embeddings.
+Additionally, we demonstrate the flexibility of the approach through example applications and by adapting to multiple and more complex modalities beyond chest X-ray.
+In contrast to other studies, we intentionally do not train from scratch and use small datasets to explore the feasibility of diffusion in low-data and low-compute environments.
+
+\section{Methods}
+
+\subsection{Image generation}
+
+All images are generated with Stable Diffusion v2.0, using an interactive open-source web interface \cite{rombachHighResolutionImageSynthesis2022, AUTOMATIC1111_Stable_Diffusion_Web_2022}.
+Images are sampled using the ancestral Euler scheduler \cite{karrasElucidatingDesignSpace2022}.
+The main inference parameters influencing image generation quality are 
+the number of steps for the sampling scheduler and 
+the classifier-free guidance (CFG) scale \cite{hoClassifierFreeDiffusionGuidance2022}.
+Using more steps for sampling typically leads to better image quality but increases the inference time.
+The CFG scale can be used to set the trade-off between sample quality and sample diversity.
+A high CFG scale makes the model follow the text prompt more closely at the expense of diversity.
+Conversely, a low CFG scale results in images that deviate more from the prompt and consequently have lower fidelity but higher diversity.
+
+To introduce a medical modality as a new concept to a pre-trained diffusion model, we use Textual Inversion \cite{galImageWorthOne2022}.
+This process finds a vector in the text embedding space which optimally represents the concept.
+Practically, this is done by freezing the entire architecture apart from the embedding vector and performing backpropagation with a similarity loss, as illustrated in Figure \ref{fig:overview}.
+We train embeddings with a constant learning rate of $0.005$ for 50,000 steps with a batch size of 1, which takes approximately 4 hours on an RTX2070 GPU.
+In the work of Gal et al., prompts are generated during training from a list of templates, for instance: "\textit{a photo of a $<$embedding$>$}" or "\textit{a rendering of a $<$embedding$>$}". Since this does not necessarily apply to a medical imaging context, we prompt the model only with "\textit{$<$embedding$>$}" during training. 
+% If descriptive labels or radiology report summaries are available, it would also be an option to prompt the model with the descriptions...
+
+We experiment with the number of sampling steps, the CFG scale, the number of images used to train embeddings, and the embedding vector size.
+To evaluate the impact of these parameters on generation quality, we compute the Fr\'echet Inception Distance using 1000 generated samples compared to 1000 real examples for each parameter setting \cite{szegedyRethinkingInceptionArchitecture2015}. 
+%Confidence intervals (95\%) are estimated with bootstrapping using $10^5$ repetitions. 
+FID scores are calculated with an ImageNet pre-trained networks (FID), and a domain-specific medically pretrained network, RadImageNet (MFID) \cite{mei2022radimagenet}.
+
+To explore the potential benefits of a diffusion-based approach over a GAN-based approach, we include the state-of-the-art StyleGAN3 as a baseline \cite{Karras2021}. To allow a fair comparison, we fine-tune a pre-trained StyleGAN3 on the same hardware for the same number of steps. A blind comparison between Stable Diffusion and StyleGAN3 was made by an expert prostate radiologist, who compared 50 pairs of images generated by the two methods, shown side-to-side and randomized. The radiologist indicated his preference for each of the 50 pairs and wrote down general impressions on the generation quality.
+
+To investigate the usability of the trained embeddings, we also experiment with combining multiple trained embeddings using composable diffusion \cite{liuCompositionalVisualGeneration2023}.
+This method allows prompting with a combination of embeddings using an AND operator in the prompt, 
+e.g., "\textit{$<$cardiomegaly$>$ AND $<$pleural effusion$>$}" to generate an image with both cardiomegaly and pleural effusion present.
+Additionally, this method allows a weight to be given to each embedding to tune the strength of each embedding separately.
+In this study, we use this to experiment with interpolating between healthy and diseased states and to generate images with multiple diseases present.
+
+\subsection{Classification}
+
+For classification experiments, we train ResNet-18 models, pre-trained on ImageNet \cite{heDeepResidualLearning2016, dengImageNetLargescaleHierarchical2009}.
+Models are trained with a fixed learning rate of $10^{-4}$ with the Adam optimizer for 6250 batches of 32 images on various combinations of real and synthetic data \cite{kingmaAdamMethodStochastic2017}.
+% This corresponds to 100 epochs for the biggest synthesized dataset (2000 synthesized cases).
+AUC is evaluated on the validation set during training, and performance of the best validation checkpoint 
+on the test set is reported.
+We apply random horizontal flipping, gaussian noise, intensity transformations, channel dropout, translation, 
+scaling and rotation as data augmentation.
+
+\subsection{Datasets}
+
+%To showcase the wide applicability of Textual Inversion for adaptation to medical imaging, 
+%we demonstrate results on three different types of data: multi-modal MRI, chest X-ray and histopathology.
+
+\subsubsection{Multi-modal MRI - PI-CAI}
+
+The main dataset used in this work is a recently released public dataset of 1500 prostate MRI cases.
+This dataset was released as part of the PI-CAI (Prostate Imaging: Cancer AI) challenge, where the task 
+is to detect clinically significant prostate cancer \cite{sahaArtificialIntelligenceRadiologists2022}.
+Each case is a 3D MRI scan featuring three modalities: T2-weighted imaging (T2W), apparent diffusion coefficient maps (ADC), and diffusion-weighted imaging (DWI).
+Since this work adapts a pre-trained 2D diffusion model, we extract one 2D axial slice per case.
+Each case is first resampled to a resolution of $3 \times 0.5 \times 0.5$ mm and then center-cropped to
+a $90 \times 150 \times 150$ mm ($30 \times 300 \times 300$ px) region.
+We select the median prostate slice for negative cases using the provided full prostate segmentations.
+We select the slice with the maximum tumor area for positive cases according to the provided tumor segmentation maps.
+Each slice is finally upsampled to $512 \times 512$ px.
+Each modality is encoded as one of the RGB channels when training multi-modal embeddings.
+The training, validation and test set of the classification experiments each consist of 100 randomly sampled negative slices and 100 randomly sampled positive slices.
+The embeddings are trained on the training set.
+
+% Prostate MRI is special in that it provides multiple images of the pelvic region that each depict a unique pathophysiologically relevant aspect for the specific disease purpose. This multi-modal dataset deviates from the natural image distribution seen during pre-training, and thus makes it highly challenging for image generation.
+% To be realistic, the generated medical images need to be diagnostically consistent across the modalities. For example, prostate cancer should appear dark on ADC, bright on DWI, and show a blurry structure in T2W. 
+
+\subsubsection{Chest X-ray - CheXpert}
+
+CheXpert is a large public dataset of 224,316 chest radiographs, with corresponding labels for 14 different observations \cite{irvinCheXpertLargeChest2019}.
+Since we explicitly investigate compositional prompting
+with the learned embeddings, we only sample images with a single class present.
+Specifically, we sample 100 AP-view radiographs to train embeddings for the following four observations: 
+No Finding (healthy), Cardiomegaly, Pleural Effusion and Pneumonia.
+Each radiograph is first cropped to non-zero borders. Then, the longest edge is resized to $512$ px, while
+keeping the aspect ratio fixed.
+Finally, the image is zero-padded to a square resolution of $512 \times 512$ px.
+The training, validation, and test set for
+the classification experiments each consist of 100 healthy and 100 cardiomegaly samples.
+
+\subsubsection{Histopathology - PatchCamelyon}
+
+PatchCamelyon is a public dataset of 327,680 $96 \times 96$ px patches extracted from histopathology 
+whole-slide images of lymph node sections, originally released as part of the Camelyon16 challenge \cite{veelingRotationEquivariantCNNs2018, ehteshamibejnordiDiagnosticAssessmentDeep2017}.
+Each patch has a corresponding binary label indicating the presence of metastatic tissue. We randomly select
+100 negative and 100 positive patches for the training set. We use the official validation and testing splits of 32,768 cases each. All images are upsampled to $512 \times 512$ px.
+
+\section{Experiments}
+
+\subsection{Adapting TI parameters to medical imaging}\label{sec: ti_settings}
+
+All embeddings in this section were trained using 2D T2-weighted healthy prostate slices.
+T2-weighted images clearly show the anatomy and are, therefore, easiest to judge qualitatively.
+\tableref{tab:inference_settings} shows the FID and MFID scores after varying the number of sampling steps, CFG scale, embedding size, and the number of training cases relative to our final configuration used in the remainder of the paper: embedding size of 64 vectors per token, 100 cases per class, 100 sampling steps and a CFG scale of 2.
+
+% OLD TEXT
+% Firstly, we determine the optimal inference
+% parameters for an embedding with vector size 64, trained with 100 cases.
+% In particular, we tune the number of sampling steps and the classifier-free
+% guidance (CFG) scale. The full results are
+% shown in Table \ref{tab:inference_settings}. Following this table, in the remainder of the
+% paper we do inference with 100 steps and a CFG scale of 2, unless specified otherwise.
+% Even though a CFG scale of 1 gives slightly lower FID, images are much less
+% accurate, as will be discussed later in this section.
+
+% Secondly, we study the impact of the vector size of the trained embeddings,
+% varying it from 8 to 64, again using 100 cases during training.
+% The limit of the CLIP encoder used for Stable Difffusion is 75, so a bigger
+% embedding size would need adaptation of the framework.
+% The results are shown in Table \ref{tab:n_vectors} and show that using
+% a larger embedding size is better.
+
+% Thirdly, we study the impact of the number of cases used during training,
+% using an embedding size of 64. We vary the number of cases from 5, as
+% proposed in \cite{galImageWorthOne2022}, to 100. The results are shown in
+% Table \ref{tab:n_cases} and show that using more cases leads to better
+% embeddings.
+
+
+% Inference parameter table
+% \begin{table}
+% \begin{center}
+% \begin{tabular}{|l|c|c|c|c|}
+% \hline
+% Steps & CFG scale & Embedding size & Training cases & FID $\downarrow$\\
+% \hline\hline
+% 25 \cellcolor{gray!25} & 2 & 64 & 100 & 194 \\
+% 50 \cellcolor{gray!25}& 2 & 64 & 100 & 184 \\
+% 75 \cellcolor{gray!25}& 2 & 64 & 100 & 176 \\
+% 100 \cellcolor{gray!25}& 2 & 64 & 100 & \textbf{171} \\
+% \hline
+% \hline
+% 100 & 1 \cellcolor{gray!25}& 64 & 100 & \textbf{168} \\
+% 100 & 2 \cellcolor{gray!25}& 64 & 100 & 171 \\
+% 100 & 3 \cellcolor{gray!25}& 64 & 100 & 202 \\
+% 100 & 4 \cellcolor{gray!25}& 64 & 100 & 211  \\
+% 100 & 5 \cellcolor{gray!25}& 64 & 100 & 222  \\
+% \hline
+% \hline
+% 100 & 2 & 8 \cellcolor{gray!25}& 100 & 177\\
+% 100 & 2 & 16 \cellcolor{gray!25}& 100 & 184\\
+% 100 & 2 & 32 \cellcolor{gray!25}& 100 & 218 \\
+% 100 & 2 & 64 \cellcolor{gray!25}& 100 & \textbf{171} \\
+% \hline
+% \hline
+% 100 & 2 & 64 & 5 \cellcolor{gray!25} & 203\\
+% 100 & 2 & 64 & 10 \cellcolor{gray!25}& 181\\
+% 100 & 2 & 64 & 50 \cellcolor{gray!25}& 181\\
+% 100 & 2 & 64 & 100 \cellcolor{gray!25}& \textbf{171}\\
+% \hline
+% \hline
+% StyleGAN3 & - & - & - & \textbf{130}\\
+% \hline
+% \end{tabular}
+% \end{center}
+% \caption{FID score for embeddings generated with varying number of sampling steps, CFG scale, embedding size and number of training cases. All settings are varied against 100 steps, CFG scale 2, embedding size 64 and 100 training cases.}
+% \label{tab:inference_settings}
+% \end{table}
+
+% Table with 100 cases
+% ---
+% \begin{table}
+% \centering
+% \scalebox{0.9}{
+% \begin{tabular}{|cc|cc|cc|cc|}
+% \hline
+% Steps & FID $\downarrow$ & CFG scale & FID $\downarrow$ & Embedding size & FID $\downarrow$ & Training cases & FID $\downarrow$ \\
+% \hline
+% 25 & \textcolor{red}{194 $\pm$ 5} & 1 & \textbf{168} & 8 & 177 & 5   & 203 \\
+% 50   & 184 & 2   & 171 & 16   & 184 & 10   & 181 \\
+% 75   & 176 & 3   & 202 & 32   & 218 & 50   & 181 \\
+% 100   & \textbf{171} & 5   & 222 & 64   & \textbf{171} & 100   & \textbf{171} \\
+% \hline
+% \end{tabular}
+% }
+% \caption{\textcolor{red}{Add MedFID scores} FID score for embeddings generated with a varying number of sampling steps, CFG scale, embedding size, and a number of training cases. All settings are varied against 100 steps, CFG scale 2, embedding size 64, and 100 training cases.}
+% \label{tab:inference_settings}
+% \end{table}
+
+% Table with 1000 cases normal FID
+% ---
+% \begin{table}
+% \centering
+% \scalebox{0.9}{
+% \begin{tabular}{|cc|cc|cc|cc|}
+% \hline
+% Steps & FID $\downarrow$ & CFG scale & FID $\downarrow$ & Embedding size & FID $\downarrow$ & Training cases & FID $\downarrow$ \\
+% \hline
+% 25 & 118            & 1 & \textbf{85}   & 8 & 100           & 5 & 158 \\
+% 50 & 106            & 2 & 99            & 16 & 110          & 10 & 106 \\
+% 75 & 101            & 3 & 146           & 32 & 149          & 50 & \textbf{96} \\
+% 100 & \textbf{99}   & 5 & 173           & 64 & \textbf{99}  & 100 & 99 \\
+% \hline
+% \end{tabular}
+% }
+% \caption{\textcolor{red}{Add MedFID scores} FID score for embeddings generated with a varying number of sampling steps, CFG scale, embedding size, and a number of training cases. All settings are varied against 100 steps, CFG scale 2, embedding size 64, and 100 training cases.}
+% \label{tab:inference_settings}
+% \end{table}
+
+% % Table with 1000 cases med FID
+% % ---
+% \begin{table}
+% \centering
+% \scalebox{0.9}{
+% \begin{tabular}{|cc|cc|cc|cc|}
+% \hline
+% Steps & FID $\downarrow$ & CFG scale & FID $\downarrow$ & Embedding size & FID $\downarrow$ & Training cases & FID $\downarrow$ \\
+% \hline
+% 25 & 4.04            & 1 & 4.50             & 8 & 2.92           & 5 & \textbf{2.55} \\
+% 50 & 3.38            & 2 & \textbf{2.87}    & 16 & 3.22          & 10 & 3.25 \\
+% 75 & 3.11           & 3 & 4.51              & 32 & \textbf{2.86} & 50 & 3.41 \\
+% 100 & \textbf{2.87}   & 5 & 61.4            & 64 & 2.87          & 100 & 2.87 \\
+% \hline
+% \end{tabular}
+% }
+% \caption{\textcolor{red}{Add MedFID scores} FID score for embeddings generated with a varying number of sampling steps, CFG scale, embedding size, and a number of training cases. All settings are varied against 100 steps, CFG scale 2, embedding size 64, and 100 training cases.}
+% \label{tab:inference_settings}
+% \end{table}
+
+% Combined Table
+\begin{table}
+\centering
+\makebox[\textwidth][c]{
+\scalebox{0.9}{
+\begin{tabular}{|ccc|ccc|ccc|ccc|}
+\hline
+Steps & FID & MFID & CFG scale & FID & MFID & \makecell{Embedding\\size} & FID & MFID & \makecell{Training\\cases} & FID & MFID \\
+\hline
+25 & 118 & 4.04 & 1 & \textbf{85} & 4.50 & 8 & 100 & 2.92 & 5 & 158 & \textbf{2.55} \\
+50 & 106 & 3.38 & 2 & 99 & \textbf{2.87} & 16 & 110 & 3.22 & 10 & 106 & 3.25 \\
+75 & 101 & 3.11 & 3 & 146 & 4.51 & 32 & 149 & \textbf{2.86} & 50 & \textbf{96} & 3.41 \\
+100 & \textbf{99} & \textbf{2.87} & 5 & 173 & 61.4 & 64 & \textbf{99} & 2.87 & 100 & 99 & 2.87 \\
+\hline
+\end{tabular}
+}
+}
+\caption{FID ($\downarrow$) and MFID ($\downarrow$) scores for embeddings generated with a varying number of sampling steps, CFG scale, embedding size, and a number of training cases. All settings are varied against 100 steps, CFG scale 2, embedding size 64, and 100 training cases.}
+\label{tab:inference_settings}
+\end{table}
+
+%Although a CFG scale of 1 results in the lowest FID score in Table \ref{tab:inference_settings}, visually, the results are much worse, featuring inaccurate general anatomy.
+In general, we find that the FID and MFID scores identify general trends, but that they are not optimal metrics to judge generation quality and have sizable error margins (see Appendix \ref{sec:fid}).
+For this reason, optimal parameters were chosen by inspecting generation results visually as well.
+Figure \ref{fig:ti_settings} in Appendix \ref{sec:ti_settings_appendix} shows the effect of the parameters studied in this section visually on a single random seed. For reference, Appendix \ref{sec:no_ti} shows that directly generating images without applying textual inversion, by prompting the pre-trained model to generate prostate MRI scans, results in highly unrealistic images.
+
+\subsection{Comparison to StyleGAN3}
+
+Images generated by the fine-tuned StyleGAN3 model achieved an FID score of 53, and an MFID score of 0.12, substantially lower than those shown in \tableref{tab:inference_settings}. However, in the blinded head-to-head comparison, the expert radiologist preferred the images generated by Stable Diffusion (36/50 images, 72\%). There were more anatomically incorrect images generated by StyleGAN3, and often, the images had low contrast or were very dark.
+Similar to Section \ref{sec: ti_settings}, this indicates that FID is not a particularly informative metric for comparing two architectures in a medical setting.
+Sets of 16 randomly generated images by both Stable Diffusion and StyleGAN3 are included in Appendix \ref{sec:samle_ti} and \ref{sec:samle_stylegan}, respectively.
+
+\vspace{-4mm}
+\subsection{Classification with synthetic data}
+
+\begin{table}
+\centering
+\scalebox{0.9}{
+\begin{tabular}{|c|c|c|c|c|}
+\hline
+\#Real & \#Synthetic & AUC - Prostate MRI & AUC - Cardiomegaly & AUC - Histopathology\\
+\hline\hline
+200 & 0 & 0.780 $\pm$ 0.017 & 0.732 $\pm$ 0.021 & \textbf{0.878 $\pm$ 0.011}\\
+200 & 2000 & \textbf{0.803 $\pm$ 0.009} & \textbf{0.737 $\pm$ 0.019} & 0.862 $\pm$ 0.017\\
+\hline
+0 & 200 & 0.737 $\pm$ 0.019 & - & -\\
+0 & 2000 & 0.766 $\pm$ 0.020 & - & -\\
+200 & 200 & 0.773 $\pm$ 0.015 & - & -\\
+\hline
+0 & 2000* & 0.562 $\pm$ 0.036 & - & -\\
+200 & 2000* & 0.745 $\pm$ 0.012 & - & -\\
+\hline
+\end{tabular}
+}
+\caption{Mean test AUC $\pm$ standard deviation over 10 training runs for binary prostate cancer, cardiomegaly, and histopathology classifiers. Synthetic cases marked with an asterisk (*) were generated with an embedding trained on only 10 cases instead of 100.}
+\label{tab:auc_binary}
+\end{table}
+
+In this section, we experiment using synthetic data to train classification models on multi-modal prostate MRI, chest X-ray and histopathology images.
+Embeddings are trained on two sets of 100 cases, with only negative or only positive cases.
+With these embeddings, up to 1000 cases for each class are generated, and combinations of real and synthetic data are used to train classification models.
+Similar to before, we perform more extensive experiments with multi-modal prostate MRI.
+Results are shown in Table \ref{tab:auc_binary}, showing that for prostate MRI augmenting the 200-case training set with 2000 synthesized cases leads to a 2\% improvement in AUC, from 0.78 to 0.80.
+These 2000 synthesized cases are based on embeddings trained with the same 200-case set used to train the classification models.
+This shows that generated cases can add non-trivial variation to the data distribution and that the embedding does not simply reproduce training cases.
+Furthermore, models trained with only synthetic cases do not see a large drop in performance, indicating that the synthetic cases are diagnostically accurate. To confirm visual results from section \ref{sec: ti_settings}, classification models trained with synthetic cases generated with embeddings trained on 10 cases instead of 100 show a dramatic drop in performance.
+This confirms that more cases are needed for Textual Inversion on medical data.
+
+For cardiomegaly, however, including extra synthesized cases during training is hardly an added benefit.
+For histopathology, adding synthesized cases results in a performance drop of about 1\%, which may indicate that synthetic cases are less useful for improving models that already attain high performance.
+
+\vspace{-4mm}
+\subsection{Composability of embeddings}\label{sec:composing}
+
+\begin{figure}[t]
+\begin{center}
+\hspace*{-2cm}
+   \includegraphics[width=0.5\linewidth]{figures/disease_interpolation_small.pdf}
+\end{center}
+\vspace*{-7mm}
+   \caption{Interpolation between a healthy and diseased state for multi-modal Prostate MRI. The column titles show the trade-off between healthy and diseased.}
+\label{fig:disease_interpolation}
+\end{figure}
+
+In this section, we give preliminary evidence that composable diffusion works for medical data in two examples.
+In Figure \ref{fig:disease_interpolation}, the disease state is gradually increased from healthy to diseased.
+The tumors in the prostate example become gradually more prominent (darker on ADC, brighter on DWI). Appendix \ref{sec:interpolation_appendix} includes a more extensive figure.
+In Figure \ref{fig:chexpert_composition}, multiple conditions are progressively added to a single healthy example.
+From a healthy image, pleural effusion, pneumonia, and cardiomegaly are added to the prompt for a single random seed.
+For the image with all three diseases, we gave each embedding a strength of 0.5 and found that increasing the CFG scale to 3 works better.
+
+\begin{figure}[t]
+\begin{center}
+   \includegraphics[width=0.8\linewidth]{figures/chexpert_composition.pdf}
+\end{center}
+\vspace*{-5mm}
+   \caption{Visual example illustrating that multiple embeddings can be composed to show multiple pathologies in a single image. From left to right, pleural effusion, pneumonia, and cardiomegaly are progressively added to a healthy generated example.}
+\label{fig:chexpert_composition}
+\end{figure}
+
+% These examples show that the trained embeddings are flexible and go beyond fine-tuning towards a single new concept.
+% The fact that rendering of disease progression or accurate depiction of multiple conditions is possible, while the embeddings have only been trained on cases with a single condition present is a promising result.
+% Practically, this could be useful to generate cases with rare combinations of conditions in a single image, or to simulate disease progression for medical surveillance settings.
+
+\vspace{-4mm}
+\subsection{Controlling disease appearance with inpainting}
+
+% \begin{figure}
+% \begin{center}
+%    \includegraphics[width=0.5\linewidth]{figures/chexpert_inpainting.pdf}
+% \end{center}
+%    \caption{Inpainting of pleural effusion and pneumonia on the same healthy generated Chest X-ray example.}
+% \label{fig:chexpert_inpainting}
+% \end{figure}
+
+\begin{figure}[t]
+\begin{center}
+   \includegraphics[width=0.6\linewidth]{figures/prostate_inpainting.pdf}
+\end{center}
+\vspace*{-7mm}
+   \caption{Inpainting of prostate cancer in different locations on the same healthy generated Prostate MRI example. The top row shows the original healthy case, with the bottom rows showing inpainting in different locations with varying mask sizes.}
+\label{fig:prostate_inpainting}
+\end{figure}
+
+% In this section, we demonstrate the potential of inpainting to precisely control where disease shows in an image.
+% Starting with a generated healthy example, a portion of the image is masked.
+% The diffusion model then denoises the masked part of the image, while conditioned on a specific disease embedding.
+% For example, for the top row in Figure \ref{fig:chexpert_inpainting}, the bottom of the left lung of the healthy image is masked.
+% The diffusion model inpaints it, while it is conditioned with the pleural effusion embedding.
+% This results in pleural effusion appearing in the masked region.
+% In Figure \ref{fig:chexpert_inpainting}, it is used to force pleural effusion or pneumonia appears at the left lung.
+% Similarly, in Figure \ref{fig:prostate_inpainting}, the same healthy prostate example is masked in two different locations, with a different mask size.
+% When inpainting conditioned on the positive embedding, this generates tumors at those locations of corresponding sizes.
+% Similar to the examples in section \ref{sec:composing}, this allows engineering of examples with specific disease appearance and could for instance be useful to generate more cases with rare tumor locations.
+
+This section demonstrates the potential of inpainting to control disease location precisely.
+Starting from a healthy example, a portion of the image is masked.
+The diffusion model denoises the masked part of the image, conditioned on a specific disease embedding.
+In Figure \ref{fig:prostate_inpainting}, the same healthy prostate example is masked in two locations with a different mask size.
+When inpainting conditioned on the positive embedding, this generates tumors at those locations of corresponding sizes.
+Similar to Section \ref{sec:composing}, this allows generating examples with specific disease appearance and could be useful for generating cases with rare tumor locations.
+
+\section{Conclusion}
+
+% In this paper, we show that pre-trained latent diffusion models can be adapted to a variety of modalities in the medical domain, using Textual Inversion.
+% High quality images can be generated with embeddings trained on 100 examples on a single consumer-grade GPU.
+% We showcased various possible applications: improvement of diagnostic models in the low-data regime by adding synthetic cases during training, simulation of disease progression and generation of images with specific disease appearance.
+% Although a dedicated diffusion model trained on a large captioned medical dataset would likely generate better images, our results are promising for institutions with limited computational resources.
+% Especially for situations where collecting a large dataset is not feasible, such as rare diseases, this approach is suitable and would also be compatible with a medically pre-trained model.
+% Finally, since the trained embeddings are extremely small files, they may facilitate sharing of medical information with reduced privacy concerns.
+
+In this paper, we use Textual Inversion to demonstrate the adaptability of pre-trained latent diffusion models across various medical modalities. 
+High-quality images can be generated using embeddings trained on 100 examples on a single consumer-grade GPU. 
+Our showcased applications include enhancing diagnostic models in low-data scenarios by incorporating synthetic cases during training, simulating disease progression, and generating images with specific disease appearances.
+While a dedicated diffusion model trained on a large captioned medical dataset would likely yield superior results, our findings are promising for institutions with limited computational resources.
+This approach is particularly relevant for rare diseases where collecting large datasets is impractical. It remains viable and compatible with medically pre-trained models, including 3D models.
+Finally, the small file size of the trained embeddings may facilitate the sharing of medical information with reduced privacy concerns.
+
+\clearpage  % Acknowledgements, references, and appendix do not count toward the page limit (if any)
+
+\bibliography{midl24_94}
+
+
+\appendix
+
+\section{FID reliability}\label{sec:fid}
+
+To get an impression of the reliability of the FID metric, we estimated the 95\% confidence interval for the MFID metric using bootstrapping. Calculation of the FID score based on 2048-lenght feature vectors is computationally expensive due to the linear algebra involved in computing the metric. For this reason, we estimated the 95\% CI only for the MFID metric and our chosen configuration (100 steps, CFG 2, embedding size 64, 100 training cases) with $10^3$ repetitions, giving: 2.87 (1.34, 5.32).
+
+This has significant overlap with most of the values in Table \ref{tab:inference_settings}, so likely no hard conclusions can be drawn from that Table only. For a proper statistical comparison, a permutation test could be performed between distributions of FID scores calculated with random subsets of cases per setting. Since in this paper we used FID scores mostly to guide parameter choice, which we confirmed visually and with the classification experiments, we do not perform such rigorous (and expensive) comparisons. 
+%In general, capturing medical faithfulness of a set of generated images in a single metric is a difficult problem.
+
+\newpage
+
+\section{Textual Inversion parameters}\label{sec:ti_settings_appendix}
+
+\begin{figure}[h]
+\begin{center}
+   \includegraphics[width=\linewidth]{figures/ti_settings_overview.pdf}
+\end{center}
+   \caption{Visual examples illustrating the effect of varying inference and training settings for T2-weighted prostate MRI, all generated using the same random seed. Columns with a bold title indicate optimal values. Row labels indicate the parameter that changes along the column, with bold values set for the other parameters. For example, in the top row, the number of steps changes, but the CFG scale, embedding size, and training cases are 2, 64, and 100, respectively.}
+\label{fig:ti_settings}
+\end{figure}
+
+Figure \ref{fig:ti_settings} visually shows the effect of the parameters studied in Section \ref{sec: ti_settings} on a single random seed. A high number of sampling steps
+improves generation quality, with the generations for 25 and 50 steps showing
+incorrect anatomy for the bladder.
+Although a CFG scale of 1 results in the lowest FID score in Table \ref{tab:inference_settings},
+visually, the results are much worse, featuring inaccurate general anatomy.
+A high CFG scale (e.g. 5 in \figureref{fig:ti_settings}) also leads to bad results, showcased here by
+the simplified structure inside the prostate and a curious fractured pelvic bone.
+The difference between CFG scale 2 and 3 is not that large, but upon manual inspection, we find
+that a CFG scale of 2 gives better generations overall, as seems to be confirmed by the lower FID
+score in Table \ref{tab:inference_settings}.
+The embedding size is optimally chosen to be large, with sizes 8 and 16 showing
+inaccurate generation, particularly of the bladder.
+Although size 32 looks better, the structure of the prostate itself is not nearly as
+good as generated by the size 64 embedding.
+Finally, the impact of the amount of training cases seems to trump all other settings,
+where 5 and 10 cases produce very unrealistic images. The embedding trained
+with 100 cases generates images with the most realistic prostate structure.
+
+\newpage
+\section{Text-conditioned generation without textual inversion}\label{sec:no_ti}
+
+This section demonstrates that a pre-trained Stable Diffusion model is not capable of generating MRI images of the prostate using text prompts. Chambon et al. \cite{chambonAdaptingPretrainedVisionLanguage2022} found that when prompting the model with "A photo of a lung xray", generated images look somewhat like real chest x-rays. For prostate images, we do not find the same. Figure \ref{fig:a_prostate_mri_scan} and \ref{fig:t2_weighted_} each show four random generations when prompting the model with "A prostate MRI scan" and "A T2-weighted MRI scan of a prostate", respectively. The output vaguely resembles medical scans, but is not close to a prostate MRI scan in any meaningful way. This demonstrates that for medical modalities that are less common, fine-tuning Stable Diffusion models is essential.
+
+\begin{figure}[h]
+\begin{center}
+   \includegraphics[width=0.5\linewidth]{figures/a_prostate_mri_scan_cfg5_30_steps.png}
+\end{center}
+   \caption{Four generated images when prompting a pre-trained Stable Diffusion model with "a prostate MRI scan"}
+\label{fig:a_prostate_mri_scan}
+\end{figure}
+\begin{figure}[h]
+\begin{center}
+   \includegraphics[width=0.5\linewidth]{figures/t2_weighted_cfg5_30_steps.png}
+\end{center}
+   \caption{Four generated images when prompting a pre-trained Stable Diffusion model with "a T2-weigthed MRI scan of a prostate"}
+\label{fig:t2_weighted_}
+\end{figure}
+
+\clearpage
+\newpage
+\newpage
+
+\section{Random sample of generated images - Stable Diffusion}\label{sec:samle_ti}
+
+\begin{figure}[h]
+\begin{center}
+   \includegraphics[width=0.95\linewidth]{figures/sd_overview.pdf}
+\end{center}
+\label{fig:sd_overview}
+\end{figure}
+
+\newpage
+\section{Random sample of generated images - StyleGAN3}\label{sec:samle_stylegan}
+
+\begin{figure}[h]
+\begin{center}
+   \includegraphics[width=0.95\linewidth]{figures/stylegan_overview.pdf}
+\end{center}
+\label{fig:stylegan_overview}
+\end{figure}
+
+\newpage
+\section{Disease interpolation}\label{sec:interpolation_appendix}
+
+\begin{figure}[h]
+\begin{center}
+   \includegraphics[width=\linewidth]{figures/disease_interpolation.pdf}
+\end{center}
+   \caption{Visual examples illustrating interpolation between healthy and diseased states for multi-modal Prostate MRI, various pathologies on Chest X-ray, and lymph node metastasis in histopathology. The column titles show the trade-off between healthy and diseased. The Chest X-ray examples are all generated using the same random seed.  The prostate images are cropped to the prostate region for visibility.}
+\label{fig:disease_interpolation_appendix}
+\end{figure}
+
+The disease state gradually increases from healthy to diseased, using composable diffusion. For instance, the cardiomegaly radiograph in the second column (25\% diseased) is generated with a prompt like "\textit{0.25*$<$healthy$>$ AND 0.75*$<$cardiomegaly$>$}".
+This seems to work well across the modalities studied in this paper: the tumors in the prostate example become gradually more prominent (darker on ADC, brighter on DWI); the heart in the cardiomegaly example appears to grow from left to right; the tissue in the lymph node metastasis example becomes gradually more abnormal.
+
+
+
+\end{document}

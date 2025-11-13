@@ -1,0 +1,561 @@
+% Chapter 1
+
+\chapter{RTX Radiosity} % Main chapter title
+
+\label{Chapter4} % For referencing the chapter elsewhere, use \ref{Chapter1} 
+
+%----------------------------------------------------------------------------------------
+
+%----------------------------------------------------------------------------------------
+
+The preceding chapters delineate how Nvidia's RTX technology functions and how it can be leveraged through the DirectX 12 API.
+
+In this chapter we present a concrete implementation in the form of an RTX-based radiosity application referred to as \textit{RTRad}. We commence by first exhibiting the primary components of regular, progressive radiosity, which we later expand to incorporate \textit{refinement} (and more) in chapter \ref{Chapter5}.
+
+\section{Status Quo of GPU-based Radiosity}
+
+Radiosity variants or derivations are used industry-wide in many real-time rendering engines.
+Yet despite their immense potential for paralellization, many radiosity implementations continue to perform better on high core-count CPUs as opposed to GPUs.
+
+In their measurements, Carr et al. found that although CPUs currently perform better in matrix-based radiosity calculations, a GPU's performance scaling is significantly closer to linear, albeit with a fairly constricting upper limit, due to a GPU's limited memory capacity \cite{ray_engine}.
+
+The algorithm finds itself in an unusual predicament, where it is neither particularly well suited for CPU nor GPU execution. 
+Each radiosity patch can be processed in parallel on a GPU, but solving the visibility function $V$ requires a data structure to be traversed \textit{sequentially}, a process better suited to the powerful cores of a CPU.
+
+Some solutions, like the one proposed by D’Azevedo et al. \cite{ComplexGPURadiosity}, attempt to tackle this imbalance by dividing the workload onto a hybrid GPU/CPU platform, where only the view-factors are computed GPU-side via a compute-shader, then read back into CPU memory and finally used in a rudimentary CPU-based solution.
+
+The introduction of RT cores strikes a compromising balance between the few, high-performance cores of a CPU and the many, low-performance cores of a GPU. Offloading the visibility component of radiosity onto this new hardware may prove to be an ideal solution to this bottleneck. 
+
+\subsection{Lead-up to RTRad}
+
+Raytracing and radiosity are both based on the rendering equation and, as such, share many fundamental mathematical components.
+The primary goal behind \textit{RTRad} is to demonstrate that the performance increase RTX provides to raytracing is applicable to radiosity as well.
+
+In this chapter we set out to alleviate the visibility bottleneck by substituting techniques based on hemicuboid z-buffering with an RTX-based solution, which should prove more adequate for for random rays requiring random memory-access \cite{RTX_examination}.
+
+The introduction of the Turing architecture opens the door to an entirely new set of specialized computation units on GPUs that may well be useful in areas beyond their intended use-case.
+Similarly to how regular graphics processors, initially intended purely for 3D rendering, have found themselves beneficial for purposes such as cryptography and machine learning, \textit{RT cores} may also prove themselves useful for applications outside of the real-time raytracing domain.
+
+With the implementation of an RTX-based radiosity algorithm, we put forth the general argument that RT cores can offer a great computational shortcut for highly accurate visibility simulations in general (see fig. \ref{VisMethods}).
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.4]{Figures/visibility_methods.jpg}
+\decoRule
+\caption[]{Different methods for calculating visibility. This thesis examines how RTX and voxel-raymarching hold up against z-Buffering.}
+\label{VisMethods}
+\end{figure}
+
+\subsection{Target Use-Case}
+
+The implementation presented in this thesis is fully capable of quickly producing high-quality radiosity lightmaps that can be used as textures for diffuse global illumination.
+However, the underlying software is primarily intended as a research project and proof-of-concept, not a consumer-targeted application to be used in production-ready applications. 
+
+The underlying use case an RTX-based lightmapper could cover in practice, is mainly oriented towards developers or designers of 3D environments working on specialized workstations with RTX-compatible graphics cards. The faster computation time would facilitate a more comfortable workflow and, once computed, the lightmaps can be mapped onto geometry and displayed to end-users on any PC at virtually no cost at all.
+
+\section{Previous Work}
+
+The relative novelty of RTX means its application or examination in anything other than real-time raytracing is quite sparse.
+
+According to its documentation, contemporary versions of \textit{Unreal Engine} make use of RTX in their \textit{GPU Lightmass} system \cite{UnrealDocu}, although it is not clear in what manner or capacity.
+Shcherbakov et al. hint at the idea of potentially utilizing RTX in the future to accelerate their \textit{Dynamic Radiosity} algorithm \cite{dyn_rad},
+and Lin advocates for its usage to accelerate the VPL generation process in instant radiosity \cite{rtx_instant_rad}.
+
+Radiosity implementations running on GPU hardware \textit{without} RTX have existed for some time alongside several noteworthy publications describing them.
+
+\subsection{GPU Radiosity}
+
+As part of the 2005 \textit{GPU Gems 2} book \cite{gpu_gems_2005}, Coombe et al. provide an early implementation of the progressive refinement radiosity algorithm that runs on common GPUs using z-Buffering for visibility.
+
+Alongside a series of other acceleration techniques, this solution can ultimately "compute a radiosity solution of a 10,000-element version of the Cornell Box scene to 90 percent convergence at about 2 frames per second" \cite{gpu_gems_2005}.
+
+This implementation has served as a primary influence on this thesis with several core concepts, such as using GPU-generated mipmaps to decrease shooting resolution, being derived from it.
+
+\subsection{Rapid-Radiosity (RRad)}
+
+Not to be confused with the program presented in this thesis (RTRad), \textit{RRad} \cite{rrad} is a GPU-based implementation that served as a direct lead-up to this thesis, made with the open-source API OpenGL. Completed as a software project part of the computer graphics lecture at the Freie Universität Berlin, it highlights with clarity how visibility is the only major hurdle that prevents the widespread adoption of GPU-based radiosity.
+
+RRad approximates a scene through basic geometric shapes (spheres and triangles) and then loops over each shape and performs a simple, discrete ray-intersection on each. This geometric approximation is hard-coded into the shader's code itself, making the application simple and lightweight, but entirely unsuitable to complex environments. Fig. \ref{rrad_example} shows the default RRad scene with a lightmap of $512\times512$ pixels, for which a single bounce of light requires approx. 2 seconds of computation time on a GeForce RTX 2070S GPU.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.35]{Figures/rrad_render.jpg}
+\decoRule
+\caption[]{Simple render done with RRad. The GPU implementation means that performance is decent, but the amount and complexity of the shapes (spheres and triangles) is highly limited, which are all tested for intersections sequentially.}
+\label{rrad_example}
+\end{figure}
+
+Many fundamental design choices presented in this thesis have their roots in RRad, with the most substantial change being the replacement of the discrete, hard-coded raytraces that run on CUDA cores, to a fully flexible RTX solution.
+
+\section{Source Code and Dependencies}
+
+RTRad was developed in C++ 17 with Nvidia's own \textit{Falcor} as the underlying framework. Visual Studio 2022 served as the primary IDE and the program was exclusively tested on a system with an Nvidia RTX 2070S GPU and an AMD Ryzen 3900X CPU.
+
+The complete source code, a demonstration video, as well all executable files for the finished project can be found on the following github repository\footnote{The latest commit ID at the time of writing is \texttt{056e0e1b7cc89190231a6fbb1e81bd04ac6e0701}.}: \url{https://github.com/Helliaca/RTRad}
+
+\subsection{Falcor}
+
+Falcor is an open-source framework intended specifically for rapid prototyping of real-time rendering applications \cite{falcor, RTX_Tuto}.
+Maintained as well as internally utilized by Nvidia, it provides a considerable set of advanced graphics features such as stereo rendering for VR, physically based shading and, most importantly for the context of this thesis, built-in RTX support \cite{RTX_Tuto}.
+
+Additionally, there are thin abstraction layers on top of DirectX 12 that reduce the amount of redundant, verbose DirectX code required for a functioning application as well as convenient UI and profiling systems.
+
+RTRad is built on Falcor 4.4, leaving some advanced features available in later versions (Faclor 5.2 being the most recent at the time of writing) such as DLSS aside.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.3]{Figures/RTRad_UI.jpg}
+\decoRule
+\caption[asd]{GUI of the RTRad application. Each render pass has its dedicated GUI window to adjust settings, alongside scene controls, pipeline controls and a profiler.}
+\label{rtrad_UI}
+\end{figure}
+
+\section{Program Structure}
+
+The employed programming patterns were kept consistent with the precedent set in Falcor's source code and respective educational content (see \cite{RTX_Tuto, RTX_Intro, falcor}), including the usage of factory methods to create objects and referencing them with smart pointers to avoid memory leaks.
+
+The core program takes the form of a graphics-pipeline that consists of several graphics passes which are executed and managed by a central manager object based on Falcor's \textit{IRenderer} interface.
+
+\subsection{Class Structure}
+
+RTRad follows the class structure depicted in fig \ref{class_diag}: A \textit{BasePipelineElement} class serves as a base class that provides a custom GUI method, so that each pipeline component can manage their own GUI elements that are used to adjust settings which are bound to their respective parents through the \textit{SettingsObject} template (see fig. \ref{rtrad_UI}).
+
+\begin{figure}[h]
+\centering
+\includegraphics[scale=0.6]{Figures/ClassDiagram.png}
+\decoRule
+\caption[]{Simplified class diagram of RTRad. The TextureGroup class (green) represents the input/output data container, which is processed by up to four subsequent passes (orange).}
+\label{class_diag}
+\end{figure}
+
+A \textit{BaseRenderPass} serves as the base class for render passes which form the backbone of the pipeline. A central \textit{RTRad} object manages its execution and data-flow. Each pass self-manages its UI elements, shaders and shader-uniform variables. A \textit{TextureGroup} serves as the input-output data structure which is passed through the pipeline.
+
+\section{Input Data}
+
+The underlying goal is to take a scene, consisting of geometry and materials, and generate a bitmap texture containing diffuse global illumination as the output, where each pixel corresponds to a radiosity patch. 
+
+Mapping each pixel in the output texture to a surface in 3D space is accomplished through the scene's \textit{UV coordinates}.
+
+\subsection{Subdivision through UV Mapping}
+
+The process of ascribing each 3D vertex an additional 2D coordinate on a texture is called \textit{UV mapping}.
+Utilizing this process for radiosity patch placement comes with the benefit of streamlining the data-containers for each input. Increasing or decreasing the resolution of the lightmap can occur seamlessly, as every patch points to a texture-coordinate correspondent to it.
+
+There exist a plethora of algorithms to automatically generate UV unwrappings for any 3D model or scene \cite{UV_unwrapping}. In practice, rendering engines tend to come equipped with their own built-in tools specifically meant for automatic lightmap UV generation \cite{unreal_uv_unwrap, unity_docs}.
+
+Making these unwrappings as seamless and efficient as possible is a unique challenge beyond the scope of this thesis. All unwrappings utilized in RTRad were created manually, or with the tools contained in the \textit{Blender} 3D modelling software.
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.4]{Figures/UV_mapping.jpg}
+\decoRule
+\caption[]{The default RRad scene \cite{rrad} (right) and its UV coordinates (left) with a checker pattern applied as a texture. Each square of the checker pattern would correspond to a radiosity patch.}
+\label{UV_unwrapping}
+\end{figure}
+
+\subsection{Input Components}
+
+Recall the Monte-Carlo approximation for view factors established in (\ref{eqn:ViewFactor_MonteCarlo}):
+
+\begin{equation}
+    F_{i,j} = \frac{1}{K} \sum_{k=1}^{K} A_j \frac{\cos \theta_{ki} \cos \theta_{kj}}{\lVert x_{ki}-x_{kj} \rVert ^2} V(x_{ki},x_{kj})
+\end{equation}
+
+$\cos \theta_{ki}$ can be derived as the dot product between the normalized normal vector of the sample point and the normalized vector pointing from $x_{ki}$ to $x_{kj}$. As such, the exact data required to calculate a form factor $F_{i,j}$ is the following:
+
+\begin{itemize}
+    \item Surface area $A_j$
+    \item Normal vectors $n_{ki}$ and $n_{kj}$
+    \item World-space positions $x_{ki}$ and $x_{ki}$
+    \item Visibilities of the the two locations $V(x_{ki},x_{kj})$
+\end{itemize}
+
+Since the processing order of rays is not deterministic, it is imperative that all of these data points for all patches are available at all times of a radiosity iteration.
+We accomplish this by pre-computing individual textures that contain each data-point for all patches. The conglomeration of these textures is aptly named \textit{TextureGroup}, and serves as the primary input-output data structure for the entire application.
+
+\subsubsection{Texture-Group}\label{TextureGroup}
+
+Each individual texture contains different information, but conforms to the exact same UV mapping.
+If, for instance, we require the normal vector of a patch, we simply perform a look-up operation on the texture containing normal vectors.
+
+In total, following textures make up the texture group:
+
+\begin{itemize}
+    \item $pos$: World-position
+    \item $nrm$: World-space normal vector (normalized)
+    \item $mat$: Material properties (color)
+    \item $arf$: Surface area of each patch
+    \item $lig_{in}$: Input lighting - i.e. emission - values of the current iteration
+    \item $lig_{out}$: Output lighting texture to write to
+\end{itemize}
+
+Pixels that are not occupied by any geometry at all, are marked as 'non-patches' by setting their alpha value in the $pos$ texture to zero. When sampling for lighting contribution, only pixels with a non-zero alpha value are processed.
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.42]{Figures/TextureGroup.jpg}
+\decoRule
+\caption[]{Original scene (left) and corresponding texture group at a resolution of $128\times128$ (right). The bottom rows corresponds to each texture being mapped back onto the geometry.}
+\label{figTexturGroup}
+\end{figure}
+
+\section{CITPass}
+
+The \textit{create input textures pass} is a separate, a-priori rasterization pass that generates the above described textures from the scene's 3D geometry.
+
+It involves applying a custom vertex shader that places each vertex into a position in clip-space that corresponds to its UV coordinates. Whilst a typical vertex shader commonly applies an objects model, view and projection matrices like so:
+
+\begin{equation}
+    vert(v) = P * V * M * v.pos
+\end{equation}
+
+our custom vertex shader for the CITPass simply applies a vertex's UV coordinates:
+
+\begin{equation}
+    vert(v) = 
+    \begin{bmatrix}
+    2 * (v.uv.x - \frac{1}{2}) \\
+    2 * (v.uv.y - \frac{1}{2}) \\
+    0 \\
+    1
+\end{bmatrix}
+\end{equation}
+
+UV coordinates range from zero to one, whilst clip-space is defined as the $[-1, 1]$ range, hence the subtraction of $\frac{1}{2}$ and multiplication by 2. We assume the UV mapping to contain no overlapping geometry, making the z-coordinate produced by this vertex shader irrelevant.
+
+With the vertex shader in place, setting the output resolution to the desired resolution of the input textures then ensures that the subsequent pixel shader is executed exactly once for each pixel - e.g. each patch -  in these textures.
+
+An example how how this texturegroup looks like after the CITPass can be seen in fig. \ref{figTexturGroup}. The lighting textures $lig_{in}$ and $lig_{out}$ store the emissive values $L_e$ for each patch, which serves as the radiant-exitance for the first radiosity pass.
+
+\subsection{Surface Area}
+\label{SurfaceArea}
+
+Whilst normal vectors, positions and material properties are easily passed into the pixel shader through the rasterization pipeline, surface areas of patches require additional information that a simple, barycentric interpolation cannot provide.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.5]{Figures/SurfaceArea.jpg}
+\decoRule
+\caption[]{Approximation of a patches surface area: Since this triangle occupies 12 patches on the lightmap, the world-space surface area of each patch can be approximated by ascribing each patch the surface area of the triangle divided by the amount of patches.}
+\label{triangle_surface_area}
+\end{figure}
+
+Our textures consist of pixels, effectively squares, which correspond to radiosity patches.
+The set of pixels rastered by a triangle, will only \textit{partially} cover or be covered by it. As such it is difficult to calculate an accurate value for the world-space surface area each patch possesses, for which we employ the following approximation:
+\textit{The surface area of any one patch is equal to the surface area of the underlying triangle divided by the total amount of patches occupied by said triangle.}
+
+Let $A_{\bigtriangleup}^{w}$ be the world-space surface area of the triangle, with $A_{\bigtriangleup}^{uv}$ being its surface area on the $[0,1]$ bounded UV map.
+The amount of patches a triangle occupies can be derived from the product of its UV surface area and the total amount of patches in the texture $n$. For instance, if a triangle occupies half of the UV map, its UV surface area will be equal to $\frac{1}{2}$, which implies that it is represented by $\frac{n}{2}$ patches.
+
+The world-space surface area $A_{\boxdot}^{w}$ of a single patch can then be computed from the relationship between  this product and its world-space triangle $A_{\bigtriangleup}^{w}$ (see fig. \ref{triangle_surface_area}):
+
+\begin{equation}
+    A_{\boxdot}^{w} \approx \frac{A_{\bigtriangleup}^{w}}{A_{\bigtriangleup}^{uv} * n}
+\end{equation}
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.32]{Figures/CITPass.jpg}
+\decoRule
+\caption[]{Dataflow diagram of the CITPass, resulting in the texturegroup that serves as the input-output datastructure for subsequent passes.}
+\label{CITPass}
+\end{figure}
+
+We perform this operation on a per-triangle basis within the geometry shader of the CITPass. Unlike other common applications of geometry shaders (see \ref{GeometryShader}) we do not modify the output vertices, but merely append the fraction above as an attribute to each vertex, which then gets passed on to the pixel shader that stores it in the surface area texture \textit{arf}.
+
+The overall execution and information flow of the CITPass is visualized in fig. \ref{CITPass}.
+
+\section{RTLPass}
+
+The central component of our application is the \textit{ray-traced lightmap pass} (RTLPass), which takes the generated texturegroup as its input values and produces an output texture correspondent to the lightmap after a single iteration of progressive radiosity. For each subsequent pass the output lighting-texture is swapped and fed back into the algorithm as the input for the next iteration (see fig. \ref{RTRad_flow}).
+
+The RTLPass is the only DXR pass (non-rasterization pass) in the entire application. It launches the ray-generation shader for each pixel in the lighting texture, which commences a separate GPU thread for each radiosity patch which loops over all the other patches to sum up their respective lighting contribution into the output texture\footnote{Note that since visibility is symmetrical under $V(x_1, x_2) = V(x_2, x_1)$, only half the rays given in algorithm \ref{RTLPass_psuedocode} are theoretically required. Unfortunately, in practice this leads to multi-threading memory collisions that are described in section \ref{memory_conflicts}.}.
+
+\begin{figure}[th]
+\centering
+\makebox[\textwidth][c]{\includegraphics[scale=0.3]{Figures/RTRad_Flow.jpg}}
+\decoRule
+\caption[asd]{Generalized overview of information flow in RTRad. The 3D scene is used by the CITPass to populate a blank texturegroup which, alongside the acceleration structure, serves as the input for the RTLPass. The output texture of the RTLPass can then be used as input for the next iteration. Textures can be visualized on screen through a \textit{VITPass} (see \ref{VITPass}). The purpose of \textit{CVMPass} and \textit{SewSeamsPass} are described in sections \ref{VoxelRaymarch} and \ref{SewSeamsPass} respectively.}
+\label{RTRad_flow}
+\end{figure}
+
+The overarching procedure of this pass closely resembles the progressive radiosity algorithm given in section \ref{ProgressiveRadiosity} and can be summarized with the following pseudo-code:
+
+\begin{algorithm}[H]
+    \caption{RTLPass}\label{RTLPass_psuedocode}
+    \begin{algorithmic}[1]
+      \For{$i \in [0, n]$}\Comment{For each patch (executed in parallel)}
+        \State $L_{out}(i) \gets L_e(i)$\Comment{Set initial lighting value}
+        \For{$j \in [0,n]$}
+            \If{$j \neq i$} \Comment{For every other patch}
+                \State Shoot a ray from $pos(i)$ to $pos(j)$
+                \If{no geometry is encountered along the way}
+                    \State Calculate view factor $F(i,j)$
+                    \State $L_{out}(i) \gets L_{out}(i) + mat(i) * F(i,j) * L_{in}(j)$ \Comment{Add contribution}
+                \EndIf
+            \EndIf
+        \EndFor
+    \EndFor
+    \end{algorithmic}
+\end{algorithm}
+
+\subsection{Visibility Raytracing}
+
+As defined in section \ref{RaytracingForVisibility}, two locations $x_1$ and $x_2$ are mutually visible if a ray launched from one towards the other, arrives at the other unimpeded:
+
+\begin{equation}
+    V(x_1, x_2) \leftrightarrow I(x_1, x_2 - x_1) = x_2
+\end{equation}
+
+The insight gained from the shader execution order pictured in chapter \ref{Chapter3} (fig. \ref{rtx_pipeline_detailed}) implies that, in order to minimize the required amount of BLAS traversal the ray lengths ought to be kept as short as possible in addition to stopping execution upon any intersections.
+
+As an alternative to the equation above, two points $x_i$ and $x_j$ are also mutually visible if a ray from $x_i$ towards $x_j$ with some offset $\varepsilon$ and of length $|x_i - x_j| - 2\varepsilon$ does not encounter any geometry at all, which in RTX would trigger the execution of the miss shader.
+
+Shortening the rays to a length of $|x_i - x_j| - 2\varepsilon$ and then determining visibility through the \textit{miss shader} requires fewer intersection tests, binding-table lookups and should generally speed up the algorithm, as any non-visible pairs can be quickly discarded through the  \verb|RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH| flag.
+
+In our implementation, we use the ray payload to get indices on the origin and destination patches into the miss shader.
+Alternatively, one could also store a boolean that represents visibility and then perform lighting calculations in the ray-generation shader itself.
+
+Below we provide a simplified, superficial version of our RTLPass shader code:
+
+\begin{lstlisting}
+// Custom ray-payload
+struct RayPayload
+{
+    uint2 origin_coord;     // sampler patch
+    uint2 destination_coord;// sampled patch
+};
+
+[shader("raygeneration")]
+void launchRays()
+{
+    uint2 origin_coord = DispatchRaysIndex().xy;
+
+    for (uint x = 0; x < lightmap.width(); x++) {
+        for (uint y = 0; y < lightmap.height(); y++) {
+
+            uint2 destin_coord = uint2(x, y);
+
+            float3 origin_pos = pos[origin_coord];
+            float3 destin_pos = pos[destin_coord];
+
+            RayDesc ray;
+            ray.Origin = origin_pos;
+            ray.Direction = destin_pos - origin_pos;
+            ray.TMin = EPSILON;
+            ray.TMax = distance(origin_pos, destin_pos) - 2 * EPSILON;
+
+            RayPayload rpl = { origin_coord, destin_coord };
+
+            TraceRay(scene,
+                RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 
+                0xFF, 0, 0, 0
+                ray,
+                rpl
+            );
+        }
+    }
+}
+
+[shader("miss")]
+void primaryMiss(inout RayPayload rpl)
+{
+    // Lighting calculations.
+    // Determine what light rpl.destin_coord contributes onto rpl.origin_coord
+}
+\end{lstlisting}
+
+\subsection{View Factor Calculation}
+
+From the results of some of our early prototypes we deduced that increasing the amount of samples in a Monte-Carlo based view factor was operationally equivalent with simply increasing the resolution of the underlying lightmap itself. Instead of sampling a single patch multiple times, this would essentially divide the patch up into several smaller ones (see fig. \ref{lightmap_sizes}).
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.59]{Figures/Lightmap_sizes.png}
+\decoRule
+\caption[]{Original scene (a) and patches for a lightmap of $32\times32$, $64\times64$ and $128\times128$ pixels respectively (b-d). Each black or white rectangle corresponds to a single patch.}
+\label{lightmap_sizes}
+\end{figure}
+
+In light of the foregoing, we determined that a Monte-Carlo view factor with $K=1$ was sufficient, where larger values of $K$ can effectively be simulated by larger lightmaps as well as our employed Monte-Carlo \textit{undersampling} (see section \ref{StaticUndersampling}). As such, we are able to compute view factors in a single step through the following formula:
+
+\begin{equation}
+    F_{i,j} = \frac{1}{K} \sum_{k=1}^{K} A_j \frac{\cos \theta_{ki} \cos \theta_{kj}}{\lVert x_{ki}-x_{kj} \rVert ^2} V(x_{ki},x_{kj}) \approx  A_j \frac{\cos \theta_{i} \cos \theta_{j}}{\lVert x_{i}-x_{j} \rVert ^2} V(x_{i},x_{j})
+\end{equation}
+
+Bearing in mind the individual textures given in section \ref{TextureGroup}, allows us formulate this equation as the exact programmatic steps our shader undertakes to compute the view factors between two patches $i$ and $j$:
+
+\begin{equation}
+    F(i, j) = arf(j) \frac
+    {(nrm(i) \cdot \frac{pos(j) - pos(i)}{||pos(j) - pos(i)||}) * (nrm(j) \cdot \frac{pos(i) - pos(j)}{||pos(i) - pos(j)||})}
+    {||pos(i) - pos(j)||^2}
+\end{equation}
+
+where $nrm(i)$ represents a texture-lookup on the normal-vector texture for patch $i$ etc.
+
+\subsection{Lighting Contribution}
+\label{RTRad_Lighting}
+
+Combining the factors from the radiosity equation given in \ref{eqn:RadiosityEquation} with the view factor definition given above, yields the total lightflow from a patch $j$ to another patch $i$ as the following:
+
+\begin{equation}\label{eqn:RTRad_Lighting}
+    L(j \xrightarrow{} i) = lig_{in}(j) * mat(i) * \frac{\rho}{\pi} * F(i, j)
+\end{equation}
+
+where $\rho$ is the reflectivity constant, $mat$ is the color of the material and $lig_{in}$ is the input lighting texture (equivalent to the emission texture on the first pass).
+
+This equation can be seen reflected in the code of our miss shader. A simplified version of said shader is listed below:
+
+\begin{lstlisting}
+void AddContribution(uint2 self_c, uint2 other_c) {
+    // World positions
+    float3 self_wpos = pos[self_c].xyz + minPos;
+    float3 other_wpos = pos[other_c].xyz + minPos;
+
+    // Distance
+    float3 self_to_other = other_wpos - self_wpos;
+    float r = length(self_to_other) * distance_factor;
+
+    // Cosines
+    self_to_other = normalize(self_to_other);
+    float3 self_nrm = nrm[self_c].xyz;
+    float3 other_nrm = nrm[other_c].xyz;
+    float self_cos = dot(self_nrm, self_to_other);
+    float other_cos = dot(other_nrm, -self_to_other);
+
+    if (self_cos <= 0.0f || other_cos <= 0.0f) return;
+
+    // Form factor
+    float F = arf[other_c].r * self_cos * other_cos * (1.0f / (PI * r * r));
+
+    // Apply contribution
+    lig_out[self_c] += lig_in[other_c] * mat[self_c] * reflectivity_factor * F;
+}
+\end{lstlisting}
+
+We found that several custom tweaks not shown in the pseudo-code above, such as clamping lighting contribution and form factors to certain maximum values, significantly improved lighting quality.
+
+\subsection{Indexing and Memory Conflicts}\label{memory_conflicts}
+
+In theory, the reciprocity rule (\ref{eqn:ReciprocityRule}) implies that a view factor between two patches  only needs to be computed once, with its inverse resulting from a simple multiplication in the form of $F_{ji} = \frac{A_i}{A_j}F_{ij}$.
+This simple fact has far-reaching implications in that dramatically fewer texture-lookup and ray-trace operations are required, effectively cutting the required computational expense in half. Unfortunately, it does not play out this trivially in practice.
+
+A naive implementation may look as follows:
+
+\begin{algorithm}[H]
+    \caption{RTLPass - Reciprocity Rule}\label{RTLPass_pseudocode_naive}
+    \begin{algorithmic}[1]
+      \For{$i \in [0, n]$}
+        \State $L_{out}(i) \gets (0,0,0)$
+        \For{$j \in [i+1,n]$}
+            \State Shoot a ray from $pos(i)$ to $pos(j)$
+            \If{no geometry is encountered along the way}
+                \State Calculate view factor $F(i,j)$
+                \State $L_{out}(i) \gets L_{out}(i) + F(i,j) * L_{in}(j)$
+                \State $L_{out}(j) \gets L_{out}(j) + F(i,j) * \frac{arf(i)}{arf(j)} * L_{in}(i)$
+            \EndIf
+        \EndFor
+    \EndFor
+    \end{algorithmic}
+\end{algorithm}
+
+Note in particular line 3, where the inner for-loop commences at $i+1$. Under this offset the complexity of the algorithm is lowered to its Gaussian sum $\frac{n^2 + n}{2}$ which, despite ultimately boiling down to $O(n^2)$, still provides a considerable gain in performance.
+
+The crux of this approach emerges from parallelization, as multiple threads modifying a single patch cause \textit{memory write collisions}. Specifically, parallelizing the outer for loop in algorithm \ref{RTLPass_pseudocode_naive} will cause such collisions on line 8, as multiple separate threads adopt the same value for $j$. If the inner loop is parallelized, the same issue will occur on line 7.
+
+Thread safety features, such as mutex locks, come with their own respective performance overheads and are not available in common GPUs.
+If ignored, these write conflicts manifest themselves as unusual artifacts depicted in fig. \ref{MemoryCollisions}. The resulting smudges can be allayed under specific conditions using certain batching parameters, though the results are highly unreliable\footnote{The results in fig. \ref{MemoryCollisions} have been produced with a lightmap resolution of $128\times128$ and a batch size of $64\times64$. On our hardware, different batch sizes sway the rate and intensity of these imperfections, but finding the ideal size largely comes down to trial-and-error.}.
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.39]{Figures/MemoryCollisions.jpg}
+\decoRule
+\caption[asd]{Results when applying a regular algorithm \ref{RTLPass_psuedocode} (right) and when applying the flawed algorithm \ref{RTLPass_pseudocode_naive} (left). Note in particular the grey smudges on the walls that result from collisions of multiple threads writing simultaneously to the same memory address. The location and intensity of the smudges are mostly consistent across multiple runs, but differ depending on input parameters.}
+\label{MemoryCollisions}
+\end{figure}
+
+For a more reliable solution, following options are available:
+
+\begin{itemize}
+    \item Adhering to our original algorithm \ref{RTLPass_psuedocode}, where each thread is assigned a singular patch $i$ that it can write to. No writing conflicts will occur, albeit view factors and rays will have to be computed twice for each patch-pair.
+    \item These duplicate calculations can be prevented by temporarily caching their results. For instance, a thread processing patch $i$ would temporarily store the visibility and/or view factor towards another patch $j$ in memory, so that when the thread processing patch $j$ samples patch $i$, the cached value can simply be retrieved. Unfortunately, GPUs have notoriously limited memory capacities and the amount of memory required lies in $O(n^2)$.
+    Our testing concluded that caching visibility data \textit{can} be viable for small lightmaps. A detailed account on our findings regarding visibility caching can be found in section \ref{Viscaching}.
+    \item Since Turing GPUs contain between 40 to 80 RT cores, a rough limit of 40-80 threads can be assumed to be writing to memory simultaneously. An indexing solution ensuring that any patch-pairs which may potentially write into shared memory are far enough apart in the index-sequence may diminish the effects of memory-conflicts sufficiently to make the final result identical.
+\end{itemize}
+
+Most multi-threaded, progressive refinement solutions implement the first solution by calculating all view factors on-the-fly.
+Naturally, the performance balance depends on whether the benefits of GPU parallelization can outweigh the cost incurred by doubling the amount of visibility calculations.
+
+Our implementation runs, by default, with the same approach but also allows visibility caching to be enabled for smaller lightmaps (see section \ref{Viscaching}).
+
+\subsection{Batching}
+
+Operating systems typically expect applications to remain responsive in scheduling. Forcing an indefinitely large workload onto the GPU will cause the program to be terminated by the OS after exceeding a certain time threshold, which can be reached rather quickly by a workload as complex as progressive radiosity.
+
+To circumvent this problem, we compute lightmaps in a series of batches, as opposed to all at once.
+The batching process is managed by internally the RTLPass object, which allows the user to adjust certain batching parameters through its GUI.
+These parameters allow defining the dimensions of the rectangle - or strip - that is computed with each batch. 
+
+By gradually testing various thresholds, we determined an upper limit of $128^4$ rays traced per batch to be adequate for our specific hardware.
+Depending on the sampling and resolution settings, the RTLPass object ensures that batching parameters are dynamically adjusted in order to remain at or below this limit.
+
+We recommend maintaining the batch size as close to this limit as possible, because a larger batch count (such as a single patch per batch) inevitably comes with a large overhead cost in setting up each individual render pass.
+
+\section{SewSeams Pass}
+\label{SewSeamsPass}
+
+When patches are not aligned with geometry, lights and shadows can leak and produce undesirable protuberances in the form of unrealistic shadows or highlights \cite{FormFactorLecture}. 
+
+Increasing lightmap size or adjusting UV coordinates can eliminate these issues entirely, but is difficult to do automatically. Some re-meshing solutions generate edges along predicted discontinuities of the radiosity function \cite{FormFactorLecture}, though this only functions if each patch is given its own primitive.
+
+Similar inaccuracies (labeled as \textit{geometry leaks} in fig. \ref{leaks_fig}) can result from pixels neighbouring a patch that does not have its center covered by a surface, as these will not be rasterized by the CITPass. These types of leaks can be far more frequent than the former and will not only manifest themselves in corners.
+
+Conservative rasterization prevents this issue, but produces additional problems, as it overwrites patches when occupied by several primitives in addition to annulling our approximation for surface area (see section \ref{SurfaceArea}).
+
+\begin{figure}[H]
+\centering
+\includegraphics[scale=0.4]{Figures/leaks.jpg}
+\decoRule
+\caption[asd]{Light and shadow leaks on UV-mapped lighting textures. Geometry leaks occur when a patch/pixel is only marginally covered by a surface. }
+\label{leaks_fig}
+\end{figure}
+
+We employed a custom solution in the form of an additional \textit{SewSeams} pass that is executed after each radiosity iteration. 
+
+This pass runs for every lightmap pixel that was not rastered by the CITPass and thus is not treated as a patch. If any of the pixel's neighbours \textit{is} a patch, then the pixel assumes its color. This process effectively expands the UV mapping of each cohesive shape by a margin of one pixel, which eliminates the vast majority of geometry-based leaks entirely (as shown in fig. \ref{leaks_fig2}).
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.9]{Figures/leaks2.png}
+\decoRule
+\caption[asd]{Scene without (a) and with (b) a \textit{SewSeams} pass.}
+\label{leaks_fig2}
+\end{figure}
+
+\section{VITPass}\label{VITPass}
+
+For visualization purposes we employ an additional \textit{visualize input textures pass} (VITPass), which serves as a tool to display and analyze input and output data. Whilst this pass may not be an intrinsic part of our algorithm, it certainly proved invaluable to debug, optimize and analyze our implementation.
+
+We employ a plethora of settings that can be accessed through Falcor's UI to adjust precisely what output should be displayed and in what form. The user can choose which mipmap level of which texture to display and whether to render them as texture, masked texture or applied to the underlying 3D model.
+
+As is common practice in radiosity, we employ a \textit{bi-linear} magnification filter to smooth out each texture, which can be toggled on or off (see fig. \ref{bilinear_filter}).
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.31]{Figures/bilinear_filter.jpg}
+\decoRule
+\caption[asd]{Low resolution lightmap ($64\times64$) without (left) and with (right) a bilinear magnification filter.}
+\label{bilinear_filter}
+\end{figure}
+
+The VITPass is built on a custom vertex and pixel shader, which allow for a wide variety of different setups. Additional information such as lightmap resolution, refinement-nodes or voxel-maps can also be adequately visualized (see fig. \ref{visualization_examples}).
+
+All scene renders or raw textures contained in this thesis are produced using the VITPass (unless stated otherwise).
+
+\begin{figure}[th]
+\centering
+\includegraphics[scale=0.83]{Figures/Visualization_Examples.png}
+\decoRule
+\caption[asd]{Examples of data visualization through the VITPass. left-to-right, top-to-bottom: Normal vectors, voxel map, texture resolution and quad-tree of a scene.}
+\label{visualization_examples}
+\end{figure}

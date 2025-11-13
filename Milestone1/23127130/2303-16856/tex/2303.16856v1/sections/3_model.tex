@@ -1,0 +1,129 @@
+\section{Problem Definition}
+\label{sec:definition}
+The dance generation problem is defined as an autoregressive manner. Distinguishing from previous works \cite{huang2020dance,li2021choreographer} that directly took the music context as input, we decouple the music context into music style and music beat. More precisely, our model takes three inputs: 1) \emph{historical motion}, which is a sequence of poses $\vect{X}_{1:T}=\{{\vect{x}_{1}}, \cdots, {\vect{x}_{T}}\} \in \mathbb{R}^{T\times(J\times9+3)}$, where $J$ is joint amount with the representation of rotation matrix and the root trajectory is also included; 2) \emph{beat context}, which means a longer sequence of binary value $\vect{B}_{1:T+n}=\{b_{1}, \cdots, b_{T+n}\}$, where $b_{i} \in \{0,1\}$, and $n > 0$; 3) \emph{style exemplars}, which guide the style of generated dance and are represented as fixed $w$-length sequences of music feature $\vect{M}$ and motion $\vect{X}'$, where the music feature consists of 20-D MFCCs and 12-D chorma features. Then, the task is to predict the next pose ${\vect{x}_{T+1}}$ given historical motion, beat context, and style exemplars. To alleviate the error accumulation brought by autoregressive structure, similar to \cite{li2021learn}, we let the model predict future $n$ frames instead of single next frame at each time during training, and we set $n=7$ in our experiments.
+
+\section{Methodology}
+\label{sec:model}
+
+\subsection{Model Overview}
+%
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/overview.pdf} 
+    \caption{\textbf{Model Overview.} Our model is composed of three core components: (a) the \emph{style encoder} integrates the style information from the music and motion style exemplars, enabling that the generated motions have consistent style with the seed motion and the input music, then (b) the \emph{long-history motion encoder} encodes long historical motion into a embedding, which carries choreographic structure information to guide the synthesis of long-term motion, (c) the \emph{motion generator} fuses the style information and long-history embedding into the pipeline, and performs the beat-guided motion generation autoregressively. The entire training process requires only unpaired datasets.}
+    \label{fig:overview}
+\end{figure}
+%
+Paired data refers to music-dance sequential pairs that are strictly aligned frame by frame. In contrast, unpaired data means separate, non-temporally aligned music and dance sequences. Existing methods \cite{lee2018listentodance,li2021choreographer,guillermo2021transflower} can only use paired datasets for training, which are expensive to obtain. And these end-to-end models trained on paired data tend to over-focus on low-level details of frame-to-frame alignment between different modalities, while ignoring the more important high-level features of choreographic rhythm and style. Then they are prone to overfitting. For a well-trained human choreographer, he can choreograph a natural dance even if only the rhythmic structure (e.g., beat) and dance style are specified. A good generator needs to have this top-down generation capability. To learn a robust generator, we imitate this choreography process, while taking advantage of the easy-to-get unpaired data.
+
+As illustrated in \fig\ref{fig:overview}, like the inputs for the human choreographer, we decouple the input context into the beat context and the style exemplars. The beat context controls the rhythmic structure, and the style exemplars specify the style of generated movements by feeding into the style encoder. When training, to avoid utilizing the paired data, we identify the motion beats as the beat context, while we randomly sample the music and motion segments from the dataset according to the style label of the target dance motion as the style exemplars. This random sampling introduces reasonable noise to the training, which enhances the model robustness. Then during inference, we directly use the input music to identify the beat context and music style exemplar respectively. A fixed seed motion as the motion style exemplar gives a style hint to the generator. The whole process does not require any paired data.
+
+We perform the motion generation in an autoregressive manner, which tends to be style-inconsistent when synthesizing a long-term dance due to the accumulation of prediction errors. To generate realistic long-term dance, except for employing techniques like predicting multiple frames at a time, explicit modeling of choreographic structure has proven effective in previous works \cite{chen2021choreomaster,aristidou2021rhythm}. The motion repeat constraint is one of the most common rules in choreography theory. Choreographers often utilize repeat motion to echo the repeated phrases (e.g., verse and chorus) in music \cite{chen2021choreomaster}. To include this constraint, we design a new long-history motion encoder, which can represent the ongoing motion as a query to scan a similar motion window from the long historical motion. Then, we fuse the queried structural information into the generation pipeline, which guides the generator to synthesize realistic long-term motion in a choreographic-aware way. A similar noisy training strategy (see \fig\ref{fig:overview}) is also introduced to make model robust.
+
+\subsection{Style Encoder}
+We use Transformer \cite{vaswani2017attention}, which has been widely used to model multi-modal data in many successful temporal systems \cite{huang2020dance,li2021choreographer,siyao2022bailando,fan2022faceformer}, to encode the music and motion style exemplars respectively.
+The music style encoder $\mathcal{E}_M$ encodes the music style exemplar $\vect{M}$ into the music style embedding matrix $\vect{H}_{\text {music}}$, while the motion style encoder $\mathcal{E}_X$ encodes the motion style exemplar $\vect{X}'$ into the motion style embedding matrix $\vect{H}_{\text {motion}}$. Note that both music and motion style encoders have the same network structure, so the shapes of output matrices are both $w \times d_s$, and we set the length of examplar $w$ to 2 seconds in this paper. Finally, we get the integrated style embedding matrix $\vect{H}_{\text {style}}$ by adding $\vect{H}_{\text {music}}$ to $\vect{H}_{\text {motion}}$.
+
+\subsection{Long-history Motion Encoder}
+%
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/long_hist.pdf} 
+    \caption{\textbf{Long-history Motion Encoder.} We use the ongoing motion (query) to find a similar historical motion window (key), then the subsequent motion (value) of the motion window is helpful for the prediction of future motion according to the motion repeat constraint in choreographic theory.}
+    \label{fig:long_hist}
+\end{figure}
+%
+Attention mechanism is naturally suited for mining useful information from motion sequences \cite{mao2020history,jang2022motionpuzzle}. We present an attention mechanism to fit the motion repeat constraint in choreographic theory. We assume that if the ongoing motion is very similar to a historical motion window, then the future motion is likely to be similar to the subsequent motion of the motion window. As illustrated in \fig\ref{fig:long_hist}, we use the $m$-frames motion window ${\vect{X}}_{i: i+m-1}$ as key, the $n$-frames subsequent motion of the history motion ${\vect{X}}_{i+m: i+m+n-1}$ as value, and the ongoing $m$-frames motion ${\vect{X}}_{T-m+1: T}$ as the query.
+\begin{align}
+    {\vect{q}} &= \eqword{AvgPool}(\eqword{CNN}_{q}\left({\vect{X}}_{T-m+1: T}\right)) \in \mathbb{R}^{d}, \\
+    {\vect{k}_i} &= \eqword{AvgPool}(\eqword{CNN}_{k}\left({\vect{X}}_{i: i+m-1}\right)) \in \mathbb{R}^{d}, \\
+    {\vect{V}_i} &= \eqword{CNN}_{V}({\vect{X}}_{i+m: i+m+n-1}) \in \mathbb{R}^{n\times d},
+\end{align} 
+\noindent
+where $i \in\{1,\cdots, T-m-n+1\}$, $\eqword{CNN}(\cdot)$ means 1-D convolutional neural network, $\eqword{AvgPool}(\cdot)$ means average pooling, and we set window size $m=10$ in this work. After obtaining the query, key, and value, we perform the standard dot-product attention calculation as
+\begin{equation}
+    a_{i}=\frac{\eqword{exp}({\vect{q} \vect{k}}_{i}^{T})}{\sum_{i=1}^{T-m-n+1} \eqword{exp}({\vect{q}} {\vect{k}}_{i}^{T})}.
+\end{equation}
+Then we get the long-history embedding matrix
+\begin{equation}
+    {\vect{E}_{\eqword{hist}}}=\sum_{i=1}^{T-m-n+1} a_{i}\vect{V}_i \in \mathbb{R}^{n \times d}.
+\end{equation}
+Moreover, we use randomly sampled motion segments from the dataset, which keep the same style label as the ground-truth dance, to replace the historical motion during training (see \fig\ref{fig:overview}). The noisy training mechanism helps to enhance the model generalization.
+
+\subsection{Motion Generator}
+Given the latest $w$ frames of historical motion $\vect{X}_{T-w+1:T}$, beat context $\vect{B}_{T-w+1:T+n}$, long-history embedding ${\vect{E}_{\text {hist}}}$, and style embedding ${\vect{H}_{\text {style}}}$, we use a Transformer-based model $\mathcal{G}$ to synthesize future $n$ frames of dance movements
+\begin{align}
+    \hat{\vect{X}}_{T+1:T+n} = \mathcal{G}(&\vect{X}_{T-w+1:T}, \vect{B}_{T-w+1:T+n}, \vect{E}_{\text {hist}}, \vect{H}_{\text {style}}).
+\end{align}
+\noindent
+We perform some pre-processing on the inputs before feeding them into the Transformer. As shown in \fig\ref{fig:generator}, the input historical motion is padded by repeating the last frame $n$ times $\vect{X}_{\text{pad}} \in \mathbb{R}^{(w+n) \times (J\times9+3)}$. On the one hand, the padding operation adapts the historical motion length to the Transformer output. On the other hand, due to the smoothness of movements, the next few frames of motion are usually close to the $\vect{x}_T$, then our padding operation can reduce the learning difficulty by letting the model learn the residuals. Moreover, we add the padding embedding $\vect{e}_{\text{pad}}$, which is a binary vector to indicate whether the current position is padded or not, together with the standard position embedding $\vect{e}_{\text{pos}}$ into the inputs.
+%
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.9\textwidth]{figures/generation_model.pdf} 
+    \caption{\textbf{Motion Generator.} The Transformer-based generator synthesizes a realistic dance sequence, conditioned on the historical motion, the beat context, the long-history embedding, as well as the style embedding.}
+    \label{fig:generator}
+\end{figure*}
+
+\subsubsection{Style and Beat Fusion.}
+We consider that music and dance are temporally aligned in beat and globally matched in style. Then our high-level idea is to fuse the style embedding in a time-agnostic way, while fusing the beat context in a time-aware way.
+
+To modulate the generated dance with the style globally, we apply the conditional layer normalization (CLN) \cite{kexuefm-7124} to replace the standard layer normalization in Transformer. The key idea of CLN is to predict the affine coefficients $\gamma$ and $\beta$ from the style embedding, which manipulate feature maps by scaling and shifting different channels. \citet{kexuefm-7124} found that it is not easy to directly predict these two coefficients, as it may make the training process unstable. To solve this, we choose to predict the changes $\Delta \gamma$ and $\Delta \beta$ using the one-hidden-layer MLP, 
+\begin{align}
+    \Delta \beta = \operatorname{MLP_{\beta}}\left(\vect{H}_{\text {style}}\right),
+    \Delta \gamma = \operatorname{MLP_{\gamma}}\left(\vect{H}_{\text {style}}\right),
+\end{align}
+\noindent
+which makes prediction easier. Then, the style fusion can be formulated as
+\begin{equation}
+y=\frac{x-\mathbb{E}[x]}{\sqrt{\operatorname{Var}[x]+\epsilon}} \cdot (\gamma+\Delta \gamma) + (\beta +\Delta \beta).
+\label{con:cln}
+\end{equation}
+
+To let the generator perceive the rhythmic structure during the generation, we include the time-to-arrival embedding $\vect{e}_{\text{beat}}$ to encode the temporal beat context. We translate each element of the binary beat sequence into the number of frames remaining until the next beat point, which helps the generator to learn a natural transition between beats. 
+
+\subsubsection{Long-history Embedding Fusion.}
+Long-history embedding carries memory about the choreographic structure from historical motion, and we need a gate mechanism similar to LSTM \cite{hochreiter1997lstm} to control the effects brought by the long-history memory. The Multimodal-Adaptation-Gate (MAG) method \cite{rahman2020integrating} was proposed for multimodal fusion via an adaptive gate. We apply the MAG to fuse the long-history embedding $\vect{E}_{\text{hist}}$ after the third layer of Transformer. More specifically, we first compute the gate factor
+\begin{equation}
+    \vect{g} = \mathcal{R}\left(\vect{W}_g\left[\vect{z}_{i} ; \vect{e}_{i}\right]+b_g\right),
+\end{equation}
+\noindent
+which is used to inhibit unreliable memory. $\vect{z}_{i}$ is the output feature of the Transformer in the $i$-th temporal position, $\vect{e}_i$ denotes the $i$-th row of $\vect{E}_{\text{hist}}$, and $\mathcal{R}(\cdot)$ means the activation function. Then, we get the valid memory gated by $\vect{g}$
+\begin{equation}
+    \vect{h}_{i} = \vect{g} \odot \left(\vect{W}_h \vect{e}_{i}\right)+b_h,
+\end{equation}
+\noindent
+where $\vect{W}_g, \vect{W}_h$ are weight matrices and $b_g, b_h$ are scalar biases. Finally, the fused feature $\bar{\vect{z}}_{i}$ is formulated as
+\begin{align}
+    \bar{\vect{z}}_{i}=\vect{z}_{i}+\alpha \vect{h}_{i},
+    \alpha=\min \left(\frac{\left\|\vect{z}_{i}\right\|_{2}}{\left\|\vect{h}_{i}\right\|_{2}} \beta, 1\right),
+\end{align}
+\noindent
+where $\beta$ is a hyper-parameter, and the scaling factor $\alpha$ controls the effect of $\vect{h}_i$ within a desirable range.
+
+\subsection{Unpaired Learning Scheme}
+\label{subsec:unpaired}
+As shown in \fig\ref{fig:overview}, during training, we use the random music and motion, which have the same style label as the target dance, as the style exemplars, while identifying the ground-truth motion beats as the beat context. We perform the algorithm proposed by \cite{ho2013extraction} for the motion beat identification. The core idea of \cite{ho2013extraction} is to detect the local minima of joints deceleration as the motion beat. Moreover, to improve the clustering of the different styles in the latent space, we apply a triplet loss on the music style embedding space via
+\begin{align}
+    \mathcal{L}_\eqword{trip} = & \max \big\{\left\|(\mathcal{E}_M(\vect{M}), \mathcal{E}_M(\vect{M}_\eqword{pos})\right\|_{2}-\left\|\mathcal{E}_M(\vect{M}), \mathcal{E}_M(\vect{M}_\eqword{neg})\right\|_{2} + \delta, 0\big\},
+\end{align}
+\noindent
+where $\vect{M}_\eqword{pos}$ denotes the positive sample that is a randomly sampled music clip of the same style as $\vect{M}$, while $\vect{M}_\eqword{neg}$ denotes the negative sample that is a randomly sampled music clip of the different style as $\vect{M}$. $\delta$ is the margin. The triplet loss encourages style embedding of the same cluster to be closer to each other. Finally, when inference, we identify the onsets of input music as the beat context to replace the motion beats used during training, and directly use the input music and fixed seed motion as the style exemplars.
+
+We use a pose reconstruction loss for the predicted future $n$-frames motion, which is calculated by the L2 loss between the predicted motion and target motion:
+\begin{equation}
+    \mathcal{L}_{\eqword{rec}} = \sum\left\|\hat{\vect{x}}_{t}-\vect{x}_{t}\right\|_{2},
+\end{equation}
+\noindent
+where $\hat{\vect{x}}_{t}$ is the predicted motion and $\vect{x}_{t}$ is the target motion. Again, we use a strategy of future-$n$ supervision to drive the model to pay more attention to the more temporal context during training by predicting future $n$ frames, and we keep only the first frame of the output as the predicted pose during the inference process.
+
+To solve the human foot sliding problem, our model predicts the foot contact labels and use L2 loss between predicted and real foot contact labels to compute the foot contact loss. 
+\begin{equation}
+    \mathcal{L}_{\eqword{foot}} = \sum\left\|\hat{c}_{t}-c_{t}\right\|_{2},
+\end{equation}
+where $c_{t}, \hat{c}_{t}$ denote the true and predicted foot contact labels respectively. We extract the foot contact label by simply setting a foot velocity threshold.
+
+Collectively, the total loss function is: 
+\begin{equation}
+    \mathcal{L} = \lambda_{\eqword{rec}}\mathcal{L}_{\eqword{rec}} + \lambda_{\eqword{foot}}\mathcal{L}_{\eqword{foot}} + \lambda_{\eqword{trip}}\mathcal{L}_{\eqword{trip}}
+\end{equation}

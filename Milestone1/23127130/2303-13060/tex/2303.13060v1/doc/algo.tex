@@ -1,0 +1,231 @@
+% \newpage
+\section{Framework}
+
+\begin{figure*}[th!]
+    \centering
+    \includegraphics[width=.88\linewidth]{pipeline_008_.pdf}
+    \caption{An illustration of the \tool{Diffpattern} framework for reliable layout pattern generation.  }
+    \label{fig:pipeline}
+\end{figure*}
+
+\subsection{Overview of \tool{DiffPattern}}
+As illustrated in \Cref{fig:pipeline}, our framework consists of three phases:
+(1) {Deep Squish Pattern Representation.} Given a set of layout patterns, we first extract their deep squish pattern representation in which every layout pattern is decomposed into a topology tensor $\vec{T}$ and two geometric vectors $\vec{\Delta}_x$ and $\vec{\Delta}_y$.
+(2) {Topology Tensor Generation.} We subsequently feed the extracted topology tensors $\vec{T}_0$ into a diffusion model. By gradually adding noise to $\vec{T}$ with fixed probabilities $q(\vec{T}_k|\vec{T}_{k-1})$, the model learns how to reverse this $K$-step process.
+To synthesize a new topology tensor $\hat{\vec{T}}$, we randomly sampled a noise topology $\vec{T}_K$, and every entry in $\vec{T}$ jumps between finite states with estimated probability $p_\theta(\vec{T}_{k-1}|\vec{T}_k)$ until getting a reasonable topology tensor $\vec{\hat{T}}_0$. 
+(3) {2D Legal Pattern Assessment.} Given the generated topology tensors $\vec{\hat{T}}$, we established an explainable nonlinear system to figure out the proper geometric vectors for each topology tensor according to the {\it Design Rules}. 
+
+
+\subsection{Deep Squish Pattern Representation}
+\label{subsec:compact}
+
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.88\linewidth]{deepsquishpattern_008_.pdf}
+    \caption{An illustration of Deep Squish Pattern Representation. The Topology Tensor is a lossless and compact representation of the topology matrix. And the Naive Concatenating brings unbalanced power to each bit and an exponentially increasing state space. }
+    \label{fig:compact}
+\end{figure}
+
+As we have discussed in \Cref{subsection:quish}, the squish pattern is a lossless representation of the layout pattern, and the topology matrix can be treated as a one-channel 2D binary mask, as shown in \Cref{fig:compact} (left). However, the information density of each pixel is still not satisfactory given that the training/inference efficiency of diffusion methods is more sensitive to the size of input images but significantly less on the number of states of each pixel. To address this issue, we propose a novel pattern representation method, {\it Deep Squish Pattern,} to attain a more compact pattern representation.
+
+Here we use a running example, as shown in \Cref{fig:compact}. There is a topology matrix with four (2$\times$2) adjacent pixels. Each pixel is assigned with either zero or one to indicate shape or space, respectively.
+A simple idea to enlarge the information density is to encode the bits from multiple pixels into one pixel. However, directly concatenating every bit from different pixels and forming a new state number, {\it e.g.,} using 0-15 to represent 16 different states of (2$\times$2) adjacent pixels, will bring unbalanced power to each position and may import numerical instability to the network when the bit count is large. For example in the 4$\times$4 case, the first bit gets a power of $2^{15}$ while the last bit only gets a power of 1. Furthermore, the count of states increases exponentially with the count of bits.
+% In the running examples, the green pixel will get a power of 8 while the orange gets a power of 1 in this case. 
+
+% \yh{On the other hand, when the size of the selected folded patch increases, its logical representation state increases exponentially, for example, the number of states required by a $4\times4$ patch is $2^{4*4}=65536$, which makes the size of the transition probability matrix for these states even more terrifying when we use a discrete method.}
+
+Since a state space with 16 ($2^4$) discrete states can be expressed by a permutation of four subspaces with two states. Instead of encoding different positions with different power, we assign equivalent weight to each position by folding the squish topology matrix into a topology tensor $\vec{T}$ with multiple channels. In the folding step, a patch with the size of $\sqrt{C}\times \sqrt{C}$ from the topology matrix is transferred to a point with $C$ channels in the tensor $\vec{T}$. $C$ is a hyperparameter, which is chosen by considering the trade-off between local information density and the input size. Deep Squish Pattern representation enlarges the practical receptive field of the model and is naturally suitable for pixel-based machine learning methods. Once the generation procedure ends, we can also equivalently recover the original topology matrix by flattening the topology tensor.
+% \yh{$\vec{Q}=\vec{Q}^{bit3}\otimes\vec{Q}^{bit2}\otimes\vec{Q}^{bit1}\otimes\vec{Q}^{bit0}$}
+%Therefore, we squeeze the squish topology representation on a small space (n*n) to the channel, so that different pixels have the same power. The hyperparameter n is chosen according to the size of the image to trade off information density and global spatial information, where we choose n=4 in this article. In fact, since the convolution kernels do not share parameters across channels, our representation is equivalent to using a larger kernel size and a larger stride in the first convolutional layer, which helps to get a larger receptive field, increase the information density and reduce the image size.
+
+
+
+% Based on the assumption that the state transition distributions on each pixel are independent, a 16$\times$16 transition matrix can be expressed as the Kronecker product of four 2$\times$2 transition matrices. Furthermore, given the assumption of independent and identical distribution, the four transition matrices are the same matrix, that is, the transition matrix of 16$\times$16 can be completely derived from a matrix of 2$\times$2 in essence.
+
+\subsection{Topology Tensor Generation}
+
+Once we have encoded the existing layout pattern efficiently by using deep squish pattern representation, we aim to learn the distribution of existing topology tensors and generate new ones with reasonable topology attributes. Let ${\vec{T}_0}\in \{0,1\}^{C\times M\times M}$ be a topology tensor extracted from existing patterns. The naive idea is that treat the binary tensor as a grayscale image, learn the distribution through a diffusion model introduced in \Cref{sec:2.1} and clip the generated topology into a binary one by setting a threshold on it as previous pixel-based pattern generation methods \cite{zhang2020layout,yang2019deepattern} do. The problem of learning how to generate discrete values (zero and one in our case) at every entry is left to the network. However, we argue that requesting the network learn a discrete output in a continual state space from the training set is a waste of model representation ability. A more elegant way is to generate discrete output naturally. 
+
+\minisection{Discrete Diffusion Model.}
+% Therefore, we introduce a discrete diffusion model \cite{austin2021structured} to the binary topology generation problem. 
+Unlike the traditional diffusion model utilized in the computer vision domain, we aim to synthesize the topology of layout pattern, where every entry in the topology belongs to a discrete state. We have made several key modifications to enhance the diffusion model and synthesize discrete topology patterns directly. To derive them, we first re-formulate the problem.
+
+At the $k$-th of $K$ diffusion step, $x_k\in \{0,1\}$ is an entry in the topology tensor $\vec{T}$. In the discrete diffusion model, a transition probability matrix $[\vec{Q}_k]_{ij} = q(x_k=j|x_{k-1}=i)$ is defined to describe the state transition probability for each $\vec{x}$ at the $k$-th diffusion step,
+\begin{equation}
+\vec{q}\left(\vec{x}_k \mid \vec{x}_{k-1}\right) := \operatorname{Cat}\left(\vec{x}_k ; \vec{p}=\vec{x}_{k-1} \vec{Q}_k\right),
+\label{eq:d3pm-forward}
+\end{equation}
+where $\vec{x}_k$ is the one-hot version of the entry $x_k$, $\operatorname{Cat}(\vec{x}|\vec{p})$ is a categorical distribution over the row vector $\vec{x}$ with probabilities given by the row vector $\vec{p}$, and $\vec{x}_{k-1} \vec{Q}_k$ can be understood as a row vector-matrix product. 
+The $\vec{Q}_k$ is applied to each entry in the topology tensor independently and $\vec{q}$ factorizes over these higher dimensions as well. The proposed deep squish pattern representation is customized for this discrete diffusion process, since the size of transition matrix $\vec{Q}$ increases with the count of states of each pixel. Every entry $x$ in the topology tensor owns only two states. On the other side, in the reverse diffusion process, the neural network aims to predict the categorical distribution probability $\vec{p}_\theta(\vec{x}_{k-1}|\vec{x}_k)$ over each entry to recover the original tensor.
+ 
+The choice of transition probability matrix $\vec{Q}_k$ is critical, which should ensure the forward process $\vec{q}(\vec{x}_k|\vec{x}_0)$ converging to a known stationary distribution when $k$ becomes large. A uniform stationary distribution is a natural choice in topology tensor generation, which means given any $\vec{x}_0$, the distribution of every entry $\vec{x}_k$ should follows,
+\begin{equation}
+    \vec{q}(\vec{x}_k|\vec{x}_0)\rightarrow \left[0.5,0.5\right],~\text{when}~k\rightarrow K.
+\end{equation}
+So we design a doubly stochastic matrix $\vec{Q}_k$ with strictly positive entries for topology denoising diffusion process,
+\begin{equation}
+\vec{Q}_k = \begin{bmatrix} 1-\beta_k & \beta_k \\ \beta_k & 1-\beta_k \end{bmatrix},
+\end{equation}
+where ${\beta_k} \in (0,1)$ is the hyperparameter controlling the noise level. In order to ensure that the model can learn the original sample distribution more finely and quickly reach a stable distribution, we follow the classical setting in previous works \cite{ho2020denoising,austin2021structured}. We set a smaller noise in the early diffusion step and a larger noise in the later step. Specifically, we use a linearly increasing schedule for $\beta_k$:
+\begin{equation}
+\beta_k = \frac{(k-1)\left(\beta_K-\beta_1\right)}{K-1}+\beta_1,~k = 1,...,K,
+\end{equation}
+where $\beta_1$ and $\beta_K$ are hyperparameters. 
+% A transition probability matrix $\vec{Q}_k$ is defined to describe the state transition probability for each discrete variable at $k-th$ diffusion step. In detail, instead of the Gaussian distribution introduced in \Cref{sec:2.1}, $\vec{Q}_k$ treat the diffusion process as a categorical distribution. From the perspective of categorical distribution, the forward process in \Cref{eq:ddpm-forward} can be expressed by,
+
+
+
+% On the other side, in the reverse diffusion process, the neural network aims to predict the categorical distribution probability $\vec{p}$.
+% which means that the mathematical representation of the forward diffusion process is changed from \Cref{eq:ddpm-forward} to \Cref{eq:d3pm-forward}. 
+
+
+% In our settings, the entry in deep squish pattern $\vec{T}_0$ is treated as a random variable with two possible discrete states, we utilize a set of transition probability matrix $\vec{Q}_k$ with shape $2\times2$. The choice of transition probability matrix $\vec{Q}_k$ is critical, which should ensure the forward process $q(\vec{T}_k|\vec{T}_0)$ converging to a stationary distribution within $K$ steps. The stationary distribution is determined by the specific task and the meaning of the discrete variables. In view of the zero or one in the pattern indicates whether shape and there is no ordered relationship between them, we choose the uniform stationary distribution in our deep squish pattern generating. This also inspires us to choose a doubly stochastic matrix with strictly positive entries as $\vec{Q}_k$:
+% \begin{equation}
+% \vec{Q}_k = \begin{bmatrix} 1-\beta_k & \beta_k \\ \beta_k & 1-\beta_k \end{bmatrix}
+% \end{equation}
+% where ${\beta_k} \in (0,1)$ is the hyperparameter controlling the noise level. In order to ensure that the model can learn the original sample distribution more finely and quickly reach a stable distribution, we follow the settings of previous work \cite{ho2020denoising,austin2021structured}, using smaller noise in the early diffusion step and larger noise in the later step. Specifically, we use a linearly increasing schedule for $\beta_k$.
+
+
+% the choice of transition probability matrix $\vec{Q}_k $is critical.
+% \begin{equation}
+% p_\theta\left(\vec{x}_{t-1} \mid \vec{x}_t\right) \propto \sum_{\widetilde{\vec{x}}_0} q\left(\vec{x}_{t-1} \mid \vec{x}_t , \widetilde{\vec{x}}_0\right) \widetilde{p}_\theta\left(\widetilde{\vec{x}}_0 \mid \vec{x}_t\right)
+% \end{equation}
+
+% Let ${\vec{T}_0}\in \{0,1\}^{C\times M\times N}$ be a deep squish pattern extracted from existing patterns, and ${\bf \Bar{X_0}}\in \{0,1\}\in \mathcal{R}^{CMN}$ is the flatten version. Since $X_0$ is binary, a naive idea is generating a grayscale image though a diffusion methods and clip it into a binary one by setting a threshold on it as previous pixel-based pattern generation methods \cite{zhang2020layout,yang2019deepattern} do. However, we argue that the binarization on the output is a waste of model representation ability. Thanks to the improvement of generation methodology, we use a discrete diffusion method \cite{austin2021structured} to generate discrete binary deep squish patterns directly without threshold. 
+
+% Each entry in deep squish pattern ${\bf X_0}$ can be treated as a random variable with two possible discrete states. We use the probability transition matrix ${\bf Q_t}$ to describe the state transition probability for each element at step $t$.
+
+% Note that the squish topology is a binary matrix, a simple and feasible method is to treat it as a grayscale image with pixel values of 0 and 255, so that the classic image generation diffusion model can be directly used, and only the 256 bins in the final quantization step are changed to 2 bins. However, in each step of the noise addition and denoising process of the traditional diffusion model, the pixel values of an image are normalized to -1 to 1 and treated as continuous values for operations, such as adding Gaussian noise. For an ordinary image with 256 feasible pixel values, since the interval between two adjacent pixel values is only 2/256 after normalization, it will not cause a significant effect to operate as a continuous variable, which has been demonstrated by some experimental results of related study. But this continuum is a catastrophic damage to squish patterns as binary images, which will result in low efficiency of squish pattern generation, because there will be many meaningless values in the intermediate forward and reverse diffusion process.
+
+% To overcome the above challenges, we must consider the binary properties of squish patterns, treat each value in the matrix as a binary discrete state, and use a diffusion model in the discrete state space for the corresponding generation task. The discrete denoising diffusion probability model (D3PM) was proposed by \cite{austin2021structured}, which defines the probability transition matrix Q to replace the Gaussian probability distribution in the original diffusion model. The probability transition matrix Q is used to describe the state transition probability between discrete variables at different times.
+
+% And the forward process can be expressed by,
+% \begin{equation}
+% q\left(\vec{x}_t \mid \vec{x}_0\right)=\operatorname{Cat}\left(\vec{x}_t ; \boldsymbol{p}=\vec{x}_0 \overline{\boldsymbol{Q}}_t\right), \quad \text { with } \overline{\boldsymbol{Q}}_t=\boldsymbol{Q}_1 \boldsymbol{Q}_2 \ldots \boldsymbol{Q}_t,
+% \label{eq:forward}
+% \end{equation}
+
+% In every step $t$ in the backward process, we want to recover the image from the noised version. We use a neural network with parameter $\theta$ to predict the denoising process.
+% \begin{equation}
+% p_\theta\left(\vec{x}_{t-1} \mid \vec{x}_t\right) \propto \sum_{\widetilde{\vec{x}}_0} q\left(\vec{x}_{t-1} \mid \vec{x}_t , \widetilde{\vec{x}}_0\right) \widetilde{p}_\theta\left(\widetilde{\vec{x}}_0 \mid \vec{x}_t\right)
+% \end{equation}
+
+% The object is to minimize the variational lower bound,
+
+% \begin{equation}
+% \begin{aligned}
+% L_{\mathrm{VLB}} &=L_T+L_{T-1}+\cdots+L_0 \\
+% \text { where } L_T &=D_{\mathrm{KL}}\left(q\left(\mathbf{x}_T \mid \mathbf{x}_0\right) \| p_\theta\left(\mathbf{x}_T\right)\right) \\
+% L_t &=D_{\mathrm{KL}}\left(q\left(\mathbf{x}_t \mid \mathbf{x}_{t+1}, \mathbf{x}_0\right) \| p_\theta\left(\mathbf{x}_t \mid \mathbf{x}_{t+1}\right)\right) \text { for } 1 \leq t \leq T-1 \\
+% L_0 &=-\log p_\theta\left(\mathbf{x}_0 \mid \mathbf{x}_1\right)
+% \end{aligned}
+% \end{equation}
+
+% According to \Cref{eq:forward}, we have a close form for this term.
+% \begin{equation}
+% \begin{aligned}
+% q\left(\vec{x}_{t-1} \mid \vec{x}_t, \vec{x}_0\right)&=\frac{q\left(\vec{x}_t \mid \vec{x}_{t-1}, \vec{x}_0\right) q\left(\vec{x}_{t-1} \mid \vec{x}_0\right)}{q\left(\vec{x}_t \mid \vec{x}_0\right)}\\
+% &=\operatorname{Cat}\left(\vec{x}_{t-1} ; \boldsymbol{p}=\frac{\vec{x}_t \boldsymbol{Q}_t^{\top} \odot \vec{x}_0 \overline{\boldsymbol{Q}}_{t-1}}{\vec{x}_0 \overline{\boldsymbol{Q}}_t \vec{x}_t^{\top}}\right) 
+% \end{aligned}
+% \end{equation}
+
+% The choice of transition probability matrix is critical.
+% Here we use a uniform probability transition matrix here,
+% \begin{equation}
+% Q_k = \begin{bmatrix} 1-\beta_k & \beta_k \\ \beta_k & 1-\beta_k \end{bmatrix}
+% \end{equation}
+% where $\beta_k$ is the hyperparameter.
+
+% D3PM has been shown to work well for the generation of natural images such as cifar10 \cite{austin2021structured}, by treating the pixel value of each pixel as a variable with 256 discrete states and defining the transition probability matrix as a discrete Gaussian matrix. Considering the special properties of squish patterns, we adapt a uniform probability transition matrix in this paper, that is, each state has the same probability of transitioning to other states except the original state, which is controlled by . For binary discrete states of squish patterns, the probability transition matrix $Q_t$ is shown below.
+\minisection{Training Diffusion Model.} To training the discrete diffusion model for topology tensor generation, the training objective at step $k$ is to minimize the loss function,
+% We follow the loss function adopted by D3PM \cite{austin2021structured} which adds an auxiliary denoising loss on baisc of \Cref{eq:ddpm-loss}. In the actual training process, the above loss function can simplify and focus on a specific step $k$, as shown in \Cref{eq:d3pm-loss-true}.
+% \begin{equation}
+% L_{total}=L_{\mathrm{VLB}}+\lambda \mathbb{E}_{q\left(\vec{T}_0\right)} \mathbb{E}_{q\left(\vec{T}_k | \vec{T}_0\right)}\left[-\log p_{\vec{\theta}} \left(\vec{T}_0 | \vec{T}_k\right)\right]
+% \label{eq:d3pm-loss}
+% \end{equation}
+\begin{equation}
+L = D_{\mathrm{KL}}\left(\vec{q}\left(\vec{x}_{k-1} | \vec{x}_{k}, \vec{x}_0\right) \parallel \vec{p}_\theta\left(\vec{x}_{k-1} | \vec{x}_{k}\right)\right) - \lambda\log \vec{p}_{\vec{\theta}} \left(\vec{x}_0 | \vec{x}_k\right),
+\label{eq:d3pm-loss-true}
+\end{equation}
+where $\lambda$ is a hyperparameter to balance the loss terms.
+
+Given a topology tensor $\vec{T}_0$, we randomly sample a target step $k$ from $1$ to $K$ firstly, and expect to get the noisy sample $\vec{T}_k$. Fortunately, we can explicitly derive that $\vec{x}_k$ obeys the following categorical distribution:
+\begin{equation}
+    \vec{q}\left(\vec{x}_k|\vec{x}_0\right) = \operatorname{Cat}\left(\vec{x}_k ; \vec{p}=\vec{x}_0 \overline{\vec{Q}}_k\right),
+\end{equation}
+where $\overline{\vec{Q}}_k=\vec{Q}_1 \vec{Q}_2 \ldots \vec{Q}_k$.
+% $q\left(\vec{T}_k|\vec{T}_0\right) = \operatorname{Cat}\left(\vec{T}_k ; \vec{p}=\vec{T}_0 \overline{\vec{Q}}_k\right)$, where $\overline{\vec{Q}}_k=\vec{Q}_1 \vec{Q}_2 \ldots \vec{Q}_k$
+Then, we can directly sample from the above distribution to obtain $\vec{T}_k$, instead of adding noise $k$ times.
+
+After sampling $\vec{T}_k$, we feed it into the neural network with the embedding of the time step $k$. The neural network will predict the logits of the posterior distribution $\vec{p}_{\vec{\theta}}\left(\vec{x}_0|\vec{x}_k\right)$, and then $\vec{p}_{\vec{\theta}}\left(\vec{x}_{k-1} | \vec{x}_k\right)$ can be calculated as following:
+\begin{equation}
+\vec{p}_{\vec{\theta}}\left(\vec{x}_{k-1} | \vec{x}_k\right) = \sum_{\widetilde{\vec{x}}_0} \vec{q}\left(\vec{x}_{k-1} | \vec{x}_k , \widetilde{\vec{x}}_0\right) \vec{p}_{\vec{\theta}}\left(\widetilde{\vec{x}}_0 | \vec{x}_k\right),
+\label{eq:d3pm-reverse}
+\end{equation}
+where the term $\widetilde{\vec{x}}_0$ will visit every possible state of $\vec{x}_0$. And $\vec{q}\left(\vec{x}_{k-1} | \vec{x}_k, \widetilde{\vec{x}}_0\right)$ has a closed form according to \Cref{eq:d3pm-forward} and Bayes' theorem,
+\begin{equation}
+\vec{q}\left(\vec{x}_{k-1} | \vec{x}_k, \vec{x}_0\right) = \operatorname{Cat}\left(\vec{x}_{k-1} ; \vec{p}=\frac{\vec{x}_k \vec{Q}_k^{\top} \odot \vec{x}_0 \overline{\vec{Q}}_{k-1}}{\vec{x}_0 \overline{\vec{Q}}_k \vec{x}_k^{\top}}\right),
+\label{eq:d3pm-closedform}
+\end{equation}
+where $\odot$ is a pixel-wise multiplication.
+
+So far, all items in the loss function have been obtained, and the diffusion model can be trained by the commonly used gradient descent method.
+
+\minisection{Generating Deep Squish Pattern.} Once the training phase ends, we can synthesize fresh topology by sampling noise topology $\vec{T}_K$ from the stationary distribution, a random uniform distribution, and then gradually removing the predicted noise from it in the reverse procedure. The sampling process can be expressed by,
+\begin{equation}
+    p_\theta(\hat{\vec{T}}_0|\vec{T}_K) =p_\theta(\hat{\vec{T}}_{0}|\vec{T}_1) \prod_{k=2}^{K}p_\theta(\vec{T}_{k-1}|\vec{T}_k),
+\end{equation}
+where $\vec{T}_k$ is the estimated pattern topology at step $k$ and $\hat{\vec{T}}_0$ is the newly sampled topology tensor. The denoising procedure is illustrated in \Cref{fig:sampling}. The generated topology tensor $\hat{\vec{T}}_0$ is naturally a binary one where each entry equals either zero or one. When the sampling ends, we flatten the $\hat{\vec{T}}_0$ for Legal Pattern Assessment. 
+
+
+% After training, our model can generate new deep squish patterns without any real pattern input. We only need to sample $\vec{T}_K$ from the stationary distribution set by the model, and
+
+\begin{figure}[tb!]
+    \centering
+    \includegraphics[width=0.88\linewidth]{d3pm-fig6_004_.pdf}
+    \caption{An illustration of the (flattened) samples from our Discrete Diffusion Model.}
+    \label{fig:sampling}
+\end{figure}
+
+\minisection{Topology Pre-filter.} We conduct a rule-based topology pre-processing here to filter out invalid topology, {\it e.g.,} Bow-tie, according to domain knowledge. Thanks to the high-quality topologies generated by our discrete diffusion model, only less than 0.1\% of generated topologies are filter-out by the pre-filter in our settings.
+
+
+
+
+
+
+\subsection{2D Legal Pattern Assessment}
+\label{sec:2.4}
+
+Once the squish pattern generation is finished, we need the legal $\Delta_x$s and $\Delta_y$s of all generated topologies to generate DRC-clean layout patterns.
+The decomposition of topology generation and legal pattern assessment brings flexibility to \tool{DiffPattern} when the design rules change, as we further discussed in \Cref{sec:4.3}.
+Instead of using a black-box deep-learning-based method as previous works \cite{zhang2020layout,wen2022layoutransformer} do, we use a white-box method to solve the problem. We first list all constraints for each generated topology according to the design rules introduced in \Cref{fig:drc_rule} and then formulate a nonlinear system combining all of them, as in Formula (\ref{eq:nonlinear}), 
+\begin{equation}
+    \label{eq:nonlinear}
+    \begin{cases}
+        \delta_{xi}, \delta_{yj} > 0,                                                          &\forall \delta_{xi}, \delta_{yj};\\
+        \sum \delta_{xi}  =\sqrt{C}M, \quad \sum \delta_{yj}  =\sqrt{C}M;                                       \\
+        \sum_{i=a}^b \delta_{i} \geq\textit{Space}_\textit{min},                               &\forall (a,b)\in Set_{S};\\
+        \sum_{i=a}^b \delta_{i} \geq\textit{Width}_\textit{min},                               &\forall (a,b)\in Set_W;\\
+        \sum \delta_{xi}\delta_{yj}\in[\textit{Area}_\textit{min},\textit{Area}_\textit{max}], &\forall \text{ Polygon};
+    \end{cases}
+\end{equation}
+where $\textit{Space}_\textit{min}$ and $\textit{Width}_\textit{min}$ are the lower bound of `Space' and `Width'. $\sqrt{C}M\times \sqrt{C}M$ is the shape of topology matrix.
+$\textit{Area}_\textit{min}$ and $\textit{Area}_\textit{max}$ define the legal area range of each polygon in the pattern.
+All the constants are pattern-independent and given by design rules.
+Both $Set_{S}$ and $Set_W$ are pattern-dependent and indicate which pair of scan lines is constrained by design rules on `Space' and `Width', respectively. 
+
+Note that the nonlinear system in \Cref{eq:nonlinear} can be efficiently solved with vast nonlinear programming algorithms or numerical methods, and the solution is usually not unique. Every solution of $\Delta_x$ and $\Delta_y$ together with the associated topology formulates a complete squish pattern representation.
+As further detailed in \Cref{sec:4.3}, \tool{DiffPattern} can easily synthesize a large number of legal layout patterns from a single topology with the given design rules. Theoretically, there are cases where no legal solution is figured out in a limited time. Although it never happens in our experiments (more than $1.0\times 10^8$ times attempts), we can simply remove these unsolvable cases from the generated topology set to avoid synthesizing illegal patterns. 
+In most cases, the choice of the initial value for the nonlinear programming algorithms may have a minor impact on pattern diversity and legality. In practice, we randomly choose a pair of existing geometric vectors from datasets as the start point, which will empirically accelerate the convergence of nonlinear programming algorithm. 
+
+
+
+
+
+
+
+
+
+

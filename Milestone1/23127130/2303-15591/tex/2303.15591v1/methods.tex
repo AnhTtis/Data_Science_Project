@@ -1,0 +1,133 @@
+\section{Approach}
+
+\subsection{Preliminaries}
+Consider an input space $\mathcal{X}$ and a categorical label set $\mathcal{Y}$ where each class is represented via a one-hot encoding. A representation $\mathcal{R} \subset \mathbb{R}^d$ of the input is defined by the composition of an augmentation function $\mathcal{A}:\mathcal{X} \to \mathcal{X}$ and an encoder model $E_\theta : \mathcal{X}\to\mathcal{R}$, parameterized by $\theta$.  The augmentation function is a composition of standard image transformations such as random cropping, horizontal flipping \etc. A general recognition task $\mathcal{T}$ can be defined in terms of a finite training set, $\{(x_i, y_i)\}_{i\in \mathcal{D}_\text{train}}$ and $N_c$ categories such that, $y_i \in [N_c]$. The goal, is to leverage a pre-trained encoder, $E_{\theta^*}$ and the training set to obtain a classifier for the task $\mathcal{T}$.
+
+\subsection{Overview of Vision Transformers (ViT)}
+\noindent In a typical ViT, the image, $x \in \mathbb{R}^{h \times w \times 3}$ is uniformly divided into $N$ fixed-sized patches, each of which are projected to a $d$-dimensional embedding and are added a positional embedding, resulting in a patch token $z_n \in \mathbb{R}^{d} $.  Additionally, a class token $z_\text{cls} \in \mathbb{R}^{d}$ is concatenated to the sequence of the patch tokens to form the input, $Z^0 \in \mathbb{R}^{(N+1) \times d}$.  Starting from layer $l=0$, the incoming activations at each layer, $z^{l-1}$ are first normalized using LayerNorm (LN), and then processed by a multi-headed self-attention block (MSA) followed by an MLP block. At the last layer, the resulting class token is normalized to yield the final representation.  The overall computations in a ViT encoder can be summarised as 
+\begin{align}
+Z^0& = [z_\text{cls}, z_0, \ldots, z_{N-1}] \notag\\
+H^{l-1} &= \text{MSA}(\text{LN}(Z^{l-1})) + Z^{l-1} ~~~ l=0,...,L-1  \notag \\
+Z^l &=\text{MLP}(\text{LN}(H^{l-1})) + H^{l-1} ~~~ l=0,...,L-1 \notag \\
+y &=LN(Z^L_\text{cls}) \notag
+\end{align}
+where $L$ represents the number of encoder layers.  The multi-headed self-attention mechanism (MSA) abstracts patchwise representation by aggregating the right context at each layer. The context aggregation is facilitated by softmax attention that relies on patch-to-patch similarities and its parameters are governed by the pre-training task objective. During adaptation, however, the representations for downstream task might benefit from aggregating a slightly different context at each layer. Our prompt tuning approach facilitates task specific modulation of this context by augmenting and learning layerwise patch tokens.
+
+\subsection{Expressive Prompt Tuning}
+
+At the input layer of the ViT, we introduce prompt tokens,  $P^0 \in \mathbb{R}^{M\times d} $ which are $M$ parameterized vectors of dimension $d$ concatenated to the input token sequence, $Z^{0}$, of the ViT. Input-level prompts, also referred to as \textit{shallow} prompts, are propagated through the encoder together with the class and patch tokens such that at every layer, each token interacts with every other token through the self-attention layers. The propagated prompts at the last layer are average-pooled to obtain the final representation. The insertion and propagation of the prompts described above can be expressed as 
+\begin{align}
+\tilde{Z}^0& = [Z^0 || P^0] \label{eq:promptrep} \\
+\tilde{H}^{l-1} &= \text{MSA}(\text{LN}(\tilde{Z}^{l-1})) + \tilde{Z}^{l-1} ~~~ l=0,...,L-1 \notag \\ % \label{eq:prompt_MSA}
+\tilde{Z}^l &=\text{MLP}(\text{LN}(\tilde{H}^{l-1})) + \tilde{H}^{l-1} ~~~ l=0,...,L-1 \notag \\
+Z^L,  &P^L = \texttt{chunk}(\tilde{Z}^l ) \notag\\
+\tilde{y} &= \text{AvgPool}(P^L) \notag \\
+y &= LN(\tilde{y})  \notag
+\end{align}we use $||$ to denote the concatenation along the sequence axis and \texttt{chunk} to denote the splitting of the propagated sequence of length $N+M+1$ into the $N+1$ tokens and $M$ prompts. Shallow prompts are capable of modeling some of the desired token relations for a task. However, they have limited capacity due to the inability to alter for specific per-layer interactions with the class and image tokens.
+
+To enhance the prompt capacity, we introduce layer-wise residual prompts, $\mathbf{\Delta}^l \in \mathbb{R}^{M \times d}$ that are added to the propagated prompts at various computations within the MSA block for an intermediate layer $l$. This includes the output of attention LayerNorm, query-key-value projections and linear multi-head projection. We summarise the MSA computations at layer $l$ with $N_h$ heads and input $Z$
+\begin{align}
+Z' &= LN(Z) \notag \\
+Q_h &= Z' W_h^Q;~K_h = Z' W_h^K;~V_h = Z' W_h^V \notag \\
+\text{g}_h &= \texttt{Att}(Q_h, K_h, V_h) ~~~~~ i=1,...,N_h\label{eq:SA}\\
+O &= [\text{g}_1||\ldots||\text{g}_{N_h}]W^\text{proj} \notag 
+\end{align}
+above $h$ is used to represent the head index of $W^Q, W^K, W^V$ and $W^\text{proj}$ denotes the projection matrix of the MSA block. The residually prompted computations can then be expressed as
+\begin{align}
+Z' &= LN(Z)+[\bar{\mathbf{0}} || \mathbf{\Delta_{LN}}] \notag\\
+\tilde{Q}_h &= Q_h+ [\bar{\mathbf{0}} || \mathbf{\Delta_Q}] \notag\\
+\tilde{K}_h &= K_h + [\bar{\mathbf{0}} || \mathbf{\Delta_K}] \notag\\
+\tilde{V}_h &= V_h + [\bar{\mathbf{0}} || \mathbf{\Delta_V}] \notag\\
+\tilde{O} &= O + [\bar{\mathbf{0}} || \mathbf{\Delta_{proj}}] \notag
+\end{align}
+where the concatenation of $(N+1) \times d$ dimensional zero matrix, $\bar{\mathbf{0}}$ with the residual-prompts, signifies that the residuals $\mathbf{\Delta}$  are added only at the propagated prompt positions and not to the image patch or class token positions. The above residual computations occur at every layer with independently learned residual prompts, and we drop the layer indices in the equations for brevity. The overall EXPRES architecture is visualized in Figure \ref{fig:main}.
+
+\subsection{Interpreting Residual Prompting}
+\noindent We take a closer look at residual prompting for self-attention and interpret it's functionality. The $\texttt{Att}$ operation in Eq. \eqref{eq:SA} facilitates weighted aggregation over all ``value'' tokens where the weights are computed using the ``query'' and a ``key'' tokens as $w_{ij} \propto \text{exp}\left( \frac{q_i^Tk_j}{\sqrt{d/N_h}}\right)$. When prompted with residual tokens, the expression for the weights that aggregate information for a patch token $q_i$ can be factored as,
+ \begin{align}
+\tilde{w}_{ij} &\propto\text{exp}\left(\frac{q_i^T(k_j + \mathbf{\Delta}_{K,j})}{\sqrt{d/N_h}}\right) \notag \\
+&= \text{exp}\left(\frac{q_i^Tk_i }{\sqrt{d/N_h}}\right) \text{exp}\left(\frac{q_i^T\mathbf{\Delta}_{K,j}}{\sqrt{d/N_h}}\right) \label{eq:reweigh} \\
+&=w_{ij}*\alpha_{ij}. \notag
+\end{align}
+Based on Eq. \eqref{eq:reweigh}, residual prompts facilitate task-specific reweighting of the attention weights independently at every layer, allowing the modulation of context aggregated per patch token.
+Such layerwise modulation can lead to better adaptation of the final representation compared to shallow prompting that restricts the modulation to the input layer.
+Moreover, the two-way interaction between prompts and patch tokens leads to greater flexibility than other forms of multilayered prompting \cite{jia2022vpt,MemFT} that allow for only partial interaction. For instance, \cite{jia2022vpt} restrict the prompts to act only as keys and never as queries.
+
+Residual prompt based attention reweighting is also interesting from parameter efficiency perspective as it circumvents the need for updating the attention weight matrices (done in finetuning approaches) to achieve the same goal of task specific adaptation. Specifically, each layer of a ViT consists of three attention weight matrices, each with $d\times d$ dimensions, resulting in $\mathcal{O}(d^2)$ learnable parameters. In contrast, each prompt is $d$ dimensional so, only $\mathcal{O}(d)$ parameters need to be adapted even with $M$ prompts, where $M << d$. We empirically validate that the high capacity as well as parameter efficiency of our prompting approach is crucial for achieving good adaptation performance in limited labelled data settings. 
+
+ \subsection{Learning the Prompts}
+ 
+\begin{table*}[h]
+    \centering
+    \resizebox{1
+    \textwidth}{!}{
+\begin{tabular}{ccccccccc|ccccc|ccccccccc}
+\toprule
+ &  \multicolumn{8}{c}{natural}  &     \multicolumn{5}{c}{specialized}    &\multicolumn{9}{c}{structured}   \\
+\midrule
+        & \rotatebox{90}{\bf{CIFAR-100}}
+  &\rotatebox{90}{\bf{Caltech101} }
+  &\rotatebox{90}{\bf{DTD} }
+  &\rotatebox{90}{\bf{Flowers102} }
+  &\rotatebox{90}{\bf{Pets} }
+  &\rotatebox{90}{\bf{SVHN} }
+  &\rotatebox{90}{\bf{Sun397} }
+  &\rotatebox{90}{\bf{Mean}}
+  &\rotatebox{90}{\bf{Patch Camelyon} }
+  &\rotatebox{90}{\bf{EuroSAT} }
+  &\rotatebox{90}{\bf{Resisc45} }
+  &\rotatebox{90}{\bf{Retinopathy} }
+  &\rotatebox{90}{\bf{Mean}}
+  &\rotatebox{90}{\bf{Clevr/count} }
+  &\rotatebox{90}{\bf{Clevr/distance} }
+  &\rotatebox{90}{\bf{DMLab}}
+  &\rotatebox{90}{\bf{KITTI/distance} }
+  &\rotatebox{90}{\bf{dSprites/location} }
+  &\rotatebox{90}{\bf{dSprites/orientation} }
+  &\rotatebox{90}{\bf{SmallNORB/azimuth} }
+  &\rotatebox{90}{\bf{SmallNORB/elevation} }
+  &\rotatebox{90}{\bf{Mean}}  \\
+\midrule
+Linear &63.4 &85.0 &63.2 &97.0 &86.3 &36.6 &51.0 &68.93  &78.5 &87.5 &68.6 &74.0 &77.16  &34.3 &30.6 &33.2 &55.4 &12.5 &20.0 &9.6 &19.2 &26.84 
+\\
+
+MLP-2 &63.2 &84.8 &60.5 &97.6 &85.9 &34.1 &47.8 &67.70  &74.3 &88.8 &67.1 &73.2 &75.86  &45.2 &31.6 &31.8 &55.7 &30.9 &24.6 &16.6 &23.3 &32.47 
+\\
+MLP-3 &63.8 &84.7 &62.3 &97.4 &84.7 &32.5 &49.2 &67.80  &77.0 &88.0 &70.2 &56.1 &72.83  &47.8 &32.8 &32.3 &58.1 &12.9 &21.2 &15.2 &24.8 &30.62 
+\\
+MLP-5 &59.3 &84.4 &59.9 &96.1 &84.4 &30.9 &46.8 &65.98  &73.7 &87.2 &64.8 &71.5 &74.31  &50.8 &32.3 &31.5 &56.4 &7.5 &20.8 &14.4 &20.4 &29.23 
+\\
+MLP-9 &53.1 &80.5 &53.9 &95.1 &82.6 &24.4 &43.7 &61.90  &78.5 &83.0 &60.2 &72.3 &73.49  &47.5 &27.9 &28.9 &54.0 &6.2 &17.7 &10.8 &16.2 &26.15 
+\\
+\midrule
+Sidetune \cite{zhang2020side}  &60.7 &60.8 &53.6 &95.5 &66.7 &34.9 &35.3 &58.21  &58.5 &87.7 &65.2 &61.0 &68.12  &27.6 &22.6 &31.3 &51.7 &8.2 &14.4 &9.8 &21.8 &23.41 
+\\
+Biastune \cite{cai2020tinytl} &72.8 &87.0 &59.2 &97.5 &85.3 &59.9 &51.4 &73.30 &78.7 &91.6 &72.9 &69.8 &78.25  &61.5 &55.6 &32.4 &55.9 &66.6 &40.0 &15.7 &25.1 &44.09 
+\\
+Adapter-256 &74.1 &86.1 &63.2 &97.7 &87.0 &34.6 &50.8 &70.50  &76.3 &88.0 &73.1 &70.5 &76.98  &45.7 &37.4 &31.2 &53.2 &30.3 &25.4 &13.8 &22.1 &32.39 
+\\
+Adapter-64 &74.2 &85.8 &62.7 &97.6 &87.2 &36.3 &50.9 &70.65  &76.3 &87.5 &73.7 &70.9 &77.10  &42.9 &39.9 &30.4 &54.5 &31.9 &25.6 &13.5 &21.4 &32.51 
+\\
+Adapter-8 &74.2 &85.7 &62.7 &97.8 &87.2 &36.4 &50.7 &70.67  &76.9 &89.2 &73.5 &71.6 &77.80  &45.2 &41.8 &31.1 &56.4 &30.4 &24.6 &13.2 &22.0 &33.09 \\
+Partial-1 &66.8 &85.9 &62.5 &97.3 &85.5 &37.6 &50.6 &69.44  &78.6 &89.8 &72.5 &73.3 &78.53  &41.5 &34.3 &33.9 &61.0 &31.3 &32.8 &16.3 &22.4 &34.17 
+\\
+FT-all &68.9 &87.7 &64.3 &97.2 &86.9 &\bfseries87.4 &38.8 &75.88 &79.7 &95.7 &\bfseries84.2 &73.9 &83.36 &56.3 &58.6 &41.7 &65.5 &57.5 &46.7 &25.7 &29.1 &47.64 
+\\
+\midrule
+VPT-shallow \cite{jia2022vpt} &77.7 &86.9 &62.6 &97.5 &87.3 &74.5 &51.2 &76.81  &78.2 &92.0 &75.6 &72.9 &79.66  &50.5 &58.6 &40.5 &67.1 &68.7 &36.1 &20.2 &34.1 &46.98 \\
+ VPT-deep \cite{jia2022vpt} &\bfseries78.8 &\bfseries90.8 &65.8 &98.0 &88.3 &78.1 &49.6 &78.48  &81.8 &96.1 &83.4 &68.4 &82.43   &\bfseries68.5 &60.0 &\bfseries46.5 &72.8 &73.6 &47.9 &\bfseries32.9 &\bfseries37.8 &54.98 \\
+ \midrule
+ EXPRES (\textit{ours})&78.0&89.6&\bfseries68.8&\bfseries98.7&\bfseries88.9&81.9&\bfseries51.9&\bfseries79.7&\bfseries84.8&\bfseries96.2&80.9&\bfseries74.2&\bfseries84.0&66.5&\bfseries60.4&\bfseries46.5&\bfseries77.6&\bfseries78.0&\bfseries49.5&26.1&35.3&\bfseries55.0\\
+ \bottomrule
+\end{tabular}    }
+    \caption{\textbf{VTAB-1k benchmark:} Per task adaptation results with ViT-B/16 model pretrained on ImageNet-21k..}
+    \label{tab:vtab}
+\end{table*}
+
+
+In this work, we are mainly interested in two types of downstream tasks - image classification and semantic segmentation. To train the prompts for classification, we optimize a standard cross entropy loss with respect to the representation, $y$ in Eq. \eqref{eq:promptrep} and the corresponding ground-truth label, $y*$. In the case of semantic segmentation, we adapt the model as well as the objective to perform dense predictions. At the final layer of the encoder, we extract the keys corresponding to the patch tokens and pass them through the classifier. The sequence outputs are then reshaped into a 2d map and resized to original image resolution using bilinear interpolation, resulting in a pixel wise prediction. Finally, to optimize the prompts with the classifier head, we use a dense cross entropy loss as follows
+\begin{align}
+\{p_m^*\}, \{\mathbf{\Delta^*}\} = \argmin\limits_{\{p_m\}, \{\mathbf{\Delta}\}, C}  \sum_{j\in I_\text{ctxt}} \sum_{h,w}  L_\text{CE}(y_{jhw}, y_{jhw}^*) \notag
+\end{align}
+where,  $h,w$ are used to index the spatial positions at the resolution, $H\times W$ of the input image.
+

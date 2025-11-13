@@ -1,0 +1,148 @@
+\section{Method}
+\label{sec:method}
+
+
+While modeling a scene with a radiance field is effective in rendering from novel viewpoints, it hinders our capability to relight the scene with different illumination conditions {as illumination is entangled with the appearance and shape}. 
+% 
+To relight with unseen illumination conditions, we incorporate physics-based shading into the forming of radiance fields, {thus disentangling it by construction}.
+
+%
+In the following subsections we first discuss the illumination model that we propose which allows us to achieve disentanglement, then detail how we implement the model into a deep generative model.
+%
+
+\subsection{Illumination model}
+\label{sec:illumination}
+
+To explicitly constrain the rendering process on illumination we use a simplified version of the Phong reflectance model~\cite{phong1975illumination}.
+The color at a location is computed using
+{%
+\begin{equation}
+    \bc = \int_{\intomega} \left(\mathbf{k}_d \odot \left(\normal \cdot {\intomega} \right) L^d({\intomega}) + k_s \left(\reflect \cdot {\intomega} \right)^\alpha L^s(\intomega)\right) \,d{\intomega}
+    ,
+    \label{eq:phong}
+\end{equation}
+}%
+%
+where $\normal$ is its normal, $\reflect$ is the reflection direction given by Eq.~(\ref{eq:reflection_direction}),  $\mathbf{k}_d \in  \mathbb{R}^3$ is the diffuse reflectance,  $k_s  \in \mathbb{R}$
+is the specular reflectance coefficient, $\alpha$ is the shininess constant, and $L^d$ and $L^s: \mathbb{R}^3 \rightarrow \mathbb{R}^3$ are the diffuse and specular environment maps (distance light distributions) respectively parameterized by incident light direction, $\intomega$ on the surface of the unit sphere. The operator  $\odot$ is element-wise multiplication and $\cdot$ is the dot product. For brevity, when we element-wise multiply a scalar with a vector, we assume each element of the vector is multiplied by the scalar. 
+Here, the first term computes the diffuse color $\bc_d$ and the second term computes the specular color $\bc_s$.  
+
+
+\paragraph{Further simplification via Spherical Harmonics.}
+% 
+We assume a single environment map for diffuse and specular, $L^d = L^s = L$. To speed up rendering Eq.~(\ref{eq:phong}) and efficient representation, we follow Ramamoorthi et al.~\cite{ramamoorthi2001efficient}, and pre-integrate the environment map to compute the irradiance environment map 
+\begin{equation}
+    E(\normal) = \int_{\intomega}  \left(\normal \cdot {\intomega} \right) L({\intomega}) \,d{\intomega}.
+    \label{eq:irradiance}
+\end{equation}
+The irradiance environment map can be efficiently (approximately) represented in Spherical Harmonics (SH) basis using only 9 basis functions. See~\cite{ramamoorthi2001efficient} for details. 
+
+Consider that irradiance environment map is represented by SH coefficients $\mathbf{l}_k \in \mathbb{R}^3$ with SH basis $H_k : \mathbb{R}^3 \rightarrow \mathbb{R}$ and $k \in [1,9]$.
+We can fold all illumination-related terms in~\eq{phong} using the SH basis functions.
+Thus, the diffuse term can be rewritten as 
+\begin{equation}
+    \mathbf{c}_d = \mathbf{k}_d \odot \sum_k \ill_k  H_k(\normal)
+    .
+    \label{eq:diffuse_shading}
+\end{equation}
+% 
+% 
+
+For the specular component we assume that $\alpha = 1$\footnote{Using $\alpha = 1$ allows us to use the same irradiance environment map to compute the specular color.} in~\eq{phong} which, with the SH basis again folding in the illumination terms gives us 
+
+\begin{equation}
+    \bc_s =  k_s \sum_k   \ill_k  H_k(\reflect)
+    .
+    \label{eq:specular}
+\end{equation}
+{%
+Note here that unlike in \eq{diffuse_shading} we use $\reflect$ to retrieve the irradiance environment map values  
+rather than $\normal$, as we are interested in the specular component, which reflects off the surface.
+}%
+The final color is then a composition of specular and diffuse components 
+\begin{equation}
+    \bc = \bc_d + \bc_s
+\end{equation}
+
+
+{%
+As we will show in \Section{experiments}, this simple formulation works surprisingly well, with the illumination being explicitly factored out.
+In other words, by controlling $\ill_k$ in~\eq{diffuse_shading} and \eq{specular}, one can control how the face renders under different illuminations. Although, we do not model other effects of light on the skin, such as subsurface scattering~\cite{krishnaswamy2004sss}, we expect our model to account for it from the training process.
+
+}%
+
+\subsection{Generator}
+\label{sec:generator}
+
+% 
+To imbue a 3D generative model with explicitly controllable illumination, 
+we condition the tri-plane generator on both the camera pose $\pose$ and the illumination $\ill$.
+{%
+This allows us to take into account the distribution of illumination conditions within our training dataset, similar to how pose was considered in EG3D~\cite{Chan2022eg3d}.
+}%
+Mathematically, we write our tri-plane generator as 
+% 
+\begin{equation}
+\feat^{XY}, \feat^{YZ}, \feat^{XZ} = \triplaneG \left( \pose, \ill \right)
+   . 
+\end{equation}
+% 
+For a given point in space $\bx\in \mathbb{R}^3$, the aggregated features are obtained using $\feat_\bx = \feat^{XY}_\bx + \feat^{YZ}_\bx + \feat^{XZ}_\bx$. 
+However, as discussed earlier, simply conditioning the tri-plane generator $\triplaneG$ alone is not enough to enable explicit and consistent control over the camera pose and illumination---there is no guarantee that the generated content will remain constant while illumination and camera pose changes.
+{%
+We thus utilize $\feat_\bx$ and apply the illumination model in \Section{illumination}.
+}%
+
+{%
+Specifically, as shown in \Figure{pipeline}, instead of directly regressing the color $\bc$ and the density $\density$ at a given point as in EG3D~\cite{Chan2022eg3d}, we decode $\feat_\bx$ using diffuse and specular decoders. We then apply shading through \eq{diffuse_shading} and \eq{specular} to obtain the diffuse color $\mathbf{c}_d$ and the specular color $\mathbf{c}_s$ of a point.
+}%
+
+
+\paragraph{Diffuse decoder.} % -- \eq{diffuse_shading}.} 
+We regress the diffuse reflectance $\mathbf{k}_d$, normal $\normal$ and density $\density$ at a point given tri-plane features $\mathbf{f_x}$ using diffuse decoder (see \Figure{pipeline}).
+We then apply \eq{diffuse_shading} to obtain the diffuse color $\bc_d$.
+{Here, as in other NeRF work~\cite{zhang2021nerfactor,verbin2022refnerf} we opt to directly regress the normals, as we also found that using the derivative of the density to be unreliable for training.}
+
+
+\paragraph{Specular decoder.} % -- \eq{specular}.} 
+We regress the specular reflectance coefficient $\shiny$ using the specular decoder.
+We also compute the reflection direction which is a function of the view direction $\view$ and the normal $\normal$ given by
+\begin{equation}
+    \reflect = \view - 2 (\view \cdot \normal)\normal
+    .
+    \label{eq:reflection_direction}
+\end{equation}
+We then obtain the specular color $\bc_s$ using the specular shading model given by \eq{specular}.
+
+
+\paragraph{Volume rendering.}
+Following~\cite{Chan2022eg3d, niemeyer2021giraffe}, we volume render the image $\bI_\bc$ and feature images $\bI_\bw$ by tracing over color $\bc$ and features $\bw$ respectively via \eq{volume_rendering}.
+
+
+
+
+\paragraph{Superresolution.}
+{%
+Lastly, to generate high-resolution images, as in EG3D~\cite{Chan2022eg3d} we upsample the rendered images $\bI_\bc$ to $\bI_\bc^+$ via an upsampling module $\upsampleU$, guided by the feature images $\bI_\bw$.
+We write
+}%
+
+\begin{equation}
+    \bI_\bc^+ = 
+    \upsampleU(\bI_\bc, \bI_\bw)
+    .
+\end{equation}
+
+\subsection{Training}
+
+{%
+We extend the standard training process of EG3D~\cite{Chan2022eg3d} and adapt it to our framework.
+Specifically, for the GAN setup, we use the rendered image $\bI_\bc$, and condition the discriminator on both the camera poses $\pose$ and the illumination SH coefficients $\ill$.
+We further introduce a regularization on the estimated normal $\normal$, such that it matches the estimated densities.
+}%
+Similar to Zhang \etal~\cite{zhang2021nerfactor}, we introduce a loss term defined as
+\begin{equation}
+    \mathcal{L}_{\normal} = | \normal(\bx) - \nabla_\bx \density (\bx) |_1
+    ,
+\end{equation}
+where $\nabla_{\bx}$ is the spatial gradient.

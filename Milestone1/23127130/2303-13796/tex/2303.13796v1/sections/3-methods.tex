@@ -1,0 +1,216 @@
+
+\section{Methodology}
+\label{chapter:method}
+In this section, we first review the formulation of previous camera systems and then present our camera system customized for distorted images in~\cref{chapter:method-camera}. 
+%
+~\cref{chapter:net_structure} presents our network architecture with two key components: (i) translation estimation module and (ii) mesh reconstruction module.
+%
+Subsequently, we explain the proposed hybrid re-projection loss functions for distorted human mesh reconstruction in~\cref{chapter:method-loss}.
+
+% We also extend our method to parametric-based method by simply change the mesh reconstruction head to pose and shape estimation head. We call this variation \Oursp. We also report results of $\rm POET^{\cP}$ in this paper. The detailed pipeline will be demonstrated in supplementary materials.
+
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=0.85\linewidth]{pictures/dollyzoom.pdf}
+%     \caption{Solving rotation and horizontal ambiguity with distortion. When two human body with same included angle to the human-camera axis, they look alike in face direction. But the horizontal translation will cause different distortion type in left and right side. From this figure we can find that the closer the human body to camera center, the bigger the distortion type is, the smaller the rotation ambiguity is. And the distortion difference on each side reveals the horizontal translation.}
+%     \label{fig:rotation_vague}
+%     % \end{subfigure}
+    
+% % \caption{Solving the translation and rotation ambiguity by dolly-zoom effect and distortion scale.}
+% % \label{fig:camera}
+% \end{figure}
+
+
+% \begin{figure}[htp]
+%   \centering
+%   \fbox{\rule{0pt}{2in} \rule{0.9\linewidth}{0pt}}
+%   %\includegraphics[width=0.8\linewidth]{egfigure.eps}
+
+%   \caption{Effect of Distortion on Projection.}
+%   \label{fig:distortion}
+% \end{figure}
+
+
+\begin{figure*}[t]
+  \centering
+   \includegraphics[width=0.95\linewidth]{pictures/pipeline.pdf}
+  \hfill
+  \vspace{-10pt}
+  \caption{\textbf{\Ours pipeline overview}. The whole pipeline mainly consists of two modules and a hybrid re-projection supervision. MRM terms the mesh reconstruction module. TEM indicates the translation estimation module. $F_{grid}$ is the spatial feature from the backbone. $F_{vp}$ and $F_{vd}$ represents per-vertex position and distortion feature . $(s, t_{x}, t_{y})$ are the weak-perspective parameters. $J_{2D}^{im}$ terms 2D joints in the cropped image coordinate system. $J_{2D}^{ori}$ terms 2D joints in original image coordinate system before cropped. $h$ terms image height.}
+  \label{fig:pipeline}
+\end{figure*}
+
+%   The perspective camera use focal length calculated by $f=s \times z$} and the estimated $transl$.
+
+\subsection{Preliminary}
+\label{chapter:method-camera}
+\noindent\textbf{Camera system analysis.} In weak-perspective projection, the inner depth variance is ignored in the human body, which means this projection model views the human body as a no-thickness object like a plane. Thus the projection matrix should be as follows:
+\begin{equation}
+\small
+\begin{bmatrix}
+  f&  & \\
+  &f  & \\
+  &  &1
+\end{bmatrix}\begin{bmatrix}
+ x+T_{x}\\
+ y+T_{y}\\
+z+T_{z}
+\end{bmatrix} = \begin{bmatrix}
+ f(x+T_{x})\\
+ f(y+T_{y})\\
+T_{z},
+\end{bmatrix}\text{, $z=0$},
+\end{equation}
+where $f$ refers to focal length in NDC (Normalized Device Coordinate) space, $x, y, z$ refers to a vertex point on human body mesh, $T_{x}, T_{y}, T_{z}$ refers to translation.
+%
+The weak-perspective camera parameter $(s, t_{x}, t_{y})$, which represents 2D orthographic transformation, is connected  to translation under this focal length by:
+\begin{equation}
+\small
+\begin{bmatrix}
+f(x+T_{x})/T_{z} \\
+f(y+T_{y})/T_{z}
+\end{bmatrix}
+= \begin{bmatrix}
+s(x+t_{x})  \\
+s(y+t_{y}) 
+\end{bmatrix}.\\
+\end{equation}
+Finally, we can get:
+\begin{equation}
+\small
+s \times T_{z} = f\text{, }T_{x} = t_{x}\text{, }T_{y} = t_{y}.
+\label{equation:f_sz}
+\end{equation}
+%
+While the projection of the perspective camera is:
+
+\begin{equation}
+\small
+\begin{bmatrix}
+x_{2D} \\
+y_{2D}
+\end{bmatrix} = \begin{bmatrix}
+f(x+T_{x})/(z+T_{z}) \\
+f(y+T_{y})/(z+T_{z})
+\end{bmatrix}
+= \begin{bmatrix}
+s(x+t_{x})  \\
+s(y+t_{y}) 
+\end{bmatrix}.
+\label{equation:pers_proj}
+\end{equation}
+%
+From~\cref{equation:pers_proj}, if the $z$ gets smaller, the projected $x_{2D}, y_{2D}$ will get larger. This phenomenon causes the closer points on the close-up photographed image to dilate and the farther points to shrink. \textit{Thus, the 3D translation information is projected into the 2D space as a pixel-level distortion on limb, torso, or faces.}. Usually, when the human body is farther than $5~\si{\metre}$, the distortion will be subtle. Under these circumstances, a weak-perspective projection could be used.
+
+Following the weak-perspective assumption, we take the $f=s \times T_{z}$ ($f$ is in NDC space) as an approximation. $T_{z}$ is the translation of the pelvis, which could be viewed as a mean translation of the whole human body. The difference compared to previous methods~\cite{hmr, spec, cliff}
+is that we first estimate the body translation and then calculate the focal length.    
+So we still need to estimate a weak-perspective camera parameter $(s, t_{x}, t_{y})$ to compute the focal length and get the 2D location in the image. Following SPEC~\cite{spec}, we get the $T_{x}, T_{y}$ in the full image from the $t_{x}, t_{y}$ by affine transformation using the bounding box. 
+
+\noindent\textbf{Distortion image.}
+As described in~\cref{chapter:method-camera}, our approach projects the 3D translations of human body points into 2D images as the limbs dilate or shrink. We adopt the $x$-$y$ plane of the pelvis as the reference plane representing a `scale equals 1' plane. When the human is distant from the camera, it can be approximated as a zero-thickness plane, where all distortion scales are 1. And as shown in~\cref{equation:pers_proj}, distortion scales are inversely proportional to the z-distance from the camera when the body is closer. To quantify limb distortion caused by perspective projection, we introduce a distortion image $I_d$, where $I_d= T_z / I_{Depth}$. $I_{Depth}$ indicates depth image. The distorted image and its pixel value enable a visual and numerical representation of the limb dilation or shrinkage caused by the perspective camera. For instance, when the pelvis is fixed, a finger can appear twice as dilated when $z$ of the finger reaches from \SIrange{1}{0.5}{\meter}.
+%
+% \SI{6.4e6}{\mm}
+
+\subsection{Network Structure}
+\label{chapter:net_structure}
+
+Given a monocular image, \Ours applies an off-the-shelf Convolution Neural Network, \eg~\cite{resnet,hrnet}, as image encoder, the output multi-level features can be used as input for the translation module and mesh reconstruction module.
+
+\noindent\textbf{Translation module.} As shown in~\cref{fig:pipeline}, we estimate the distortion image $I_{d}$ and IUV image $I_{IUV}$ with an FPN~\cite{FPN} structure. It is easier to train the image-to-image task by using them as an intermediate representation than directly regress the $T_{z}$. 
+Another advantage is that we can distillate the real important information for translation estimation without background context.
+As noted in~\cref{chapter:method-camera}, the distortion type corresponds to one certain translation, and the distortion is determined when the image was captured, whether or not cropped or rotated afterwards. So we further warp the distorted image into the continuous UV space~\cite{decomr} to eliminate the 2D scale, shift, and rotation. 
+%
+We represent $T_{z}$ as a learnable embedding.
+A $1\times1$ convolution is first applied to up-sample the channels of the warped distortion image. Then cross-attentions~\cite{transformer} is performed between the warped distortion feature and z-axis embedding, with a fully connected layer to regress the $T_{z}$. Note that we use sigmoid then $\times10$ to restrict the $T_{z}$ from 0\si{\metre} to 10\si{\metre}.
+%
+Following SPEC~\cite{spec}, we get $T_{x}$ and $T_{y}$ by applying affine transform on the estimated $t_{x}, t_{y}$ with ground-truth bounding boxes (See Sup. Mat. for more details).
+%
+The loss function of the translation module formulates as follows:
+\begin{equation}
+\small
+\mathcal{L}_{Transl} = \lambda_{IUV}\mathcal{L}^{2}_{IUV} + \lambda_{d}\mathcal{L}^{2}_{d}  + \lambda_{z}\mathcal{L}^{1}_{z},
+\end{equation}
+where $\mathcal{L}_{IUV}^{2}$ terms $\mathcal{L}2$ loss of IUV image, $\mathcal{L}_{d}^{2}$ terms $\mathcal{L}2$ loss of distortion image, and $\mathcal{L}_{z}^{1}$ terms $\mathcal{L}1$ loss of z-axis translation. 
+
+
+% \label{chapter:method-vhead}
+\noindent\textbf{Mesh reconstruction module.} 
+Different from previous methods using graph convolutions~\cite{graphcmr} or transformers~\cite{fastmetro, meshgraphormer} to build long-range dependence among the different vertices, we adopt a light-weight MLP-Mixer~\cite{mlpmixer} structure to model the attention among different vertices, following a fully connected layer to lift per-vertex position features $F_vp$ from the spatial feature~$F_{grid}$ which was used to predict $I_{IUV}$. 
+%
+As illustrated in~\cref{fig:pipeline}, since the distortion feature has already been warped into UV space, we could easily sample the per-vertex distortion feature $F_vd$ from the warped distortion feature $F_d$ by pre-defined Vertex UV coordinates $V_{uv}$~\cite{decomr}.
+ We concatenate $F_vd$ with $F_vp$ and use fully connected layers to regress the coarse mesh of $431$ vertices. 
+ %
+The coarse mesh is up-sampled using two fully connected layers, resulting in an intermediate mesh with $1,723$ vertices and a full mesh with $6,890$ vertices. 3D joint coordinates are obtained using a joint regression matrix provided by the SMPL~\cite{smpl} body model.
+% 
+The total loss for the mesh reconstruction module is:
+\begin{equation}
+\small
+\begin{split}
+\mathcal{L}_{Mesh} = \lambda_{J_{3D}}\mathcal{L}^{1}_{J_{3D}} + \lambda_{J_{2D}^{P}}\mathcal{L}^{1}_{J_{2D}^{P}} + \lambda_{J_{2D}^{W}}\mathcal{L}^{1}_{J_{2D}^{W}}\\ + \lambda_{V}(\mathcal{L}^{1}_{V^{''}}+\mathcal{L}^{1}_{V^{'}}+\mathcal{L}^{1}_{V}) ,
+\end{split}
+\end{equation}
+where $\mathcal{L}^{1}_{J_{3D}}$ terms $\mathcal{L}$1 loss of 3D joints, $\mathcal{L}^{1}_{V^{''}}$, $\mathcal{L}^{1}_{V^{'}}$ and $\mathcal{L}^{1}_{V}$ terms $\mathcal{L}$1 loss of coarse, intermediate vertices, and full vertices respectively. $\mathcal{L}^{1}_{J_{2D}^{P}}$ and $\mathcal{L}^{1}_{J_{2D}^{W}}$ represents loss of perspective and weak-perspective re-projected 2D joints, and will be further illustrated in~\cref{chapter:method-loss}.
+
+\subsection{Hybrid Re-projection Supervision}
+% \paragraph{Translation Head Loss Function.}
+
+% As shown in~\cref{equation:f_sz}, $f=s\times T_{z}$, 
+
+Most existing methods~\cite{hmr, cliff, fastmetro} usually use a pre-defined focal length $f$. SPEC~\cite{spec} train a CamCalib network to estimate the focal length.
+%
+Then, z-axis translation $T_{z}$ can be calculated by $T_{z} = 2f/hs$ .
+%
+On the contrary, as illustrated in~\cref{equation:f_sz}, we aim to get the focal length $f$ by directly predicting the orthographic scale $s$ and z-axis translation $T_{z}$. Following HMR~\cite{hmr}, we still use the weak-perspective projection besides perspective projection. 
+
+\noindent\textbf{Weak-perspective re-projection.}
+For weak-perspective projection loss, we follow HMR~\cite{hmr}, use focal length $ f_{W}$ as $5,000$ pixels, and thus formulate the weak-perspective intrinsic matrix and translation separately as:
+
+
+\begin{equation}
+\small
+ \mathit{K}_{W} =\begin{bmatrix}
+ f_{W} &  & h/2\\
+  &   f_{W} & h/2\\
+  &  & 1
+\end{bmatrix}\text{, }
+\mathit{T_{W}} = \begin{bmatrix}
+   t_{x}  \\
+  t_{y} \\
+ 2f_{W}/sh
+\end{bmatrix}.
+\end{equation}
+%
+Then we project the 3D joints $\hat{J}_\mathit{3D}$ and measure the difference with 2D keypoints in image coordinates as: 
+
+\begin{gather}
+\small
+    \hat{J}_\mathit{2D}^{W} = K_{W}(\hat{J}_\mathit{3D}^{\otimes} + T_{W}),
+\\
+\mathcal{L}_{\mathit{2D}}^{W} = \sum_{i=1}^{N_{j}} \frac{1}{d_{J[i]}}\| \hat{J}_\mathit{2D}^{W}[i] \; - \; J_\mathit{2D}^{im}[i] \|_F^1,
+\label{eq:weak_loss}
+\end{gather}
+%
+where \textit{{ $\hat{J}_\mathit{3D}^{\otimes}$} means we detach the gradient from the body model joints in weak-perspective projection.} This means we only update the weak-perspective camera $(s, t_{x}, t_{y})$ and do not want this wrong projection to harm the body pose gradient flow. $(s, t_{x}, t_{y})$ are mainly used to locate the human body's position in image coordinates and compute the focal length ${f_{P}}$. For better position alignment, we divide a distortion weight $d_{J[i]}$, which is sampled from distortion image $I_{d}$ by $J^{im}_{2D}[i]$ for every joint. This forces the dilated limbs to get a smaller weight while the shrunk limbs get a bigger weight.
+
+\paragraph{Perspective re-projection.}
+\label{chapter:method-loss}
+The projection loss uses perspective and weak-perspective re-projection loss simultaneously.
+We have 3D joints by $\hat{J}_\mathit{3D} = \mathcal{J}_{reg}V$.
+% $\hat{J}_\mathit{3D} = \mathcal{M}(\theta, \beta)$. 
+We use ground-truth focal length $ f_{P}$ to stabilize the training. For samples without ground-truth focal length, we will use a focal length of $1,000$ pixels for 224$\times$224 images. This will make the translation range approximately from 5 to 10 meters. During inference, according to ~\cref{equation:pers_proj}, we compute the focal length in screen space for perspective projection by $ f_{P} = shT_{z}/2$ pixels, where $h$ terms cropped image height, equals 224 pixels in our setting. Thus we can formulate the perspective intrinsic matrix $\mathit{K}_{P}$ and projected 2D joints $\hat{J}_\mathit{2D}^{P}$ as:
+\begin{gather}
+\small
+\mathit{K}_{P} =\begin{bmatrix}
+ f_{P} &  & H/2\\
+  &   f_{P}  & H/2\\
+  &  & 1
+\end{bmatrix}, 
+\hat{J}_\mathit{2D}^{P} = K_{P}(\hat{J}_\mathit{3D} + T_{P}^{\otimes}),
+\label{eq:project}
+\end{gather}
+%
+where $\mathit{T_{P}^{\otimes}}$ terms the translation estimated by translation head in~\cref{chapter:net_structure}. We detach it as well to avoid the alignment conflicting of two re-projection.
+%
+We project the 3D joints $\hat{J}_\mathit{3D}$ and measure the difference with the original 2D keypoints in the image coordinates before cropped. 
+
+

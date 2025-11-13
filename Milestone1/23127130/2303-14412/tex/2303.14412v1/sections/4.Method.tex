@@ -1,0 +1,75 @@
+\section{Proposed Method}\label{sec:method}
+\input{figures/Fig2-framework}
+\input{figures/Fig3-RCA}
+We propose a framework of FLIS (FreestyleNet) by leveraging the pre-trained text-to-image diffusion network: Stable Diffusion~\cite{rombach2022high}. An overview of our method is presented in Figure~\ref{fig:framework}. The original Stable Diffusion adopts a text encoder of CLIP~\cite{radford2021learning} to extract text embeddings from the input text and then injects them into a diffusion model through cross-attention to perform generation. Starting from a noise $x_{T}$, the reverse diffusion is performed using a denoising U-Net inside the model for $T$ time steps to generate the final result $x_{0}$. To empower Stable Diffusion with the ability of synthesizing images on a specified layout, we propose a Rectified Cross-Attention (RCA) to integrate the layout in each cross-attention layer of the U-Net. 
+In the following, we will elaborate on 1) how to rectify the pre-trained text-to-image diffusion model in the context of FLIS, and 2) how to further exploit the freestyle capability of the rectified diffusion model for FLIS.
+
+\subsection{Rectifying Diffusion Model}\label{sec:method_sub1}
+
+We propose to rectify the pre-trained diffusion model to facilitate FLIS. The rectification is performed by: 1)~representing semantics by using text embeddings, 2)~injecting semantics to layout through the proposed RCA, and 3)~fine-tuning the diffusion model on layout-based training data.
+
+\noindent\textbf{Representing Semantics.} The rich semantics learned in the pre-trained text-to-image model lie in the textual space. To deploy them for FLIS, we need to represent the desired semantics by texts.
+%
+Here we provide a simple yet effective solution. We first describe each semantic (\eg, an object class from COCO-Stuff~\cite{caesar2018coco}) with a word (\eg, ``cat") or several words (\eg, ``teddy bear"), which we call a \textit{concept}.
+% 
+Then, we stack all \textit{concepts} corresponding to the classes appeared in the input semantic layout (``sky mountain snow person" in Figure~\ref{fig:framework}), and input them into the text encoder. The resulting text embeddings serve as the semantics to perform the following generation. 
+
+\noindent\textbf{Injecting Semantics to Layout.}
+Given the text embeddings (\ie, semantics), the next step is to inject the semantics into the input layout. 
+%
+However, it is not intuitive how to achieve that on a pre-trained text-to-image diffusion model.
+
+%
+Before diving into our solution, we elaborate the cross-attention layer in this pre-trained model.
+%
+The cross-attention layer takes two inputs: text embeddings and image features. It calculates an attention map between them, and outputs a weighted sum on the text values using the weights on the attention map.
+Each channel of the attention map is related to a text embedding. For instance, we can find the channel corresponding to a text embedding extracted from the word ``cat''. The spatial layout of this cat in the generated image is similar to this channel, as concluded in \cite{hudson2021generative,hertz2022prompt}. Therefore, by modifying this channel, we can change the shape and location of this cat in the generated image. 
+Inspired by this, we propose a Rectified Cross-Attention (RCA) to integrate the input layout into the image generation process. 
+The idea of RCA is to rectify the attention maps of each text embedding using the corresponding mask. In this way, it determines the spatial layout of the generated image.
+
+As illustrated in Figure~\ref{fig:RCA}, the input to RCA consists of three parts: input image feature, text embeddings, and layout. RCA computes image queries $Q$, text keys $K$, and text values $V$ through three projection layers, respectively. After that, attention score maps $\mathcal{M}$ are calculated as:
+\begin{equation}
+  \mathcal{M}=\frac{QK^T}{\sqrt{d}}\in\mathbb{R}^{C\times H\times W},
+  \label{eq1}
+\end{equation}
+where $d$ is the scaling factor that is set as the dimension of the queries and keys, and $C$, $H$, $W$ are the channel number, height, and weight of $\mathcal{M}$, respectively. Next, we utilize the layout to constrain the spatial distribution of the attention maps by rectifying the attention.
+
+We translate the input one-channel semantic layout into a $C$-channel layout, where each channel is a binary map for an individual \textit{concept}. 
+For the text embedding corresponding to the \textit{concept}, we use its associated semantic mask as the binary map. 
+%
+For other embeddings, \eg, paddings, we set the values on the binary map to $1$. 
+%
+To match the spatial size of the attention score maps $\mathcal{M}$, we resize the $C$-channel layout to obtain $L\in\mathbb{R}^{C\times H\times W}$. $\mathcal{M}$ is then rectified by:
+\begin{equation}
+  \widehat{\mathcal{M}}^{k}_{i,j}= \begin{cases}
+  \mathcal{M}^{k}_{i,j}, & L^{k}_{i,j} = 1, \\
+  -inf, & L^{k}_{i,j} = 0,
+  \end{cases}
+\label{eq2}
+\end{equation}
+where $\mathcal{M}^{k}_{i,j}$ and $L^{k}_{i,j}$ denote the values at position $(i,j)$ in the $k$-th channels of $\mathcal{M}$ and $L$, respectively. $\widehat{\mathcal{M}}$ represents the rectified attention score maps. Thereafter, we can calculate the output image feature $\mathcal{O}$ of this RCA layer by:
+\begin{equation}
+  \mathcal{O}=\text{softmax}(\widehat{\mathcal{M}})V.
+  \label{eq3}
+\end{equation}
+
+After applying softmax, the rectified attention map becomes a binary map with the spatial distribution similar to the input layout. Using this map, the model forces each text embedding to affect only pixels in the region specified by the input layout. In other words, the semantics from the text are injected to the layout.
+
+\noindent\textbf{Model Fine-tuning.} Equipped with the proposed RCA, the pre-trained diffusion model can be fine-tuned on any sets of layout-based training data.
+%
+The objective for fine-tuning is the same as that for pre-training (image denoising)~\cite{rombach2022high}:
+\begin{equation}
+  \mathcal{L}(\theta)=\mathbb{E}_{z,l,y,\epsilon\sim\mathcal{N}(0,1),t}\Bigl[\lVert\epsilon-\epsilon_{\theta}(z_{t},t,l,c_{\phi}(y))\rVert_{2}^{2}\Bigr],
+  \label{eq4}
+\end{equation}
+where $z$ is the latent code extracted from the input image, $l$ is the input layout, $y$ is the input text, $\epsilon$ is a noise term, $t$ is the time step, $\epsilon_{\theta}$ is the denoising U-Net, $z_{t}$ is the noisy version of $z$ at time $t$, and $c_{\phi}$ is the text encoder. We merely fine-tune the denoising U-Net while keeping the text encoder and the autoencoder of Stable Diffusion frozen. We refer readers to the original paper of Stable Diffusion~\cite{rombach2022high} for the training details.
+
+\subsection{Generating Freestyle Images}\label{sec:method_sub2}
+\input{figures/Fig4-myResults}
+The fine-tuned diffusion model is endowed with the ability to synthesize images given both layouts and texts. By describing the desired semantics in the input text, we generalize the model by excavating its pre-trained knowledge to perform freestyle layout-to-image synthesis. Here we showcase three capabilities of the proposed model for FLIS as well as the mechanisms behind them.
+
+\noindent\textbf{Binding New Attributes.} Having a layout that contains an object of interest (\eg, cat), one may further want to generate a specific species of cat (\eg, tabby cat). In this scenario, we first replace ``cat" with ``tabby cat" in the text input. Then, following \cref{eq2}, we adopt the binary map of the input layout $L$ (corresponding to the region you want to place this tabby cat) to rectify the two attention score maps, which are related to ``tabby" and ``cat" respectively.
+
+\noindent\textbf{Specifying the Style.} We can render a given image in the desired style by adding a description (\eg, ``an ink painting of") to the input text. Since we aim to specify the global style of the generated image, the attention score maps corresponding to these added words are not rectified.
+
+\noindent\textbf{Generating Unseen Objects.} Benefiting from the general knowledge learned from the pre-training phase, our model is able to generate objects from unseen classes. This is achieved by simply describing the object in the text input and rectifying the corresponding attention map through \cref{eq2} with the layout related to this object.

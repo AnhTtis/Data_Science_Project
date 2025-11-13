@@ -1,0 +1,106 @@
+\section{Proposed Model}
+\label{sec:model}
+
+
+In this section, we describe our proposed speech codec consisting of four components: an encoder, a residual quantizer, an AudioLM block, and a decoder. The encoder, residual quantizer, and decoder follow similar structures from SoundStream. 
+% Please refer to~\cite{zeghidour2021soundstream} for complete details on SoundStream. 
+At the very high level, the encoder takes raw speech in the time domain as an input and extracts low-rate features that contain sufficient information to reconstruct the speech. The residual quantizer finds discrete representations of the inherently continuous encoded features. AudioLM poses the modeling of the quantized discrete representation as a language modeling problem and estimates the probability distribution of the next discrete audio token given previous audio tokens. Finally, the decoder reconstructs the input speech signal from the discrete encoded features.
+
+\subsection{SoundStream}
+
+We now briefly describe the SoundStream model \cite{zeghidour2021soundstream} that we used for creating high-quality audio tokens.
+
+\subsubsection{Encoder}
+Given a raw speech signal $\mathbf{x} \in [-1,1]^T$ of length $T$, the encoder $\mathcal{E}: [-1,1]^T \rightarrow \mathbb{R}^{T_e \times N_e}$ creates a sequence of embeddings of length $T_e \ll T$, each with dimension $N_e$. In our proposed model, the encoder takes raw waveform speech at $T = \SI{16}{kHz}$ as input and generates $N_e=128$ dimensional speech features with a frame rate of $\SI{50}{Hz}$. The architecture of the encoder is fully convolutional based on causal 1D convolutions. Hence, the algorithmic delay is determined by the overall striding factor (i.e., $T/T_e = 320$ samples or \SI{20}{ms}).
+
+\subsubsection{Residual Vector Quantizer (RVQ)}
+
+Transmission of continuous speech features over low-bandwidth channels is achieved via vector quantizers (VQs) \cite{zeghidour2021soundstream}, where the features are turned into discrete representations while introducing minimal distortion. Given the encoded features $\mathbf{e} \in \mathbb{R}^{T_e \times N_e}$, the residual quantizer $\mathcal{Q}: \mathbb{R}^{T_e \times N_e} \rightarrow \{0, \ldots, 2^{\lceil\log N_c\rceil}\scalebox{1.75}[1.0]{\text{-}}1\}^{T_e \times N_q}$ computes the corresponding binary representation of $\mathbf{e}$ and its inversion, where $N_q$ is the number of quantizers and $N_c$ is the codebook size of a single quantizer. In our proposed model, we always use the codebook of size $N_c = 2^{10}$ and vary the number of layers in the residual VQs: $N_q \in \{3,4,6,12,24\}$.
+
+
+\subsubsection{Decoder}
+
+The decoder $\mathcal{D}\!:\!\, \mathbb{R}^{T_e \times N_e} \rightarrow [-1,1]^T$ synthesizes the original speech signal from the post-quantized embeddings. In our work, we adopt the CNN-based decoder method trained with adversarial loss in addition to losses on waveform and spectral domains. The architecture of the decoder is similar to that of the encoder, with a transposed convolutional layer to upsample the output. The adversarial training framework relies on two types of discriminators: waveform domain and short time Fourier Transform (STFT) domain discriminators.
+
+\subsection{AudioLM}
+
+
+\begin{figure}
+    \captionsetup{belowskip=-10pt}
+    \centering
+    \begin{subfigure}[b]{0.26\textwidth}
+         \centering
+         \includegraphics[clip, trim=0 0 0 0,height=3.9cm]{diagrams/visqol.pdf}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.21\textwidth}
+        \centering
+        \includegraphics[clip, trim=0 0 0 0, height=3.9cm]{diagrams/final_ssl_mos.pdf}
+    \end{subfigure}
+    \caption{Objective evaluation of different LMCodec models. (left) LMCodec with a fixed number of RVQ layers (i.e., $N_\mathcal{C}+N_\mathcal{F} = 12$) on various standard metrics. (right) LMCodec with $N_\mathcal{C}+N_\mathcal{F} \in \{6,12,24\}$ on SSL-MOS \cite{cooper2022generalization}. Numbers next to the markers refer to the number of coarse-level codes $N_\mathcal{C}$.}
+    \label{fig:objective_eval}
+\end{figure}
+
+
+In this subsection, we describe the problem of language modeling of SoundStream tokens. Adding a language model in the bottleneck enables interesting modeling tasks, including modeling the distribution of future SoundStream tokens (Section \ref{sec:coarse-audiolm}) or tokens at different VQ layers (Section \ref{sec:fine-audiolm}).
+
+For the rest of this paper, let $N_{\coarse}$ and $N_{\fine}$ denote the number of quantizers for the coarse-level and fine-level AudioLMs, respectively. Figure \ref{fig:overall} shows the overall architecture of our proposed model, in which we use $N_{\coarse} = 4$ and $N_{\fine} = 8$. In our experiment, we use various combination of $(N_\mathcal{C}, N_\mathcal{F})$ ranging from $N_\mathcal{C} + N_\mathcal{F} = 3$ to $N_\mathcal{C} + N_\mathcal{F} = 24$. Additionally, let $c^{(n)}_{k}$ denote the SoundStream token at frame $n$ and VQ layer $k$.
+
+\subsubsection{Coarse-level AudioLM\label{sec:coarse-audiolm}}
+
+The goal of the coarse-level AudioLM is to model the distribution of the next coarse SoundStream tokens. Specifically, we are interested in modeling the conditional distribution of the next SoundStream tokens given the past information 
+\begin{equation}
+p_{\coarse}\Big(c^{(n)}_{k} \Bigm| \underbrace{c^{(n)}_{k-1}, \ldots, c^{(n)}_{1}}_{\text{coarse-level current frame}}, \underbrace{c^{(n-1)}_{N_\coarse}, \ldots, c^{(1)}_{1}}_{\text{past information}}\Big)
+\end{equation}
+for $k \in \{1, \ldots, N_\coarse\}$.
+
+Given the distribution of the future SoundStream tokens, we build a codec by using lossless Entropy Coding (Section \ref{sec:entropy_coding}). More specifically, the discrete probability distribution of SoundStream tokens can be estimated both at the sender and the receiver sides, and we use this to drive an entropy codec. Note that in our proposed method, we only need to transmit $N_{\coarse}$ tokens per single audio frame. The remaining $N_{\fine}$ tokens are generated at the receiver side only as described in the next section.
+
+\subsubsection{Fine-level AudioLM\label{sec:fine-audiolm}}
+Similar to the coarse-level AudioLM, the fine-level AudioLM predicts the top VQ layers given the information about bottom VQ layers in addition to the past information. Specifically, we are interested in modeling the distribution of the fine-level SoundStream tokens conditioned on the coarse-level tokens and the past information:
+\begin{equation}
+\resizebox{.9\hsize}{!}{$p_{\fine}\Big(c^{(n)}_{k} \Bigm| \underbrace{c^{(n)}_{k-1}, \ldots, c^{(n)}_{N_\coarse+1}}_{\text{fine-level current frame}}, \underbrace{c^{(n)}_{N_\coarse}, \ldots, c^{(n)}_{1}}_{\text{coarse-level current frame}}, \underbrace{c^{(n-1)}_{N_\coarse + N_\fine}, \ldots, {c}^{(1)}_{1}}_{\text{past information}}\Big)$}
+\end{equation}
+for $k \in \{N_{\coarse}+1, \ldots, N_{\coarse} + N_{\fine}\}$. Note that our model is causal, in contrast to AudioLM.
+
+Since we only transmit the coarse-level tokens, we model the distribution of the fine-level tokens by assuming that we have access to ground-truth coarse-level SoundStream tokens. We note that, while \cite{borsos2022audiolm} also proposes a similar fine-level AudioLM stage, our contribution here is the causal formulation of the task, which makes our approach more suitable and amenable to online decoding.
+
+\subsection{Entropy Coding (EC)\label{sec:entropy_coding}}
+
+Given the distribution of coarse-level SoundStream tokens, we transmit data by using entropy coding, a lossless data compression technique. In this work, we provide experimental results using Huffman coding, in addition to the estimated entropy rate. We treat each code from the residual VQs separately and do not perform any grouping to reduce the upper bound on the bitrate.
+
+\begin{figure}
+    \centering
+    \captionsetup{belowskip=-13pt}
+    \centerline{\includegraphics[clip, trim=3.5cm 0.5cm 3.2cm 2.2cm, width=8cm]{diagrams/distribution.pdf}}
+    \caption{Distribution of codes prediction for inputs from the non-voice section and inputs from the middle of phonemes }
+    \label{fig:audio-output}
+\end{figure}
+
+We first note that our proposed codec requires only sending coarse-level SoundStream tokens using entropy coding. Specifically, given raw audio, LMCodec first encodes audio into SoundStream tokens and models the probability distribution of the next SoundStream tokens, driving the entropy codec. 
+Note that the discrete probability distribution of SoundStream tokens can be estimated both at the sender and the receiver sides, so the receiver can losslessly reconstruct the coarse tokens. 
+To generate audio output from only coarse-level tokens, we use a fine-level AudioLM to synthesize fine-level tokens from the transmitted coarse-level tokens and then generate audio from both coarse-level and fine-level tokens using \linebreak SoundStream decoder.
+
+
+
+\subsection{Training Strategy}
+
+We adopt a 2-stage training paradigm. First, we train only the encoder, quantizer, and decoder. Then, we freeze the weights of these components and train only the AudioLM components. We train the coarse-level and fine-level AudioLM models separately.
+
+\subsubsection{Loss Functions}
+
+We trained the SoundStream model using the standard adversarial loss, feature matching loss, reconstruction loss, and quantization loss according to \cite{zeghidour2021soundstream}. In training AudioLM models, we use the standard cross-entropy loss for language modeling over the vocabulary space.
+
+\subsubsection{Training configurations}
+
+To create our codec modules, we adapted the architectures of the encoder, quantizer, generator, and discriminators used in SoundStream \cite{zeghidour2021soundstream} and AudioLM from \texttt{T5X}. Both AudioLM models are the decoder-only models based on the \texttt{base} model of \texttt{t5.1.1} (with approximately 250 million parameters).
+% pre-trained on multilingual C4 dataset \cite{raffel2020exploring}.
+
+
+The SoundStream model is trained on \SI{16}{kHz} audio from the LibriVox dataset \cite{kearns2014librivox} for 1M steps.
+% using a batch size of \textcolor{red}{???} and \textcolor{red}{optimizer}. 
+Both coarse-level and fine-level AudioLM models are trained on \SI{16}{kHz} audio from the Libri-Light dataset \cite{kahn2020libri} for 1M steps with a batch size of 32 and sequence length of 1024 SoundStream tokens with Adafactor optimizer \cite{shazeer2018adafactor} with a decay rate of 0.8. 
+
+We trained multiple coarse-level and fine-level AudioLM models to achieve varieties of bitrates. The bitrates are calculated based on the entropy coding of codes from coarse-level AudioLM.
+
+
+

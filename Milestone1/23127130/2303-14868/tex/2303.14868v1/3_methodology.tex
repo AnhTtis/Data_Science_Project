@@ -1,0 +1,99 @@
+\iffalse
+There are two main settings for FL, cross-silo and cross-device FL~\cite{mothukuri2021survey}. Specifically, cross-silo FL consists of fewer clients with strong computation and communication overheads. Cross-device FL is the opposite, with hundreds or thousands of clients with much stronger memory, communication, or computational resource limitations. However, from a practical perspective, linear layer leakage is mainly applicable for cross-device FL. For cross-silo FL, modification of the model architecture to place FC layers at the start for leakage is much easier to detect. Detectability is much less feasible for cross-device FL where clients, often just smartphones or edge devices, follow a standard FL protocol. These resource-restricted clients are unable to check their own models or communication between clients to check for model differences. For them, SA can be their strongest and only form of defense. With this setting in mind, we now look at the challenges that linear layer leakage attacks face.
+\fi
+
+\subsection{Requirement for linear layer leakage}
+Linear layer leakage relies on a fundamental requirement. Since the images are leaked from the gradients, the images must be able to be stored in the model gradients. For example, consider a CIFAR-100 image ($32\times32\times3$). In order to store the image in the update, the total number of gradients must be at least $32\cdot32\cdot3=3,072$. For a batch of 64 images, this number would then become $3,072\cdot64=196,608$. If aggregation across 100 clients is added, this would then be $3,072\cdot64\cdot100=19,660,800$ total gradients. These gradients come from the weights connecting the input image to the first FC layer, and the minimum size of the first FC layer would need to be $6,400$ units just to be able to store all image information.
+
+However, this only considers the case where images are stored in the gradients perfectly. In reality, multiple images can activate the same neuron causing overlap as discussed in Section~\ref{sec:related_work}, and in order to maintain a high leakage, the number of neurons must be greater than the total number of images. We find experimentally using the binning approach from Robbing the Fed~\cite{fowl2022robbing}, that if the number of neurons is $4$ times the number of images, we can achieve an overall leakage rate of $70-80\%$ on Tiny ImageNet~\cite{le2015tiny}, MNIST~\cite{lecun1998mnist}, and CIFAR-100~\cite{krizhevsky2009learning}. However, with the previous example, this would be over $78.6$ million gradients, where these gradients would come from the weight parameters of an inserted FC layer at the start of the network. Furthermore, another FC layer would be needed to resize the previous FC layer to the input image size prior to input to the rest of the model. This process then adds another $78.6$ million weight parameters, making the total size about $157.3$ million weights, roughly $13.46\times$ the size of a ResNet-18.
+
+From the previous example, we can see the difficulty in scaling linear layer leakage attacks to the FL setting in terms of model size. An increased model size will exacerbate the fundamental problem of FL: the clients have resource restrictions. This additional overhead will affect all aspects of resource constraints, increasing the memory required for storage and training the model along with the communication and computational costs associated. With a larger model size, receiving the model and sending the update back to the server will be more costly for the client. Similarly, a larger model will result in a longer time to compute the update. Our goal then is to minimize these costs.
+
+\subsection{Single client overhead and sparsity}
+A batch gradient is the average across all gradients of the individual training samples in the batch. Aggregation is done on top of the batch gradients across multiple clients. Following this, the aggregation of client updates can be interpreted as a single large batch aggregation. This leads to the natural perspective of prior work where an attack on an aggregate update is simply an attack on a single large batch. However, there is a key difference between a large batch update and multiple smaller batch updates being aggregated together to make up a single update when approaching from an attack perspective. Specifically, the storage requirement of linear layer leakage for each individual client is not the same as for all clients combined.
+
+For an individual client with a batch size of 64 on CIFAR-100, an FC layer needs to have $786,432$ weight gradients to maintain a 4:1 ratio of neurons to images. This does not change regardless of how many other clients are present. While this is clear for individual client attacks, the application towards SA is much less obvious. Since an attacking server only has access to the aggregate update, the total number of weight gradients must still be large enough to store all images across all clients. However, our concern is with the resource overhead of individual clients. The prior work perspective of treating the aggregate update as a single large batch means each client must take on the full overhead of the total number of images. Despite this, individual clients only actually need enough for their own. 
+
+Hence, we propose the use of sparsity as the primary method for decreasing the resource overhead of linear layer leakage. Given SA, a server can access only the aggregate update, and as a result, the model must still be large enough to contain all images across participating clients. However, each individual client update only needs to be large enough to support their own images. If all added parameters and gradients are zero outside of this small set used for each individual client's images, the properties still hold. Thus, the added parameters for the entire model are large enough to store all images across clients, but individual clients will only have a small set of non-zero parameters. The size of this small set is also irrespective of the number of clients in the aggregation, only needing to scale to the batch size for each individual client. With a high level of sparsity in the model parameters and updates, sparse tensors can be utilized to decrease the resource overhead. Sparse tensors are representations aimed at the efficient storage of data that is mostly comprised of zeroes. We use the COO (coordinate) format, a common sparse representation in PyTorch~\cite{paszke2019pytorch} that stores the indices and values of all the non-zero elements. When non-zero elements make up a small part of the total size, this leads to more efficient memory usage and quicker computation, both desirable traits for FL. Additional compression can also be used on top of sparsity to further decrease communication costs.
+
+\begin{figure}[!t]
+% \vspace*{-2.5mm}
+\begin{center}
+\includegraphics[width=0.9\columnwidth]{images/mandrake_figure.drawio.pdf}
+\end{center}
+\vspace*{-5mm}
+\caption{\label{fig:mandrake_attack} \name attack allows for sparsity by design. The red color indicates non-zero parameters and the white is zeros. The majority of added parameters come from the weights connecting the convolutional layer output and the first FC layer and only $\frac{1}{N}$ of this is non-zero, where $N$ is the number of clients.}
+\vspace*{-5mm}
+\end{figure}
+
+\subsection{Convolutional layer for sparsity}
+\name encapsulates the idea of producing sparsity within the attack design through the additional placement of a convolutional layer in front of the 2 FC layers used by standard linear layer leakage methods~\cite{our2022mandrake}. Figure~\ref{fig:mandrake_attack} shows an attack overview. An input image to the convolutional layer can be directly passed through using a number of kernels equal to the image channels. Each convolutional kernel will push a different input channel forward using weight parameters of all zeros and a single one in the center of a different kernel channel. For a 3-channel image, only 3 convolutional kernels will be required to push the image through.
+
+The addition of a convolutional layer allows another level of attack scalability in the number of convolutional kernels in the model. Particularly, the number of convolutional kernels is chosen based on the number of color channels in the input images, and this scales with the number of clients attacked. If we have 3-channel input images and 100 clients, $3\cdot100=300$ kernels are used. Each client would use a different set of 3 kernels in the convolutional layer to push their images forward. All other kernel parameters can be set to zero. Similarly, only the weight parameters connecting the output of those 3 non-zero kernels to the FC layer will be non-zero. For this connection between convolutional output and the FC layer, the number of non-zero weight parameters would be
+\vspace{-3 pt}
+\begin{equation}\label{eq:2}
+    |\{w_N \text{ s.t. } w_N\neq0\}| = \frac{1}{N} \cdot |w_N|
+\vspace{-3 pt}
+\end{equation}
+\noindent
+where $N$ is the number of clients in aggregation and $|w_N|$ is the total number of weight parameters connecting the convolutional output and FC layer. The number of non-zero weights is also constant regardless of the number of clients
+% \vspace{-3 pt}
+\begin{equation}\label{eq:3}
+    |\{w_N \text{ s.t. } w_N\neq0\}| = |\{w_{N+1} \text{ s.t. } w_{N+1}\neq0\}|
+% \vspace{-3 pt}
+\end{equation}
+\noindent
+For a client batch size of 64 on CIFAR-100, using an FC layer of 256 units results in a leakage rate of $77\%$ using the same binning strategy of~\cite{fowl2022robbing}. The number of non-zero weight parameters between the convolutional output and FC layer would be $(32\cdot32\cdot3)\cdot256=786,432$, only $1\%$ of the number of non-zero parameters compared to prior work. 
+
+Additionally, scaling the convolutional layer means that the FC layer will stay at a fixed size and only scale to the client batch size. This is particularly useful for preventing a size increase in the weights of the second FC layer. Since the second FC layer resizes the output of the previous FC layer (used for leakage) to the size of the input image, naively increasing the size of the first FC layer results in an increase in the same increase in the size of the second. The final design then has these layer sizes. The convolutional layer has $N\times input_{ch}$ kernels, the first FC layer has a number of units equal to batch size $\times$ 4 (the ratio of neurons to images), and the second FC layer has a number of units equal to the input image size. What we then see is that \name has roughly half the total parameters of~\cite{fowl2022robbing} while maintaining the same leakage rate. The number of weight parameters (non-zero and zero) is
+% \vspace{-3 pt}
+\begin{equation}\label{eq:4}
+    |w_N| = dim_{input} \cdot N \cdot |\text{FC layer}| + |\text{FC layer}| \cdot dim_{input}
+% \vspace{-3 pt}
+\end{equation}
+\noindent
+where $dim_{input}$ is the input image size. The $|\text{FC layer}|$ depends on the batch size and does not change regardless of the number of clients. For a batch size of 64, we fix it to be 256 units and achieve a $77\%$ total leakage rate. Increasing or decreasing this layer size further can result in a higher or lower leakage rate and model size respectively.
+
+On the other hand, Robbing the Fed, which achieves prior SOTA in leakage rate and number of additional parameters, adds a total number of $|w_{N,RtF}| = 2\cdot dim_{input} \cdot N \cdot |\text{FC layer}|$ parameters from their method. The value of the size of the FC layer is fixed to be the same as our method in order for comparison. In aggregation, when $N>>1$ we have that $|w_{N,ours}| \approx \frac{1}{2}\cdot |w_{N,RtF}|$. This is considering all zero and non-zero parameters equally for our method. Robbing the Fed does not have non-zero weight parameters, so we also have that $|\{w_{N,ours} \text{ s.t. } w_{N,ours}\neq0\}| \approx \frac{1}{N} \cdot |\{w_{N,RtF} \text{ s.t. } w_{N,RtF}\neq0\}|$.
+
+We did not use the convolutional kernel weights or the biases added during the comparison in the number of parameters, but they are significantly fewer than the weight parameters of the FC layers. For 100 clients, the number of parameters added by the convolutional kernel weights and the layer biases are only $0.01\%$ of the FC layer weights. 
+
+\subsection{Linear layer leakage method}
+While the convolutional layer allows for sparsity and separate leakage between each client, the underlying methodology of the linear layer leakage is still important. We use the binning methodology of Robbing the Fed~\cite{fowl2022robbing} instead of the trap weights in~\cite{boenisch2021curious} since the leakage rate achieved with the same FC layer size is higher for binning. 
+
+The approach of using a convolution layer to separate the weight gradients between clients prevents the FC layer from increasing, but also means we cannot retrieve the individual bias gradients $\frac{\delta L}{\delta B^i}$, as they will be aggregated between clients. However, knowing the bias gradient values are not important for reconstruction. If we know the range of values, we can directly scale the weight gradients. If the images are between [0,1], we can recover the images using only the weight gradients through
+% \vspace{-3 pt}
+\begin{equation}\label{eq:6}
+    x^i_{k} = \frac{abs({\frac{\delta L}{\delta W^i}_k} - \frac{\delta L}{\delta W^{i+1}}_k)}{max(abs({\frac{\delta L}{\delta W^i}_k} - \frac{\delta L}{\delta W^{i+1}}_k))}
+% \vspace{-3 pt}
+\end{equation}
+where we scale the weight gradient such that it has a maximum value of 1. If the ground truth image has a max value of 1, the reconstructed image will be exact. If this is not the case and the maximum is lower, the reconstruction will have a shifted brightness. This approach is described further in~\cite{our2022mandrake} and the images are easily identifiable after the range shift. This process does not cause issues with reconstructions either, with the method still achieving a high SSIM~\cite{wang2004image} and L-PIPS score~\cite{zhang2018unreasonable}.
+
+\subsection{Secure aggregation masking}
+While sparsity allows us to take advantage of the large number of zero parameters in the model, the property becomes difficult to maintain through SA, as a non-sparse mask will be used regardless of whether the individual client update is sparse or not. 
+%From the perspective of SA, the encryption mask needs to cover all parameters. If only the non-zero parameters are encrypted, this allows a server can easily identify which parameters are non-zero.
+\iffalse
+In particular, if the sparsity patterns across the clients do not overlap then the server can learn that the non-zero parameters at a client exist within a particular subset for each individual client, which can leak information about a client's local update and dataset. Recently, an approach was proposed for sparse SA in the case of random overlapping sparsity patterns~\cite{sparse_sa} to ensure no parameter is sent by only a single individual client. However, since the approach of using convolutional layers relies on creating orthogonal sparsity patterns for the client models, it is not suitable in this use case.
+\fi
+Thus, even though the client updates are sparse, SA applies a non-sparse mask on top of the update such that it is encrypted. Since masking removes the property of sparsity from the update, the client incurs a communication overhead when sending the update back to the server which will not be mitigated. For 100 clients with a batch size of 64 on CIFAR-100, the model size that is transmitted from the server to the client by \name is 18.04MB and the update sent back to the server is 303.33MB. Robbing the Fed is larger than both, adding a size overhead of 600.11MB to both ends of communication.
+
+However, while sparsity does not benefit the communication cost when the client sends the update back to the server, it benefits all other aspects of client resource overhead, including when the server sends the model to the client, the storage on the client, and the time for computing the update. The total number of added parameters of \name is also half the size of Robbing the Fed.
+
+\subsection{Broad applicability of sparsity}
+
+Sparsity can help with many forms of attacks with FL. While we use the binning method of~\cite{fowl2022robbing}, sparsity also helps the trap weight methodology~\cite{boenisch2021curious} differently. We find that the baseline attack of trap weights is unable to scale to an increasing number of clients in aggregation. As the total number of images increases, even if the ratio of neurons to images remains the same, the leakage rate will decrease (we refer to the supplement for experiments). However, using the convolutional layer method of \name, the leakage process is separate between clients. This will prevent the leakage rate decrease with an increasing number of clients.
+
+While we previously explored the application of sparsity in linear layer leakage attacks, the idea can be applied to other attacks when scaling to aggregation. For example, sparsity can be used in the same way for the blind-source separation method of Cocktail Party attack~\cite{kariyappa2022cocktail} when scaling to aggregation. This would result in both model size and computation complexity decrease. Using the original method of Cocktail Party, the complexity would be $\mathcal{O}(n\times n)$~\cite{kariyappa2022cocktail}, where $n$ is the total number of images. However, using sparsity would decrease the computational complexity by lowering $n$ from the total number of images to just the batch size of the individual client instead.
+
+Along the same line, sparsity could be brought to gradient inversion to decrease the computational complexity. The original challenge in scaling to aggregation for gradient inversion is that the number of total images is significantly larger. However, sparsity once again can be used to decrease the computational complexity $\mathcal{O}(n\times dim_{input})$, so that $n$ is the client batch size instead of the total number of images. This approach would require model modification to introduce sparsity similar to \name, resulting in a model size increase. However, the storage size benefits of sparsity can also help decrease the overhead.
+
+\iffalse
+\noindent
+Section discussions:
+\begin{itemize}
+    \item Discuss intuition of linear layer leakage
+    \item Resource challenges coming from scaling the attack.
+    \item The difference between single mega-batch and multiple smaller batches aggregated
+    \item Design from the perspective of sparsity
+\end{itemize}
+\fi

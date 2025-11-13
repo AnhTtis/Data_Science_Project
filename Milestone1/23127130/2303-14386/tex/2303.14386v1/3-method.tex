@@ -1,0 +1,134 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{\algname{}}
+
+We first reconfigure the decoding procedure of DETR to leverage the CLIP embeddings as its class prompts. Next, we propose an efficient way of ensembling with CLIP using RoI-based masked attention and RoI pruning.  
+
+\subsection{Prompt-based Decoding}
+
+Our first objective is designing a highly efficient decoding pipeline for an end-to-end Transformer-based open-vocabulary detector. To achieve this, we propose the concept of \emph{prompt-based decoding}. Similar to OV-DETR\,\cite{zang2022open}, our approach involves selecting either an image embedding ${\bf e^{img}}$ or a text embedding ${\bf e^{txt}}$ from CLIP to provide prior information about the classes that the decoder detects. However, we take this approach further by treating the two embeddings as \emph{class prompts}. These prompts modifies object queries ${\rm Q}$ in real-time via self-attention, enabling them to instantly detect class objects specified by the prompts. 
+
+
+\begin{figure}[t!]
+\begin{center}
+\includegraphics[width=8.6cm]{figures/method/matching.pdf}
+\end{center}
+\vspace*{-0.25cm}
+\hspace*{1.0cm}{\small (a) OV-DETR.} \hspace*{2.3cm}{\small (b) Prompt-OVD.}
+\vspace*{-0.15cm}
+\caption{Difference in label assignment after decoding, where \# of classes $k$ is 4 and \# of object queries $m$ is 3. }
+\label{fig:decoding}
+\vspace*{-0.3cm}
+\end{figure}
+
+\smallskip\smallskip
+\noindent\textbf{Decoding.} The decoder in DETR is a structure of alternating self-attention and cross-attention modules in each layer. Thus, we prepend the CLIP embedding as the prompts to the self-attention module of every decoding layer,
+\begin{equation}
+\begin{gathered}
+{{\rm Q}_{l}^{\prime} = {\rm SelfAttn}_{l}([ {\rm \mathbb{F}}_{\rm proj}({\rm {\bf e}_{clip}^{mod}}) ; {\rm Q}_{l}])} \in \mathbb{R}^{m \times d}\\
+{\rm mod} \in {\rm \{txt, img\}},
+\label{eq:self_attn}
+\end{gathered}
+\end{equation}
+where $\mathbb{F}_{\rm proj}$ is the projection layer to ensure that the CLIP embedding dimension $d^{\prime}$ matches the Transformer's embedding dimension $d$. In Eq.\,\eqref{eq:self_attn}, we prepend only a single clip embedding for simplicity, but multiple clip embeddings of different classes can be prepended in a batch (e.g., 10 prompts for 10 different classes). This results in the object queires ${\rm Q}^{\prime}$ becoming \emph{class-agnostic} for the classes given by prompts. They are then fed as input to the cross-attention module in the same layer, aggregating key contents from the encoder output ${\rm I}_{L}$ to represent objects,
+\begin{equation}
+\begin{gathered}
+{{\rm O}_{l} = {\rm CrossAttn}_{l}({\rm Q}_{l}^{\prime}, {\rm I}_{L})} \in \mathbb{R}^{m \times d}.
+\end{gathered}
+\end{equation}
+The object embeding ${\rm O}_{l}$ is also used as the object query ${\rm Q}_{l+1}$ to the next layer and, therefore, the final object embedding ${\rm O}_{L}$ is the output of the last decoding layer.  
+
+
+%  @@@@@@@ need to say in teraining -> only visible class are given as prompt / while in testing all the class (base + nobel) will be given @@@@@
+
+
+\smallskip\smallskip
+\noindent\textbf{Prediction.} Figure \ref{fig:decoding} contrasts the difference in label assignment after decoding of OV-DETR and \algname{}. Specifically, OV-DETR forces all the object queries to be class-specific for {binary} classification, which requires input query tokens\,(i.e., the input of Transformer decoding layers) whose number is linearly proportional to the number of detected classes. For example, when using LVIS data with 1,203 classes, it requires $1,203 \times m$ object embeddings where $m = 1,500$ by default. On the other hand, \algname{} uses class-agnostic queries with prompts, which turns binary classification into a \emph{multi-label} classification.\footnote{Multi-label classification is a generalization of multi-class classification. Here, the labels are nonexclusive and there is no constraint on how many of the classes each RoI (bounding box) can include.} This requires only $m$ object embeddings but having identical number of predictions, i.e., $k \times m$. As for the box regression, each object embedding produces a single bounding box.
+
+\subsection{Ensemble with ViT-based CLIP}
+
+\begin{figure}[t!]
+\begin{center}
+\includegraphics[width=8.6cm]{figures/method/attention.pdf}
+\end{center}
+\vspace*{-0.5cm}
+\caption{Attention mask generation with RoIs. }
+\label{fig:masks}
+\vspace*{-0.4cm}
+\end{figure}
+
+
+Our second objective is to improve the classification performance on base and novel classes by utilizing the \emph{zero-shot} classification ability of the ViT-based CLIP. Let ${\rm \hat{B}_{det}}=\{{\bf b}_1, \dots {\bf b}_{m}\}$ denote the set of $m$ bounding boxes predicted by the prompt-based decoding as in Eq.\,\eqref{eq:prediction}. For zero-shot classification, a naive approach is repeatedly inferring on the cropped image for all RoIs as: 
+\begin{equation}
+\forall_{1 \leq i \leq m} {\bf e}^{\rm img}_{i} = {\rm CLIP}_{\rm img}\big({\rm Crop}({\bf x}, {\bf b}_i)\big)\in \mathbb{R}^{d^{\prime}},
+\label{eq:iter_infer}
+\end{equation}
+and calculation of cosine similarity between the embedding ${\bf e}^{\rm img}_{i}$ of the $i$-th cropped image and text class embeddings ${\bf e}^{\rm txt}_{y}$, returning class prediction probabilities as:
+\begin{equation}
+\begin{gathered}
+{\rm \hat{P}}_{\rm clip} = [\hat{\bf p}_{1}, \dots, \hat{\bf p}_{m}] \in \mathbb{R}^{m \times k}\\
+\!\!\!\hat{\bf p}_{i}\! = \!{\rm Softmax}\big( \frac{1}{\tau} [ {\rm cos}({\bf e}^{\rm img}_{i}, {\bf e}^{\rm txt}_{1}), \dots, {\rm cos}({\bf e}^{\rm img}_{i}, {\bf e}^{\rm txt}_{k}) ] \big), \!\!\!
+\end{gathered}
+\end{equation}
+where $\tau$ is the temperature on the logits. 
+
+
+
+Inspired by \cite{kuoopen2023fvlm}, we combine the CLIP class probabilities with the detection class probabilities to improve overall classification performance. The final class probabilities are given by: 
+\begin{equation}
+\!\!\!\!{\rm {P}}_{\rm final}{[\cdot, j]}\!= \!
+\begin{cases}
+\alpha {\rm {P}}_{\rm det}{[\cdot, j]} + (1\!-\!\alpha) {\rm {P}}_{\rm clip}{[\cdot, j]} &\!\!\!\! \text{if $j \in C_{B}$}\!\!\!\!\!\! \\
+\beta {\rm {P}}_{\rm det}{[\cdot, j]} + (1\!-\!\beta) {\rm {P}}_{\rm clip}{[\cdot, j]}  &\!\!\!\! \text{if $j \in C_{N}$},\!\!\!\!\!\!
+\end{cases}
+\label{eq:ensemble}
+\end{equation}
+where $[\cdot, j]$ is the index for the $j$-th class column in the probability matrix ${\rm P} \in \mathbb{R}^{m \times k}$; $C_B$ and $C_N$ are the set of base and novel classes; and $\alpha, \beta \in [0, 1]$ control the probability weights for base and novel classes, respectively. This ensemble approach helps mitigate the classification performance gap between base and novel classes in open-vocabulary detection because novel classes benefit much more than base classes. The analysis can be found demonstrated in Section \ref{sec:abl_study}.
+
+% here, write the equation of how to ensemble.
+% say the details about the two techniqes belwo
+
+\subsubsection{RoI-based Masked Attention} 
+
+
+
+The iterative inference of Eq.\,\eqref{eq:iter_infer} harms the efficiency of using the large ViT-based CLIP model. RoI-Align \cite{he2017mask} is an efficient operator for extracting the feature maps from all the cropped patches, but this operator is confined to CNN architectures. Therefore, we introduce a new concept of \emph{RoI-based masked attention}, extracting the feature maps with a minimal cost of a single inference step.  
+
+Let ${\rm W}_{Q}, {\rm W}_{K}, {\rm W}_{V}$ be the query, key, value projection matrices of the \emph{last} attention layer in the ViT. Then, the attention map ${\rm Attn}({\rm E}_Q, {\rm E}_K)\in \mathbb{R}^{hw}$ of the last Transformer layers is computed by:
+\begin{equation}
+\begin{gathered}
+\!\!\!{\rm Attn}=  {\rm Softmax} \big(\frac{({\rm E}_Q {\rm W}_{Q}) ({\rm E}_K{\rm W}_{K})^{\top}}{\sqrt{d}} \big) \!\!\!\\
+{\rm where} ~~ {\rm E}_Q = [{\bf e}^{\rm cls}_{L-1}] ~~ {\rm and} ~~ {\rm E}_K = [{\bf e}^{\rm cls}_{L-1}; \rm{I}_{L-1}].
+\end{gathered}
+\label{eq:pruning}
+\end{equation}
+${\bf e}^{\rm cls}_{L-1}$ is the class token and ${\rm I}_{L-1}$ is the patch tokens from the ($L$-1)-th Transformer layer. Note that the query ${\rm E}_Q$ includes only the class token since the clip image embedding is the projection of the class token's output\,\cite{radford2021clip}. We convert this attention process to the {RoI-based masked attention}. As seen in Figure \ref{fig:masks}, we generate attention masks ${\rm M}_{\hat{\rm B}} = [{\rm M}_{{\bf b}_{1}}, \dots, {\rm M}_{{\bf b}_{m}}] \in \mathbb{R}^{m \times hw}$; ${\rm M}_{{\bf b}_{i}}$ has the $0$ values for the area that overlaps the given RoI ${\bf b}_{i}$, -100 otherwise. Each mask penalizes the patch tokens outside the corresponding RoI not to affect the attention operation as:
+\begin{equation}
+{\rm Softmax} \big(\frac{({\rm E}_Q {\rm W}_{Q}) ({\rm E}_K{\rm W}_{K})^{\top} \!\!+ {\rm M}_{{\bf b}_{i}}}{\sqrt{d}}  \big).
+\end{equation}
+This eliminate the need of iterative inference over all RoIs by simply applying the proposed RoI-based masked attention in the last Transformer layer. Thus, the inference on the image is now modified from Eq.\,\eqref{eq:iter_infer} to:
+%the ViT-based CLIP in Eq.\,\eqref{eq:iter_infer} is modified by r:
+\begin{equation}
+[{\bf e}^{\rm img}_{i},\dots,{\bf e}^{\rm img}_{m}] = {\rm CLIP}_{\rm img}({\bf x}, \hat{\rm B}_{\rm det})\in \mathbb{R}^{m \times d^{\prime}}.
+\label{eq:new_clip_img}
+\end{equation}
+
+
+
+\subsubsection{RoI Pruning} 
+
+To make better use of CLIP, it is necessary to provide only RoIs that likely contain target objects. As discussed in \cite{zhong2022regionclip}, the contrastive learning of CLIP is unaware of the alignment between local image regions and text tokens, leading to incorrect predictions for background regions. To address this, we propose a simple RoI pruning that identifies non-background RoIs from box predictions. We define an \emph{object score} as the maximum prediction probability values across all classes given by prompts. Given the box prediction ${\rm \hat{B}_{det}}$ and its class prediction ${\rm \hat{P}_{det}}$ from the Transformer decoder, we keep only the RoIs with an object score higher than a certain threshold $\epsilon$ as:
+\begin{equation}
+{\rm \hat{B}}_{\rm prune} = \{ {\bf b}_{i} \in {\rm \hat{B}}_{\rm det} : {\bf p}_{i} \in {\rm \hat{P}}_{\rm det} \wedge {\rm max} ({\bf p}_{i}) \geq \epsilon \}.
+\end{equation}
+Therefore, we replace the input of the RoI-based masked attention with the pruned RoIs.
+
+\subsection{Training and Evaluation Pipeline}
+
+For label assignment, \algname{} conducts multi-label classification using bipartite matching with the Hungarian algorithm\,\cite{lin2017focal}. Therefore, following the existing optimization pipeline in \cite{carion2020end, zhu2020deformable}, we uses focal loss $\ell_{\rm cls}$ for multi-label classification, and L1 loss $\ell_{\rm l1}$ and GIoU loss $\ell_{\rm iou}$\,\cite{rezatofighi2019generalized} for box regression. The embedding loss $\ell_{\rm embed}$ proposed by \cite{zang2022open} is also used to distil the CLIP's knowledge for open vocabulary object detection, 
+\begin{equation}
+\ell = \lambda_{\rm cls}\ell_{\rm cls} + \lambda_{\rm l1}\ell_{\rm l1} + \lambda_{\rm iou}\ell_{\rm iou} + \lambda_{\rm embed}\ell_{\rm embed}, 
+\label{eq:naive_roi}
+\end{equation}
+where $\lambda$s are the balancing parameters. 
+
+We set the number of object queries $m$ to 300 and 1,500 for MS-COCO~\cite{lin2014microsoft} and LVIS~\cite{gupta2019lvis}, respectively. Following the literature\,\cite{guopen2022vild, zang2022open, zhong2022regionclip, zhou2022detic, rasheedbridging}, only base classes are given in training time, while novel classes are given together with base classes in testing time. Appendix A provides further details on the training and evaluation pipeline.
