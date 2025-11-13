@@ -1,0 +1,290 @@
+% \appendix
+% \section{Appendix}
+\beginsupplement
+
+% ------------------------------------------------
+
+\label{appendix:a}
+%You may include other additional sections here.
+
+We organize additional supporting experimental findings as follows: 
+Sec.~\ref{comparison_algorithms} contains brief descriptions of the compared methods. The implementation details about SIESTA, REMIND, and DER are included in Sec.~\ref{section:additional_implementation_details}. An analysis on rehearsal policies is located in Sec.~\ref{sec:replay-policy}. We compare offline MobileNetV3-L with offline ResNet18 in Sec.~\ref{sec:eval_arch}, and we analyze MobileNet quantization layers in Sec.~\ref{mobilenetlayer}.
+A comparison with the offline model when augmentations are used can be found in Sec.~\ref{sec:offline-with-augmentations}. Sec.~\ref{sec:online_and_sleep_experiments} describes online learning results when sleep is omitted. For SIESTA, we study the impact of buffer size in Sec.~\ref{sec:buffer} and batch size in Sec.~\ref{sec:batch}. Finally, we include additional computational analysis in Sec.~\ref{sec:gflops}.
+
+
+\section{Comparison Algorithms}
+\label{comparison_algorithms}
+
+This paper compared SIESTA's performance against state-of-the-art continual learning algorithms, including:
+
+\begin{itemize}
+    \item \textbf{REMIND~\cite{hayes2020REMIND}}: Instead of veridical replay (i.e., raw pixels), REMIND performs representation replay using mid-level CNN features that are compressed by PQ. This significantly reduces memory and enables REMIND to store more examples to mitigate catastrophic forgetting. It keeps earlier CNN layers fixed for feature extraction and trains later plastic layers for classification. Another variant of REMIND \cite{gallardo2021self} replaces supervised pretraining by self-supervised pretraining and improves REMIND's performance.
+    
+    \item \textbf{SLDA~\cite{hayes2020lifelong}}: SLDA learns only the final classification layer while keeping earlier pretrained CNN layers fixed. It stores separate mean vectors for each class and a shared covariance matrix; only these class statistics are updated during online training and used for predictions.
+    
+    \item \textbf{iCaRL~\cite{rebuffi2017icarl}}: iCaRL performs incremental batch learning using veridical replay (i.e., raw pixels). It utilizes distillation loss and a nearest class mean classifier to prevent catastrophic forgetting.
+    
+    \item \textbf{BiC~\cite{wu2019large}}: BiC builds on iCaRL and also uses distillation loss and replay. It introduces a bias correction mechanism to prevent bias from class imbalance. For that, a linear model is learned on validation data to recalibrate the model's probabilities.
+    
+    \item \textbf{WA~\cite{zhao2020maintaining}}: WA applies a knowledge distillation loss and a bias correction step where it aligns the norms of new class weights to those of old class weights.
+
+    \item \textbf{End-to-End~\cite{castro2018end}}: End-to-End is a variant of iCaRL. Instead of the nearest class mean classifier, it utilizes the CNN's output layer.  
+    
+    \item \textbf{DER~\cite{yan2021dynamically}}: By reusing previous feature extractors, DER freezes previously learned representations and augments them with incoming features obtained from a newly trained feature extractor. It employs a channel-level mask-based pruning mechanism to dynamically expand representations. It uses an auxiliary classifier along with a regular classifier to discriminate between old and new concepts. In this paper, we compare with two variants of DER: DER without pruning (referred to as DER$\dag$) and DER with pruning (referred to as DER$\ast$). We also compare with a previous version referred to as S-DER~\cite{li2021preserving} which also combines multiple feature extractors and applies pruning. However, S-DER still has $2.4\times$ more parameters than offline ResNet18.
+
+    \item \textbf{DyTox~\cite{douillard2021dytox}}: DyTox is a Transformer-based encoder/decoder framework where the encoder and decoder are shared among tasks.
+    Unlike DER which keeps a copy of the whole network per task, DyTox proposes a dynamic task token expansion method to adapt to new tasks. Thus it alleviates the issues of a) expanding the network parameters to scale and b) requiring task identifiers in dynamic expansion methods.
+
+    \item \textbf{Nearest Class Mean (NCM)}: NCM computes a running mean for each class. During test time, a test sample is given the label of the nearest class mean. It becomes a variant of SLDA if the covariance matrix is fixed to the identity matrix.
+    
+    \item \textbf{Offline}: The offline model has access to the entire dataset and is trained using conventional batch training with multiple epochs. It serves as an approximate upper bound for an online learning model.
+\end{itemize}
+
+
+Veridical replay based methods apply various image augmentations.
+For example, BiC and DER use random crops and horizontal flips, while DyTox uses Rand-Augment.
+REMIND uses feature augmentation by doing random crops and mixup directly on the stored mid-level features. To compare continual learning methods, rather than augmentation strategies, our experiments in Sec.~\ref{sec:offline-comparison-experiments}  omitted augmentations during the continual learning phase for SIESTA, REMIND, and DER. This allowed us to compare these algorithms in a fair way, where we also used the same DNN architecture.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Additional Implementation Details}
+\label{section:additional_implementation_details}
+
+\subsection{MobileNetV3-L}
+We use a slightly modified version of MobileNetV3-L with SIESTA, DER, and REMIND.  We use the GELU activation instead of ReLU and Hard Swish in all MobileNetV3-L layers, except for the squeeze and excitation block. We replace batch normalization with group normalization and weight standardization in the $\mathcal{F}$ and $\mathcal{G}$ layers. We used GELU activation because it improves gradient flow. And, we used group normalization with weight standardization because they are effective for small batch-sizes while performing competitively to batch normalization for large batch-sizes.
+We incorporate these architectural modifications into MobileNetV3-L to get rid of adverse effects of batch normalization and make the model more general purpose.
+
+The offline MobileNetV3-L was trained for $600$ epochs using the AdamW optimizer with an initial LR of $0.004$ and a weight decay of $0.05$. We used the Cosine Annealing LR scheduler with a linear warm up of $5$ epochs.
+
+
+\subsection{Base Initialization}
+
+SIESTA, REMIND, and DER are initialized using all images in the first batch of 100 classes from ImageNet-1K, which is referred to as ``base initialization.'' We use the same data ordering as REMIND~\cite{hayes2020REMIND}. Base initialization consists of three phases:
+\begin{enumerate}
+    \item Following \cite{gallardo2021self}, we first perform self-supervised pre-training of the network using SwAV. We use the small batch procedure from the original SwAV paper~\cite{caron2020unsupervised}. Following others who have used self-supervised learning with mobile DNNs, we modified the scale of global and local crops in multi-crop augmentation. We use $2\times 224 + 6\times 128$ crops with a minimum scale crop range of $[0.3-0.05]$ and maximum scale crop range of $[1.0-0.3]$. We use $1000$ prototypes, a Sinkhorn regularization parameter $\epsilon$ of $0.03$, queue length of $384$ features, and $2000$ epochs. We set the base LR to $0.6$, final LR to $0.0006$, and batch size to $64$. The remaining settings are identical to the original SwAV~\cite{caron2020unsupervised} system.
+
+    \item For REMIND and SIESTA only, we then fit the parameters of the product quantization algorithm OPQ to the embeddings produced by $\mathcal{H}$. OPQ is configured to use $8$ codebooks of size $256$. In our main results, $\mathcal{H}$ consists of the first 8 layers of the DNN.
+
+    \item Supervised fine-tuning is then done on the DNN, where for DER the entire network is trained, but for REMIND and SIESTA only $\mathcal{F}$ and $\mathcal{G}$ are trained using the reconstructed tensors from $\mathcal{H}$. For DER, we use the SGD optimizer with an initial LR of $0.1$ which is decayed by a $0.1$ multiplier every $15$ epochs. We use $50$ epochs and the standard PyTorch augmentations (random resized crop and random horizontal flip) for training DER. For SIESTA and REMIND, we train for $50$ epochs. SGD is used for optimization with an initial LR of $0.2$ for the last layer and a LR of $0.07$ for the remaining layers. The LR is decayed by a $0.1$ multiplier every $15$ epochs. REMIND uses augmentations found optimum in the original REMIND paper~\cite{hayes2020REMIND}. SIESTA uses Cutmix and Mixup. These augmentations are applied using participation probability $p_{cutmix}=0.6$ and $p_{mixup}=0.4$. We set $\beta=1.0$ for Cutmix and $\alpha=0.1$ for Mixup.
+\end{enumerate}
+After base-initialization, DER achieves $96.90\%$ top-5 accuracy and REMIND/SIESTA achieve $96.84\%$ top-5 accuracy on the validation set for the first 100 classes. 
+
+
+\subsection{SIESTA}
+SIESTA's settings for training during continual learning are described in Sec.~\ref{sec:experimental-setup}.
+
+
+
+\subsection{REMIND}
+In our augmentation-free experiments, we configured REMIND to use the same number of updates as SIESTA ($11.53$M), which was done by setting REMIND to use a replay mini-batch size of $9$. 
+
+In our augmentation experiments, we used REMIND's default configuration, which uses a replay mini-batch size of $50$. For these experiments, REMIND uses the same augmentation scheme as in the original REMIND paper.
+
+\subsection{DER} 
+
+For our experiments without augmentations, we configured DER to use a similar number of updates as SIESTA and REMIND. To do this, we set the number of epochs used during each $100$ class increment to $10$. We adjusted the LR scheduler accordingly. 
+In experiments with augmentations, DER used $47$ epochs in every $100$ class increment and random resized crop and random horizontal flip augmentations.
+Other implementation details e.g., optimizer and fine-tuning of the unified classifier follow the original DER paper~\cite{yan2021dynamically}.
+In all experiments, DER stored $10$ MobileNetV3-L models for $10$ learning steps, the current batch of at least $100000$ images, and a replay buffer of $10000$ images ($224\times 224$ uint$8$); all of which required $20.99$ GB in memory.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Rehearsal Policies}
+\label{sec:replay-policy}
+
+\input{tables/LT_expts}
+
+Since real-world data distribution is often long-tailed (LT) and imbalanced, we investigate the robustness of SIESTA and REMIND to LT data distribution using Places-LT dataset~\cite{liu2019large}. It is a long tailed variant of the Places-2 dataset~\cite{zhou2017places}. It has a total of $365$ categories with $62500$ training images raging from $5$ to $4980$ images per class. We use the Places-LT validation set from \cite{liu2019large} as our test set consisting of a total of $7300$ images with a balanced distribution of $20$ images per class. 
+
+Since Places-LT is a small dataset, we first initialized all MobileNetV3-L layers with SwAV weights pre-trained on ImageNet base initialization subset i.e., $100$ classes. 
+Next we fine-tuned the $\mathcal{F}$ and $\mathcal{G}$ layers using Places-LT base initialization subset i.e., $65$ randomly chosen classes. The fine-tuning phase uses the same configuration as our ImageNet experiments. After that, the remaining $300$ classes are learned incrementally in a total of $6$ steps where each step consists of $50$ classes. SIESTA uses $38400$ updates per sleep cycle and REMIND uses $5$ replay samples. The total number of updates for end-to-end training is bounded by $0.28$M. The Offline model is initialized with SwAV weights and trained for $40$ epochs using the same configuration as the ImageNet fine-tuning phase. Other implementation details follow ImageNet experiments with augmentation-free settings.
+
+
+Table~\ref{tab:places} compares SIESTA with REMIND in terms of mean $\pm$ standard deviation across 5 different random class orderings on Places-LT. SIESTA$\dag$ uses uniform sampling, while SIESTA uses uniform balanced sampling (balanced per class).
+We see that SIESTA$\dag$ outperforms REMIND in terms of final and average accuracy and shows greater robustness than REMIND to Places-LT. Additionally, we see that the final accuracy has a low standard deviation ($<1\%$), demonstrating that REMIND and SIESTA$\dag$ are robust against different data orderings. Also, we see that SIESTA with balanced uniform sampling (SIESTA) provides the highest accuracy, demonstrating its robustness to class imbalance.
+
+\input{figures/sleep_policies}
+
+After validating that balanced uniform sampling was superior to uniform sampling on Places-LT, we studied additional rehearsal sampling strategies on both balanced (ImageNet-1K) and long-tailed (Places-LT) distributions. For these experiments only 300 classes from ImageNet were used, where 200 were learned continually. We evaluated the following sampling policies:
+\begin{itemize}[noitemsep,nolistsep,leftmargin=*]
+    \item \emph{Balanced Uniform}: Sampling each class uniformly, so that each has the same number of samples. This is used in our main results.
+    
+    \item \emph{Uniform}: Sampling uniformly regardless of category.
+    
+    \item \emph{Least Updated}: Examples are prioritized based on how many times they contribute to updating DNN parameters so that the DNN does not forget about the examples with least counts.
+    
+    \item \emph{Max Interference}: Samples having different class boundaries may interfere with one another due to the similarity or proximity in embedded space. These interfered samples may provide optimum supervision to improve performance. Interference is computed based on cosine similarity among penultimate features.
+    
+    \item \emph{Max Loss}: Samples that the network is most uncertain about may better optimize the training objective. One way to implement this is by prioritizing samples that have the highest cross-entropy loss.
+    
+    \item \emph{Min Margin}: The minimum margin policy prioritizes samples based on the separation between the highest and second highest probabilities given by the DNN. Lower separation corresponds to higher uncertainty and higher sampling probability.
+    \item \emph{Prototypical}: Samples closest to the respective class means are the most prototypical (i.e., class representative) whereas samples furthest from class means are the least prototypical. Giving higher priority to the most representative examples and lower priority to the least representative examples may improve learning that class.
+    
+    \item \emph{Balanced Prototypical}: Selects equal number of samples per class using the prototypical criterion.
+\end{itemize}
+Since the standard deviation across orderings is low (see Table~\ref{tab:places}), we compare different policies based on a single ordering.
+
+Results with different sampling policies are summarized in Fig.~\ref{fig:replay_policies}. Only the balanced uniform sampling policy was effective for both datasets. On ImageNet (Fig.~\ref{subfig:replay_plot_imagenet}), we found that most of the replay methods perform similarly except max interference, which performs poorly. Max interference replays hard examples which is detrimental for small models~\cite{sorscher2022beyond}. In contrast, on Places-LT (Fig.~\ref{subfig:replay_plot_places}) we observed that balanced prototypical and balanced uniform performed best. We selected balanced uniform for our main results due to its simplicity and because it was effective across dataset label distributions.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Architecture Comparisons}
+\label{sec:eval_arch}
+
+
+The goal of this study is to find an optimum network architecture for efficient continual learning.
+Here we compare MobileNetV3-Large with ResNet18 to examine which architecture produces more universal features in the bottom network layers, $\mathcal{H}$. To do this, we pre-train $\mathcal{H}$ using SwAV on the same pre-train set for both networks. We then train the top layers $\mathcal{G}$ and output layer $\mathcal{F}$ on ImageNet-1K in an offline way on reconstructed features from $\mathcal{H}$.
+The compression locations in both models maintain the same spatial dimension of $14 \times 14$. Since ResNet18 has a larger channel dimension ($256$) than MobileNetV3-L ($80$), the compression error is relatively higher in ResNet18.
+
+Table~\ref{tab:arch} depicts comparisons with augmentations and without augmentation. In both cases, MobileNetV3-L features yield better accuracy than ResNet18 features. Therefore, MobileNetV3-L produces more generalizable features than ResNet18. Furthermore, MobileNetV3-L requires $1.9\times$ fewer parameters than ResNet18. This comparison validates our rationale for choosing MobileNetv3-L.
+
+
+\begin{table}[t]
+  \caption{Offline comparison training only $\mathcal{F}$ and $\mathcal{G}$ on quantized features from $\mathcal{H}$ for MobileNetV3-Large and ResNet18 on ImageNet-1K. The $(\uparrow)$ and $(\downarrow)$ indicate high and low values to reflect optimum results respectively. $\mathcal{P}$, $\alpha$, and $\mathcal{E}_{OPQ}$ indicate the number of trainable parameters in millions, final top-5 accuracy ($\%$), and OPQ quantization error, respectively.
+  }
+  \label{tab:arch}
+  \centering
+  \resizebox{\linewidth}{!}{
+     \begin{tabular}{lcccc}
+     \hline
+     Architecture & Augment & $\mathcal{P} (\downarrow)$ & $\alpha (\uparrow)$ & $\mathcal{E}_{OPQ} (\downarrow)$ \\
+     \hline
+     ResNet18 & \checkmark & $10.08$ & $82.63$ & $0.40$ \\
+     MobileNetV3-L & \checkmark & $\mathbf{5.36}$ & $\mathbf{86.47}$ &  $\mathbf{0.18}$ \\
+     \hline
+     ResNet18 & $\times$ & $10.08$ & $79.54$ & $0.40$ \\
+     MobileNetV3-L & $\times$ & $\mathbf{5.36}$ & $\mathbf{84.57}$ & $\mathbf{0.18}$ \\
+     \hline
+    \end{tabular}
+    }
+\end{table}
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{MobileNet Quantization Layer}
+\label{mobilenetlayer}
+
+In Table~\ref{tab:layer_analysis}, we examined SIESTA's utility (parameters and memory) and performance (accuracy and compression error) for various MobileNet quantization layers. We maintained identical OPQ configurations for this analysis.
+As we move quantization layer up towards input, SIESTA's accuracy increases due to increase in trainable parameters and OPQ quantization error decreases due to decrease in channel dimension. However, the increase in accuracy comes at a cost of increased memory. Since spatial dimension in upper layers increases, the memory requirement increases due to increased number of vectors corresponding to larger spatial dimension. For example, spatial dimension in layer 5 is $2\times$ larger than that in layer 8, hence memory required to store features in layer 5 becomes $4\times$ more than layer 8. 
+The opposite is true when moving quantization layer down towards output. To balance accuracy and efficiency we select layer 8 for all our experiments in the main results.
+Layer 8 provides suitable tensor size to meet lower memory budget while maintaining optimum accuracy.
+
+
+\begin{table}[t]
+  \caption{SIESTA's performance as a function of quantization layer based on ImageNet-1K without augmentation. Here, $\mathcal{S}$ is the tensor size ($r\times s\times d$), $\mathcal{P}$ is the number of trainable parameters in millions, $\mathcal{M}$ is the memory consumption in GB, $\mu$ is the average top-5 accuracy ($\%$), $\alpha$ is the final top-5 accuracy ($\%$), and $\mathcal{E}_{OPQ}$ indicates the OPQ quantization error. The $(\uparrow)$ and $(\downarrow)$ indicate high and low values to reflect optimum performance respectively.
+  }
+  \label{tab:layer_analysis}
+  \centering
+  \resizebox{\linewidth}{!}{
+     \begin{tabular}{lcccccc}
+     \hline
+     Layer & $\mathcal{S}$ & $\mathcal{P} (\downarrow)$ & $\mathcal{M} (\downarrow)$ & $\mu(\uparrow)$ & $\alpha (\uparrow)$ & $\mathcal{E}_{OPQ} (\downarrow)$ \\
+     \hline
+     $3$ & $56^{2}\times 24$ & $5.47$ & $32.19$ & $89.39$ & $85.18$ & $0.03$ \\
+     $5$ & $28^{2}\times 40$ & $5.46$ & $8.08$ & $89.16$ & $84.68$ & $0.07$ \\
+     $8$ & $14^{2}\times 80$ & $5.36$ & $2.05$ & $88.33$ & $83.59$ & $0.18$ \\
+     $14$ & $7^{2}\times 160$ & $4.26$ & $0.55$ & $85.37$ & $79.69$ & $0.35$ \\
+     \hline
+    \end{tabular}
+    }
+\end{table}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Comparison with the Offline Learner when Augmentations are Used}
+\label{sec:offline-with-augmentations}
+
+
+In Table~\ref{tab:aug_expts_supp}, we compare SIESTA with REMIND and DER under identical settings where all methods use MobileNetV3-L, SwAV pre-training, same number of updates, and augmentations. SIESTA outperforms DER by $15.18\%$ (absolute) in final accuracy while using $10\times$ less memory and $10\times$ fewer parameters. While SIESTA uses same number of parameters and same amount of memory as REMIND, it outperforms REMIND by $4.03\%$ (absolute) in final accuracy. When comparing to the offline learner, SIESTA has the smallest gap ($3.74\%$ absolute) in terms of final accuracy. 
+
+Using McNemar's test to compare SIESTA's final top-5 accuracy in the iid and class incremental setting, there was no significant difference in the accuracy of the two systems ($P = 0.85$). Thus, SIESTA appears to be invariant to the order of the data when augmentations are used, which is consistent with our findings from Sec.~\ref{sec:offline-comparison-experiments} without augmentations. Using a McNemar's test, we observed that there was a significant difference between the offline model and SIESTA when augmentations were used for both orderings ($P < 0.001$). This is in contrast to our results without augmentations, where we found no significant difference. There are several routes that we believe are promising for closing this gap. These include using self-supervised learning methods that outperform SwAV, using additional capacity in $\mathcal{H}$, and developing additional augmentation techniques that could be used with the reconstructed tensors. 
+
+\input{tables/aug_expts_supp}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Online Learning Comparisons}% \& Sleep}
+\label{sec:online_and_sleep_experiments}
+
+        
+\input{figures/online_only}
+
+In Fig.~\ref{fig:online}, we show learning curves on ImageNet-1K comparing online learning methods with an awake-only variant of SIESTA, which does not perform sleep steps.  SIESTA (Awake Only) is an online learning method that updates $\mathcal{F}$ as described in Sec.~\ref{sec:siesta_awake}. From Fig.~\ref{fig:online}, we can see that SIESTA (Awake Only) rivals popular online learning methods NCM and SLDA, whereas with sleep it vastly outperforms them. All models use the same SwAV pre-trained DNN.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Impact of Buffer Size}
+\label{sec:buffer}
+
+In Table~\ref{tab:buffer-size} we studied SIESTA's performance as we altered the size of the buffer. We kept the total number of updates during a sleep cycle constant, which is consistent with observations in the dataset pruning literature that even when using pruned datasets a comparable number of updates are necessary to get equivalent performance in a neural network~\cite{sorscher2022beyond}.
+We see that SIESTA performs remarkably with smaller buffer size. The drop in final accuracy while changing buffer size from $2.01$ GB to $0.75$ GB is only $3.02\%$ (absolute).
+
+\begin{table}[t]
+  \caption{Impact of buffer size on SIESTA's performance evaluated on ImageNet-1K without augmentation. The $(\uparrow)$ and $(\downarrow)$ indicate high and low values to reflect optimum performance respectively. $\mu$ and $\alpha$ denote average top-5 accuracy ($\%$) and final top-5 accuracy ($\%$), respectively. Buffer size is reported in GB.}
+  \label{tab:buffer-size}
+  \centering
+     \begin{tabular}{cccc}
+     \hline
+     Buffer Size & Quantized Instances & $\mu (\uparrow)$ & $\alpha (\uparrow)$ \\
+     \hline
+     $0.75$ & $479665$ &  $87.33$ & $80.57$ \\
+     $1.51$ & $959665$ &  $88.30$ &  $83.30$ \\
+     $2.01$ & $1281167$ &  $88.33$ & $83.59$ \\
+     \hline
+    \end{tabular}
+\end{table}
+
+
+
+
+\section{Batchsize and Training Time for SIESTA}
+\label{sec:batch}
+
+In Table~\ref{tab:batch_size} we studied SIESTA's performance as we varied the batch size in offline training during sleep. We kept the total number of updates during a sleep cycle constant.
+We conducted the experiments on same hardware (NIVIDIA RTX A$5000$ GPU). SIESTA shows robustness to varying batch size where it performs almost similarly for batch size ranges from $32$ to $512$. Increasing batch size provides a speed up, where a batch size of $512$ requires $2\times$ less time than batch size $32$ to finish ImageNet-1K training.
+
+
+\begin{table}[t]
+  \caption{Impact of batch size on SIESTA's performance evaluated on ImageNet-1K without augmentation. The $(\uparrow)$ and $(\downarrow)$ indicate high and low values to reflect optimum performance respectively. $\mu$ and $\alpha$ denote average top-5 accuracy ($\%$) and final top-5 accuracy ($\%$), respectively. Total training time $\mathrm{T}$ is reported in hours.}
+  \label{tab:batch_size}
+  \centering
+     \begin{tabular}{rrrr}
+     \hline
+     Batch & $\mathrm{T} (\downarrow)$ & $\mu (\uparrow)$ & $\alpha (\uparrow)$ \\
+     \hline
+     $32$ & $3.80$ & $88.36$ & $83.53$ \\
+     $64$ & $2.39$ &  $88.33$ & $83.59$ \\
+     $128$ & $2.20$ &  $88.38$ &  $83.72$ \\
+     $256$ & $1.97$ &  $88.34$ & $83.61$ \\
+     $512$ & $1.89$ & $88.29$ & $83.50$ \\
+     \hline
+    \end{tabular}
+\end{table}
+
+
+
+\section{Additional Computational Analysis}
+\label{sec:gflops}
+
+In the main text, to assess the computational efficiency of the continual learning algorithms we used the number of updates via backpropagation. An alternative is to estimate the number of FLOPS (floating-point operations per second) for each method. Here we estimate the number of FLOPS for a subset of the methods and juxtapose that with updates. FLOPS may be a more meaningful metric for SIESTA, since each update during sleep is only updating the $\mathcal{F}$ and $\mathcal{H}$ rather than all layers of the DNN; however, SIESTA does require compute for reconstruction that the other methods omit. The three models use the configurations for augmentation-free on ImageNet. GFLOPS were estimated with DeepSpeed\footnote{\url{https://github.com/microsoft/DeepSpeed}} using the same hardware across methods (NVIDIA GeForce GTX TITAN X GPU). 
+
+GFLOPS for SIESTA, REMIND, and DER are given in Table~\ref{tab:flops} along with the total number of updates. SIESTA yields $1.9\times$ higher GFLOPS than REMIND and $4.3\times$ higher GFLOPS than DER. Thus SIESTA offers higher efficiency and throughput than compared methods. 
+
+\input{figures/flops}
+
+\begin{table}[t]
+  \caption{Computational comparison among methods in terms of GFLOPS and total number of updates in million, $\mathcal{U}$. This is based on ImageNet-1K dataset. The $(\uparrow)$ and $(\downarrow)$ indicate high and low values to reflect optimum performance respectively.}
+  \label{tab:flops}
+  \centering
+     \begin{tabular}{lcc}
+     \hline
+     Method & GFLOPS $(\uparrow)$ & $\mathcal{U}$ $(\downarrow)$ \\
+     \hline
+     DER & $4021.61$ & 12.43 \\
+     REMIND & $9188.17$ & 11.53 \\
+     \textbf{SIESTA} & $\mathbf{17393.40}$ & 11.53 \\
+     \hline
+    \end{tabular}
+\end{table}
+
+In real-world continual learning, we could potentially have an infinitely long (never ending) data stream, which would be larger than ImageNet-1K, raising the question: how well do these models computationally scale to larger datasets? To find this, we measured the total computational costs associated with using a larger dataset by increasing batches where one batch corresponds to $100$ classes from ImageNet-1K. Fig.~\ref{fig:flops} illustrates the computational comparison in larger scale beyond ImageNet-1K. It is evident that as size of dataset grows, the gap in GFLOPS between SIESTA and compared methods grows significantly. Thus SIESTA becomes far more efficient than others in large scale regime.
+
+
+

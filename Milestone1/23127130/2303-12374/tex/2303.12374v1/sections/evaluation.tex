@@ -1,0 +1,325 @@
+\section{Experimental Evaluation}
+In this section, we present an experimental evaluation of Kernel Launcher.
+Experiments were performed on the VU site of the DAS6 distributed supercomputer~\cite{bal2016medium}.
+Table~\ref{tab:gpu-properties} lists the properties of the GPUs used for the evaluation.
+Software versions were CUDA toolkit 11.7, CUDA driver 515.65.01, Kernel Tuner 0.4.3, and CentOS 8.5.
+
+\begin{table}[]
+    \scriptsize
+        \caption{GPUs used in our experiments. Bandwidth (BW) in GB/s. Peak single precision (SP) and double precision (DP) performance in GFLOP/s.}\label{tab:gpu-properties}
+    \centering
+    \begin{tabular}{l|l|r|r|r|r}
+    \toprule
+    GPU & Architecture & Cores & BW & Peak SP & Peak DP \\
+    \midrule
+    RTX A4000 & Ampere (GA104) & 6{,}144 & 448 & $19{,}170$ & 599 \\
+    Tesla A100 & Ampere (GA100) & 6{,}912 & 1{,}555 & $19{,}500$ & 9700 \\
+    \bottomrule
+    \end{tabular}
+  \vspace{-.3cm}
+\end{table}
+
+\subsection{Application}
+
+To evaluate the usability and performance of Kernel Launcher, we have integrated our library into % to tune several kernels.
+MicroHH~\cite{gmd-10-3145-2017,chiel_van_heerwaarden_2017_822842}, a computational fluid dynamics software for direct numerical simulation and large-eddy simulation of turbulent flows in the atmospheric boundary layer.
+This C++ application runs on both multi-core CPUs and CUDA-enabled GPUs.
+The code supports many different integration schemes and nemerous configuration options, including the size of the three-dimensional domain grid and floating-point precision (single or double precision).
+MicroHH is an excellent candidate for runtime kernel selection since achieving high performance requires distinct tuning parameters for each combination of GPU architecture, grid size, and floating-point precision.
+% Stijn: Interesting candidate?
+% Ben: tja, eigenlijk zou je willen dat je kunt stellen dat MicroHH regelmatig op verschillende GPUs of probleem groottes gedraaid wordt (het liefst zelfs binnen dezelfde run), want dan heb je pas echt een argument voor run-time kernel selectie. Je kunt als je het bovenstaande argument niet zo sterk vind het ook gewoon weglaten. We hebben voor de evaluatie microhh gebruikt, punt. Als je het niet noemt is er vaak ook niemand die er een punt van maakt.
+
+
+\subsection{Tunable Parameters}
+For this paper, we selected two kernels from MicroHH for analysis.
+The first kernel is called \verb=advec_u= and corresponds to a large stencil operation.
+In particular, the kernel performs advection along the X-axis and is part of the second order advection scheme with fifth order interpolation.
+The second kernel is called \verb=diff_uvw= and is an element-wise operation.
+This kernel is part of the second order Smagorinsky diffusion for large-eddy simulation.
+
+Both kernels work on a three-dimensional grid where each grid point requires an operation to be performed.
+the kernels launched a single CUDA thread for each grid point, with each thread processing the point associated with its 3D global thread index.
+However, we have rewritten the kernels and introduced several code optimizations that resulted in the following tunable parameters (see Table~\ref{tab:evaluation_params}):
+
+
+
+\begin{table}
+\caption{List of tunable parameters and their default value.}
+\label{tab:evaluation_params}
+\centering
+\begin{tabular}{l||p{5cm}|l}
+\toprule
+Name & Values & Default value \\
+\midrule
+Block size X & 16, 32, 64, 128, 256 & 256 \\
+Block size Y & 1, 2, 4, 8, 16 & 1 \\
+Block size Z & 1, 2, 4, 8, 16 & 1 \\
+Tile factor X & 1, 2, 4 & 1 \\
+Tile factor Y & 1, 2, 4 & 1 \\
+Tile factor Z & 1, 2, 4 & 1 \\
+Unroll X & \texttt{true}, \texttt{false} & \texttt{false} \\
+Unroll Y & \texttt{true}, \texttt{false} & \texttt{false} \\
+Unroll Z & \texttt{true}, \texttt{false} & \texttt{false} \\
+Tile contiguous X & \texttt{true}, \texttt{false} & \texttt{false} \\
+Tile contiguous Y & \texttt{true}, \texttt{false} & \texttt{false} \\
+Tile contiguous Z & \texttt{true}, \texttt{false} & \texttt{false} \\
+Unravel permutation & \texttt{XYZ}, \texttt{XZY}, \texttt{YXZ}, \raggedright \texttt{YZX}, \texttt{ZXY}, \texttt{ZYX} & \texttt{XYZ} \\
+Min. blocks per SM & 1, 2, 3, 4, 5, 6 & 1 \\
+\bottomrule
+\end{tabular}
+\vspace{-.2cm}
+\end{table}
+
+
+\begin{itemize}[leftmargin=*]
+\item 
+\textbf{Block Size XYZ}.
+The number of threads in each CUDA thread block along the X, Y, and Z axis.
+The default thread block size is $(256, 1, 1)$
+
+\item
+\textbf{Tiling Factor XYZ}.
+We modified the kernel so  that each thread processes multiple grid points along the X, Y, and Z axis.
+For example, tiling factors $(3, 1, 2)$ indicate that each thread processes 6 points: 3 along the X-axis and 2 along the Z-axis.
+Processing multiple items per thread can increase cache utilization and reduce thread scheduling overhead, but assigning too many items to each thread results in insufficient concurrency.
+By default, no tiling is used. %, i.e. $(1, 1, 1)$.
+
+\item
+\textbf{Loop Unrolling XYZ}.
+The tiling involves three nested loops, one for each axis of the 3D grid.
+Each of the three loops can either be \emph{fully} unrolled or \emph{not} unrolled.
+Unrolling a loop increases instruction-level parallelism and could result in additional compiler optimizations, at the cost of increased register usage and instruction count. 
+There is a boolean parameter for each axis.
+
+
+\item
+\textbf{Tiling stride XYZ}.
+Since each thread processes multiple items, there are multiple ways to assign the grid points to threads.
+We implemented two options for each axis.
+The first option is that each threads processes the points that are consecutive along one axis (e.g., item $x, x+1, x+2, \ldots$).
+The second option is that the points are block-strided (e.g., item $x, x+b_X, x+2b_X, \dots$ where $b_X$ is the block size along the X axis).
+The first option can lead to better data reuse for stencil-like kernels (especially if the loop is unrolled), while the second option may give better memory access patterns.
+%There is a boolean parameter for each axis.
+
+\item
+\textbf{Unravel permutation}.
+The thread blocks are launched as a one-dimensional list of blocks.
+Each thread then \emph{unravels} its 1D thread block identifier into a 3D grid index.
+Since there are six possible permutations of $(X,Y,Z)$, there are six possible ways to perform this unraveling.
+We added this parameter since it affects the scheduling order of thread blocks and thus impacts cache utilization on the GPU.
+For example, for the unravel permutation $(Z,X,Y)$, the order in which thread blocks are scheduled is first along the Z axis, then X axis, and finally the Y axis.
+
+\item
+\textbf{Thread blocks per SM}.
+The number of threads that can reside on a \emph{streaming multiprocessor} (SM) impacts performance.
+However, there is a delicate trade-off between available concurrency and register usage:
+More threads per SM means more concurrency, at the cost of fewer available registers per thread.
+We use CUDA's \verb=__launch_bounds__= compiler hint to tune the number of thread blocks per SM, and thus the register usage.
+
+\end{itemize}
+
+
+
+
+
+\subsection{Capture Results}
+
+\begin{table}[]
+\caption{Time and size required to capture kernel.}
+\label{tab:evaluation_captures}
+\centering
+\begin{tabular}{l|l|l||l|l}
+\toprule
+Kernel & Grid size & Precision & Capture time & Capture size \\
+\midrule
+%time=2331538 size=70842672
+\texttt{advec\_u} & $256^3$ & float & 2.3\,sec & 70.8\,MB \\
+%time=4621459 size=141685344
+\texttt{advec\_u} & $256^3$ & double & 4.6\,sec & 141.7\,MB \\
+%time=18248830 size=551678256
+\texttt{advec\_u} & $512^3$ & float & 18.2\,sec & 551.6\,MB \\
+%time=43263257 size=1103356512
+\texttt{advec\_u} & $512^3$ & double & 43.2\,sec & 1103\,MB \\
+%time=5576891 size=212798464
+\texttt{diff\_uvw} & $256^3$ & float & 5.6\,sec & 212.8\,MB \\
+%time=11928014 size=425596928
+\texttt{diff\_uvw} & $256^3$ & double & 11.9\,sec & 425.6\,MB \\
+%time=43341804 size=1656099840
+\texttt{diff\_uvw} & $512^3$ & float & 43.3\,sec & 1656\,MB \\
+%time=82349427 size=3312199680
+\texttt{diff\_uvw} & $512^3$ & double & 82.3\,sec & 3312\,MB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{sidewaysfigure*}
+\includegraphics[width=\textwidth]{fig/histograms.pdf}
+\caption{Tuning results for each combination of kernel, grid size, floating-point precision, and GPU. Each graph is a histogram showing the distribution of performance for all kernel configurations in the entire search space. Performance is expressed as the runtime ratio compared to the optimal configuration for that particular scenario. The arrow at \emph{default} indicates the performance of the default kernel configuration. The arrow at \emph{configuration $\mathcal{C}$} indicates the performance of  the optimal configuration for \texttt{advec\_u}-$256^3$-float-A100 (The top left scenario).}
+\label{fig:evaluation_histograms}
+\end{sidewaysfigure*}
+
+
+% Ben; Ik moest dit figure helemaal hier zetten om ervoor te zorgen dat het opzelfde pagina kwam als de tekst die dit figuur bespreekt
+\begin{figure*}[t!]
+\includegraphics[width=\textwidth]{fig/tuning.pdf}
+\caption{Tuning sessions for both random and Bayesian optimization (\texttt{bayes}) search strategy. Each dot represents one configuration evaluated by the tuner. The vertical axis is the measured kernel time (note: does not start at zero). The horizontal axis is the wall clock time in minutes of the tuning session. The dashed lines indicates the performance of the the best configuration found during the tuning session.}
+\label{fig:evaluation_tuning}
+\end{figure*}
+
+We executed MicroHH for two grid sizes ($256{\times}256{\times}256$ and $512{\times}512{\times}512$) and two floating-point precision (\texttt{float} and \texttt{double}).
+Table~\ref{tab:evaluation_captures} shows the time required to capture each kernel and the size of the capture on disk.
+The captures are written to persistent storage on a shared file system (NFS); thus,  IO times depend heavily on the load of the file system.
+The table shows that the capture time required scales with the size of the capture which, in turn, scales with the grid size. 
+
+
+Considering all tunable parameters and their possible values, the entire search space consists of more than 7.7 million kernel configurations, which means exhaustively tuning each kernel in the application is infeasible. As such, we tune the eight captured kernels for two search strategies from Kernel Tuner: 
+a \emph{random} search, since it gives an unbiased performance distribution, 
+and \emph{Bayesian optimization}, since previous work~\cite{willemsen2021bayesian} shows it outperforms other search strategies.
+Figure~\ref{fig:evaluation_tuning} shows two examples of the tuning sessions for a grid size of $256^3$, single precision, and an NVIDIA A100 GPU.
+The other tuning sessions show similar result and are, therefore, not included.
+
+These results show that both search strategies find increasingly better performing kernel configurations.
+Since an exhaustive search is infeasible, we consider the best-performing configuration found after one hour of tuning to be the \emph{optimum}. 
+Bayesian optimization strongly prefers better-performing kernel configurations, whereas the configurations selected by random search show a much larger spread. 
+We found that Bayesian optimization takes, on average, 3.4 minutes (max: 6.5 minutes) to find a configuration 10\% away from the optimum and 7.5 minutes (max: 19 minutes) for a 5\% difference. 
+A complete comparison of the different optimization strategies in Kernel Tuner is outside the scope of this work and we refer interested readers to the work by Schoonhoven et al.~\cite{schoonhoven2022benchmarking}.
+
+% Stijn: Maybe we should say something about tuning times? Like, what is the average time to find the optimum?
+
+
+\subsection{Tuning Results}
+
+
+
+Next, we evaluate the tuning results of all eight captured kernels for the two GPUs: the A4000 and the A100.
+In the remainder of this paper, we shall refer
+to each combination of kernel, grid size, precision, and GPU as a \emph{scenario}. 
+We will denote each scenario as \emph{kernel}-\emph{grid}-\emph{precision}-\emph{GPU} (e.g., \texttt{advec\_u}-$256^3$-{float}-{A100}).
+
+\begin{sidewaysfigure*}
+\includegraphics[width=\textwidth]{fig/matrix.pdf}
+\caption{Matrix showing how well the optimal configuration for one scenario performs in another scenario. The numbers are the fraction of optimum.}
+\label{fig:evaluation_matrix}
+\end{sidewaysfigure*}
+
+Figure~\ref{fig:evaluation_histograms} shows 16 histograms of the kernel times measured by the random search strategy for each scenario.
+The performance of each configuration is expressed as the fraction relative to the best performing configuration (i.e., the \emph{optimum}) for that particular scenario.
+For example, a fraction of $0.8$ indicates that a configuration only reached 80\% of the performance compared to the optimum and is, thus, $1/0.8 = 1.25$ times slower.
+The histogram shows how difficult it would be to tune these kernels by hand.
+%These histograms give a good indication of how difficult it is to tune these kernels.
+For example, for the scenario \texttt{advec\_u}-$256^3$-float-A100, only 0.8\% of the configurations are within 10\% of the optimum.
+As such, it would be challenging and time-consuming to find this optimum manually, which is why auto-tuning tools are a necessity.
+
+
+Each graph includes a \emph{black} arrow that indicates the performance of the default configuration.
+The Figure shows that, for each graph, the default configuration is not near the optimum, meaning that auto-tuning can significantly increase performance. % for these kernels.
+The default configuration across all 16 scenarios reaches only an average performance of 75\%, meaning tuning can increase performance by an average of 25\%.
+
+We found that the optimal configuration is different for each of the 16 scenarios, and any particular configuration that gives high performance for one scenario usually performs poorly for others.
+To illustrate this, we consider the best kernel configuration $\mathcal{C}$ for the scenario \texttt{advec\_u}-$256^3$-float-A100.
+Figure~\ref{fig:evaluation_histograms} shows a \emph{red} arrow in each histogram that indicates the performance of $\mathcal{C}$ for each of the 16 scenarios.
+The Figure shows that while $\mathcal{C}$ performs well in certain scenarios, it performs exceptionally poorly in other scenarios.
+Configuration $\mathcal{C}$ performs worse than the default configuration in 11 of the 16 scenarios.
+This result indicates that a kernel tuned for one particular scenario may not perform well in other scenarios, demonstrating the need to individually tune the kernels for all scenarios.
+
+\subsection{Performance Portability}
+
+
+To quantify the portability of the optimal configuration found when tuning from one scenario to another, Figure~\ref{fig:evaluation_matrix} shows the normalized relative performance. % of the ported configuration.
+
+For example, when the optimal configuration found for 
+\texttt{advec\_u}-$256^3$-float-A4000 is applied to the 
+\texttt{advec\_u}-$512^3$-float-A4000 kernel, it achieves only 44\% of the best-known configuration for that problem. It is important to realize that between these two kernels, only the grid size has changed and both use single precision on the A4000. 
+
+Conversely, for double precision, the optimal performance is very close for both $256^3$ and $512^3$. 
+This is because of the design of the A4000, which has a limited number of double-precision \emph{floating-point units} (FPUs): only 1/32nd compared to the number of single-precision FPUs. Therefore, the kernels using double precision are compute-bound on the A4000, meaning many kernel configurations in the search space show similar performance once their memory-throughput is efficient enough to run into the bottleneck introduced by the limited number of double-precision FPUs. This observation is confirmed by the narrow search space distributions for kernels using double precision on the A4000. 
+
+The A100 has many more double-precision FPUs, as its double-precision peak performance is half the single-precision peak performance. Consequently, we see more differences and, therefore, even less portability of the optimal configuration from one scenario to the next. For example, where the optima of \texttt{advec\_u}-$256^3$-double-A4000 and \texttt{advec\_u}-$512^3$-double-A4000 show near-identical performance, \texttt{advec\_u}-$256^3$-double-A100 and \texttt{advec\_u}-$512^3$-double-A100 only achieve 76\% of the optimal performance when applied to each other's scenario. 
+The results for the \texttt{diff\_uvw} kernel are similar, except that varying only the problem size only leads to suboptimal performance for double precision on the A100.
+
+\begin{table}[t]
+    \caption{Performance portability metric (PPM) for the \texttt{advec\_u} kernel using the default or optimal configurations applied to each scenario. Kernel Launcher always selects the optimal configuration.}
+    \label{tab:advec-u-ppm}
+    \centering
+    \begin{tabular}{l|c|c|c}
+\toprule
+Configuration tuned for	& Best	& Worst	& PPM \\
+\midrule
+(default configuration)	& 0.90	& 0.53	& 0.69 \\
+A100, float, $256^3$	& 1.00	& 0.36	& 0.62 \\
+A100, float, $512^3$	& 1.00	& 0.71	& 0.88 \\
+A100, double, $256^3$	& 1.00	& 0.68	& 0.81 \\
+A100, double, $512^3$	& 1.00	& 0.68	& 0.83 \\
+A4000, float, $256^3$	& 1.00	& 0.44	& 0.71 \\
+A4000, float, $512^3$	& 1.00	& 0.57	& 0.72 \\
+A4000, double, $256^3$	& 1.00	& 0.69	& 0.75 \\
+A4000, double, $512^3$	& 1.00	& 0.62	& 0.78 \\
+Kernel Launcher	& 1.00	& 1.00	& 1.00 \\
+\bottomrule
+    \end{tabular}
+\vspace{20pt}    
+%\vspace{-8pt}
+%\end{table}
+%\begin{table}[t]
+    \caption{Performance portability metric (PPM) for the \texttt{diff\_uvw} kernel using the default or optimal configurations applied to each scenario. Kernel Launcher always selects the optimal configuration.}
+    \label{tab:diff-uvw-ppm}
+    \centering
+    \begin{tabular}{l|c|c|c}
+\toprule
+Configuration tuned for& Best	& Worst	& PPM \\
+\midrule
+(default configuration)	& 0.78	& 0.67	& 0.74 \\
+A100, float, $256^3$	& 1.00	& 0.69	& 0.82 \\
+A100, float, $512^3$	& 1.00	& 0.69	& 0.82 \\
+A100, double, $256^3$	& 1.00	& 0.66	& 0.84 \\
+A100, double, $512^3$	& 1.00	& 0.66	& 0.81 \\
+A4000, float, $256^3$	& 1.00	& 0.66	& 0.83 \\
+A4000, float, $512^3$	& 1.00	& 0.60	& 0.79 \\
+A4000, double, $256^3$	& 1.00	& 0.49	& 0.63 \\
+A4000, double, $512^3$	& 1.00	& 0.43	& 0.60 \\
+Kernel Launcher	& 1.00	& 1.00	& 1.00 \\
+\bottomrule
+    \end{tabular}\vspace{-8pt}
+\end{table}
+
+Overall, we see that 
+the configuration that is optimal for a given precision and problem size on the A100 only yields 70\%-77\% for \texttt{advec\_u} and 69\%-82\% for \texttt{diff\_uvw} of the performance that could have been achieved on A4000, if the optimal configuration for that scenario had been used instead. 
+Similarly, using the optimal configurations for A4000 only achieves 67\%-83\% for \texttt{advec\_u} and 50\%-77\% for \texttt{diff\_uvw} of the performance that could have been achieved on A100.
+This is surprising since both GPUs are from the same vendor and even belong to the same architecture (Ampere).
+These results demonstrate the need for software development tools to use auto-tuning results obtained in different scenarios.
+
+We computed the \emph{performance portability metric}~\cite{pennycook2016metric} (PPM) to quantify the portability of the default and optimal configurations to all scenarios, as shown in Tables~\ref{tab:advec-u-ppm} and \ref{tab:diff-uvw-ppm}. 
+As can be seen in both tables, the performance portability score of the default configuration is in the same range as the scores for the configurations that have been tuned for one scenario. 
+This means that tuning for only one scenario and then using this configuration in all scenarios may lead to worse overall performance compared to not tuning all. 
+However, using Kernel Launcher's runtime kernel selection, the application always selects the optimal configuration to achieve the 100\% of the potential performance in each scenario.
+%
+To create performance portable applications that can achieve optimal performance in every scenario, it is necessary to select between different configurations based on the problem at hand.
+%These results also highlight the limitations of Kernel Tuner.  % Stijn: Reviewer 2 does not like this sentence
+Without Kernel Launcher's runtime kernel selection and runtime kernel compilation capabilities, a similar result could only have been achieved by the user recompiling the application every time it is executed on a different problem.
+
+\subsection{Kernel Launcher Overhead}
+\label{sec:evaluation_overhead}
+For each kernel, Kernel Launcher introduces some overhead on the first launch since the kernel's source code must compiled dynamically at run time.
+We found that the first kernel call takes, on average, $294$ ms for our benchmarks.
+Figure~\ref{fig:evaluation_overhead} shows a breakdown of this time.
+There are four sources of overhead: reading the wisdom file, runtime compilation using NVRTC (\texttt{nvrtcCompileProgram}), loading the compiled code into the GPU (\texttt{cuModuleLoad}), and scheduling the kernel onto the GPU (\texttt{cuLaunchKernel}).
+The figure shows that the runtime compilation (NVRTC) is the most expensive stage and constitutes around 80\% of this overhead.
+
+
+\begin{figure}
+\centering
+\includegraphics[width=.5\textwidth]{fig/overhead.pdf}
+\caption{Average time required for the first and subsequent launches of a kernel using Kernel Launcher. See Section~\ref{sec:evaluation_overhead} for explanation.}
+\label{fig:evaluation_overhead}
+\end{figure}
+
+For subsequent launches, runtime compilation is not necessary since the compiled kernel is cached.
+We found that subsequent kernel calls using Kernel Launcher take just 3 $\mu{}s$ on average.
+This is comparable to the overhead of CUDA when launching a GPU kernel without the use of Kernel Launcher.
+
+
+%\subsection{Kernel Launcher Overhead}
+% Stijn: Maybe something on overhead of KL? something like time to compile kernel/load compile kernel? something like overhead in launching a kernel (should negligible)
+
+% Ben: that would be very interesting, the question is I guess what to compare against, do you still have a baseline that doesn't use Kernel Launcher? Or could you measure overhead when comparing against using the default (is the default precompiled?) as a means to save work on performing this comparison
+

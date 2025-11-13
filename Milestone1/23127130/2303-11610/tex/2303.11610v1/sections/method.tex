@@ -1,0 +1,177 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+\section{Proposed approach}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Overview}
+
+Given an input point cloud, we produce two augmented views that are processed with the same deep neural network to extract point-level features.
+These features are used to obtain pseudo-labels in the \textit{online pseudo-labelling} step through the Sinkhorn-Knopp algorithm~\cite{cuturi2013sinkhorn} (Sec.~\ref{sec:pseudo_labelling}).
+Concurrently, we process the same features with the last network layers to segment novel and base classes.
+These features are stored in the \textit{class-balanced queue} to mitigate the problem of batches with missing classes (Sec.~\ref{sec:class_balanced_queue}).
+We exploit pseudo-label values (class probabilities) to filter out uncertain points, thus adding to the queue only high-quality points (Sec.~\ref{sec:unc_train}).
+Lastly, we train our network by minimising the \textit{optimisation objective} function through a swapped prediction task based on the computed pseudo-labels (Sec.~\ref{sec:optimization_objective}).
+Fig.~\ref{fig:main_chart} shows the block diagram of NOPS.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Problem formulation}\label{sec:problem_formulation}
+
+Let $\mathrm{X} = \{\mathcal{X}\}$ be a dataset of 3D point clouds captured in different scenes.
+$\mathcal{X}$ is a set composed of a base set $\mathcal{X}_b$ and a novel set $\mathcal{X}_n$, s.t.~$\mathcal{X} = \mathcal{X}_b \cup \mathcal{X}_n$.
+The semantic categories that can be present in our point clouds are $\mathcal{C} = \mathcal{C}_b \cup \mathcal{C}_n$, where $\mathcal{C}_b$ is the set of base classes and $\mathcal{C}_n$ is the set of novel classes, s.t.~$\mathcal{C}_b \cap \mathcal{C}_n = \emptyset$.
+Each $\mathcal{X} \in \mathrm{X}$ is composed of a finite but unknown number of 3D points $\mathcal{X} = \{(\mathbf{x}, c)\}$, where $\mathbf{x} \in \mathbb{R}^3$ is the coordinate of the a point and $c$ is its semantic class.
+We know the class of the point $(\mathbf{x}, c)$, s.t.~$\mathbf{x} \in \mathcal{X}_b$ and $c \in \mathcal{C}_b$, but we do not know the class of the point $(\mathbf{x}, c)$, s.t.~$x \in \mathcal{X}_n$ and $c \in \mathcal{C}_n$.
+No points in $\mathcal{X}_n$ belong to one of the base classes $\mathcal{C}_b$.
+As in \cite{han2019learning, zhong2021neighborhood, zhao2022novel}, we assume that the number of classes to discover is known, i.e.~$|\mathcal{C}_n| = C_n$.
+We aim to design a computational approach that trains a deep neural network $f_{\mathbf{\Theta}}$ that can segment all the points of a given point cloud, thus learning to jointly segment base classes $\mathcal{C}_b$ and novel classes $\mathcal{C}_n$.
+$\mathbf{\Theta}$ are the weights of our deep neural network.
+$f_\mathbf{\Theta}$ is composed of two heads, $f_\mathbf{\Theta} = f_\xi \circ \{f_b, f_n\}$, where $f_b$ is the segmentation head for the base classes, $f_n$ is the segmentation head for the novel classes, $f_\xi$ is the feature extractor network and $\circ$ is the composition operator (Fig.~\ref{fig:main_chart}).
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Online pseudo-labelling}\label{sec:pseudo_labelling}
+
+We formulate pseudo-labelling as the assignment of novel points to the class-prototypes  learnt during training~\cite{caron2020unsupervised}.
+Let $\mathtt{P} \in \mathbb{R}^{D \times \rho}$ be the class prototypes, where $D$ is the size of the output features from $f_\xi$ and $\rho$ is the number of prototypes.
+Let $\mathtt{Z} \in \mathbb{R}^{D \times m}$ be the normalised output features extracted from $f_\xi$, where $m$ is the number of points of the point cloud.
+$m$ it is not known a priori and it can differ across point clouds.
+We aim to find the assignment $\mathtt{Q} \in \mathbb{R}^{\rho \times m}$ s.t.~all the points in the batch are equally partitioned across the $\rho$ prototypes.
+This equipartition ensures that the feature representations of the points belonging to different novel classes are well-separated, thus preventing the case in which the novel class feature representations collapse into a unique solution. 
+Caron et al.~\cite{caron2020unsupervised} employs an arbitrary large number of prototypes $\rho$ to effectively organise the feature space produced by $f_\xi$. 
+They discard $\mathtt{P}$ after training. 
+In contrast, we learn exactly $\rho = C_n$ class prototypes and propose to use $\mathtt{P}$ as the weights for our new class segmentation head $f_n$, which outputs the $C_n$ logits for the new classes. 
+In order to optimise the assignment $\mathtt{Q}$, we maximise the similarity between the features of the new points and the learned prototypes as
+%---------------------------
+\begin{equation}
+    \label{eq:sk_problem}
+    \max_{\mathtt{Q} \in \mathcal{Q}} \,\, \text{Tr}(\mathtt{Q}^\top \mathtt{P}^\top \mathtt{Z}) + \epsilon H(\mathtt{Q})  \rightarrow \mathtt{Q}^*,
+\end{equation}
+%---------------------------
+where $H$ is the entropy function, $\epsilon$ is the parameter that determines the smoothness of the assignment and $\mathtt{Q}^*$ is our sought solution. 
+Asano et al.~\cite{Asano2020} enforce the equipartioning constraint by requiring $\mathtt{Q}$ to belong to a transportation polytope and perform this optimisation on the whole dataset at once (offline).
+This operation with point cloud data is computationally impractical.
+Therefore, we formulate the transportation polytope such that the optimisation is performed online, which consist of processing only the points within the batch being processed
+%---------------------------
+\begin{equation}
+    \mathcal{Q} = \left\{ \mathtt{Q} \in \mathbb{R}^{C_n \times m}_+ | \mathtt{Q} \mathtt{1}_m = \frac{1}{C_n} \mathtt{1}_{C_n}, \mathtt{Q}^\top \mathtt{1}_{C_n} = \frac{1}{m} \mathtt{1}_m \right\},
+\end{equation}
+%---------------------------
+where $\mathtt{1}_\star$ represents a vector of ones of dimension $\star$.
+These constraints ensure that each class prototype is selected on average at least $m / C_n$ times in each batch. 
+The solution $\mathtt{Q}^*$ can take the form of a normalised exponential matrix
+%---------------------------
+\begin{equation}
+    \mathtt{Q}^* = \text{diag}(\alpha) \exp \left( {\frac{\mathtt{P}^\top \mathtt{Z}}{\epsilon}} \right) \text{diag}(\beta),
+\end{equation}
+%---------------------------
+where $\alpha$ and $\beta$ are renormalization vectors that are computed iteratively with the Sinkhorn-Knopp algorithm \cite{cuturi2013sinkhorn, mei2023overlap}.
+We then transpose the optimised soft assignment $\mathtt{Q}^* \in \mathbb{R}^{C_n \times m}_+$ to obtain the soft pseudo-labels for each of the $m$ novel points being processed within each batch.
+
+We empirically found that training can be more effective if pseudo-labels are smoother in the first training epochs and peaked in the last training epochs.
+Therefore, we introduce a linear decay of $\epsilon$ during training.
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Multi-headed segmentation:}
+A single segmentation head may converge to a suboptimal feature space, thus producing suboptimal prototype solutions.
+To further improve the segmentation quality, we use multiple novel class segmentation heads to optimise $f_\Theta$ based on different training solutions.
+Different solutions increase the likelihood of producing a diverse partitioning of the feature space as they regularise with each other (they share the same backbone) \cite{ji2019invariant}.
+In practise, we concatenate the logits of the base class segmentation head with the outputs of each novel class segmentation head and we separately evaluate their loss for each novel class segmentation head at training time.
+
+We task our network to over-cluster novel points, using segmentation heads that output $o\cdot C_n$ logits, where $o$ is the over-clustering factor. 
+Previous studies empirically showed that this is beneficial to learn more informative features \cite{caron2020unsupervised, fini2021unified, mei2022data, ji2019invariant}. We observed the same and concur that over-clustering can be useful for increasing expressivity of the feature representations. 
+The over-clustering heads are then discarded at inference time.
+
+
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Class-balanced queuing}\label{sec:class_balanced_queue}
+
+Soft pseudo-labelling described in Sec.~\ref{sec:pseudo_labelling} produces an equipartite matching between the novel points and the class centroids.
+However, it is highly likely that batches are sampled with point clouds containing novel classes with different cardinalities when dealing with 3D data.
+It is also likely that some scenes may contain only a subset of the novel classes. 
+Therefore, enforcing the equipartitioning constraint in each batch of the dataset could affect the learning of less-frequent (long-tail) classes.
+As a solution, we introduce a queue $\mathtt{Z}_q$ containing a randomly extracted portion of the features of the novel points from the previous iterations.
+We use these additional data to mitigate the potential class imbalance that may occur during training. 
+In practise, we compute $\mathtt{Z} \leftarrow \mathtt{Z} \oplus \mathtt{Z}_q$, where $\oplus$ is the concatenation operator, and execute the Sinkhorn-Knopp algorithm on this augmented version of $\mathtt{Z}$.
+Then, we retain only the pseudo-labels for the first $m$ columns of $\mathtt{Q}^*$.
+
+
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Uncertainty-aware training and queuing}\label{sec:unc_train}
+
+We propose to carefully select novel points for training $f_\Theta$ with fewer but more reliable pseudo-labels and to build a more effective queue $\mathtt{Z}_q$.
+We perform this selection by applying a threshold to the class probabilities of the novel class pseudo-labels.
+We found that seeking a fixed threshold for all the novel classes, that is also compatible with the variations of the class probabilities during training, is impractical.
+Therefore, we employ an adaptive threshold based on the class probabilities within each batch.
+
+Our selection strategy operates as follows.
+Let $\tau_c$ be the adaptive threshold for the points of the novel class $c \in \mathcal{C}_n$.
+Firstly, we extract the novel points that have the greatest class probability for the class $c$.
+Secondly, we compute $\tau_c$ as the $p$-th percentile of the class probabilities of these novel points.
+Lastly, we retain the novel points of class $c$ whose class probability is above the threshold $\tau_c$.
+We define this selection strategy as the function
+\begin{equation}
+    \phi : (\mathcal{F}_n, \hat{\mathcal{Y}_n}) \times p \mapsto (\bar{\mathcal{F}}_n),
+\end{equation}
+%---------------------------
+where $\mathcal{F}_n$ is the set of feature vectors extracted from $f_\xi$ and $\hat{\mathcal{Y}}_n$ is the set of class probabilities predicted by the network for these points.
+$\bar{\mathcal{F}}_n$ are both processed by the Sinkhorn-Knopp algorithm to generate our pseudo-labels and added to $\mathtt{Z}_q$ to make it more effective. 
+
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Optimisation objective}\label{sec:optimization_objective}
+
+We optimise $f_\Theta$ by using the weighted Cross Entropy objective based on the labels $\mathcal{Y}_b$ of the base samples and the pseudo-labels $\tilde{\mathcal{Y}}_n$ of the novel samples.
+We formulate a swapped prediction task based on these pseudo-labels \cite{caron2020unsupervised}.
+Secifically, we begin by generating two different augmentations of $\mathcal{X}$ that we define as $\mathcal{X}^\prime$ and $\mathcal{X}^{\prime\prime}$.
+We use the known one-hot labels for $\mathcal{Y}_b$ and the predicted soft pseudo-labels for $\tilde{\mathcal{Y}}_n$.
+We predict the novel pseudo-labels $\tilde{\mathcal{Y}}_n^\prime$ and $\tilde{\mathcal{Y}}_n^{\prime\prime}$ of the respective point clouds $\mathcal{X}^\prime$ and $\mathcal{X}^{\prime\prime}$ with our approach.
+Then, we enforce prediction consistency between the swapped pseudo-labels of the two augmentations as
+%---------------------------
+\begin{equation}
+    \label{eq:swapped_pred_task}
+    \mathcal{L}(\mathcal{X}) = \ell(\hat{\mathcal{Y}}^\prime, \tilde{\mathcal{Y}}^{\prime\prime}) + \ell(\hat{\mathcal{Y}}^{\prime\prime}, \tilde{\mathcal{Y}}^{\prime}),
+\end{equation}
+%---------------------------
+where $\hat{\mathcal{Y}}^\prime = \hat{\mathcal{Y}}^\prime_b \cup \hat{\mathcal{Y}}^\prime_n$ (same for $\hat{\mathcal{Y}}^{\prime\prime}$),
+$\tilde{\mathcal{Y}}^\prime = \mathcal{Y}_b^\prime \cup \tilde{\mathcal{Y}}_n^\prime$ (same for $\tilde{\mathcal{Y}}^{\prime\prime}$)
+and $\ell$ is the weighted Cross Entropy loss.
+We use separate segmentation heads for base classes and novel classes.
+The weights of the loss for the base classes are computed based on their occurrence frequency in the training set.
+The weights of the loss for the novel classes are all set equally as their occurrence frequency in the dataset is unknown.
+
+

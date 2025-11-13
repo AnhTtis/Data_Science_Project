@@ -1,0 +1,281 @@
+\section{Single Trajectory Model}
+\label{sec:single trajectory model}
+This section outlines our method to learn the distribution of aircraft trajectories relative to their flight procedures and to generate synthetic traffic scenarios. 
+The interactions between multiple aircraft are not considered in this section. Our approach follows the following steps, which are described in detail in this section. First, we segment our aircraft trajectories to \textbf{construct input vectors} for our Gaussian mixture models. Next, we use these input vectors to \textbf{train a Gaussian Mixture Model} for each flight stage. To avoid overfitting and manage noise within our GMMs, we \textbf{use low-rank approximations of the GMM covariance matrices}. Finally, we use these approximated matrices to \textbf{generate synthetic trajectories}. \Cref{fig:flowchart} illustrates this process. %We note that our use of Gaussian Mixture Models assumes that our data points are generated from multiple Gaussian distributions.
+
+\begin{figure}
+    \centering
+    \tikzstyle{process} = [rectangle, rounded corners, minimum width=3cm, minimum height=1cm, minimum width=5.5cm, text centered, draw=black]
+    \tikzstyle{arrow} = [thick, ->, >=stealth]
+    \begin{tikzpicture}[node distance=2cm]
+    
+        \node (step1) [process] {Segment aircraft trajectories};
+        \node (step2) [process, below of=step1] {Fit GMMs};
+        \node (step3) [process, below of=step2] {Compute low-rank approximation};
+        \node (step4) [process, below of=step3] {Generate synthetic trajectories};
+    
+        \draw [arrow] (step1.south) -- (step2.north) node[midway,right] {Trajectory segments};
+        \draw [arrow] (step2.south) -- (step3.north) node[midway,right] {GMMs};
+        \draw [arrow] (step3.south) -- (step4.north) node[midway,right] {Low-rank covariance matrices};
+    
+    \end{tikzpicture}
+        \caption{Flowchart overview of single trajectory model\label{fig:flowchart}}
+\end{figure}
+
+\subsection{Construction of Input Vector}
+\label{subsec:input vector construction}
+Before training a separate Gaussian mixture model for each flight stage, we need to construct the input vector sets in the proper format. 
+First, each aircraft trajectory is divided into radar vector and final approach segments based on the distance to its IAP.
+Then, the radar vector trajectory is assigned to one of the radar vector procedures using dynamic time warping (DTW) \cite{Muller2007}.
+
+DTW is an algorithm for measuring similarity between two temporal sequences, which may vary in length.
+It uses a dynamic programming approach to find the shortest distance between these sequences.
+Given a pair of vectors ${x_1=[x_1^{(1)},\ldots, x_1^{(m)}] \in \mathbb{R}^m}$ and ${x_2=[x_2^{(1)}, \ldots, x_2^{(n)}] \in \mathbb{R}^n}$, the DTW distance between them is computed as
+\begin{equation}
+    DTW(x_1, x_2) = D(m, n)
+\end{equation}
+where for all ${i \in \{1,\ldots,m\},\ j \in \{1,\ldots,n\}}$,
+\begin{equation}
+    D(i, j) = \lVert x_1^{(i)} - x_2^{(j)} \rVert_2 + \min \begin{cases}
+        D(i, j-1) \\ D(i-1, j) \\ D(i-1, j-1).
+    \end{cases}
+\end{equation}
+After measuring the DTW distances between the radar vector trajectory and each of the radar vector procedures, we label the trajectory as the procedure to which it is closest, as measured by DTW distance.
+
+Now with the two sets of aircraft trajectory-procedure pairs, one for each flight stage, we would like to train a GMM that takes as input the sequence of deviations between aircraft positions and the procedure points.
+One challenge for training a GMM is that all the input vectors are required to be of the same length.
+To deal with the issue of varying lengths of trajectories, we separately interpolate each dimension in an aircraft trajectory as a polynomial function of time and then re-sample a fixed number of points.
+We also generate the procedural trajectories by interpolating the waypoints of the procedures and re-sampling the same number of points.
+To integrate time into the spatial procedural trajectories of IAPs, we extract aircraft trajectories that pass very close to all the waypoints and take their mean. This allows us to estimate how a trajectory projected on a nominal path would proceed over time. %\todo{why do we do this?} 
+The radar vector procedures already involve temporal factors because the procedures are defined as the nominal paths extracted from aircraft trajectories.
+% \soyeonstrike{For the interpolation, we use piecewise cubic Hermite interpolating polynomials (PCHIP).
+% PCHIP constructs a piecewise function where each piece ${p_i(x)}$ is a cubic polynomial for the observed data points with the specified values and first derivatives (slopes) at the interpolation points.}
+
+\added{As done in prior work \cite{kochenderfer2010airspace}}, we use the piecewise cubic Hermite interpolation method. \added{We select this method because it has a number of desirable characteristics. First, it ensures that the interpolated function is continuous by fitting a cubic polynomial for each piece of the function and requiring first derivative continuity between pieces. Second, it preserves derivative information such as monotonicity; i.e., where the data is monotonic, the interpolated function will be monotonic. Finally, due to its use of low-degree polynomials, it generally avoids oscillation (Runge's phenomenon) that can be common in interpolation methods using high-degree polynomials. As a result of these properties, it is suitable for interpolating trajectory data and in particular procedural trajectories that should not oscillate between sample points.} \deleted{This method fits a cubic polynomial for each piece of the given function and imposes the continuity of the first derivative.
+It preserves monotonicity and avoids oscillation in the intervals where the data is monotonic.
+This property makes the piecewise cubic Hermite interpolation method appropriate for interpolating trajectory data, especially the procedural trajectories, which should not oscillate between the sample points.}
+
+% For each sub-interval $x_i \leq x \leq x_{i+1}$,
+% \begin{align}
+%     p_i(x) = a_ix^3 + b_ix^2 + c_ix + d_i
+% \end{align}
+% with constraints:
+% \begin{align}
+%     \begin{split}
+%         p_i(x_i) &= y_i\\
+%         p_i(x_{i+1}) &= y_{i+1}\\
+%         p'_i(x_i) &= y'_i = \frac{y_{i+1}-y_{i-1}}{x_{i+1}-x_{i-1}}\\
+%         p'_i(x_{i+1}) &= y'_{i+1} = \frac{y_{i+2}-y_i}{x_{i+2}-x_i}
+%     \end{split}
+% \end{align} 
+
+Finally, we have two sets of training input vectors. An individual input ${\tau \in \mathbb{R}^{3T+2}}$ is defined as
+\begin{align}
+\begin{split}
+\tau = &[t, d, (x_1-x_1^p), (y_1-y_1^p), (z_1-z_1^p),\\
+&\ldots,(x_T-x_T^p), (y_T-y_T^p), (z_T-z_T^p)]
+\end{split}
+\label{eq:single_model_training_data}
+\end{align}
+where $t$ and $d$ are the transit time and the total distance of the trajectory,
+$[x_{1:T}, y_{1:T}, z_{1:T}]$ are the ENU coordinates of the aircraft trajectory at each timestep from 1 to $T$, and $[x_{1:T}^p, y_{1:T}^p, z_{1:T}^p]$ are the ENU coordinates of the corresponding procedural trajectory. 
+We keep the transit time and total distance information of each trajectory so that we can later generate synthetic trajectories with reasonable airspeed.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Gaussian Mixture Model}
+\label{subsec:GMM}
+
+The Gaussian mixture model (GMM) is a probabilistic generative model that assumes the data points are generated from a mixture of Gaussian distributions.
+% \soyeonstrike{
+% It provides a convenient analytical form for representing data distributions that are potentially multimodal.
+% Due to its flexibility of capturing an arbitrary level of complexity, GMM is widely used for many tasks including density estimation, statistical inference, and clustering.}
+This model is capable of representing the multimodality and the uncertainty of complex data distributions \cite{kochenderfer2015decision}.
+Additionally, GMMs are commonly used across broad domains to generate samples that capture representative characteristics of the training data \cite{liu2019improving, chokwitthaya2020applying, li2021gaussian}. %\todo{do  we need to cite these statements about GMMs, or okay to treat as common sense?}
+These advantages align with our objectives of modeling the aircraft behavior and generating realistic trajectories. %\todo{not sure what this is missing that the reviewer was hoping for regarding justifying GMM}
+
+For each flight stage, we construct a GMM with a set of training input vectors defined as (\ref{eq:single_model_training_data}).
+If a single vector $\tau$ is sampled from $K$ mixture components, the marginal probability distribution of $\tau$ is 
+% Consider a training set ${\mathbf{\tau}=[\tau^{(1)}, \ldots, \tau^{(m)}] \in \mathbb{R}^{m \times n}}$ where each data point ${\tau^{(i)} \in \mathbb{R}^{n}}$ is generated from a mixture of $K$ Gaussian distributions. The density function of $\tau^{(i)}$ is
+\begin{align}
+    \label{eq:gmm}
+    p(\tau) = \sum_{j=1}^K \pi_j \mathcal{N}(\tau \mid \mu_j, \Sigma_j)
+\end{align}
+where ${\pi_j}$ are mixing coefficients that must satisfy ${ {\textstyle\sum}_{j=1}^{K} \pi_j=1}$ and ${\pi_j \geq 0}$ for all ${j \in \{1,\ldots,K\}}$.
+Each Gaussian density ${\mathcal{N}(\tau  \mid \mu_j, \Sigma_j)}$ is called a component of the mixture.
+The maximum likelihood estimates of the parameters ${\{\pi_j, \mu_j, \Sigma_j\}}$ for all $j$ given a dataset of the observations are obtained using the expectation-maximization (EM) algorithm \cite{dempster1977maximum}.
+
+Our model learns the sequence of deviations (i.e., relative positions) of an aircraft from the corresponding points of the procedure. Fig. \ref{fig:gmm_deviations} shows an example sequence of deviations. 
+The aircraft positions and the procedure points are indicated by black and blue crosses respectively, and the deviations are indicated by red dotted lines.
+\begin{figure}[tb!]
+\centering
+\setlength\figureheight{4.8cm}
+\setlength\figurewidth{6.3cm}
+\input{figures/gmm_dev.tex}
+\caption{Example sequence of deviations between aircraft and procedural trajectory.}
+\label{fig:gmm_deviations}
+\end{figure}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Low-rank Approximation of Covariance Matrices}
+\label{subsec:low-rank approximation}
+Derived from the aircraft and procedural trajectories as in (\ref{eq:single_model_training_data}), the input data matrix of our model is likely to be high-dimensional and contain redundant features.
+Also, the model can overfit the noise in the training set. %sparsity
+To eliminate redundant features and reduce overfitting, we perform a low-rank approximation for each covariance matrix of our GMM in Section \ref{subsec:GMM} using eigenvalue decomposition. 
+
+Consider the covariance of the $j$th Gaussian component ${\Sigma_j \in \mathbb{R}^{n \times n}}$.
+The eigenvalue decomposition of ${\Sigma_j}$ is
+\begin{align}
+    \begin{split}
+    \Sigma_j = Q\Lambda Q^{-1} &= Q\Lambda Q^T
+    = \sum_{i=1}^n \lambda_i q_i q_i^T
+    \end{split}
+\end{align}
+where ${\Lambda = \text{diag}(\lambda_1, \ldots, \lambda_n) \in \mathbb{R}^{n \times n}}$ is a diagonal matrix with eigenvalues in decreasing order, and ${Q \in \mathbb{R}^{n \times n}}$ is a matrix of the associated eigenvectors.
+
+The best rank-${k}$ (${k \leq n}$) approximation of ${\Sigma_j}$ is obtained by 
+\begin{align}
+    \widehat{\Sigma}_j = Q_k \Lambda_k Q_k^{-1}
+\end{align}
+where ${\Lambda_k \in \mathbb{R}^{k \times k}}$ is a diagonal matrix with the largest $k$ eigenvalues, and the columns of ${Q_k \in \mathbb{R}^{n \times k}}$ are the first $k$ eigenvectors.
+This is closely related to principal component analysis (PCA) where the $k$ principal axes, a set of orthonormal axes onto which the projection of the original data maximizes variance, are given by the first $k$ eigenvectors.
+We can obtain equivalent results from performing a singular value decomposition of $\tau_j$, a set of data vectors assigned to the $j$th Gaussian component.
+
+While the eigenvalue decomposition or PCA provides an analytical solution, both require the rank $k$ to be specified. 
+To determine the optimal rank $k^*$ from the observed data rather than setting a specific value for $k$, we adopt the probabilistic principal component analysis (PPCA), a probabilistic formulation of PCA based on a latent variable model \cite{tipping1999mixtures}.
+
+Consider a dataset ${x = \{x_i\}_{i=1}^m \in \mathbb{R}^{m \times n}}$ of $m$ observations.
+PPCA assumes that each observation ${x_i \in \mathbb{R}^n}$ is generated from a low-dimensional latent variable ${z_i \in \mathbb{R}^k}$ (${k<n}$) via the following model. For ${i \in \{1,\ldots ,m\}}$, 
+\begin{align}
+    \label{eq:ppca}
+    x_i &= W z_i+\mu+\varepsilon_i
+\end{align}
+where ${z_i \sim \mathcal{N}(0,I)}$ is a Gaussian latent variable with unit variance, 
+${W \in \mathbb{R}^{n \times k}}$ is the weight matrix explaining the dependencies between latent and observed variables,
+${\mu \in \mathbb{R}^n}$ is the location parameter that shifts the data,
+and ${\varepsilon_i \sim \mathcal{N}(0, \sigma^2 I)}$ is an isotropic Gaussian noise unique to each observed variable.
+From (\ref{eq:ppca}), we can compute the following conditional and marginal distributions:
+\begin{align}
+    \begin{split}
+    x_i \mid z_i &\sim \mathcal{N}(W z_i+\mu, \sigma^2 I)\\
+    x_i &\sim \mathcal{N}(\mu, WW^T + \sigma^2 I).
+    \end{split}
+\end{align}
+
+The maximum likelihood estimate (MLE) of the parameters ${\{W, \sigma^2 \}}$ can be solved in closed form \cite{tipping1999mixtures} or using the EM algorithm \cite{roweis1998algorithms}.
+The columns of the estimated $W$ define the principal subspace of standard PCA.
+
+The optimal rank $k^*$ can be determined by choosing the latent dimension ${\mathbb{R}^{k}}$ that maximizes the marginal likelihood of the model.
+
+% \begin{align}
+%      \max_\theta{\log p(x;\theta)} &= \max_\theta{\sum_{i=1}^m \log p(x_i;\theta)}.
+%     %  &= \max_\theta{\sum_{i=1}^m \log  {\int_{z_i} p(x_i \mid z_i;\theta) p(z_i;\theta) dz_i}}
+% \end{align}
+% \begin{align}
+%     z_i \mid x_i &\sim \mathcal{N}(M^{-1} W^T (x_i-\mu), \sigma^2 M^{-1})\\
+%     &\text{ where } M=W^T W + \sigma^2 I
+% \end{align}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Trajectory Generation}
+\label{subsec:trajs_generation}
+Once we have the GMM parameters for each segment, we can generate synthetic trajectories of aircraft positions based on the trained models and test procedures.
+To test the model on a set of procedures not used for the training, we need the procedural trajectories with the relative frequencies of procedures in each segment.
+
+We start generating an aircraft trajectory with its radar vector segment.
+First, we randomly select one of the test radar vector procedures with probability proportional to their relative frequencies.
+Then, we sample a sequence of deviations ${\tau^v}$ from the radar vector GMM. Next, we construct a trajectory of aircraft positions using the sampled deviations and the test procedural trajectory.
+While the total distance an aircraft travels varies with the procedure it follows, the reconstructed trajectory always has the same number of points.
+To generate a trajectory with reasonable airspeed, we first compute the adjusted total transit time as ${t'^v = (\tau^v_1 / \tau^v_2) \times d'^v}$
+% \begin{align}
+%     t'^v = \frac{\tau^v_1}{\tau^v_2} \times d'^v
+% \end{align}
+where ${\tau^v_1, \tau^v_2}$ are the transit time and total distance of the sample, and ${d'^v}$ is the total distance of the given test procedure.
+Then we align the trajectory with a vector of evenly spaced numbers over the interval ${[0, t'^v]}$.
+
+For a smooth transition between two separately modeled segments of our generated trajectory,
+we take the final $n$ positions of the reconstructed radar vector trajectory to compute the first $n$ deviations from the test final approach procedure.
+Then, we form a conditional distribution of the final approach GMM to sample the remainder of the final approach segment given the first $n$ measurements.
+% https://stats.stackexchange.com/questions/348941/general-conditional-distributions-for-multivariate-gaussian-mixtures
+
+Suppose the input vector and the Gaussian components in (\ref{eq:gmm}) are partitioned as
+\begin{align}
+    % p(\tau) &= \sum_{j=1}^K \pi_j \mathcal{N}(\tau \mid \mu_j, \Sigma_j)\\
+    p\left(
+    \begin{bmatrix} 
+        \tau_a \\ \tau_b 
+    \end{bmatrix}\right) 
+    &= \sum_{j=1}^K \pi_j \mathcal{N}\left(
+    \begin{bmatrix} 
+        \tau_a \\ \tau_b 
+    \end{bmatrix} \;\middle|\;
+    \begin{bmatrix}
+        \mu_{j,a} \\ \mu_{j,b} 
+    \end{bmatrix}, 
+    \begin{bmatrix}
+        \Sigma_{j,aa} \ \Sigma_{j,ab} \\
+        \Sigma_{j,ba} \ \Sigma_{j,bb} 
+    \end{bmatrix}\right).
+\end{align}
+
+Then, the conditional distribution of ${\tau_b}$ given ${\tau_a}$ is
+\begin{align}
+    \begin{split}  
+    p(\tau_b \mid \tau_a) &=
+    \sum_{j=1}^K \pi_{j,b \mid a}
+    \mathcal{N}\left(\tau_b \mid \mu_{j, b \mid a}, \Sigma_{j, b \mid a}
+    \right)\\
+    \text{where } \ \pi_{j,b \mid a} &= \frac{\pi_j \mathcal{N}\left( \tau_a \mid \mu_{j,a}, \Sigma_{j,aa} \right)}{\sum_{k=1}^K \pi_k \mathcal{N}\left( \tau_a \mid \mu_{k,a}, \Sigma_{k,aa} \right)} \\
+    \mu_{j, b \mid a} &= \mu_{j,b} + \Sigma_{j,ba}\Sigma_{j,aa}^{-1}(\tau_a - \mu_{j,a}) \\
+    \Sigma_{j,b \mid a} &= \Sigma_{j,bb} - \Sigma_{j,ba} \Sigma_{j,aa}^{-1} \Sigma_{j,ba}^T.
+    \end{split}
+    \label{eq:conditional_density_GMM}
+\end{align}
+
+We form this conditional distribution for the final approach GMM by partitioning each vector $\tau^f$ as illustrated in Fig. \ref{fig:traj_generate_conditional}.
+In our case, $\tau_a$ is defined as the first $n$ 3D coordinates of deviations and $\tau_b$ corresponds to the remainder of the vector.
+In the figure, the blue crosses indicate the procedural points along the IAP. 
+The set of dotted lines are the sequence of deviations $\tau^f$ partitioned into $\tau_a$ and $\tau_b$, and
+the dots are the reconstructed trajectory of aircraft positions. 
+Those marked red correspond to the conditioned part.
+
+\begin{figure}[tb!]
+\centering
+\input{figures/traj_generate_conditional.tex}
+\caption{Partition of the sequence of deviations for the final approach segment to form a conditional distribution.}
+\label{fig:traj_generate_conditional}
+\end{figure}
+
+After we sample the remaining final approach segment of deviations from the conditional, we reconstruct an aircraft position trajectory as we need for the radar vector segment.
+We also repeat the process for integrating time into the trajectory using $\tau^f_1$ and $\tau^f_2$.
+Finally, the whole synthetic trajectory is obtained by combining the aircraft trajectories of both segments.
+
+% For a smooth transition between two separately modeled segments of our generated trajectory, 
+% we condition each Gaussian distribution component of the final approach GMM on partial observations computed with the final $n$ positions of the reconstructed radar vector trajectory.
+% A sequence of deviations for the final approach segment $\tau^f$ and its associated Gaussian distribution can be partitioned as 
+% \begin{align}
+%     \begin{bmatrix} \tau_{3:3n+2}^f \\ \tau_{3n+3:}^f \end{bmatrix} =
+%     \begin{bmatrix} \tau_{a} \\ \tau_{b} \end{bmatrix} &\sim
+%     \mathcal{N}\left(\begin{bmatrix}
+%                 \mu_a \\ \mu_b 
+%             \end{bmatrix}, \begin{bmatrix}
+%                     \Sigma_{aa} & \Sigma_{ab} \\
+%                     \Sigma_{ba} & \Sigma_{bb} 
+%                 \end{bmatrix}\right)
+% \end{align}
+% where $\tau_a$ corresponds to the first $n$ coordinates of deviations and $\tau_b$ is the remainder, as illustrated in Fig. \ref{fig:traj_generate_conditional}.
+% Then, we can form the posterior distribution 
+% \begin{align}
+%     \begin{split}
+%     p(\tau_{3n+3:}^f \mid \tau_{3:3n+2}^f) &= \mathcal{N}\left(\mu_{b \mid a}, \Sigma_{b \mid a}
+%     \right)\\
+%     \text{where } \ \mu_{b \mid a} &= \mu_b + \Sigma_{ba}\Sigma_{aa}^{-1}(\tau_a - \mu_a) \\
+%     \Sigma_{b \mid a} &= \Sigma_{bb} - \Sigma_{ba} \Sigma_{aa}^{-1} \Sigma_{ba}^T.
+%     \end{split}
+%     \label{eq:conditional_density_GMM}
+% \end{align}
+% to sample the remainder of the final approach segment given the first $n$ measurements, obtained by computing the deviations between the last $n$ positions of the reconstructed radar vector trajectory and the first $n$ points of the final approach procedure.
+% Then, the aircraft position trajectory is constructed using the sample and the remainder of the final approach procedure.
+
+% Finally, the whole synthetic trajectory is obtained by combining the aircraft trajectories of both segments.
+

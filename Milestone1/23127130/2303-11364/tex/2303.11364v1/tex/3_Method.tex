@@ -1,0 +1,189 @@
+\section{Method}
+Our method, {\moniker}, extends the volume rendering equation to accurately reconstruct the geometry and appearance robust to hazy conditions.
+Our key idea is to introduce a series of important biases in the network architecture along with regularizers in the loss function that together underpin physically based scattering phenomena.
+
+\subsection{Preliminary on Neural Radiance Fields}\label{sec:nerf}
+Neural Radiance Fields (NeRFs)~\cite{mildenhall2020nerf} map a 3D sample point \(\p\) into a color $\mathbf{c}$ and volume density $\sigma$.
+Considering only emission from classic volume rendering~\cite{kajiya1984ray,tagliasacchi2022volume}, the expected color ${C}(\r)$ of a camera ray $\r(t)=\mathbf{o} + t\mathbf{d}$ with the near and far boundary $t_n$ and $t_f$ can be written as
+\begin{gather}
+	{C}(\r, \mathbf{d})=\int_{t_n}^{t_f}T(t)\sigma(\r(t))c(\r(t), \mathbf{d}) \ dt \;\textrm{with} \label{eq:nerf}\\
+    T(t)=\mathrm{exp}\left( - \int_{t_n}^{t}\sigma(\r(t')) \ dt'\right),
+	\label{eq:occlusion}
+\end{gather}
+where \(T(t)\) is the accumulated transmittance between the ray section \(t_{n}\) to \(t \).
+The predicted pixel value is then compared to the ground truth $\widehat{C}(\r,\d)$ for optimization.
+
+\subsection{3D Haze Formation}\label{sec:rte_haze}
+To address the 3D dehazing problem, we propose an alternative rendering equation to the image formation model.
+We start from the radiative transfer equation (RTE)~\cite{chandrasekhar2013radiative,van1999multiple}, which describes the behavior of light in a medium that absorbs, scatters and emits radiation.
+Assuming, a ray \(\r\left( t \right) = \mathbf{o} + t\d\) hits a surface point at \(\r\left( t_{0} \right)\), the incident radiance at the near image plane \(t_{n}\) can be divided into three parts~\cite{pharr2016physically}:
+{\small
+\begin{align}
+C(\r, \d) &= C_{\textrm{emission}}(\r) + C_{\textrm{surface}}(\r) + C_{\textrm{in-scattering}}(\r)\nonumber\\
+C_{\textrm{emission}}(\r, \d) &=
+\int_{t_{n}}^{t_{0}}\epsilon\left(\r\left( t\right),\d\right)T_{\sigma_{t}}\left( t\right)dt\nonumber\\
+C_{\textrm{surface}}(\r, \d) & =C_e\left(\r\left( t_{0} \right),\d\right)T_{\sigma_{t}}\left( t_{0}\right)\nonumber\\
+C_{\textrm{in-scattering}}(\r, \d) &=
+\int_{t_{n}}^{t_{0}}c_{\textrm{s}}\left( \r\left( t \right), \d \right)\sigma_{s}\left(\r\left( t \right)\right)T_{\sigma_{t}}\left( t \right)dt,\nonumber
+\end{align}
+}
+where \(\epsilon\) is the emission, \(C_{e}\) is the outgoing radiance at the surface intersection, \(c_{\textrm{s}}\left(\r\left( t \right), \d \right)\) is the in-scattered light and \(\sigma_{s}\) is the scattering coefficient.
+In particular, the transmittance here is computed from the attenuation coefficient \(\sigma_{t}\), \ie,
+\(T_{\sigma_{t}}\left( t\right)=\exp\left( -\int_{t_{n}}^{t}\sigma_{t}(t')dt' \right)\),
+where \(\sigma_{t}=\sigma_{a} + \sigma_{s}\) including the absorption and out-scattering effect.
+For common haze formation, the participating particles are considered non-luminous~\cite{narasimhan2003contrast}, therefore we can drop the emission part, which leads to
+{
+\small
+\begin{align}
+\begin{split}
+C(\r,\d)= {} & C_e(\r\left( t_{0} \right),\d)T_{\sigma_{t}}\left( t_{0} \right)+\\
+&\int_{t_{n}}^{t_{0}}c_{\textrm{s}}\left( \r\left( t \right), \d \right)\sigma_{s}\left(\r\left( t \right)\right)T_{\sigma_{t}}\left( t \right)dt.
+\end{split}
+\label{eq:RTE_Haze}
+\end{align}
+}
+
+Following NeRF~\cite{mildenhall2020nerf}, we represent the surface as a continuous density field with emission \(\epsilon\left(\r\left(t\right), \d\right)\coloneqq c\left(\r\left( t \right),\d\right)\sigma\left(\r\left( t \right)\right)\).
+Meanwhile, the absorption part in the attenuation \(\sigma_{t}\) can be interpreted as the surface density \(\sigma\), since the volume density $\sigma$ is equal to absorption coefficient $\sigma_{a}$ in that they both determine the probability of a photon or a ray terminating at a given location.
+As a result, we can write the rendering equation as
+{\small
+\begin{align}\begin{split}
+    C(\r,\d)=&
+    \underbrace{\int_{t_{n}}^{t_{0}}c(\r(t),\d)\sigma(t)T_{\sigma+\sigma_{s}}\left( t \right)dt}_{C_{\textrm{Surface}}} +\\
+    &\underbrace{\int_{t_{n}}^{t_{0}}c_{s}(\r(t))\sigma_{s}(t)T_{\sigma+\sigma_{s}}\left( t \right)dt}_{C_{\textrm{Haze}}}.
+    \label{eq:3D_haze_formation}
+\end{split}
+\end{align}
+}
+\cref{eq:3D_haze_formation} formally disentangles the surface and haze, represented by \(\left\{ c, \sigma \right\}\) and \(\left\{  c_{s}, \sigma_{s} \right\}\) respectively, in a principled manner.
+Once successfully optimized (see the next Section), the clear-view surfaces can be recovered using \(\left\{ c, \sigma \right\}\):
+\begin{equation}
+C(\r,\d)=
+\int_{t_{n}}^{t_{0}}c(\r(t),\d)\sigma(t)T_{\sigma}\left( t \right)dt\label{eq:clear_view}.
+\end{equation}
+
+\begin{figure}[t!]
+\centering \includegraphics[width=\linewidth]{images/architecture.pdf}
+\makeatother
+\caption{\textbf{\moniker{} architecture.} Given a set of hazy images, our method augments the existing NeRF pipeline (gray) with a haze module (yellow), which explicitly models the scattering phenomenon using atmospheric light and scattering coefficient. During training, we render the hazy reconstruction as a composition of surface and haze, which is compared to the input hazy images to optimize the learnable parameters (in green) jointly. During inference, we use the surface module (gray) to render clear views.}
+\vspace{-0.5cm}\label{fig:architecture}
+\end{figure}
+
+\subsection{Haze-aware Neural Radiance Field}\label{sec:dehaze_nerf}
+Given multiple images of a hazy scene, we aim to jointly optimize for the surface appearance and geometry, \(\left\{ c, \sigma \right\}\) as well as the haze's scattering coefficient and in-scattered light (atmospheric light),  \(\left\{c_{s}, \sigma_{s} \right\}\) based on the enhanced scattering-aware rendering equation~\cref{eq:3D_haze_formation}.
+However, the effects of these variables are interdependent. In order to correctly disentangle them, our model adopts suitable architecture designs and training regularizers to capture the distinct physical properties of haze and surface.
+An overview of \moniker{} is illustrated in \cref{fig:architecture}.
+
+\paragraph{Architecture.} Now we introduce inductive biases to match the physical properties of haze and surface.
+For clarity, we highlight the quantities directly modeled by neural networks in \nn{green}.
+
+\emph{Modeling a Surface.} Recall our goal is to learn the surface appearance and geometry, \(\left\{ c, \sigma \right\}\).
+Similar to previous works~\cite{mildenhall2020nerf}, we model the appearance \(\cnet\left( \p, \d \right)\) with an MLP, which takes the sample location \(\p\) and viewing direction \(\d\) as inputs.
+However, in order to encourage volume density \(\sigma\) to form a well-defined solid surface, instead of directly learning the volume density, we adopt the reparameterization of the volume density using signed distance function (SDF), \(\sdf\left( \r\left( t \right) \right)\in \R\), as proposed in NeuS~\cite{wang2021neus,wang2022hfs}.
+The modified surface volume density \(\sigma\left( \r\left( t \right) \right) \), referred to as opaque density, can be parameterized as \(\sdf\left( \r\left( t \right) \right)\):
+\begin{equation}
+\sigma\left( \r\left( t \right) \right) = s\left( \Phi_{s}\left( \sdf\left( \r\left( t \right) \right)\right) -1 \right)\nabla \sdf\left( \r\left( t \right) \right)\mathbf{d},\label{eq:hfneus-sigma}
+\end{equation}
+where $\Phi_{s}(x)$ is the sigmoid function $\Phi_s(x) = (1 + e^{-sx})^{-1}$, whose derivative is a bell-shaped density function centered at 0 and has a learnable standard deviation of \(\nicefrac{1}{s}\).
+We derive the discrete approximate following~\cite{mildenhall2020nerf,tagliasacchi2022volume}.
+It samples $n$ points $\left\{ \p_{i}=\mathbf{o}+t_n\mathbf{d}|n=1,...,N,t_n<t_{n+1} \right\}$ along the ray.
+The approximate pixel color of the ray is computed based on quadrature rule~\cite{max1995optical}, yielding
+\begin{align}\begin{gathered}
+C_{\textrm{surface}}(\r,\d) = \sum_{n=1}^{N}\frac{\sigma^{n}}{\sigma_{t}^{n}} T_{t}^{n}\alpha_{t}^{n}\nn{c}^{n} \textrm{ with } T_{t}^{n}=\prod_{m=1}^{n-1}\left(1 - \alpha_{t}^{m}\right) \label{eq:C_surface},
+\end{gathered}\end{align}
+where \(\alpha_{t}\) denotes the discrete \(\alpha\)-compositional weight defined as~\cite{wang2021neus,wang2022hfs}
+\begin{equation}
+ \resizebox{1\hsize}{!}{
+ $
+    \alpha_{t}^{n}=\textsc{clamp}\left( 1-\exp\left( -\sigma_{t}^{n}\delta^{n} \right),0, 1 \right) \textrm{ with } \delta^{n}=t^{n+1}-t^{n}\label{eq:alpha}\nonumber,$}
+\end{equation}
+where \(\sigma_{t}^{n}=\sigma^{n}+\nn{\sigma_{s}}^{n}\) denotes the total attenuation at sample \(n\), including the attenuation due to surface occlusion and the out-scattering.
+
+\emph{Modeling Haze.} We use a low-frequency prior to compute the scattering coefficient and atmospheric light, \(\left\{c_{s}, \sigma_{s} \right\}\), since these components usually vary slowly in a common hazy scenes~\cite{li2015simultaneous}.
+In practice, we use a small band-limited \textsc{MLP}~\cite{lindell2022bacon} for the scattering coefficient \(\sigma_{s}\) to capture inhomogenous haze.
+Analogous to \cref{eq:C_surface}, the haze color can be approximated as
+% \begin{equation}
+% \begin{gathered}
+% C_{\textrm{haze}}(\r) = \sum_{i=1}^{n}\frac{\nn{\sigma_{s}}^{n}}{\sigma_{t}^{n}} T_{t}^{n}\alpha_{t}^{n}\nn{c_{s}}^{n}.\label{eq:C_haze}
+% \end{gathered}
+% \end{equation}
+\begin{equation}
+\begin{gathered}
+C_{\textrm{haze}}(\r) = \sum_{n=1}^{N}\frac{\nn{\sigma_{s}}^{n}}{\sigma_{t}^{n}} T_{t}^{n}\alpha_{t}^{n}\nn{c_{s}}^{n}.\label{eq:C_haze}
+\end{gathered}
+\end{equation}
+During optimization, the color for an arbitrary input hazy image can be written as $C = C_{\textrm{surface}} + C_{\textrm{haze}}$.
+At test time, we can reconstruct the clear-view color by discretizing \cref{eq:clear_view}, namely:
+\begin{gather}
+ C_{\textrm{clear}}\left( \r,\d \right) = \sum_{n=1}^{N}T_{\sigma}^{n}\alpha^{n} \nn{c}^{n}, \label{eq:clear_view_discrete}\\
+ \resizebox{1\hsize}{!}{
+ $T_{\sigma}^{n} = \prod_{j=1}^{n-1}\left(1 - \alpha^{j}\right)\, \textrm{and }\, \alpha^{n} = \textsc{clamp}\left( 1 - \exp\left( -\sigma^{n}\delta^{n} \right),0, 1 \right).\nonumber$}
+\end{gather}
+\paragraph{Optimization.} While the inductive biases separate the high-frequency surface appearance and geometry from the low-frequency color and density of the scattering medium, we introduce further regularizers to guide the optimization process to converge to more plausible clear-view geometry and color.
+
+\emph{Koschmieder Consistency.}
+Given an accurate depth map \(D\), assuming globally constant scattering coefficient \(\bar{\sigma}_{s}\) and airlight \(\bar{c}_{s}\), the relation between a clear-view image \(C_{\textrm{clear}}\) and the hazy image \(C\) can be described by the Koschmieder law~\cite{israel1959koschmieders} as
+\begin{equation}
+\resizebox{0.88\hsize}{!}{
+\(C(\r)=C_{\textrm{clear}}(\r)\exp(-\bar{\sigma}_{s} D(\r))+\bar{c}_{s}(1-\exp(-\bar{\sigma}_{s} D(\r)))\).
+}\label{eq:koschmieder}
+\end{equation}
+This model is widely adopted as the basis for image-based single and multiview dehazing.
+The Koschmider model is an approximation of our rendering equation~\cref{eq:3D_haze_formation} under the assumption of
+spatially-invariant (i.e., homogeneous) scattering coefficient and an ideal surface
+\begin{align}
+C_{\textrm{surface}}\left( \r \right) & \approx C_{\textrm{clear}}(\r)\exp(-\bar{\sigma}_{s} D(\r)) = \tilde{C}_{\textrm{surface}}\left( \r \right)\\
+C_{\textrm{haze}}\left( \r \right) & \approx \bar{c}_{s}(1-\exp(-\bar{\sigma}_{s} D(\r)) = \tilde{C}_{\textrm{haze}}\left( \r \right),
+\end{align}
+
+We promote this relation with
+%
+\begin{align}
+&\loss_{\textrm{2D}} = \left\|C_{\textrm{surface}}\left( \r \right) -  \tilde{C}_{\textrm{surface}}\left( \r \right)\right\|_{1} \\+
+&\left\| C_{\textrm{haze}}\left( \r \right)\! - \!\tilde{C}_{\textrm{haze}}\left( \r \right)\right\|_{1} \!\!+\!
+ \left\| C\! -\! \tilde{C}_{\textrm{surface}}\left( \r \right)\! -\! \tilde{C}_{\textrm{haze}}\left( \r \right)\right\|_{1}\!, \nonumber
+\end{align}
+%
+where \(\bar{\sigma}_{s}\) and \(\bar{c}_{s}\) are the average over the samples on the ray, while
+the depth value \(D\left( \r \right)\) is computed via the learned surface geometry~\cite{mildenhall2020nerf,yu2022monosdf} by accumulating over ray-length over all the samples on a ray:
+\begin{equation}
+    D\left( \r \right) = \sum_{n=1}^{N} T_{\sigma}^{n}\alpha^{n}t^{n}.
+\end{equation}
+
+\emph{Color Prior.}
+Without knowing the original image, the heavily attenuated color in the hazy image can be explained by the haze but also by a dull surface color.
+In order to reconstruct plausible clear-view colors, we adopt the popular 2D prior widely used in image-based dehazing methods, Dark Channel Prior (DCP)~\cite{he2010single}, which arises from the observation, that for most pixels in a natural haze-free image, the minimum of three color channels is close to zero.
+We apply this prior to the estimated clear image \(C_{\textrm{clear}}\)
+\begin{align}
+DC(C_{\textrm{clear}})\left(\x\right)&=\underset{\y\in\Omega\left(\x\right)}{\min}\left(\underset{c\in\left\{r,g,b\right\}}{\min}C_\textrm{clear}^{c}\left(\y\right)\right),
+\label{eq:DCP_definition}\\
+\loss_{\textrm{dcp}}&=\frac{1}{K}\sum\limits_{k=1}^{K}\Vert DC\left(C_{\textrm{clear}}\right)\Vert_{1}.
+\label{eq:loss_dcp}
+\end{align}
+
+
+\subsection{Implementation Details}
+We adopt the same setting as that in HF-NeuS~\cite{wang2021neus} wherever possible.
+This includes the MLPs for the surface SDF, \(\sdf\) and the view-dependent surface color, \(\cnet\), as well as the sampling strategy, the background composition, and learning rate schedule.
+
+\paragraph{Loss.}
+Our loss is composed of several terms:
+\begin{equation}
+    \loss = \loss_{\textrm{color}} + \lambda\loss_{\textrm{eikonal}} + \alpha\loss_{\textrm{dcp}} + \beta\loss_{\textrm{2D}},\label{eq:total_loss}
+\end{equation}
+where \(\loss_{\textrm{dcp}}\) and \(\loss_{\textrm{2D}}\) are the regularizations introduced in \cref{sec:dehaze_nerf},
+while the photo-consistency loss, $\loss_{\textrm{color}}$, is the standard NeRF loss, and the eikonal loss, \(\loss_{\textrm{eikonal}}\), is commonly used to regularize SDF~\cite{gropp2020implicit},
+\begin{align}
+    \loss_{\textrm{color}}& = \frac{1}{K}\sum_{k=1}^{K}\left\|\widehat{C}_{k}(\r,\d) - C_{k}(\r,\d)\right\|_{1},\\
+    \loss_{\textrm{eikonal}} &= \frac{1}{KN}\sum_{k}^{K}\sum_{n}^{N}(\|\nabla f({\mathbf{r}}_{k}(t_n))\|_2 - 1)^2,
+\label{eq:loss_color}
+\end{align}
+where $\widehat{C}_{k}(\r,\d)$ is the pixel color. $N$ and $K$ denote the total sampling points on a ray and the total number of rays sampled per training batch.
+
+Finally, because of the surface representation using SDF, we can optionally adopt the object masks for supervision~\cite{yariv2021volume,wang2021neus,wang2022hfs}.
+Specifically, given the object mask, \(M\), the mask loss $\loss_{\textrm{mask}}$ for a sampled ray $k$ is defined as
+\begin{equation}
+    \loss_{\textrm{mask}} = \text{BCE}(M_k, \hat{O}_k),\label{eq:mask_loss}
+\end{equation}
+where $\hat{O}_k = \sum_{i=1}^{N}T_{\sigma}^{i}\alpha^{i}$ is the total weight for the clear-view surface color along the camera ray, and $\text{BCE}$ is the binary cross entropy loss.
+

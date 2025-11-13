@@ -1,0 +1,189 @@
+\section{Method}
+
+In this section, we present the design of LiDARFormer. As shown in Figure~\ref{fig:architecture}, our framework consists of three parts: (\ref{section:basline}) A 3D encoder-decoder backbone network using 3D sparse convolution; (\ref{section:xsf}) A Cross-space Transformer (XSF) module extracting large-scale and context features in the BEV; (\ref{section:xtf}) A Cross-task Transformer (XTF) decoder that aggregates class-wise and object-wise global contextual information from voxel and BEV feature maps. Our network adopts the multi-task learning framework from LidarMultiNet~\cite{ye2022lidarmultinet}, but further associates the global features between segmentation and detection through a shared cross-task attention layer.
+
+
+\subsection{Voxel-based LiDAR Perception}
+\label{section:basline}
+LiDAR point cloud semantic segmentation and object detection aim to predict pixel-wise semantic labels $L=\{l_{i}|l_{i}\in (1\dots K)\}_{i=1}^{N}$ and object bounding boxes $O=\{o_{i}|o_{i}\in\mathbb{R}^{7}\}_{i=1}^{B}$ in a point cloud $P=\{p_{i}|p_{i}\in\mathbb{R}^{3+c}\}_{i=1}^{N}$, where $N$ denotes the number of points, $B$ and $K$ are the number of objects and classes. Each point has $(3+c)$ input features, i.e. the 3D coordinates $(x,y,z)$, the intensity of the reflection, LiDAR elongation, timestamp, etc. Each object is represented by its 3D location, size and orientation. 
+
+\textbf{Voxelization}
+We first transform the point cloud coordinates $(x,y,z)$ into the voxel index $\{\mathcal{I}_{i}=(\lfloor \frac{x_{i}}{s_{x}} \rfloor,\lfloor\frac{y_{i}}{s_{y}}\rfloor, \lfloor \frac{z_{i}}{s_{z}}\rfloor)\}_{i=1}^{N}$, where $s$ is the voxel size. Then, we use a simple voxel feature encoder, which only contains a Multi-Layer Perceptron (MLP) and maxpooling layers to generate the sparse voxel feature representation $\mathcal{V}\in\mathbb{R}^{M\times C}$:
+
+\begin{equation}
+   \mathcal{V}_{j} = \max\limits_{\mathcal{I}_{i}=\mathcal{I}_{j}}(\textnormal{MLP}(p_{i})) , j\in (1\dots M)
+\end{equation}
+where $M$ is the number of unique voxel indices. We also generate the ground truth label of each sparse voxel through majority voting: $L_{j}^{v} = \argmax\limits_{\mathcal{I}_{i}=\mathcal{I}_{j}}(l_{i})$.
+
+\textbf{Sparse Voxel-based Backbone Network}
+We use a VoxelNet~\cite{zhou2018voxelnet} as the backbone of our network, where the voxel features are gradually downsampled to $\tfrac{1}{8}$ of the original size in the encoder. The sparse voxel features are projected onto the dense BEV map, followed by a 2D multi-scale feature extractor to extract the global information. For the detection task, we attach a detection head to the BEV feature map to predict the object bounding boxes. For the segmentation task, the BEV feature is reprojected to the voxel space, where we use a U-Net decoder to upsample the feature map back to the original scale. We supervise our model with the voxel-level label $L^{v}$ and project the predicted label back to the point level via a de-voxelization step during inference.
+
+\subsection{Cross-space Transformer}
+\label{section:xsf}
+As shown in Figure~\ref{fig:teaser}, voxel-based LiDAR detection and segmentation generally require the backbone network to extract feature representations on the 2D dense BEV space and 3D sparse voxel space, respectively. To overcome the challenge of merging the features learned from these two tasks, the previous multi-task network~\cite{ye2022lidarmultinet} proposed a global context pooling module to directly map the features based on their location without considering differences in sparsity. In contrast, we propose a cross-space Transformer module that utilizes deformable attention to enhance feature extraction between these spaces to further increase the receptive field.
+
+\begin{figure}[t]
+\centering
+    \begin{minipage}[b]{1.0\linewidth}
+        \includegraphics[width=1.0\linewidth]{figs/xst.pdf}
+        \subcaption{Dense-to-sparse Cross-space Transformer}
+        \label{fig:xst_a}
+    \end{minipage}
+    \begin{minipage}[b]{0.9\linewidth}
+        \includegraphics[width=1.0\linewidth]{figs/xst_b.pdf} 
+        \subcaption{Sparse-to-dense Cross-space Transformer}
+        \label{fig:xst_b}
+    \end{minipage}
+  \caption{\textbf{Illustration of the Cross-space Transformer (XSF) module.} XSF consists of two parts: a multi-height deformable self-attention, and a feed-forward network. (a) convert dense BEV features to sparse voxel features, (b) convert sparse voxel features to dense BEV features with two more densify operations.}
+  \label{fig:xst}
+\end{figure}
+
+As shown in Figure~\ref{fig:architecture}, we employ a cross-space Transformer to 1) convert the sparse voxel features in the last scale $\mathcal{F}^{sparse}_{in}\in\mathbb{R}^{C\times M'}$ into dense BEV features (\textit{Sparse-to-dense}), and 2) convert the dense BEV features from 2D multi-scale feature extractor $\mathcal{F}^{dense}\in\mathbb{R}^{(C\times \frac{D}{d_{z}}) \times \frac{H}{d_{x}} \times \frac{W}{d_{y}}}$ to sparse voxel features $\mathcal{F}^{sparse}_{out}\in\mathbb{R}^{C\times M'}$, where $d$ is the downsampling ratio and $M'$ is the number of valid voxels in the encoder's last scale (\textit{Dense-to-sparse}). The cross-space Transformer is illustrated in Figure~\ref{fig:xst}. Specifically, in Figure~\ref{fig:xst_a}, $\mathcal{F}^{dense}$ is divided into slices by height as $\mathcal{F}^{dense}_{3D}\in\mathbb{R}^{C\times \frac{D}{d_{z}} \times \frac{H}{d_{x}} \times \frac{W}{d_{y}}}$. Then we take the features from $\mathcal{F}^{dense}_{3D}$ at the valid coordinates $(u, v, h)$ of $\mathcal{F}^{sparse}_{in}$ as query $\textbf{Q}_{3D}$ to predict $\mathcal{F}^{sparse}_{out}$. The deformable attention \cite{zhu2021deformable} is adopted as a self-attention layer to explore global information in the dense feature map. 
+Since $\mathcal{F}^{dense}$ lacks height information, due to the fact that 2D multi-scale feature extractor mainly focuses on BEV-level information,
+we develop a multi-head multi-height attention module to learn features along all heights: For every reference voxel whose location is $\xi = (u, v)$ on the sliced BEV feature map at height $h$, the deformable self-attention uses a linear layer to learn BEV offsets $\Delta \xi$ at all heads and heights.
+The features at $\xi + \Delta \xi$ will be sampled from different multi-heights-sliced BEV feature maps through bilinear interpolation. 
+The output of the multi-height deformable self-attention $\chi (p)$ can be formulated as:
+\begin{equation}
+    \chi (p) = \sum_{i=1}^{N_{head}}{W_{i}[\sum_{j=1}^{N_{height}} \sum_{r=1}^{R} \sigma (W_{ijr} q_{p}) W_{i}^{'} x^{j} (\xi + \Delta \xi_{ijr})]}
+\end{equation}
+where $N_{head}$ is the number of heads, $N_{height} = \frac{D}{d_{z}}$ is the number of heights, $W$ is learnable weights, $R$ is the number of sampling points, $x^{j}$ is the multi-heights-sliced BEV features, $q_{p}$ is the query features at the position $\xi$, and $\sigma (W_{ijr} q_{p})$ is the attention weight.
+
+Since the Dense-to-sparse cross-space Transformer is applied after the 2D feature extractor, it will not affect the learned 2D BEV features, thus has limited impact on increasing the detection performance. To  increase the receptive field of the 2D BEV feature extractor, we add a cross-space Transformer module converting $\mathcal{F}^{sparse}_{in}$ into dense BEV features in a similar manner, as shown in Figure~\ref{fig:xst_b}. It equips the BEV feature which will be fed into a 2D multi-scale feature extractor with more context information.  
+
+\subsection{Cross-task Transformer Decoder}
+\label{section:xtf}
+
+Although object detection and semantic segmentation share correlated information, they are usually learned in two separate network structures. LidarMultiNet~\cite{ye2022lidarmultinet} demonstrates that through sharing intermediate feature representation, both detection and segmentation performance can get improved. However, no high-level information is shared during the training of the multi-task network. To further explore the multi-task learning synergy, we propose to use a shared transformer decoder to bridge between the class-level information from segmentation and the object-level information from detection. In this section, we first present a novel segmentation decoder that uses class feature embedding to perform dynamic segmentation. Then, we introduce an approach to connect this segmentation decoder with the conventional detection decoder through cross-task attention.
+
+\textbf{Segmentation Transformer Decoder} Inspired by the coarse-to-fine methods~\cite{zhang2019acfnet, yuan2020object} in the 2D image segmentation, we propose a class-aware feature refinement module to enhance the global information learning for the segmentation task. We use an initial segmentation prediction to generate the class feature embedding. Then, we use a transformer with bidirectional cross-attention to refine both voxel and class feature representations. The class feature representation is also served as the dynamic kernel in the later segmentation head.
+
+Given an initial semantic segmentation score $y=\{pred_{j}|pred_{j}\in [0,1]^{K}\}_{j=1}^{M}$, and its encoded feature representation $\mathcal{F} \in \mathbb{R}^{M\times C}$, where $M$ is the number of valid predictions, we generate the class feature embedding $\varepsilon = \{\varepsilon_{k}|k\in\{1\dots K\}\}$ as follows: 
+$\varepsilon_{k} = \frac{\sum_{j=1}^{M}pred_{j}[k]\cdot \mathcal{F}_{j}}{\sum_{j=1}^{M}pred_{j}[k]}$.
+In our cross-task transformer, we use a coarse prediction and its corresponding BEV features to initialize the class feature embedding.
+The class feature embedding $\varepsilon$ encapsulates the class center information based on the coarse segmentation result of each scan. Assuming that points from the same class have similar or correlated features in the encoded feature embedding, the learned class features can help the network distinguish the edge points that are ambiguous in the segmentation head.
+
+\begin{figure}[t]
+  \begin{center}
+    \includegraphics[width=1\linewidth]{figs/cross-task-transformer.pdf}
+  \end{center}
+  \caption{\textbf{Cross-task Transformer (XTF).} The segmentation and detection decoders share a self-attention layer to transfer the cross-task features. In the segmentation decoder, we use a bidirectional cross-attention to refine voxel features based on the aggregated class feature embedding. For simplicity, the skip connection and the layer norm are ignored in this figure.}
+  \label{fig:transformer}
+  \vspace{-10pt}
+\end{figure}
+
+Similar to ~\cite{yuan2020object}, we propose to use a transformer decoder to further extract the class feature embedding and refine the original voxel features simultaneously through bidirectional cross-attention. As shown in Figure~\ref{fig:transformer}, our transformer structure has two parallel branches for the voxel feature $\mathcal{V} \in \mathbb{R}^{M\times C}$ and the class feature $\varepsilon \in \mathbb{R}^{K\times C}$.
+
+We use a standard transformer decoder~\cite{vaswani2017attention}, containing a multi-head self-attention layer, a multi-head cross-attention layer, and a feed-forward layer, to extract class features using  $\varepsilon$ as the initial query embedding. In the cross-attention layer, query $\textbf{Q}_{c}$ is the linear projection of $\varepsilon$, while key $\textbf{K}_{v}$ and value $\textbf{V}_{v}$ are the linear projection of $\mathcal{V}$. It can be formulated as :
+
+\begin{equation}
+    \textnormal{CrossAtt}(\mathcal{V}\to \varepsilon) = \textnormal{Softmax}(\frac{\textbf{Q}_{c}\textbf{K}_{v}^{T}}{\sqrt{C}})\textbf{V}_{v}.
+\end{equation}
+
+Next, we use an inverse transformer decoder to transfer the encoded class features back to the voxel features. It is infeasible to use self-attention in the voxel branch due to the huge size of the voxels. Conversely, query $\textbf{Q}_{v}$ is from the linear projection of $\mathcal{V}$, key $\textbf{K}_{c}$, and value $\textbf{V}_{c}$ are the linear projection of the output $\varepsilon'$ in the class branch:
+
+\begin{equation}
+    \textnormal{CrossAtt}(\varepsilon' \to \mathcal{V}) = \textnormal{Softmax}(\frac{\textbf{Q}_{v}\textbf{K}_{c}^{T}}{\sqrt{C}})\textbf{V}_{c}.
+\end{equation}
+
+The output voxel feature $\mathcal{V}'$ is then concatenated to the original features $\mathcal{V}^{r} = (\mathcal{V}, \mathcal{V}')$ for the segmentation head.
+
+\textbf{Dynamic Kernel}
+Conventional segmentation networks use a segmentation head that consists of convolution or linear layers to reduce the channel size of a voxel feature to the number of classes to make the prediction. The weights learned in the segmentation head are shared among different frames. Therefore the segmentation head is hard to adjust to the varying conditions of scenes. Following the new trend in the image instance segmentation~\cite{wang2020solov2,wang2021max,cheng2021maskformer,li2022mask}, we directly use the learned class feature embedding $\varepsilon'$ as the kernel to generate the semantic logits $\mathcal{S} = \frac{\Phi(\mathcal{V}^{r} ) \cdot \varepsilon'^{T}}{\sqrt{C}} \in \mathbb{R}^{M\times K}$, where $\Phi$ is the convolution layer that reduces the channel size of the voxel feature to $C$. 
+
+\begin{table*}[t]
+\begin{minipage}{.34\textwidth}
+\centering
+\caption{Detection results on the \texttt{test} split of nuScenes. ``TTA" means test-time augmentation. }
+\label{tab:nusc_det_test}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l|c|c>{\columncolor[gray]{0.95}}c}
+\Xhline{4\arrayrulewidth}
+    Model & Ref & mAP & NDS \\
+    \Xhline{2\arrayrulewidth}
+    Cylinder3D~\cite{zhu2021cylinder3dtpami} & TPAMI 2021 & 50.6 & 61.6 \\
+    CBGS~\cite{zhu2019class} & arXiv 2019 & 52.8 & 63.3 \\
+    CenterPoint~\cite{yin2021center} & CVPR 2021 & 58.0 & 65.5 \\
+    HotSpotNet~\cite{chen2020object} & ECCV 2020 & 59.3 & 66.0 \\
+    Object DGCNN~\cite{wang2021object} & NeurIPS 2021 & 58.7 & 66.1 \\
+    AFDetV2~\cite{hu2022afdetv2} & AAAI 2022 & 62.4 & 68.5 \\
+    Focals Conv~\cite{Chen2022focalsparse} & CVPR 2022 & 63.8 & 70.0 \\
+    TransFusion-L~\cite{bai2022transfusion} & CVPR 2022 & 65.5 & 70.2\\
+    LargeKernel3D~\cite{chen2022scaling}  & arXiv 2022 & 65.3 & 70.5 \\
+    LidarMultiNet~\cite{ye2022lidarmultinet}  & AAAI 2023 & 67.0 & 71.6 \\
+    MDRNet-TTA~\cite{huang2022rethinking} & arXiv 2022 & 67.2 & 72.0 \\
+    LargeKernel3D-TTA~\cite{chen2022scaling}  & arXiv 2022 & 68.8 & 72.8 \\
+    \Xhline{2\arrayrulewidth}
+    LiDARFormer    && 68.9 & 72.4  \\
+    LiDARFormer-TTA    && \textbf{71.5} & \textbf{74.3}  \\
+    
+    \Xhline{4\arrayrulewidth}
+\end{tabular}
+}
+\end{minipage}
+\hfill
+\begin{minipage}{.3\textwidth}
+\centering
+\caption{Segmentation results on the \texttt{test} split of nuScenes.}
+\label{tab:nusc_seg_test}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l|c|>{\columncolor[gray]{0.95}}c}
+    \Xhline{4\arrayrulewidth}
+    Model & Ref & mIoU \\
+    \Xhline{2\arrayrulewidth}
+    PolarNet~\cite{Zhang_2020_CVPR} & CVPR 2020 &  69.8\\
+    PolarStream~\cite{chen2021polarstream} & NeurIPS 2021 &  73.4\\
+    JS3C-Net~\cite{yan2020sparse} & AAAI 2021 &  73.6 \\
+    Cylinder3D~\cite{zhu2021cylindrical} & CVPR 2021 &  77.2 \\
+    AMVNet~\cite{liong2020amvnet} & arXiv 2020&  77.3 \\
+    SPVNAS~\cite{tang2020searching} & ECCV 2020 &  77.4 \\
+    Cylinder3D++~\cite{zhu2021cylindrical} & CVPR 2021 &  77.9 \\
+    AF2S3Net~\cite{Cheng_2021_CVPR} & CVPR 2021 &  78.3 \\
+    DRINet++~\cite{ye2021drinet++} & arXiv 2021&  80.4 \\
+    SPVCNN++~\cite{tang2020searching} & ECCV 2020 &81.1 \\
+    LidarMultiNet~\cite{ye2022lidarmultinet} & AAAI 2023 & 81.4 \\
+    \Xhline{2\arrayrulewidth}
+    
+    LiDARFormer &&  81.0 \\
+    LiDARFormer-TTA &&  \textbf{81.5} \\
+    
+    \Xhline{4\arrayrulewidth}
+\end{tabular}
+}
+\end{minipage}
+\hfill
+\begin{minipage}{.31\textwidth}
+\centering
+    \caption{Results on the \texttt{val} split of nuScenes. %The results of other methods are taken from the literature.  
+    *: Reported by ~\cite{zhu2021cylindrical}.}
+    \label{tab:nusc_val}
+    \resizebox{\linewidth}{!}{%
+    \begin{tabular}{l|>{\columncolor[gray]{0.95}}c|c>{\columncolor[gray]{0.95}}c}
+    \Xhline{4\arrayrulewidth}
+    Model & mIoU & mAP & NDS \\
+    \Xhline{2\arrayrulewidth}
+    RangeNet++~\cite{milioto2019rangenet++} & 65.5* & - & -  \\
+    PolarNet~\cite{Zhang_2020_CVPR}   & 71.0*     & - & -       \\
+    SalsaNext~\cite{cortinhal2020salsanext}  & 72.2*     & - & -        \\
+    AMVNet~\cite{liong2020amvnet}     & 77.2     & - & -        \\
+    Cylinder3D~\cite{zhu2021cylindrical} & 76.1     & - & -       \\
+    RPVNet~\cite{xu2021rpvnet}     & 77.6     & - & -         \\
+    \Xhline{2\arrayrulewidth}
+    CBGS~\cite{zhu2019class} & - & 51.4 & 62.6\\
+    CenterPoint~\cite{yin2021center} & - & 57.4 & 65.2\\
+    TransFusion-L~\cite{bai2022transfusion} & - & 60.0 & 66.8 \\
+    BEVFusion-L~\cite{liu2022bevfusion} & - & 64.7 & 69.3 \\
+    \Xhline{2\arrayrulewidth}
+    LidarMultiNet~\cite{ye2022lidarmultinet} & 82.0 & 63.8 & 69.5 \\
+    \Xhline{2\arrayrulewidth}
+    LiDARFormer seg only    & 81.7    & - & -   \\
+    LiDARFormer     & \textbf{82.7}    & \textbf{66.6} & \textbf{70.8}    \\
+    \Xhline{4\arrayrulewidth}
+    \end{tabular}
+    }
+\end{minipage}
+
+\end{table*}
+
+\textbf{Cross-task Attention}
+As shown in Figure~\ref{fig:transformer}, we adopt the detection transformer decoder from the well-studied CenterFormer~\cite{Zhou_centerformer}, which represents the object-level feature as center query embedding initialized from BEV center proposals. We initialize the class feature embedding $\varepsilon$ using the BEV feature.
+Class and center features are concatenated and then sent into a shared transformer decoder, where the information between detection and segmentation tasks are transferred to each other through a cross-task self-attention layer. Due to the memory limitation, the class and center feature aggregate features separately from the voxel and BEV feature maps, respectively.

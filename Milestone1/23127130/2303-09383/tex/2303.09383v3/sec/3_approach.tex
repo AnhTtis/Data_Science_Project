@@ -1,0 +1,105 @@
+\section{Human Attention Transformer}
+\label{sec:approach}
+In this section, we first formulate scanpath prediction as a sequence of dense prediction tasks using behavior cloning. We then introduce our proposed transformer-based model, HAT, for scanpath prediction. Finally, we describe how we train HAT and use it for fast inference.
+
+\subsection{Preliminaries}
+% Scanpath prediction is often modelled as an imitation learning problem where a model is trained to generate scanpaths that are similar to human scanpaths. Inverse reinforcement learning \cite{yang2020predicting,yang2022target} and behavior cloning methods \cite{zelinsky2021predicting,de2022scanpathnet} have been proposed to predict human scanpaths. These methods often break down scanpath prediction into a sequential prediction of the next fixation given the image input and all previous fixations. To simplify the problem, fixations are often discretized using a coarse grid and models are trained to output a {\it categorical} probability distribution of fixation grids. For instance, Yang~\etal \cite{yang2022target} discretize the fixations into a \htimesw{20}{32} grid and use the grid center as the predicted fixation at inference. However, we argue that discretizing fixations would hurt the accuracy of the fixation prediction model especially for high-resolutional input where fixations are likely to fall into the same grid.
+
+%To avoid the precision loss incurred by grid discretization in existing fixation prediction methods \cite{zelinsky2019benchmarking,yang2020predicting,chen2021predicting,yang2022target}, we formulate scanpath prediction as a sequential dense prediction task without discretizing the fixations. 
+To avoid the precision loss caused by grid discretization present in prior fixation prediction methods \cite{zelinsky2019benchmarking,yang2020predicting,chen2021predicting,yang2022target}, we formulate scanpath prediction as a sequential prediction of pixel coordinates. 
+Given a $H{\times}W$ image and an optional initial fixation $f_0$ (often set as the center of an image), a scanpath prediction model  predicts a sequence of human-like fixation locations $f_1, \cdots, f_n$, with each fixation $f_i$ being a pixel location in the image. Note that $n$ is variable that may be different for each scanpath due to the different termination criteria of different human subjects. To model the uncertainty in human attention allocation, existing methods \cite{yang2022target,yang2020predicting,chen2021predicting,zelinsky2019benchmarking} often predict a probability distribution over a coarse grid of fixation locations at each step. HAT follows the same spirit but outputs a dense fixation heatmap. Specifically, HAT outputs a heatmap $Y_i\in[0,1]^{H{\times} W}$ with each pixel value indicating the chance of the pixel being fixated in the next fixation. In addition, HAT also outputs a termination probability $\tau_i\in[0,1]$ indicating how likely the model is to terminate the scanpath at the current step $i$. To sample a fixation, we apply $L_1$-normalization on $Y_i$. In the following, we omit the subscript $i$ for brevity.
+% \mhoai{This 2nd last sentence is not clear to me. What's the purpose of $L_1$-normalization???}
+
+\subsection{Network Architecture}
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=1.0\linewidth]{images/working_mem.pdf}
+  \caption{\textbf {Working memory construction.} We construct the working memory by starting with the visual embeddings (``what") flattened from $P_1$ over the spatial axes and selected from $P_4$ at previous fixation locations. A scale embedding is introduced to capture scale information. Spatial embeddings and temporal embeddings are further added to the tokens to enhance the ``where" and ``when" signals. At every new fixation (marked in red), we simply add a new foveal token while keeping other tokens unchanged.}
+  \label{fig:foveation}
+\end{figure}
+HAT is a novel transformer-based model for scanpath prediction. At each fixation, HAT outputs a set of prediction pairs $\{(Y_t, \tau_t)\}_{t=1}^T$ where $t$ indicates a task, which could be a visual search task (e.g., clock search and mouse search) or a free-viewing task.
+% \mhoai{Is $t$ a typo? I don't understand how $t$ is a task}
+\Cref{fig:overview} shows an overview of the proposed model. HAT consists of four modules: 1) a feature extraction module that extracts a feature pyramid with multi-resolutional feature maps corresponding to information extracted at different eccentricities \cite{yang2022target,rashidi2020optimal}; 2) a foveation module which maintains a dynamical working memory representing the information acquired through fixations; 3) an aggregation module that selectively aggregates the information in the working memory using attention mechanism for each task; 4) a fixation prediction module that predicts the fixation heatmap $Y_t$ and termination probability $\tau_t$ for each task $t$.\\
+\textbf{The feature extraction module}
+consists of a pixel encoder (e.g., ResNet \cite{he2016deep}, a Swin transformer \cite{liu2021swin}), and a pixel decoder (e.g., FPN \cite{lin2017feature} and deformable attention \cite{zhu2020deformable}). Taking a $H{\times} W$ image as input, the pixel encoder encodes the input image into a high-semantic but low-resolution feature map. 
+%The pixel decoder gradually up-samples the low-resolution feature map to higher resolution by a scale factor of two and constructs a pyramid of four multi-scale feature maps, 
+The pixel decoder up-samples the feature map several times, each time by a scale factor of two, to construct a pyramid of four multi-scale feature maps 
+denoted as $P=\{P_1, \cdots, P_4\}$, where $P_1\in \mathbb{R}^{C{\times}\frac{H}{32}{\times}\frac{W}{32}}$, $P_4\in \mathbb{R}^{C{\times}\frac{H}{4}{\times}\frac{W}{4}}$, and $C$ is the channel dimension.\\
+\textbf{The foveation module}
+% Humans are known to have a foveated retina which samples the visual information in the view in a non-uniform manner---pixels around the fixation are sampled at high resolution (i.e., foveal vision) while the pixel resolution gradually drop off as its distance from the fixation point increases (i.e., peripheral vision). The foveal vision is used to scrutinize details of the scene or objects, whereas the peripheral vision provides broad, spatial information of the scene. Inspired by \cite{yang2022target} which apply foveation on the feature pyramid, 
+constructs a {\it dynamic} working memory using the feature maps $P_1$ and $P_4$ to represent the information a person acquires from the peripheral and foveal vision, respectively. We discard medium-grained feature maps $P_2$ and $P_3$ in computing the peripheral representation for computational efficiency. 
+% We did not observe performance improvement after adding $P_2$ in the peripheral tokens (see \Sref{sec:ablation} for details). 
+Finally, we apply a Transformer encoder \cite{vaswani2017attention} to dynamically update the working memory with the information acquired at a new fixation.
+\Cref{fig:foveation} illustrates the construction of the working memory. 
+The working memory consists of two parts: peripheral tokens and foveal tokens. We first flatten the low-resolution feature map $P_1$ over the spatial axes to obtain the peripheral visual embeddings $V^p\in\mathbb{R}^{(\frac{H}{32}\cdot\frac{W}{32}){\times} C}$. Feature vectors in $P_4$ at each fixation location are selected as the foveal visual embeddings $V^f\in\mathbb{R}^{k{\times} C}$, where $k$ is number of previous fixations. For simplicity, we round the fixation to its nearest position in $P_4$.
+Then we add a learnable {\bf scale} embedding to each token to discern the scale/resolution of the visual embeddings. As the spatial information is shown to be important in predicting human scanpath (e.g., center bias and inhibition of return \cite{wang2010searching}), we enrich the peripheral and foveal tokens with their 2D {\bf spatial} information in the image. 
+% We use the 2D sinusoidal position encoding \cite{li2021learnable} to encode the 2D spatial location of each token in the image space. 
+Specifically, we create a lookup table of 2D sinusoidal position embeddings \cite{li2021learnable} $G\in\mathbb{R}^{H{\times} W{\times} C}$ by concatenating the 1D sinusoidal positional encoding of the horizontal and vertical coordinates of each pixel location. For a visual embedding at position $(i, j)$ of a given feature map of stride $S$ ($S=32$ for $P_1$ and $S=4$ for $P_4$), its position encoding is defined by the element at position $(t_i, t_j)$ in $G$ where $t_i=\lfloor i\cdot S\rfloor$ and $t_j=\lfloor j\cdot S\rfloor$. 
+% Not only knowing \enquote{what} and \enquote{where} have been seen in previous fixations is important for predicting the next fixation, also important is \enquote{when} the pixel has been seen as information acquired in distant past fixations would has less effect on the current gaze behavior (i.e., fading memory). 
+% The fading memory effect is more prominent in target-absent visual search tasks and free-viewing task where the scanpaths are long. To this end, 
+Furthermore, we add to each foveal token the {\bf temporal} embedding, a learnable vector, according to its fixation index to capture the temporal order among previous fixations.\\
+\textbf{The aggregation module}
+% We represent each task (a visual search task or the free-viewing task) with a task-specific search query. 
+is a transformer decoder \cite{vaswani2017attention} that selectively aggregates information from the working memory using a set of learnable, task-specific queries $Q\in \mathbb{R}^{N{\times} C}$, where $N$ is the number of tasks (e.g., $N=18$ for COCO-Search18 \cite{chen2021coco} and $N=1$ for free-viewing datasets). The transformer decoder has $L$ layers, with each layer consisting of a cross-attention layer, a self-attention layer and a feed-forward network (FFN). Different from the standard transformer decoder \cite{vaswani2017attention}, we follow \cite{cheng2022masked} and switch the order of cross-attention and self-attention module.
+Firstly, each task query selectively gathers the information in working memory acquired through previous fixations using cross-attention. Then, the self-attention layer followed by a FFN is applied to exchange information in different queries which could boost the contextual cues \cite{chun1998contextual} in each query. When generating a scanpath, HAT maintains its state across fixations \textit{only} in the working memory, the input $Q$ is the same at each fixation prediction.\\
+% Note that unlike DETR \cite{carion2020end} where queries form a unordered set and thus matching queries with the ground-truth annotations is required to compute the loss, here the queries can be considered as an ordered set of kernels. By convolving with the high-resolution feature map, each kernel yields a fixation heatmap indicating where to look at next for a specific task.
+\textbf{The fixation prediction module} yields the final prediction---a fixation heatmap $\hat{Y}_t$ and a termination probability $\hat{\tau}_t$ for each task $t$. For the termination prediction, a linear layer followed by a sigmoid activation is applied on top of each updated query $q_t\in Q$:
+\begin{equation}
+    \hat{\tau}_t = \text{sigmoid}(Wq_t^T+b),
+\end{equation}
+where $W$ and $b$ are the parameters of the linear layer. For the fixation heatmap prediction, a Multi-Layer Perceptron (MLP) with two hidden layers first transforms $q_t$ into a task embedding, which is then convolved with the high-resolution feature map $P_4$ to get the fixation heatmap $\hat{Y}_t$ after a sigmoid layer:
+\begin{equation}\label{eq:heatmap}
+    \hat{Y}_t=\text{sigmoid}(P_4 \odot \text{MLP}(q_t)),
+\end{equation}
+where $\odot$ denotes the pixel-wise dot product operation. Finally, we upsample $\hat{Y}_t$ to the image resolution.
+Note that the predictions for all tasks, i.e., $\hat{Y}\in\mathbb{R}^{N{\times} H{\times} W}$ and $\hat{\tau}\in\mathbb{R}^{N{\times}1}$, are yielded in parallel.
+
+\subsection{Training and Inference}
+\textbf{Training loss.}
+We follow \cite{zelinsky2019benchmarking} and use behavior cloning to train HAT. The problem of scanpath prediction is broken down into learning a mapping from the input triplet of an image, a sequence of previous fixations, and a task to the output pair of a fixation heatmap and a termination probability. Given the predicted fixation heatmaps $\hat{Y}\in\mathbb{R}^{N{\times} H{\times} W}$ and termination probabilities $\hat{\tau}\in\mathbb{R}^{N{\times}1}$, the training loss is only calculated for its ground-truth task $t$:
+\begin{equation}
+    \mathcal{L}=\mathcal{L}_\text{fix}(\hat{Y}_t, Y)+\mathcal{L}_\text{term}(\hat{\tau}_t, \tau),
+\end{equation} 
+where $Y\in[0,1]^{H{\times} W}$ and $\tau\in\{0,1\}$ are the ground-truth fixation heatmap and termination label for task $t$, respectively. We compute $Y$ by smoothing the ground-truth fixation map with a  Gaussian kernel with the kernel size being one degree of visual angle. $\mathcal{L}_\text{fix}$ denotes the fixation loss and is computed using pixel-wise focal loss \cite{lin2017focal,law2018cornernet}:
+\begin{equation}%\label{eq:focal}
+\begin{aligned}
+\mathcal{L}_\text{fix} = \frac{-1}{HW}\sum_{i,j}
+\begin{cases} 
+    (1-\hat{Y}_{ij})^\alpha\log(\hat{Y}_{ij}) & \textrm{if } Y_{ij}=1,\\[5pt]
+    \begin{gathered}
+    (1-{Y}_{ij})^\beta(\hat{Y}_{ij})^\alpha\\
+    \log(1-\hat{Y}_{ij}) 
+    \end{gathered}& \text{otherwise},
+\end{cases}
+\end{aligned}
+\label{eq:loss_fn}
+\end{equation}
+where $Y_{ij}$ represents the value of $Y$ at location $(i, j)$ and we set $\alpha=2$ and $\beta=4$ following \cite{yang2022target,law2018cornernet}.
+$\mathcal{L}_\text{term}$ is the termination loss and is computed by applying a binary cross entropy (negative log-likelihood) loss, i.e., 
+\begin{equation}
+    \mathcal{L}_\text{term}=-\omega\cdot\tau\log(\hat{\tau}_t)- (1-\tau)\log(1-\hat{\tau}_t),
+\end{equation}
+where $\omega$ is a weight to balance the loss of positive and negative training examples since there are many more  negative labels than positive labels for training a termination prediction, especially for target-absent visual search and free-viewing tasks where scanpath are long. We set $\omega$ to be the ratio of the number of negative training instances to the number of positive ones.\\
+% \myheading{Auxiliary task.}
+% Following \cite{yang2022target}, we also use object center map detection as an auxiliary task to train HAT for visual search tasks. To predict the 80 object center maps (one for each object category in COCO \cite{lin2014microsoft}), we simply append 80 additional object detection queries in the aggression module of HAT and output one center map for each object detection query using \Eref{eq:heatmap}. As in \cite{law2018cornernet,zhou2019objects}, we use pixel-wise focal loss (\Eref{eq:focal}) to train the center map detection task. One merit of HAT is that the aggression module automatically exchange information among different queries, which implicitly enhance the fixation queries with both features of the target and the contextual objects that might provide positional cues for locating the target.
+\textbf{Inference.}
+Similarly to \cite{yang2020predicting,yang2022target,chen2021predicting}, HAT also generates scanpaths autoregressively, but in an efficient way. Given an image, HAT only computes the image pyramid $P$ and peripheral tokens once. For a new fixation, a foveal token is constructed and appended to the working memory after which the aggregation module and fixation prediction module yield the fixation heatmaps and termination predictions for all tasks in parallel.
+
+% \subsection{Pretraining for Scanpath Prediction}
+% Due to the high cost in collecting human scanpaths, existing human scanpath datasets are often relatively small (containing thousands of images) compared to existing large-scale image datasets such as ImageNet \cite{deng2009imagenet} and MSCOCO \cite{lin2014microsoft} which contain hundreds of thousands or even millions of images. Therefore, existing scanpath prediction models usually use pretrained backbones and only train task-specific sub-networks for scanpath prediction using gaze data. For example, \cite{yang2020predicting,zelinsky2019benchmarking} use ImageNet-pretrained ResNet50 and \cite{yang2022target} uses COCO-pretrained Panoptic-FPN \cite{kirillov2019panopticfpn}. Similarly, our preliminary work \cite{yang2023predicting} adopts a pixel encoder and pixel decoder pretrained for panoptic segmentation on COCO dataset. Pretraining backbones on a segmentation task is reasonable for predicting visual search scanpaths as visual search requires semantic understanding of the scene and objects. However, such a pretrained backbone could limit the model's capability in predicting free-viewing scanpath which is controlled by the low-level image features such as contrast and color \cite{itti2000saliency}.
+% In this section, we design a novel pretext task for pretraining the feature extraction module and foveation module of our HAT model for free-viewing task.
+
+% \begin{figure}[t]
+%   \centering
+% \includegraphics[width=1.0\linewidth]{images/pretrain.pdf}
+%   \caption{{\bf Scanpath--image matching (SIM)} for pretraining HAT.}
+%   \label{fig:pretrain}
+% \end{figure}
+
+
+% To overcome the lack of training human scanpaths, we seek to design a generic pretraining approach that can take advantage of any existing human scanpath regardless of its task (TP, TA, FV, or others). Inspired by recent developments in self-supervised learning \cite{chen2020simple,he2020momentum,chen2021exploring}, we propose scanpath--image matching (SIM) for pretraining HAT for free-viewing scanpath prediction. \Fref{fig:pretrain} sketches how SIM works. 
+% Denote a pair of its ground-truth (GT) image and scanpath as $(I_i, S_i)$. For every scanpath $S$, we regard its GT image as the best match, with a higher matching score than any other images. Based on this, for each scanpath we contrast its GT image over other negative images using a contrastive loss similar to \cite{chen2020simple}:
+% \begin{equation}\label{eq:pretrain}
+%     \mathcal{L}_i = -\log\frac{\exp\big(g(I_i, S_i)/\sigma\big)}{\sum_{j\in{\mathcal{N}}}\exp\big(g(I_j, S_i)/\sigma\big)},
+% \end{equation}
+% where $\sigma$ is a temperature parameter and $\mathcal{N}_i$ denotes a negative set of images for $I_i$, i.e., $\forall j \in \mathcal{N}_i, j\neq i$. $g$ is a neural network composed of HAT followed by a a two-layer MLP. The HAT in pretraining has one single query in the aggregation module and does not have the fixation prediction module. It takes in an image $I_i$ and a scanpath $S_i$ and generates an image-scanpath embedding $\bm{z}_{ii}=\text{HAT}(I_i, S_i)$. The MLP layer then projects $\bm{z}_{ii}$ to a matching score that measures how much scanpath $S_i$ is compatible with image $I_i$. Minimizing \eqref{eq:pretrain} force HAT to captures the relation between image contents (low-level features and/or high-level semantics) and the sequential fixations, and potential gaze behavior patterns.

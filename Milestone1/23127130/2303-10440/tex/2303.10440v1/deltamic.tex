@@ -1,0 +1,714 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\pdfoutput=1
+
+\usepackage{iccv}
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{comment}
+\usepackage{tabularx}
+
+% Include other packages here, before hyperref.
+
+% If you comment hyperref and then uncomment it, you should delete
+% egpaper.aux before re-running latex.  (Or just hit 'q' on the first latex
+% run, let it finish, and you should be clear).
+\usepackage[pagebackref=true,breaklinks=true,colorlinks,bookmarks=false]{hyperref}
+
+\iccvfinalcopy % *** Uncomment this line for the final submission
+
+\def\iccvPaperID{10806} % *** Enter the ICCV Paper ID here
+\def\httilde{\mbox{\tt\raisebox{-.5ex}{\symbol{126}}}}
+
+% Pages are numbered in submission mode, and unnumbered in camera-ready
+\ificcvfinal\pagestyle{empty}\fi
+
+\begin{document}
+
+%%%%%%%%% TITLE
+\title{Differentiable Rendering for 3D Fluorescence Microscopy}
+
+\author{Sacha Ichbiah \qquad Fabrice Delbary \qquad Hervé Turlier\\
+Center for Interdisciplinary Research in Biology, Collège de France \\
+\textit{CNRS, Inserm, PSL University}, Paris, France \\
+{\tt\small herve.turlier@college-de-france.fr}
+}
+
+\maketitle
+% Remove page # from the first page of camera-ready.
+\ificcvfinal\thispagestyle{empty}\fi
+
+
+%%%%%%%%% ABSTRACT
+\begin{abstract}
+    Differentiable rendering is a growing field that is at the heart of many recent advances in solving inverse graphics problems, such as the reconstruction of 3D scenes from 2D images. By making the rendering process differentiable, one can compute gradients of the output image with respect to the different scene parameters efficiently using automatic differentiation.
+   Interested in the potential of such methods for the analysis of fluorescence microscopy images, we introduce \textbf{deltaMic}, a microscopy renderer that can generate a 3D fluorescence microscopy image from a 3D scene in a fully differentiable manner. By convolving the meshes in the scene with the point spread function (PSF) of the microscope, that characterizes the response of its imaging system to a point source, we emulate the 3D image creation process of fluorescence microscopy.
+   This is achieved by computing the Fourier transform (FT) of the mesh and performing the convolution in the Fourier domain. 
+   Naive implementation of such mesh FT is however slow, inefficient, and sensitive to numerical precision. We solve these difficulties by providing a memory and computationally efficient fully differentiable GPU implementation of the 3D mesh FT. We demonstrate the potential of our method by reconstructing complex shapes from artificial microscopy images. Eventually, we apply our renderer to real confocal fluorescence microscopy images of embryos to accurately reconstruct the multicellular shapes of these cell aggregates. % by minimizing the loss between the real and the rendered image. 
+\end{abstract}
+
+\section{Introduction}
+Fluorescence microscopy \cite{lichtman2005fluorescence} has become the most widespread technique to image biological objects.
+In fluorescence microscopy, biological samples are made visible by attaching a fluorescent dye - or fluorophore - to the structure of interest. Then a laser excites the dye, which emits, in response, fluorescent light that goes through the optics of the microscope and is detected by a photosensitive sensor to produce a 2-dimensional image. 
+In confocal microscopy, the focal plane is varied to generate a 3D volumetric image composed of optical sections of the biological sample. 
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figure_1.eps}
+  \caption{Overview of the differentiable fluorescence microscopy rendering pipeline. The renderer takes as input a triangle mesh, that represents the shape of a biological object, and a parameterized point spread function (PSF), that emulates the optics of the microscope, and outputs a 3D artificial microscopy image. By making every element of the pipeline differentiable, the gradients of the voxel image values with respect to the mesh geometry and PSF parameters can be computed efficiently with backpropagation. In turn, these gradients can be used to optimize input parameters to make the output image fit a real microscopy image.}
+\end{figure}
+
+\begin{figure*}[h]
+    \centering
+    \includegraphics[width=\linewidth]{Figure_2.eps}
+    \caption{We apply our pipeline to learn both vertices position and PSF parameters from 3D confocal microscopy images.}
+\end{figure*}
+
+In spite of the ubiquitous use of fluorescence microscopy in biology, extracting relevant quantitative information from 3D fluorescence images remains a major bottleneck, spurring the development of new methods. In recent years, researchers took inspiration from the field of computer vision, building in particular on the success of 2D convolutional neural networks (CNN) and adapting their architectures to the pecularities of biological images \cite{10.1007/978-3-319-24574-4_28,10.1007/978-3-319-46723-8_49}. These deep learning (DL)-based tools for fluorescence imaging \cite{belthangady2019applications} have made it possible to perform or automate various image analysis tasks, including image restoration \cite{CARE}, instance segmentation \cite{schmidt2018,Cellpose}, or feature encoding with self-supervised learning \cite{cytoself}. 
+However, the expressivity of neural networks also comes with drawbacks: CNNs are prone to feature "hallucinations" (i.e. detecting aberrant signal from noise), which is problematic for scientific research and medical applications, that cannot suffer from such errors. The goal of fluorescence microscopy is to identify one particular biological structure, which has generally a high degree of organization, such as lipid-membranes, cytoskeletal networks, or other organelles, by making them bright while keeping everything else dark. Therefore, except for unavoidable noise, fluorescence images are generally very sparse and made of well-structured objects such as points, filaments, surfaces or bulk solids.
+Because of this underlying simplicity, in parallel to the development of deep-learning based tools, one could witness in recent years a reverse trend in microscopy image analysis, going away from deep-learning, in favor of methods that rely on stronger prior knowledge \cite{DBLP:conf/icml/BatsonR19,DBLP:conf/icml/LehtinenMHLKAA18,ahmet_can_solak_2022_7222198}.
+
+Here, we demonstrate that differentiable rendering \cite{https://doi.org/10.48550/arxiv.2006.12057} stands out as a powerful approach to insert such priors for fluorescence image analysis: from defined parameters, such as parametrized shapes of objects and optical properties of the imaging system, one can approximate the image formation process. We introduce \textbf{deltaMic}, a differentiable renderer for 3D fluorescence microscopy images. 
+Rendered images can be compared to true biological images using a voxel-based norm, and gradients of this loss with respect to input parameters can be determined efficiently with automatic differentiation. Minimizing this loss with a gradient-based optimization allows to fit the geometry of biological objects and to emulate the optical model of the microscope.
+%In physics-based differentiable rendering \cite{10.1145/3388769.3407454}, the whole scene and optical system are often modeled, with light-paths traced to generate images. Here, we found sufficient to rely on a simplified physical model of the image creation process, from which realistic volumes can be generated. It takes a triangle mesh and a parameterized Point Spread Function (PSF) as inputs, and generates a volumetric image from them.
+Our renderer relies on an efficient and flexible framework to approximate the image formation process, that takes a mesh and a parameterized Point Spread Function (PSF) as inputs, and generates a volumetric image from them. To generate this 3D image, the mesh describing the geometry is convolved with the PSF via an element-wise product in the Fourier domain. We use distribution theory to express the Fourier Transform (FT) of a 2D shape embedded in 3D \cite{DBLP:conf/iclr/JiangWHMN19,1142981}, and derive the expression of the FT and its gradient in the case of a triangle mesh. We propose a narrow-band strategy to accelerate massively the computation of the mesh FT, and provide a custom C++/CUDA implementation of both the forward and the backward passes that greatly enhances speed and memory efficiency. Our PyTorch implementation allows for gradients of the rendered 3D image values with respect to input parameters to be computed through automatic differentiation. We demonstrate the inverse-rendering capabilities of our pipeline by reconstructing the PSF and the complex shape of various objects and of early embryos from artificial and true fluorescence images. Importantly, we rely on previously developed approaches in the field of differentiable rendering to regularize the optimization problem \cite{10.1145/3478513.3480501}.\\
+
+ \textbf{Main contributions:} \\
+$\bullet$ We propose a simplified model of the fluorescence microscopy imaging process, combining an mesh description of objects geometry and a simple parameterized point spread function. \\
+$\bullet$ We present a differentiable formulation of the Fourier transform of a triangle surface mesh, and its highly-optimized GPU implementation.\\
+$\bullet$ We demonstrate the capacity of our differentiable renderer to reconstruct shapes from both artificial and real 3D microscopy images without the need for additional shape-regularization terms.\\
+
+\begin{comment}
+    $\bullet$ We extract accurate explicit mesh representations of biological objects from microscopy data, facilitating further geometry analysis \cite{DDG} or physical simulations \cite{da2022viscous}.
+\end{comment}
+
+
+An open-source implementation of our method is available on
+\href{https://github.com/VirtualEmbryo/deltamic}{https://github.com/VirtualEmbryo/deltamic}%\footnote {Removed for blind review}.https://github.com/sacha-ichbiah/deltamic
+
+\section{Related work}
+
+\subsection{Point spread function models}
+The resolution of images seen with a fluorescence microscope are fundamentally limited by the diffraction of light \cite{Inoue2006}. If this response is invariant by translation, we can describe the imaging system by determining its PSF, that describes the response of the imaging system to a point source. Numerous physics-based models of PSFs have been developed \cite{Gibson:92,Kraus:89,Hanser:03,Hanser:04, ARNISON200253}, mostly for deconvolution applications \cite{sage2017deconvolutionlab2}.
+\begin{comment}
+   Given an image $u_\alpha$, deconvoluting a signal aims at inverting the effects of this diffraction, by finding the solution $u_\rho$ of the equation $u_\rho \star h + \xi = u_\alpha $, where $\xi$ is a noise term, which usually follows poisson statistics \cite{5570958}. A good deconvolution thus requires an accurate determination of the PSF.   
+\end{comment}
+The most straightforward way to determine a PSF is to directly generate microscopy images of tiny fluorescent beads that approximates a point source, and then fit the parameters of a given model to match this experimental PSF.
+In our approach, we decide to approximate the PSF by a Gaussian kernel, that is fully characterized by its covariance matrix. We note that our approach can be extended to learn parameters of more realistic PSF models, especially when vectorized implementations are available \cite{Li:17}.
+
+\begin{comment}
+A popular model \cite{Gibson:92} is based on an optical theory of the diffraction of light \cite{Kraus:89}, and has been used successfully to fit experimental data \cite{https://doi.org/10.1111/j.1365-2818.2012.03675.x}. Recent works \cite{Li:17} provide efficient implementations based on a decomposition of integrals with Bessel functions that can be integrated directly in a differentiable pipeline.
+Another approach, applied in \cite{Hanser:03,Hanser:04, ARNISON200253,6235915}, is based on the fact that the Fourier transform of the PSF can be described by the pupil function, a 2D function defined in the 2D unit disk. An orthogonal decomposition of the pupil function thus provides a flexible way to describe the PSF. In our approach, we decide to express the PSF as a gaussian blur.
+\end{comment}
+
+\subsection{Artificial microscopy images generation}
+
+Creating artificial microscopy images has been the object of several studies, in order to evaluate image-analysis algorithms \cite{rajaram2012simucell} and to create automatically annotated datasets for neural network training \cite{mill2021synthetic}. 
+These works can be grouped into two families, with models that aims at reproducing the real image-formation process \cite{dmitrieff2017confocalgn}, and other approaches that uses texture synthesis \cite{malm2015simulation,wiesmann2017using} or generative DL \cite{HOLLANDI2020453,eschweiler20213d} to make photorealistic images.
+
+In \cite{dmitrieff2017confocalgn}, fluorophore distribution is defined via a boolean mask that indicates the presence or absence of fluorophores. This mask is subsequently convolved with a PSF provided by the user before adding camera noise. 
+We follow and extend this approach, by giving a more accurate mathematical definition of the fluorophore density, that we define as a $\mathbb{R}^3$-valued density.
+%allowing to formulate the derivatives of this density and to use these to fit real data.
+
+
+\subsection{Instance segmentation of fluorescent images}
+Biological image analysis is a subdomain of the broader field of computer vision, and state of the art segmentation methods in both fields followed the same historical evolution \cite{6279591}: thresholding, watershed-transform \cite{beucher1992watershed,beucher2018morphological,fernandez2010imaging} or optimization with graph-cuts \cite{boykov2006graph} were the dominant segmentation techniques before the advent of deep-learning based pipelines \cite{10.1007/978-3-319-24574-4_28,10.1007/978-3-319-46723-8_49}. 
+
+In 2D, the best results for the segmentation of biological objects have been obtained by using a large dataset of annotated images from varied sources to train a CNN to predict instance masks robustly and generically, being not bound to any particular biological samples nor imaging modalities \cite{Cellpose2,Omnipose,TissueNet}. Such approach could not yet be successfully reproduced in 3D, showing that DL-based volumetric data analysis is not just about extending 2D neural networks to 3D. 3D images, or Z-stacks, are obtained by stacking together 2D images by changing the position of the focal plane along the optical axis z, leading to large anisotropy along this spatial direction. This anisotropy is different for each imaging condition, leading to heterogeneous 3D datasets and making both the training and generalization of CNNs a daunting task. 
+Limited GPU memory also poses large technical difficulties with current 3D biology images of typical size from $512^3$ with a classical confocal microscope to $2048^3$ with latest light-sheet technologies.
+%Labeling volumetric data constitutes another challenge, that requires both expert knowledge of the biological system, great spatial visualization abilities to label consistently from one plane to another, and good labeling software to proceed efficiently. Moreover, passing from 2D to 3D already raises considerably the number of voxels to label and the difficulty of these tasks.
+
+\subsection{Energy based segmentation}
+
+A large portion of the classical literature on image segmentation relies on the minimization of an energy functional $\mathcal{E}(\Lambda,m)$, that aims at modeling a distance between a desired shape $\Lambda$ and a distinctive feature in the image $m$ \cite{mumford1989optimal}. These features may be a sharp intensity gradient (using edge detectors \cite{malladi1995shape}) or regions of largely different intensities \cite{chanvese}. To model the shape of objects, one can generally rely either on an implicit level-set or explicit mesh representation. The final shape $\Lambda^*$ is obtained iteratively by gradient-based optimization of the functional. The opposite of the gradient $\dfrac{\partial \mathcal{E}(\Lambda,m)}{\partial \Lambda}$ can be interpreted as a force that moves the contour to the desired target shape, which has motivated the generic names of \textit{snakes}, \textit{active contours} \cite{DBLP:journals/ijcv/KassWT88} or \textit{active meshes} \cite{dufour20103} for such methods. One large drawbacks, it that these techniques most often require user-defined shape regularization terms (mechanically equivalent to global tension or bending energies) to penalize sharp features and obtain smooth shapes.
+
+The peculiarity of fluorescent images of slender biological structures, such as membranes, is that the shape is defined by a thin region of high intensity immersed in the dark, which is not well-adapted for region-based or edge-based energies evoked earlier. Alternative approaches have directly defined a force based on the distance to the local maximum intensity in the image \cite{limeseg,10.1093/bioinformatics/btab557}. Others have defined a proper energy functional as a distance between a microscopy image and an artificial image created from a mesh, as in \cite{10.1007/978-3-642-10331-5_51,Nguyen2016}. The artificial image is generated by creating a thin boolean mask from the mesh, that is then convolved with a PSF, that is assumed to be known. 
+Our approach builds on these ideas but proposes a more rigorous, versatile and three-dimensional image rendering procedure, where we optimize both the mesh representing the shape and the PSF parameters together, without needing any explicit regularization terms to smooth the mesh. 
+
+\subsection{Differentiable rendering} %and automatic differentiation}
+
+Rendering geometrical 2D or 3D shapes into raster (discrete) 2D images is an ubiquitous topic in computer graphics, and an increasing number of rendering frameworks are now made differentiable. This allows to solve inverse-rendering problems, where one can learn directly the parameters of a scene (shapes, textures, material properties) from single or multiple views of raster images \cite{10.1145/3414685.3417871,10.1145/3355089.3356498,DBLP:journals/corr/abs-2006-12057}.
+In most cases, rasterization pipelines are not differentiable natively and discontinuities or occlusions can lead to incorrect gradients. A simple solution to soften sharp changes is to smoothen the image formation process with different strategies \cite{pytorch3d,Liu_2019_ICCV,10.1145/3414685.3417861,DBLP:conf/cvpr/KatoUH18}. 
+
+Our fluorescence microscope renderer is based on mathematical operations that are differentiable by design, and does not need special adaptations to obtain meaningful gradients. Indeed, convoluting the mesh FT with a PSF naturally smoothes the image, in a similar manner as what is done for differentiable rasterization \cite{Liu_2019_ICCV}. As for other frameworks, the number of parameters to optimize can be very high: a triangle mesh contains typically thousands of vertices, and a PSF can be parametrized by hundreds of parameters. 
+Assuming all the building blocks of the models are constituted of differentiable operations, reverse-mode differentiation (also called backpropagation), based on the repeated use of the chain-rule, allows to compute efficiently partial derivatives with respect to any parameter. The efficiency and versatility of this method lead to the development of several libraries offering both GPU acceleration of classical automatic differentiation operations \cite{torch,jax} and a high level and memory efficient implementation of backpropagation. We built our pipeline in PyTorch \cite{torch} and provide our mesh FT as a differentiable function.
+
+\section{Rendering fluorescence microscopy images}
+
+Images are defined as intensity maps from $[0,1]^3$ to  $\mathbb{R}$ without any loss of generality, as any non-cubic images can be linearly fitted in the cube $[0,1]^3$. In the following, we will offer approximated descriptions of both the imaging system and the geometry of the biological samples, that will be combined to build our differentiable renderer.
+
+\subsection{Translation-invariant rendering model}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figure_3.eps}
+  \caption{Principle of the rendering process. In our model, the fluorophores are distributed regularly on a surface $\Lambda$ and the imaging system has a translation-invariant response function defined by the PSF. The microscopy image is created by convoluting the PSF with this uniform distribution of fluorophores.}
+\end{figure}
+
+We assume translation-invariance of the response function $h$ of the fluorescence microscope. If so, a smooth image $u_\alpha: [0,1]^3 \mapsto \mathbb{R}$ results from the convolution between a density of fluorophores $u_\Lambda: [0,1]^3 \mapsto \mathbb{R}$ and a point spread function kernel $h: [0,1]^3 \mapsto \mathbb{R}$:
+
+\begin{equation}
+u_{\alpha}(\textbf{p}) = (u_{\rho} *  h)(\textbf{p}) = \int_{[0,1]^3}  u_\Lambda (\textbf{x}) h(\textbf{p}-\textbf{x}) \mathrm{d}^3\textbf{x}.
+\end{equation}
+
+To avoid the computation of these integrals, we perform the convolution in the Fourier space by doing an element-wise multiplication of the elements of the Fourier transforms $\hat{u}_{\rho}$ and $\hat{h}$: 
+\begin{equation}
+    \hat{u}_{\alpha} = \hat{u}_{\Lambda} \cdot \hat{h}.
+\end{equation}
+
+%This convolution involves potentially complex integrals that depend of the particular expression of the PSF, which would need a taylored implementation for each PSF model. In fourier space, Instead of computing these integrals, we do the convolution in the fourier space 
+
+The biological structure of interest is made visible by fluorophores.
+The shape will thus be represented by $u_\Lambda$, whereas $h$ should describe the response of the optical system to a point source. With this image formation model, one can start from a first guess $\left(u_\Lambda^0,h^0\right)$, and minimize the distance between the rendered image $u_\alpha^0$ and a real microscopy image $m$. Doing so allows to learn both the geometry of the biological sample observed and the PSF of the imaging system, $\left(u_\Lambda^*,h^*\right)$. However, to learn meaningful representations, both of these elements have to be constrained by parametrized models that will implement our prior knowledge of the system.
+
+\subsection{Point spread-function model}
+
+The simplest PSF model is a Gaussian kernel. In this case the PSF is fully described by its covariance matrix $\Sigma \in \mathbb{R}^{3*3}$: 
+\begin{equation}
+    h(\mathbf{z})= \dfrac{\mathrm{e}^{-\frac{1}{2}\mathbf{z}^T\Sigma^{-1}\mathbf{z}}}{\sqrt{(2\pi)^n\det\Sigma}}\;,\;\mathbf{z} \in\mathbb{R}^3.
+\end{equation}
+
+The FT $\hat{h}$ of $h$ is given by: 
+\begin{equation}
+    \hat{h}(\boldsymbol{\xi}) = \mathrm{e}^{-\frac{1}{2}\boldsymbol{\xi}^T\Sigma^{-1}\boldsymbol{\xi}}, \boldsymbol{\xi} \in \mathbb{R}^3.
+\end{equation}
+In this framework, learning the PSF consists of learning all the coefficients of the covariance matrix $\Sigma$, and thus the level of blur of the rendered image. More photorealistic PSF based on a differentiable physical model could also be used \cite{Hanser:03,Hanser:04}. In that case, the learned parameters could be real optical parameters such as refraction indices or optical aberrations expressed using Zernike polynomials \cite{Zernikereview}.
+
+
+\subsection{Geometrical models of biological objects}
+
+Extracting geometry from volumetric images consists of giving approximate representations of biological objects in terms of ND (N = 0,1,2,3) discrete objects, embedded in a 3D space. 
+They can be pretty diverse, both in terms of size and of topology. Here, we decide to focus on the lipid membranes that delimits cells and nuclei and to approximate them as 2D surfaces, that can be modeled efficiently with triangle meshes. Choosing the topology in such manner also implements prior knowledge: as we see in section \ref{celegans_ex}, early embryos are composed of cells forming bounded regions that can be represented as a single non-manifold multimaterial mesh \cite{maitre2016asymmetric}.
+
+\begin{comment}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figure_4.eps}
+  \caption{We can interpret each biological object as a geometrical object.}
+  \label{fig:simplicialcomplexes}
+\end{figure}
+They are pretty diverse, both in terms of size and of topology. In the scales studied, one could consider doing the following approximations:
+\begin{itemize}
+    \setlength\itemsep{0em}
+    \item \textbf{Proteins} are seen as 0D points, as the resolution is not sufficient to see individual molecules.
+    \item \textbf{Cytoskeletons} of cells, composed of actin filaments and microtubules, can be approximated by networks of 1D polygonal curves.
+    \item \textbf{Lipid membranes} that delimits cells and nuclei are 2D, and can be modeled efficiently with triangle meshes.
+    \item \textbf{Bulk 3D organelles} such as nuclei or phase-separated liquid droplets are described as 3D volumetric meshes. 
+\end{itemize}
+\end{comment}
+% In the following, we focus on determining the geometry of cell membranes described by 2D triangle surface meshes embedded in the 3D Euclidean space. %However, we want to put the emphasis on the fact that such an approach could be reproduced with objects of other dimensions to study different aspects of cell biology. 
+
+%associated to each model: The standard-deviation matrix for the gaussian function, the zernike polynomial decomposition coefficients for the pupil function-based computation, and the optical parameter for the Gibson-Lanni psf. 
+
+
+
+\section{Fourier Transform of Surfaces}
+
+In this section, we will give an explicit expression of the FT for any 2D surfaces embedded in $\mathbb{R}^3$, and give formulas of the FT and its gradient with respect to vertices position in the particular case of a triangle mesh. 
+
+\subsection{Surfaces as spatial Dirac distributions}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width = \linewidth]{Figure_5.eps}
+  \caption{Surface $\Lambda$ describing a dividing cell and its associated density $u_\Lambda$ in $\mathbb{R}^3$.}
+\end{figure}
+The density of fluorophores $u_\Lambda$ will be equal to 1 only on an infinitely thin surface $\Lambda$, and 0 everywhere else. 
+
+
+To describe such irregular functions, one has to define them using spatial Dirac distributions. If we consider a surface given by a parameterization $\Lambda: [0,1]^2 \to [0,1]^3 $, its spatial density is given by: 
+\begin{equation}
+u_{\Lambda} = \dfrac{1}{|\Lambda|} \int_0^1 \int_0^1 \delta_{\Lambda}(x,y) a_{\Lambda}(x,y) \mathrm{d}x \mathrm{d}y,
+\end{equation}
+
+where $a_{\Lambda}$ is the surface element given by 
+$a_{\Lambda}(x,y)=\|\partial_x\Lambda\times\partial_y\Lambda\|$, and $|\Lambda|$ is the total area of the surface $\Lambda$. The normalization by the total area ensures a density $1$. When dealing with several surfaces with different densities, one has only to use a weigthed sum of such $u_{\Lambda}$.
+
+For all $\mathbf{z} \in \mathbb{R}^3$, the FT of the Dirac distribution at z is given by: 
+\begin{equation}
+    \hat{\delta}_{\mathbf{z}}(\boldsymbol{\xi}) = e^{-i \mathbf{z} \cdot \boldsymbol{\xi}}, \quad \boldsymbol{\xi} \in \mathbb{R}^3.
+\end{equation}
+Hence, the linearity of the FT gives:
+\begin{equation}
+\hat{u}_{\Lambda}(\boldsymbol{\xi}) = \dfrac{1}{|\Lambda|}  \int_0^1 \int_0^1  a_{\Lambda}(x,y) e^{-i \boldsymbol{\Lambda}(x,y)\cdot\boldsymbol{\xi}} \mathrm{d}x \mathrm{d}y.
+\end{equation}
+
+\subsection{The case of a triangulated surface}
+To describe surfaces $\Lambda$ in practice, we will use triangle meshes. To compute the FT in this special case, as the FT is linear we just need to compute the FT of each triangle of the surface and sum their contributions.
+
+
+\subsubsection{Fourier transform and gradients for a triangle}
+
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figure_6.eps}
+  \caption{Notations for a triangle mesh. As the FT is linear, the FT of a single triangle will allow us to obtain the general expression of the FT for any triangle mesh.}
+\end{figure}
+We consider one triangle $\mathcal{T}$ given by its vertices $(\textbf{v}_1,\textbf{v}_2,\textbf{v}_3)$ and compute $u_\Lambda$ and its spatial derivatives. We denote by $\textbf{v}_4 = \textbf{v}_1$ and similarly by $\textbf{v}_0 = \textbf{v}_3$. For $p=1 \ldots 3$, we define $p^- =p-1$ and
+$p^+ = p+1$ and denote by $\textbf{e}_p = \textbf{v}_{p^-} \!-\! \textbf{v}_{p^+}$  the opposite edge to $\textbf{v}_p$ and by $l_p = |\textbf{e}_p|$ its length.
+$A_\mathcal{T} = \dfrac{|\textbf{e}_3 \times \textbf{e}_1|}{2}$ denotes the area of the triangle, and $\textbf{N}_{\mathcal{T}}$ denotes its unit normal given by: $\textbf{N}_\mathcal{T} = \dfrac{\textbf{e}_3 \times \textbf{e}_1 }{2A_\mathcal{T}}$
+At last, for $p=1 \ldots 3$, we define $\textbf{w}_p = \textbf{e}_p \times \textbf{N}_{\mathcal{T}}$, the non-normalized outward normal to $\mathcal{T}$ on the edge $\textbf{e}_p$. For any p, we have: $\dfrac{\partial A_\mathcal{T}}{\partial \textbf{v}_p}  = - \dfrac{\textbf{w}_p}{2}$
+
+If we define $\hat{u}_{\mathcal{T}}(\boldsymbol{\xi}) = \int_\mathcal{T} \mathrm{e}^{-i\mathbf{z} \cdot \boldsymbol{\xi}} \mathrm{d}s(\mathbf{z})$, then for all $\boldsymbol{\xi} \in \mathbb{R}^3$, we have: 
+\begin{equation}\label{fsum}
+\hat{u}_{\mathcal{T}}(\boldsymbol{\xi}) = 2A_\mathcal{T} f_\mathcal{T}(\boldsymbol{\xi}),
+\end{equation}
+with $f_\mathcal{T}(\boldsymbol{\xi})$ defined by:
+\begin{equation}
+    f_\mathcal{T}(\boldsymbol{\xi}) = \sum_{p=1}^3 \frac{\mathrm{e}^{-i\mathbf{z}_p\cdot \boldsymbol{\xi}}}{(\textbf{e}_{p^-}\cdot \boldsymbol{\xi})(\textbf{e}_{p^+}\cdot \boldsymbol{\xi})}.
+\end{equation}
+For all $p=1\ldots3$, we have: 
+\begin{equation}
+    \frac{\partial \hat{u}_{\mathcal{T}}}{\partial \textbf{v}_p} (\boldsymbol{\xi}) = -f_\mathcal{T}(\boldsymbol{\xi})\textbf{w}_p +  2A_\mathcal{T} \frac{\partial f_\mathcal{T}(\boldsymbol{\xi})}{\partial \textbf{v}_p},
+\end{equation}
+with:
+\begin{equation}
+    \begin{split}
+\dfrac{\partial f_\mathcal{T}(\boldsymbol{\xi})}{\partial \textbf{v}_p}=  & \boldsymbol{\xi}\left[\dfrac{\text{e}^{-\text{i} \mathbf{z}_{p^+}\cdot\boldsymbol{\xi}}}{(\textbf{v}_{p^-}\cdot\boldsymbol{\xi})^2(\textbf{v}_p\cdot\boldsymbol{\xi})}-\dfrac{\text{e}^{-\text{i} \mathbf{z}_{p^-}\cdot\boldsymbol{\xi}}}{(\textbf{v}_p\cdot\boldsymbol{\xi})(\textbf{v}_{p^+}\cdot\boldsymbol{\xi})^2}\right. \\
+ & \left.-\dfrac{\text{i}\text{e}^{-\text{i} \mathbf{z}_p\cdot\boldsymbol{\xi}}}{(\textbf{v}_{p^-}\cdot\boldsymbol{\xi})(\textbf{v}_{p^+}\cdot\boldsymbol{\xi})}
++\dfrac{\text{e}^{-\text{i} \mathbf{z}_p\cdot\boldsymbol{\xi}}}{(\textbf{v}_{p^-}\cdot\boldsymbol{\xi})^2(\textbf{v}_{p^+}\cdot\boldsymbol{\xi})}\right.\\
+&\left.-\dfrac{\text{e}^{-\text{i} \mathbf{z}_p\cdot\boldsymbol{\xi}}}{(\textbf{v}_{p^-}\cdot\boldsymbol{\xi})(\textbf{v}_{p^+}\cdot\boldsymbol{\xi})^2}\right].
+    \end{split}
+\end{equation}
+
+%\begin{equation}
+%    \dfrac{\partial f_\mathcal{T}(\xi)}{\partial \textbf{v}_p} = \left[ \left( \right)  \right]
+%\end{equation}
+
+\begin{comment}
+\begin{equation}
+\boxed{\begin{gathered}
+\dfrac{\partial f_\mathcal{T}(\xi)}{\partial \textbf{v}_p} =\left[\left(-\tfrac{\text{i}}{(v_{p^-}\cdot\xi)(v_{p^+}\cdot\xi)}
++\tfrac{1}{(v_{p^-}\cdot\xi)^2(v_{p^+}\cdot\xi)}\right.\right.\\
+\left.
+-\tfrac{1}{(v_{p^-}\cdot\xi)(v_{p^+}\cdot\xi)^2}\text{e}^{-\text{i} z_p\cdot\xi}\right)\\
+\left.+\frac{\text{e}^{-\text{i} z_{p^+}\cdot\xi}}{(v_{p^-}\cdot\xi)^2(\textbf{v}_p\cdot\xi)}-\frac{\text{e}^{-\text{i} z_{p^-}\cdot\xi}}{(v_p\cdot\xi)(v_{p^+}\cdot\xi)^2}\right]\xi.
+\end{gathered}}
+\end{equation}
+
+\begin{equation}
+\boxed{\begin{gathered}
+\dfrac{\partial f_\mathcal{T}(\xi)}{\partial \textbf{v}_p} =
+\xi\left[\tfrac{\text{e}^{-\text{i} z_{p^+}\cdot\xi}}{(v_{p^-}\cdot\xi)^2(v_p\cdot\xi)}-\tfrac{\text{e}^{-\text{i} z_{p^-}\cdot\xi}}{(v_p\cdot\xi)(v_{p^+}\cdot\xi)^2}\right \\
+\left.-\tfrac{\text{i}\text{e}^{-\text{i} z_p\cdot\xi}}{(v_{p^-}\cdot\xi)(v_{p^+}\cdot\xi)}
++\tfrac{\text{e}^{-\text{i} z_p\cdot\xi}}{(v_{p^-}\cdot\xi)^2(v_{p^+}\cdot\xi)}
+-\tfrac{\text{e}^{-\text{i} z_p\cdot\xi}}{(v_{p^-}\cdot\xi)(v_{p^+}\cdot\xi)^2}\right]\\
+\end{gathered}}
+\end{equation}
+
+\end{comment}
+%The complete expression of $\dfrac{\partial f_\mathcal{T}(\xi)}{\partial \textbf{v}_p}$ is given in the appendix.
+
+\subsubsection{Density for a triangle mesh}
+A triangle mesh is a surface $\Lambda = \{\mathcal{T}\}$ defined by a set of triangles. For $\boldsymbol{\xi} \in \mathbb{R}^3$, by linearity, its FT is defined by: 
+
+\begin{equation}
+    \hat{u}_\Lambda(\boldsymbol{\xi}) = \frac{\underset{\mathcal{T} \in \Lambda}{\sum} \hat{u}_\mathcal{T} (\boldsymbol{\xi})}{|\Lambda|} = \frac{\underset{\mathcal{T} \in \Lambda}{\sum} \hat{u}_\mathcal{T} (\boldsymbol{\xi})}{\underset{\mathcal{T} \in \Lambda}{\sum} A_\mathcal{T}}.
+\end{equation}
+
+%$\textbf{e}_1,\textbf{e}_2,\textbf{e}_3$
+
+The gradient of the FT with respect to a vertex $\textbf{v}$ of the mesh is thus: 
+\begin{equation}
+    \frac{\partial \hat{u}_\Lambda(\boldsymbol{\xi})}{\partial \textbf{v}}  = \frac{1}{|\Lambda|}\left( 
+    \underset{\mathcal{T} \in \textbf{v}\star}{\sum} \frac{\partial \hat{u}_\mathcal{T} (\boldsymbol{\xi})}{\partial \textbf{v}} - 
+    \hat{u}_\Lambda (\boldsymbol{\xi}) \underset{\mathcal{T} \in \textbf{v}\star}{\sum} \frac{\partial A_\mathcal{T}}{\partial \textbf{v}}
+    \right),
+\end{equation}
+
+where $\textbf{v}\star$ denotes the set of the triangles of $\Lambda$ that contains the vertex $\textbf{v}$.
+
+\subsubsection{Numerical approximations to avoid divergence}
+The FT of a Dirac distribution on a triangle is $C^\infty$. However, large computational errors arise when one denominator in the eq. \eqref{fsum} get close to zero. Error in rounding floating-point arithmetic leads to a limited numerical precision $\epsilon$. Values smaller than this threshold $\epsilon$ cannot, in practice, be distinguished from 0. 
+Therefore, when one term in denominator gets close to 0 in the expression \eqref{fsum} we replace it by an approximation that we describe in the following. 
+
+We write $f_\mathcal{T}(\boldsymbol{\xi})=g(\textbf{e}_1\cdot\boldsymbol{\xi},\textbf{e}_2\cdot\boldsymbol{\xi},\textbf{e}_3\cdot\boldsymbol{\xi})$, with the function $g$ defined for $(s,t,u)\in\mathbb{R}^3$ by
+\begin{equation}\label{gstu}
+\begin{array}{ll}
+     g(s,t,u)\!= \!\dfrac{-\,\mathrm{e}^{i s}}{(s\!-\!t)(s\!-\!u)}
+     \!-\!\dfrac{\mathrm{e}^{i t}}{(t\!-\!u)(t\!-\!s)}
+     \!-\!\dfrac{\mathrm{e}^{i u}}{(u\!-\!s)(u\!-\!t)}.
+\end{array}
+\end{equation}
+When two values $(a,b)$ among $(s,t,u)$ are such that $|a-b|<\epsilon$, we obtain a value equal to 0 at the denominator and divergence. We solve this problem by deriving exact expressions of g(s,t,u) in the case where t=u or t=s or u=s or u=s=t, that replaces the original expression \eqref{gstu} when any $(a,b)$ among $(s,t,u)$ is such that $|a-b|<\epsilon$.
+
+%are close to each other, the distance $|a-b|$ is close to 0. If $|a-b|$ is smaller than the limited numerical precision of our floating point number representation
+%does not allow us to compute values smaller than a given threshold, and that cannot be distinguished from 0. accurately the values at the denominator,
+
+When only two values are too close from each other:
+\begin{equation}
+\begin{array}{ll}
+     g(t,t,u)&=g(u,t,t) = g(t,u,t) \\
+     &=i\dfrac{\mathrm{e}^{-i t}}{t-u}+\dfrac{\mathrm{e}^{-i t}}{(t-u)^2}-\dfrac{\mathrm{e}^{-i u}}{(t-u)^2}.
+\end{array}
+\end{equation}
+
+When all three values are too close to each other, we replace the expression by 
+\begin{equation}
+     g(u,u,u)=\frac{\mathrm{e}^{-i u}}{2}.
+\end{equation}
+
+%, the numerical accuracy limits our computation capabilities. We do the computation as if these two values were equal and replace them with the exact expression:
+%we replace g(s,t,u) by the expressions g(t,t,u) or g(u,u,u).:
+%The values which have to be taken if two or the three the variables are close to each other are given by
+
+
+\begin{comment}
+
+\section{Point Spread-Functions Models}
+
+We provide a short introduction of three PSF models: the gaussian PSF, and two photorealistic models: Gibson-Lanni and the Pupil-function based PSF. When formulated appropriately, they all lead to efficient differentiable expressions of the psf, allowing to learn the physical quantities that defines them.
+%associated to each model: The standard-deviation matrix for the gaussian function, the zernike polynomial decomposition coefficients for the pupil function-based computation, and the optical parameter for the Gibson-Lanni psf. 
+
+
+\subsection{Gaussian PSF}
+
+The simplest model is a gaussian PSF. In this case the PSF is fully described by its covariance matrix $\Sigma \in \Rbb^{n*n}$: 
+\begin{equation}
+    h(z)= \dfrac{\ee^{-\frac{1}{2}z^T\Sigma^{-1}z}}{\sqrt{(2\pi)^n\det\Sigma}}\;,\;z\in\Rbb^n
+\end{equation}
+
+The Fourier transform $\hat{h}$ of $h$ is given by: 
+\begin{equation}
+    \hat{h}(\xi) = \ee^{-\frac{1}{2}\xi^T\Sigma^{-1}\xi}, \xi \in \Rbb^n
+\end{equation}. 
+
+In this framework, learning the PSF consists of learning all the coefficients of the covariance matrix $\Sigma$. This is the most stable PSF, has it will not give rise to any unexpected artifacts, and will be the one favored in a first approach.
+
+
+\subsection{Pupil-function based model}
+\subsubsection{The OTF and the pupil function}
+
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figure_6_Hanserpsf.pdf}
+  \caption{The 2D-valued pupil function can be used to generate the PSF, and its fourier transform, the OTF}
+\end{figure}
+
+The PSF specifies the response of the imaging system to a point source object in the physical space $\mathbb{R}^3$. It always depends on the optical properties of the system such as the aperture angle $\alpha$, the wavelength of the observation light $\lambda$ or the refractive index of the immersion medium $n$.
+
+The PSF can be described equivalently in the space of spatial frequencies $(\textbf{k}_x,\textbf{k}_y,\textbf{k}_z)$ by its fourier transform, called the Optical Transfer Function (OTF). On a fluorescence microscope, the OTF has non-zero values only on a spherical cap of radius $\frac{n}{\lambda}$, with an angular span fixed by the aperture angle $\alpha$. This 2D shell can be projected on the plane $(\textbf{k}_x,\textbf{k}_y)$, by parametrizing $\textbf{k}_z = \sqrt{(\frac{n}{\lambda})^2 - (\textbf{k}_x^2 + \textbf{k}_y^2)}$, leading to a complex $\mathbb{R}^2$ valued function non-zero only on the unit disc, called the pupil function $P(k_x,k_y)$. Eventually, the PSF can be described as: 
+
+\begin{equation}
+    PSF(x,y,z) = \left|   
+    \int \int_{pupil} P(k_x,k_y) e^{2\pi i (k_x x + k_y y + k_z z)} \mathrm{d}_{k_x} \mathrm{d}_{k_y}
+    \right|
+\end{equation}
+
+The PSF can thus be described via a 2D pupil function defined on a disk. An efficient parametrization of this pupil function can be done by decomposing it into its expansion in the orthogonal basis of zernike polynomials \ref{appendix:zernike}.
+Each coefficient of the expansion can be learned efficiently. A strengh of this formulation is that Zernike polynomials represent classical optical aberrations (Fig.~\ref{fig:zernike}), giving insights into the real optical properties of the system.
+
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figures/Figure_7_zernike_polynomials.pdf}
+  \caption{Zernike Polynomials are othogonal polynomials in the unit disc that can describe optical aberrations by modifying the pupil function}
+  \label{fig:zernike}
+\end{figure}
+\end{comment}
+
+\begin{comment}
+\subsection{Gibson and Lanni model}
+
+\subsubsection{The optical model}
+
+The Gibson Lanni model is based on the hypothesis that the objective lens is completely free of aberrations. Thus, all the aberrations of the imaging system are generated by the other elements of the microscope: the specimen, the coverslip, and the immersion medium. In the optimal design conditions, the specimen is supposed to be in contact with the coveklrslip, which is not the case in practise. Moreover, the width and refraction indices of the coverslip and the immersion medium may differ from their original design values. Because of these differences, the optical path of a light ray in a design system will differ from one in the experimental condition. If we note $\rho$ the normalized radius of the focal plane, z the axial coordinate of the focal plane, and $\textbf{p}=(NA,n,t)$ with $n = (n_i, n_i^*,n_g, n_g^*,n_s)$ and $t= (t_i, t_i^*, t_g, t_g^*, z_p)$, the optical path difference OPD is given by: 
+
+\begin{equation}
+\begin{array}{cl}
+    OPD(\rho, z, \textbf{p}) = & (z+t_i)\sqrt{(n_i)^2 - (NA\rho)^2}  +  \\
+     & z_p\sqrt{n_s^2-(NA\rho)^2} - t_i^*\sqrt{n_i^{*2} - (NA\rho)^2} + \\
+     & t_g\sqrt{n_g^2-(NA\rho)^2} - t_g^*\sqrt{n_g^{*2} - (NA\rho)^2}
+\end{array}
+\end{equation}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figures/Figure_9.A_GIbson-Lanni.pdf}
+  \caption{Even with an aberration-free objective lens, differences between design and experiment parameters can lead to optical aberrations, that induces modifications of the PSF}
+\end{figure}
+
+\subsubsection{Expression of the PSF}
+
+Under the previous hypotheses, the phase aberration can be expressed as $W(\rho,z,\textbf{p}) = kOPD(\rho,z,\textbf{p})$ with $k=2\pi/\lambda$ the wave number of the emitted light. 
+
+The PSF is radially symmetric in a plane orthogonal to the optical axis. Given the phase aberration, we can obtain its expression using Kirchhoff's diffraction integral formula \cite{born2013principles,Gibson:92}
+
+\begin{equation}
+    PSF(r,\rho, z, \textbf{p})  = \left|\int^1_0 exp(iW(\rho, z, \textbf{p}) J_0(krNA\rho)\rho d\rho \right|^2
+\end{equation}
+
+Where $r$ is the distance to the optical axis, and $J_0$ is the Bessel function of the first kind of order 0. 
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width = \linewidth]{Figures/Figure_9_PSF GIbson-Lanni.pdf}
+  \caption{XY/XZ values of the Gibson-Lanni PSF}
+  \label{fig:Gibson-Lanni}
+\end{figure}
+
+We see that this model gives a PSF that is very similar to the one computed from the pupil function, with standard parameters. However, in both models, modifying the optical parameters can change considerably the PSF. 
+
+\subsubsection{Fast vectorial computation of the PSF}
+
+The previous integral is tedious to compute, and has been the object of many studies. We follow the approach of \cite{Li:17}, that allows for a fast computation of the PSF using a Bessel-series approximation. The vectorial nature of the computation is easily expressed in torch, and its derivatives obtained straightforwardly using reverse-mode differentiation.
+\end{comment}
+
+
+\section{Experiments}
+\subsection{Numerical implementation}
+
+\subsubsection{Acceleration}
+
+The computation of the artificial image requires to compute the FT $\hat{u}_\Lambda$ for each of the N voxels of the spatial grid and for each of the $n_t$ triangles, with a runtime complexity of $\mathcal{O}$(N$\cdot n_t$). The mesh FT gradient requires to compute a $\mathcal{O}$(1) sum for each voxel, for each of the $n_v$ vertices, leading to a complexity of $\mathcal{O}$(N$\cdot n_v$). 
+In practice, a $500^3$ confocal microscopy picture has of $125$ millions voxels , and a reasonable mesh will have $\approx 10^{3-4}$ vertices and triangles, leading to prohibitive computations times if this operation is not parallelized correctly. This high computational cost is a major restriction that has hampered the development of spectral methods in 3D, in spite of interesting potential applications \cite{jiang2019convolutional}.
+
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=\linewidth]{Figure_7.eps}
+  \caption{Benchmarking of the mesh FT computation. \textit{Left} In a very small 80 triangles sphere, our custom CUDA implementation improves the speed and the memory efficiency of the mesh FT by several orders of magnitude. \textit{Right} In a $[100]^3$ box, the forward pass of the mesh FT scales linearly with the number of triangles.}
+  \label{fig:figbench}
+\end{figure}
+
+
+We propose two complementary strategies to accelerate the mesh FT: GPU parallelization and a narrow-band approximation method in the frequency domain.
+
+\paragraph{GPU parallelization}
+The grid-based structure of a 3D image makes its implementation naturally adapted to massivelly parallel computations on graphical processing units (GPU). We provide a custom CUDA implementation of the forward and the backward pass. As shown in figure \ref{fig:figbench}, on a single NVIDIA V100 GPU, we obtain a $\approx 10^3$ speedup compared to the vectorized CPU implementation and we can perform computations with a far greater box size before overflow.
+
+
+
+\paragraph{Narrow-band approximation in the frequency domain}
+As stated previously, the FT of the image is expressed as the element-wise product between the FT of the mesh and of the PSF:  $\hat{u}_{\alpha} = \hat{u}_{\Lambda} \cdot \hat{h}$. Practically, our PSF acts as a low-pass filter, that will give more weight to low spatial frequencies of the mesh. A blurred image has a sparse PSF, with largest amplitudes for frequencies close to 0, therefore obliterating the fine details of the mesh. The more resolved the original biological image, the more frequencies in the PSF are needed to properly render it.
+
+For any given spatial frequency $\boldsymbol{\xi}$, if  $\hat{h}(\boldsymbol{\xi}) \approx 0$, one can spare the computation of  $\hat{u}_{\Lambda}(\boldsymbol{\xi})$ as it will have negligible impact on the value of $\hat{u}_{\alpha}(\boldsymbol{\xi})$. In practice, we apply a cutoff in the frequency domain, and only compute the FT of the mesh for the frequencies for which the PSF is larger than $1\%$ of its maximal value. For sparse PSFs, this spectral narrow-band method can reduce the computational cost by several orders of magnitude
+ (table \ref{tabletime}).
+
+\begin{comment}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figures/Figure_narrowband_threshold_2D.pdf}
+  \caption{Done}
+\end{figure}
+\end{comment}
+
+\subsubsection{A staggered optimization scheme}\label{strategies}
+
+In spite of all the speed improvements, computing the FT of the mesh and its gradient constitutes the computational bottlenecks of our pipeline. We have two ways of computing the FT of the mesh: a fast and approximate way using the narrow-band method, and a slow and exact way by doing the full computation.
+The forward path is $\approx$ 10 times slower than the backward path, it is thus crucial to compute the backward path with the narrow-band method when possible. We decide therefore to decompose the coupled optimization problem into two optimization sub-problems, that are iterated in a staggered manner:
+
+\begin{enumerate}
+\item[(a)] Shape optimization:  To learn the shape, one does only need to compute the mesh FT approximately. We compute the approximate FT of the mesh using the narrow-band method, and make an optimization step for the vertex positions, without optimizing the PSF.
+
+\item[(b)] PSF optimization: To learn the point spread function, one need to know the value of the FT of the mesh in all the available frequencies, and should not be biased by the narrow-band frequency threshold that relies on the current values of the PSF. We compute the exact FT of the mesh, and make an optimization step for the PSF parameters, without optimizing the shape.
+\end{enumerate}
+
+
+
+
+\begin{comment}
+Learning the PSF can be dangerous if the mesh is too far away from the original shape. During our experiments we found that the gaussian PSF, tough less photorealistic, was far more stable than the other ones. We decide to separate the procedure in two parts: 
+
+\begin{enumerate}
+
+\item{ \textbf{Shape and psf learning with Gaussian PSF}}:We alternate the steps a) and b) with a gaussian PSF. Interestingly, the standard width of the gaussian point spread function tends to decrease while optimising the shape. In the beginning, our renderer achieves a fewer loss by blurring a bit the contours, and progressively reduces the blur as the shape converges to the original one.
+
+\item{\textbf{PSF learning at fixed shape with a photorealistic model:}} Once the shape has been learned with the Gaussian PSF model, we change it for a more accurate psf, and optimize its parameters to fit the given image, by keeping in the b step. The exact FT of the mesh is computed once and for all and only the PSF is learned. 
+
+\end{enumerate}
+\end{comment}
+
+
+\subsubsection{Shape optimization step}
+
+\begin{comment}
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=\linewidth]{Regularisation_small.pdf}
+  \caption{Without regularisation, the gradient descent fails to converge on the original shape}
+  \label{fig:figbench}
+\end{figure}
+\end{comment}
+
+We optimize shapes by minimizing a modified L2 norm $\Phi_{\kappa}= ||u-m||^2 * m^{\kappa}$ with $\kappa = 1$, that removes external influence from dark regions of the original image $m$. Inspired by other works in differentiable rendering \cite{10.1145/3478513.3480501}, we optimize vertex positions using AdamUniform and regularize gradient values by adding a diffusion term: 
+\begin{equation} 
+    \textbf{v} \leftarrow x- \eta (\textbf{I} + \lambda \textbf{L})^{-2} \dfrac{\partial \Phi_1}{\partial \textbf{v}},
+\end{equation}
+where the Laplacian $\textbf{L}\in \mathbb{R}^{n_v \times n_v}$ is a connectivity Laplacian defined on our triangle mesh, and $\lambda  = 50$. Computing explicitly the inverse $(\textbf{I} + \lambda \textbf{L})^{-2}$ requires to use dense algebra, which can lead to prohibitive memory usage when the number of vertices $n_v$ of the mesh grows. Instead, we solve the equivalent problem of finding the solution $\text{A}$ to $(\textbf{I} + \lambda \textbf{L})^{-2} \text{A} = \dfrac{\partial \Phi_1}{\partial \textbf{v}}$ with a sparse Cholesky decomposition \cite{naumov2011parallel,10.1145/3478513.3480501}.
+
+\begin{comment}
+    
+
+\subsubsection{Gradient Descent Scheme}
+
+We are learning shape by modifying the position of vertices in a 3D space. Practically, the gradient descent greatly benefits from the use of momentum terms. We use VectorAdam \cite{DBLP:journals/corr/abs-2205-13599}, a rotational equivariant adaptation of the Adam algorithm, that has been conceived to solve our type of problems: optimizing a shape of a given mesh to minimize an objective function $\Phi$, while taking into account the rotationnal equivariance of the problem, and thus avoiding the biais of the choice a euclidean basis.
+
+\subsubsection{Beta loss}
+The gradient direction of the vertices are given by a minimizing a loss function comparing two images, the target image $m$ and the rendered image $u$. If a portion of our surface lies in a dark region of the original image $m$, a simple way to reduce the loss is to brutally reduce its area. This leads to a reduction of the distance between every vertices, and thus raises greatly the risk of collisions.
+To avoid external influence from these dark regions of the original image $m$, we multiply the loss $\Phi$ by the value of the image to a given power $\beta$. 
+\begin{equation}
+\Phi_{\beta}= ||u-m||^2 * m^{\beta}
+\end{equation}
+Raising $\beta$ gives a higher importance to the brigest regions of the image. We choose $\beta = 1$ for the rest of this work for the shape learning, and will note conveniently $\Phi_\Lambda:=\Phi_1$.
+
+\subsubsection{Sparse-Gradient and Diffusion}
+The gradients obtained through this procedure are very sparse, and their amplitude can vary greatly. A gradient descent through this procedure is not efficient. In this manner they are analogous to silhouette gradients encountered in differentiable rendering, that occurs when one shape occludes another one. Indeed, in a general manner, when we rasterize n-dimensional shapes embedded in a n+1 dimensional space, a little change in the position of the vertices lead to abrupt changes in pixel intensities. 
+Inspired by other works in differentiable rendering \cite{10.1145/3478513.3480501}, we modify the gradient descent by adding a diffusion term: 
+\begin{equation} 
+    \textbf{x} \leftarrow x- \eta (\textbf{I} + \lambda \textbf{L})^{-2} \dfrac{\partial \Phi}{\partial \textbf{x}}
+\end{equation}
+
+Where the laplacian is a connectivity laplacian defined on our polygonal line. In practice, we do not compute the inverse matrix $(\textbf{I} + \lambda \textbf{L})^{-2}$ by directly obtain the term $(\textbf{I} + \lambda \textbf{L})^{-2} \dfrac{\partial \Phi}{\partial \textbf{x}}$ with a sparse Cholesky factorisation.
+
+Adding this diffusion term greatly smoothes the gradient, averaging its values accross all its vertices. It reduces discretization artifacts, as well as self intersection caused by abrupt local changes in vertices positions. 
+\fix{Ce qui manque vraiment ici je pense c'est une étude de la robustesse de ta méthode par rapport à du bruit dans l'image sur ces memes exemples canoniques}
+\end{comment}
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=\linewidth]{Figure_8.eps}
+  \caption{Surface mesh reconstruction from 3D artificial images. Artificial 3D images were created from triangle meshes using our renderer. Then, starting from spheres or toruses, we minimize the L2 norm between the rendered and the target images to reconstruct the original shape (see also supplementary videos 1-4).}
+  \label{fig:artificial_examples}
+\end{figure}
+
+
+\begin{figure*}[h!]
+  \centering
+  \includegraphics[width =0.888\textwidth]{Figure_9.eps}
+  \caption{Shape reconstruction of \textit{C. elegans} embryos. Starting from a foam ground truth, we optimize both vertices position and PSF parameters to recover individual cell shapes from real confocal microscopy data (see also supplementary videos 5-7).}
+  \label{fig:celegans}
+\end{figure*}
+
+\subsubsection{PSF optimization step}
+The optimization of PSF parameters aims at reproducing the whole image in details, for both light and dark regions. Minimizing the traditional L2 norm $\phi_0 = ||u-m||^2 $ is therefore well-adapted to such task.
+We learn the correlation matrix $\Sigma$ with the original Adam optimizer \cite{kingma2014adam}.
+
+\subsection{Shape reconstruction from artificial images}
+We present in fig.~\ref{fig:artificial_examples} several examples of shape reconstruction from some classical meshes in computer graphics. Artificial images are generated with a Gaussian PSF characterized by an isotropic correlation matrix. Here, we focus on shape reconstruction and start directly from the target PSF correlation matrix $\Sigma$. Starting from meshes of elementary shapes (a sphere or a torus depending on the topology) we compute 10000 optimization steps for each example. Without any remeshing operation, our regularized shape optimization algorithm accurately converges to original shapes. Interestingly, in each of the four examples studied, the mesh converges with no collisions, although no collision detection or resolution method is implemented \cite{brochu2012efficient,lin2017collision}. 
+
+\subsection{Cell shape reconstruction and Gaussian PSF fitting on \textit{\textbf{C. elegans}} embryo microscopy images}\label{celegans_ex}
+We use our method to fit shapes of cell clusters of \textit{C. elegans} embryos, using 3D confocal microscopy images from \cite{cao2020establishment}. The images are of size $205\times285\times134$. 
+We describe cell clusters as non-manifold multimaterial meshes, as done in previous works \cite{brakke1992surface}, and we use a multimaterial mesh-based surface tracking method \cite{Multitracker} to manage remeshing, collision detection and T1/T2 topology transition  \cite{weaire2001physics} operations. As first guesses, we generate foam-like multimaterial meshes with the correct number of cells by minimizing a surface energy at fixed cell volumes \cite{maitre2016asymmetric}. The resulting cell clusters are of roundish shapes with $\approx$ 4000 - 10000 vertices that are subsequently optimized to fit true microscopy data. Here, we optimize jointly the PSF and the vertex positions in the mesh, following the strategy described in section \ref{strategies}. The duration of each step with a mesh of 4000 vertices is displayed in table  \ref{tabletime}. On both 4, 6 and 16 cells embryos, we predict individual cell shapes accurately after 10000 optimization steps, and the resulting reconstructed image is very close to the original microscopy image (fig.~\ref{fig:celegans}).
+
+
+\begin{table}
+\begin{center}
+\begin{tabular}{lcc}
+\hline
+Optimization step & forward (s) & backward (s)  \\
+\hline
+PSF & 0.001 & 0.004\\
+Mesh (naive) & 3.435 & 49.38  \\
+\hline
+\textbf{Mesh (ours)} & \textbf{1.757} & \textbf{17.04}  \\
+\hline
+\end{tabular}
+\end{center}
+\caption{Average duration of the PSF and mesh optimization steps for the reconstruction described in section \ref{celegans_ex} with a naive implementation (naive) and with the spectral narrow-band approximation (\textbf{ours}). The mesh has 4000 vertices.}
+\label{tabletime}
+\end{table}
+
+\begin{comment}
+\subsubsection{Learning shapes of cell clusters}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{Figures/Figure_18_multimaterial_mesh_small.pdf}
+  \caption{Our non-manifold mesh is composed of several materials. Each cell is represented by a watertight manifold, and the different cells interact with each other, sharing faces, vertices. A rough instance segmentation is generated, converted into a mesh, and smoothed by minimizing the area while keeping. TODO: REMOVE IT AND JUST EXPLAIN IT WITH A BIT OF TEXT}
+\end{figure}
+
+We describe cell clusters as non-manifold multimaterial meshes à la \cite{brakke1992surface}, and use \cite{Multitracker}, a multimaterial mesh-based surface tracker, to manage remeshing, collision detection and topology transitions. 
+
+Our gradient descent leads us to a local minimum of energy. To learn robustly the shapes obtained from microscopy data, we need to start as close as possible from the solution. We propose a two step procedure to generate a multimaterial mesh that is smooth and close enough from the sought-after shape.
+
+\begin{itemize}
+
+\item{\textbf{Instance segmentation}}: Various DNN-based tools \cite{Cellpose} allows to compute good approximate instance segmentation masks. Extracting the borders such instance segmentation gives a multimaterial triangle (surface) mesh.
+
+\item{\textbf{Surface Smoothing}}:We minimize the area total surface area while keeping fixed the volume of every manifold
+\end{itemize}
+We took microscopy data of C. Elegans embryo from \cite{cao2020establishment}, and applied our rendering pipeline on 4, 8 and 16 cell-stage embryos. First guesses were computed from instance segmentations as explained previously. 
+
+
+\begin{figure*}[h]
+  \centering
+  %%\includegraphics[width=\textwidth]{Figures/TODO.png}
+  \caption{TODO: Montrer une petite timeline avec: Évolution du mesh, Évolution de la PSF, Évolution de la loss,
+Évolution du narrow-band-factor (et donc de la finesse de la PSF), rendering des images au niveau de ce timestep., où peut-être pas: On va pas trop charger. la figure. Peut-être juste montrer le topology change.}
+\end{figure*}
+
+Even on noisy data, from unprecise initial states, to gradient descent converges and describes the shape of the embryo. We put our first guess voluntarily far away from the true shape, but numerous methods can generate meshes close from the original shape \cite{cgal}. Our rendering method would act as a refinement step, where we adjust the shape of the mesh with an image-based metric.
+
+
+\subsection{PSF learning of C.elegans embryos}
+From these equilibrium shapes, PSFs were learned using our two photorealistic models.
+TODO
+
+Faire un table avec la loss avec la PSF gaussienne et avec la Hanser/Gibson-Lanni PSF. Voir ce que ça nous donne. Si ça fait pas mieux c'est la merde. 
+Sinon faire un tableau a la computer vision avec le best en gras
+
+\subsection{Deconvolution}
+We used the previously learned PSFs to perform deconvolution of the microscopy images. It gives fairly good results TODO
+
+
+\subsection{Morphological description of P.Mammilatta}
+
+
+
+\subsection{Shape determination of the shape of early embryos}
+\subsection{Tension inference}
+\begin{figure}[h]
+  \centering
+  %\includegraphics[width=\linewidth]{sample-franklin}
+  \caption{Figure with one or two examples where we apply the meshes obtained to do force inference (TODO)}
+\end{figure}
+
+
+\subsection{PSF learning, deconvolution}
+
+\subsection{Creation of data-informed realistic artificial images}
+
+\subsection{PSF determination and artificial image generation + deconvolution}
+
+\begin{figure}[h]
+  \centering
+  %\includegraphics[width=\linewidth]{sample-franklin}
+  \caption{Figure with an example of artificial image generation, + deconvolution if possible (TODO)}
+\end{figure}
+
+\end{comment}
+
+\section{Conclusion}
+
+We have introduced \textbf{deltaMIC}, a differentiable fluorescence microscopy image renderer that takes a surface mesh and a parametrized PSF to generate realistic 3D confocal fluorescent images. The GPU-parallelized C++/CUDA implementation of the mesh FT allows to compute the forward and backward passes in tractable times, and is further optimized through a spectral narrow-band method. We demonstrate that our differentiable renderer can accurately retrieve fine details of complex shapes from artificial or real 3D microscopy fluorescent images, thanks to its ability to fine-tune the shape loss function via the PSF. Contrary to other active-mesh segmentation methods, it does not require arbitrary shape regularization terms to achieve smooth results. Yet, other priors may be added to constrain shapes, based on physical or geometric knowledge, and could prove useful to solve inverse mechanical problems \cite{frishman2020learning,roffay2021inferring}. 
+
+Our method constitutes a fundamental building block for inverse rendering of 3D fluorescence microscopy images and paves the way for many applications. Extending our approach to 1D polygonal lines would allow to characterize the geometry of filaments in cytoskeletal networks, whose segmentation remain a major challenge \cite{ozdemir2021automated}. 
+Furthermore, our method shares several insights with deconvolution techniques for microscopy, which are fundamentally based on inverse image rendering and optimization \cite{sarder2006deconvolution}. Implementing more photorealistic PSF models based on specific microscope modalities \cite{Hanser:03,Hanser:04,Zernikereview} could allow performing blind deconvolution of microscopy images in an original manner.
+From an implementation perspective, and in spite of all the improvements proposed, the computational cost of our method remains a bottleneck for large 3D images, and other acceleration strategies would be explored.  
+Eventually, it could be interesting to explore deep-learning based applications, where our renderer could be a differentiable building block of a larger pipeline, as in 2D applications \cite{DBLP:conf/cvpr/KatoUH18,DBLP:journals/corr/abs-2003-08934}.
+
+\section{Acknowledgments}
+%Commented for now because of blind review
+SI, FB and HT are supported by the CNRS and Collège de France. HT received funding from the European Research Council (ERC) under the European Union’s Horizon 2020 research and innovation programme (Grant agreement No. 949267). SI was funded by Ecole Polytechnique (AMX grant).  We thank Baptiste Nicolet for insightful disussions, and H. Borja da Rocha and K. Crane for their meshes.
+
+%\newpage
+\begin{comment}
+We proposed a differentiable fluorescence microscopy image renderer that takes surface meshes and a parametrized PSF and generate realistic 3D confocal fluorescent images. Our optimized implementation of the mesh FT allows to compute the forward and backward passes in tractable times, and is further optimized through a spectral narrow-band approximation and a staggered optimization scheme. We demonstrated that our differentiable renderer is capable to accurately retrieve fine details of complex shapes from artificial or real 3D microscopy fluorescent images, thanks to its ability to fine-tune via the PSF the shape loss function. Our method constitutes a fundamental building block for 3D inverse rendering of fluorescence microscopy images and paves the way for many applications.
+%It fits naturally into the class of active-mesh segmentation methods based on an energy, but in contrary to existing approaches it does not require arbitrary shape regularization terms - whose parameters have to be fine-tuned by the user - to achieve smooth results. Yet, it leaves the possibility to add priors to constrain the shape based on known physical or geometric constraints. 
+Several expansions have been discussed throughout the text. First, our approach to 1D polygonal lines would allow to characterize the geometry of filaments in cytoskeletal networks, whose segmentation remain a major challenge \cite{ozdemir2021automated}. Our method shares furthermore analogies with deconvolution techniques for microscopy, which are fundamentally based on inverse image rendering and optimization \cite{sarder2006deconvolution}. Implementing more photorealistic PSF models, based on the specific microscope modalities \cite{Hanser:03,Gibson:92}, could allow performing blind deconvolution of microscopy images in an original manner, by naturally using geometric priors to regularize this - often ill-posed - inverse problem.
+Eventually, from an implementation perspective, and in spite of all the improvements proposed, the computational cost of our method remains a bottleneck for large 3D images. Further narrow-band acceleration strategies could be explored, as well as refined parallel implementations for multi-GPU clusters.  
+%Finally, it could be interesting to explore deep-learning based applications, where our renderer could be a differentiable building block of a larger pipeline, as in several 2D applications \cite{DBLP:conf/cvpr/KatoUH18,DBLP:journals/corr/abs-2003-08934}.
+
+\end{comment}
+
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{deltamic}
+}
+
+\end{document}

@@ -1,0 +1,191 @@
+\section{Method}
+\label{sec:method}
+
+By and large, modern day segmentation models rely on datasets of images and their corresponding manually annotated semantic maps to be trained. However, producing pixel-wise annotations for novel datasets involves considerable costs, which is exacerbated when the budget available for labelling is limited or when the data requires particularly expensive domain experts to contribute to the annotation process.
+
+Alternatively, training segmentation models using a combination of expensive pixel-wise annotations and other types of cheaper annotations, such as image-wise labels or single-pixel annotations is known to be beneficial, as well as using cross-task transfer learning techniques~\cite{Mensink}. This is motivated by empirical findings showing that, under a limited annotation budget, allocating a proportion of the budget to inexpensive image-level class labels led to superior performance compared to allocating the budget entirely to segmentation labels~\cite{Bearman16}. However, the optimal proportion of the budget to allocate per annotation type is a priori unknown beforehand and data-dependent. Thus, the goal of our method is to find this data-specific optimal budget allocation in an online manner, as it is necessary for any dataset builder starting off.
+
+% Given an initially unlabelled training dataset~$\mathcal{D}=\{\x^{(i)}\}_{i=1}^N$, 
+\subsubsection{Problem formulation.} Let~$p_\textrm{data}(\x)$ be the distribution of training images. Each training image~$\x$ can be annotated with a pixel-wise segmentation labeling~{$(\x,\y)\sim{}p_\textrm{data}(\x)p_\textrm{sgm}(\y\mid\x)$} or an image-wise classification annotation~{$(\x,c)\sim{}p_\textrm{data}(\x)p_\textrm{cls}(c\mid\x)$}.\footnote{Without loss of generality, we will assume that the image-wise label is a discrete class label, but other kind of annotations are equally valid as long as they are informative in the cross-task learning process.} The distributions $p_\textrm{cls}$ and~$p_\textrm{sgm}$ represent the task of manually annotating the image and have associated sampling costs of~$\alpha_\textrm{c}>0$ and $\alpha_\textrm{s}\gg\alpha_\textrm{c}$, respectively.
+
+By sampling $C$~classifications from $p_\textrm{cls}$ and $S$~segmentation from ~$p_\textrm{sgm}$, we can build an annotated training dataset $\T=(\T_c,\T_s)\sim{}(p_\textrm{cls}^C, p_\textrm{sgm}^S)$. The dataset~$\T$ then has an annotation cost,
+\begin{equation}
+    \alpha_\textrm{c}C+\alpha_\textrm{s}S,
+\end{equation}
+which we assume to be bounded by an upper limit, or \emph{budget},~$B$.
+
+To annotate $\T$ however, we can choose different \emph{strategies}, or combinations of $C$ and~$S$, that lead to different performances of the segmentation model. The utility of a strategy~$(C, S)$ is the expected performance of a model trained with the annotations that strategy yielded,
+\begin{equation}
+    \label{eq:utility}
+    u(C, S) = \mathbb{E}_{(\T_c,\T_s) \sim{}(p_\textrm{cls}^C, p_\textrm{sgm}^S)} \left[m(\T_c, \T_s)\right],
+\end{equation}
+\noindent
+where~$m(\T_c, \T_s)$ is the performance score (\eg,~Dice score, IoU) of a segmentation model trained with datasets~($\T_c, \T_s$) and evaluated on a separate test dataset~$\mathcal{E}=\{(\x^{(i)}, \y^{(i)})\}_{i=1}^N$. To the difference of Active Learning, the expectation of Eq.~\eqref{eq:utility} is taken over the training sets of the given size since our aim is to estimate the performance of the annotation strategy~$(C, S)$ and not of the specific training datasets.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{method.pdf}
+
+\caption{Illustration of proposed method. At a given iteration $t$, $C_t$ and $S_t$ classification and segmentation annotations have already been collected (yellow region, left panel) with a budget of $B_1$. For the next annotation phase, the budget is increased to $B_2$. To determine how many new classification and segmentation annotations to collect, $M$ combinations of different quantities $(C^{(i)}, S^{(i)})$ are gathered according to Alg.~\ref{alg:build_gp_samples} to compute $m(C^{(i)}, S^{(i)})$ (blue dots in yellow region, left panel, size and opacity represent higher sampling probability). A Gaussian Process is then trained to estimate the utility of different combinations of annotation types (green area, left panel). From this, we infer $\Delta C$ and $\Delta S$ to select next by computing the combination that maximizes the expected improvement along the Pareto front given by the budget $B_2$ (red point, left panel). The next iteration starts then with the new proportions (red point, right panel) and follows the same steps (see text and Alg.~\ref{alg:the_algorithm} for details). For illustration purposes, the costs are set here to $\alpha_c=\alpha_s=1$.
+}
+\label{fig:method}
+\end{figure*}
+
+Our goal then is to find the annotation strategy that maximizes the expected performance with the budget~$B$ constraint,
+\begin{equation}
+\label{eq:the_optimization}
+\begin{aligned}
+    % \max_{C,S} \quad & \mathbb{E}_{\mathcal{T}_\textrm{c}\sim{}p_\textrm{cls}^C, \mathcal{T}_\textrm{s}\sim{}p_\textrm{sgm}^S} [s(\mathcal{T}_\textrm{c}, \mathcal{T}_\textrm{s})] \\
+    \max_{(C,S)\in\mathbb{N}^2} \quad & u(C, S), \\
+    \textrm{s.t.} \quad & \alpha_cC+\alpha_sS \le B.
+\end{aligned}
+\end{equation}
+However, optimizing Eq~\eqref{eq:the_optimization} involves solving two important points: (1) the utility function marginalizes over all possible training sets which is unfeasible to compute in practice and (2) even if we were to approximate the utility with empirical samples, doing so would require annotated data, which in turn would rely on an annotation strategy, whereby implying a circular dependency. We address both these issues in the following subsections.
+
+\subsubsection{Utility model.}
+We address the first challenge by modeling~$u$ with a Gaussian process~(GP) trained with a collection of samples~$\mathcal{M}$. Each sample~$m^{(i)}\in\mathcal{M}$ is a tuple containing a strategy~$(C^{(i)}, S^{(i)})$ and the estimated score $m(\T_c^{(i)}, \T_s^{(i)})$ obtained for a dataset sampled with that strategy. Fitting a GP to~$\mathcal{M}$, we can then model a distribution over plausible utility functions,
+\begin{equation}
+    u \sim{} \mathcal{GP}(\mu, k).
+\end{equation}
+While the mean~$\mu$ can be adapted to any specific performance metric~$m$, we use the mean function,
+\begin{equation}
+    \mu(C, S) = \gamma_c\log(\beta_cC+1) + \gamma_s\log(\beta_sS+1),
+\end{equation}
+which accounts for the fact that the performance increases logarithmically with the volume of the training data~\cite{sun2017} and that each annotation type has a different performance growth rate. Similarly, the covariance~$k$ is a combination of two RBF~kernels with different scales~$\ell_c$, $\ell_s$ for each annotation type,
+\begin{equation}
+    k\left((C, S), (C', S')\right) = \sigma^2\exp\left(-\dfrac{(C-C')^2}{2\ell_c^2}\right) \exp\left(-\dfrac{(S-S')^2}{2\ell_s^2}\right).
+\end{equation}
+The values~$\gamma_c$, $\beta_c$, $\gamma_s$, $\beta_s$ from the mean, the length scales~$\ell_c$, $\ell_s$ and the amplitude~$\sigma$ from the covariance are the trainable parameters of the~GP.
+
+\subsubsection{Iterative approximation.}
+To overcome the second challenge of solving Eq.~\eqref{eq:the_optimization}, we chose to optimize the function sequentially by allocating the available budget~$B$ in small installments of size~$\Delta{}B$. 
+
+In Alg.~\ref{alg:the_algorithm}, we summarize our iterative approach where at each iteration~$t$, new data is labelled according to the current strategy~$(C_t, S_t)$ so that the sets of annotated data~$(\T_c, \T_s)$ contain $C_t$~classification and $S_t$~segmentation annotations, respectively. 
+\begin{algorithm}[!b]
+\caption{Proposed approach}
+\label{alg:the_algorithm}
+\begin{algorithmic}[1]
+\Require Number of iterations~$T$, budget step~$\Delta{}B$, initial labelling strategy~$(C_0, S_0)$
+\State $t\leftarrow 0$, $\Delta{}C\leftarrow C_0$, $\Delta{}S\leftarrow S_0$, $\T_c=\emptyset$, $\T_s=\emptyset$, $\mathcal{M}=\emptyset$
+\While {$t<T$}
+\State Annotate new data $(\Delta{}\T_c,\Delta{}\T_s)\sim{}(p_\textrm{cls}^{\Delta{}C}, p_\textrm{sgm}^{\Delta{}S})$
+\State $\T_c \leftarrow \T_c \cup \Delta{}\T_c, \quad \T_s \leftarrow \T_s \cup \Delta{}\T_s$ \Comment{Note that $|\T_c|=C_t$ and $|\T_s|=S_t$}
+\State $\mathcal{M} \leftarrow \mathcal{M} \,\cup\,$\Call{BuildGPSamples}{$\T_c$, $\T_s$} \Comment{See Alg.~\ref{alg:build_gp_samples}}
+\State Train GP with samples in~$\mathcal{M}$
+\State Compute $(\Delta{}C, \Delta{}S)$ from Eq.~\eqref{eq:optimization_step}
+\State $C_{t+1} \leftarrow C_t + \Delta{}C, \quad S_{t+1} \leftarrow S_t + \Delta{}S$
+\State $t\leftarrow t+1$
+\EndWhile
+\Ensure $(C_T, S_T)$
+\end{algorithmic}
+\end{algorithm}
+The available annotated data~$(\T_c, \T_s)$ is then used to build~$M$ new samples for~$\mathcal{M}$ following the method described in Alg.~\ref{alg:build_gp_samples}. This sampling prioritizes elements close to the current strategy~$(C_t, S_t)$ to build more accurate approximations of~$u$ in the region where the next strategy will be found and also to account for the fact that the space of strategies below~$(C_{t-1}, S_{t-1})$ has already been sampled during the previous iterations (see Fig.~\ref{fig:method}). While the elements of~$\mathcal{M}$ should ideally be sampled from the original data and annotation distributions, this would involve additional costs. Instead, we sample them from the sets of already annotated data. While this biases the estimation of the~GP, we empirically found this bias to have a minor impact on the final strategies compared to estimations with unbiased sampling.
+
+Once the set of samples~$\mathcal{M}$ has been updated, we train a GP using these. %leading to accurate estimations of the utility function around the current strategy~$(C_t, S_t)$.
+We can then use this GP to find the optimal delta strategy~$(\Delta{}C, \Delta{}S)$ for a budget increase of $\Delta{}B$ by solving,
+\begin{equation}
+\label{eq:optimization_step}
+\begin{aligned}
+    \max_{(\Delta{}C,\Delta{}S)\in\mathbb{N}^2} \quad & \hat{u}_t(C_t + \Delta{}C, S_t + \Delta{}S), \\
+    % \textrm{s.t.} \quad & (C_t + \Delta{}C)\alpha_c + (S_t + \Delta{}S)\alpha_s \le \Delta{}B\cdot{}t,
+    \textrm{s.t.} \quad & \alpha_c\Delta{}C + \alpha_s\Delta{}S \le \Delta{}B.
+\end{aligned}
+\end{equation}
+where~$\hat{u}_t$~is a surrogate function for~$u$ obtained from the~GP. Following a Bayesian optimization approach~\cite{jones1998efficient}, we model~$\hat{u}_t$ as the expected improvement~(EI),
+\begin{equation}
+    \hat{u}_t(C, S) = \mathbb{E}_{u\sim\mathcal{GP}_t}[\max\{u(C, S) - m^*_t, 0\}],
+    \label{eq:EI}
+\end{equation}
+where~$m^*_t=m(\T_c, \T_s)$ is the best performance found so far, \ie,~the performance of the model trained with all the available annotated data. %\JGT{It's only the performance of all the available data. I am not sure if we should say that that is the best performance}
+
+
+\begin{algorithm}[t!]
+\caption{Build GP samples from labelled data}
+\label{alg:build_gp_samples}
+\begin{algorithmic}[1]
+    \Function{BuildGPSamples}{$\T_c,\T_s$}
+    \State $C \leftarrow |\T_c|$, $S \leftarrow |\T_s|$
+    \State $\mathcal{M} \leftarrow \{((C, S), m(\T_c,\T_s))\}$ \Comment{Add element with all the available data}
+    \Repeat {$M-1$}
+    \State Sample $(C', S')\in[0, C]\times[0, S]$ with probability proportional to~$\|(C',S')\|_2$
+    \State $\T'_c \leftarrow$ \{$C'$~elements sampled uniformly from $\T_c$\}
+    \State $\T'_s \leftarrow$ \{$S'$~elements sampled uniformly from $\T_s$\}
+    \State $\mathcal{M} \leftarrow \mathcal{M} \cup ((C', S'), m(\T'_c, \T'_s))$ 
+    \EndRepeat
+    \State \Return $\mathcal{M}$
+    \EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+Assuming that the utility is monotonically increasing with respect to $C$ and~$S$, the solution to Eq.~\eqref{eq:optimization_step} is in the Pareto front of strategies for which no other strategy with cost lower than~$\Delta{}B$ has simultaneously more class-labelled and more segmentation-labelled elements (\ie, the set of non-dominated feasible strategies). Note that the size of the Pareto front grows linearly with~$\Delta{}B$ and its elements can be easily enumerated. Hence, Eq.~\eqref{eq:optimization_step} can be efficiently solved by enumerating the strategies of the Pareto front and keeping the strategy with highest~EI (see Fig.~\ref{fig:method}).
+
+
+%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%
+
+%\subsubsection{Cross-task transfer learning.} Our method requires training segmentation models using different label modalities, both weakly- and fully-supervised \PMN{Should we change the \emph{class labels} to \emph{weak labels} in the method section to make it more generic?}. This problem has been broadly studied~\cite{TODO,TODO}, and any existing approach could be used in combination with the proposed method. \PMN{Betting that at least one reviewer will complain for not showing that our method can work with different weakly-supervised approaches.}
+
+\iffalse
+In this paper, we aim to find the optimal labelling strategy measured by semantic segmentation performance and cost. Standing on previous work on cross-task transfer learning, we claim that this point should be a product of a combination of classification and segmentation labels, leveraging the lower cost of classification annotation as opposed to segmentation. Let $B$ be the budget in some monetary unit (m. u.) at any labelling stage, defined by the number of annotated classification ($C$) and segmentation ($S$) samples:
+\begin{equation}
+    B = C + \alpha S,
+    \label{eq:budget}
+\end{equation}
+where $\alpha$ is a factor accounting for the cost overrun of manually segmenting an image. Our goal is to optimize Eq.~\ref{eq:budget}, which means given a budget or maximum cost $B^*$, finding $C^*$ and $S^*$ so that the performance of a segmentation model trained on the chosen number of samples is maximal. Formally, given a model $f$ that transforms from image space to segmentation mask, a dataset $D$ and an oracle which provides annotated samples for classification ($C$) and segmentation ($S$), we seek to optimize Eq.~\ref{eq:budget}. Given the nature of the problem, it would not be appropriate to sample the space in search for the best combination, as such solution would exceed $B^*$. Therefore, we propose an iterative solution to tackle the problem: starting with $B_0 < B^*$ and $(C_0, S_0)$, we predict the performance nearby using a surrogate model and move to the point that could deliver the largest gain, $B_1$, repeating the process from there. We choose Gaussian processes as the surrogate model to calculate performance. % Write something here about why to use GP
+
+This section is further organized as follows. In~\ref{sec:gp} we give a brief introduction to regression with Gaussian process, while section~\ref{sec:train_method} explains the whole pipeline.
+
+\subsection{Gaussian processes}
+\label{sec:gp}
+Gaussian processes consist of a collection of random variables such that any finite combination of which have a joint Gaussian distribution. It is completely defined by its mean and covariance functions:
+\begin{eqnarray}
+    \mu(\vect{x}) &=& \mathds{E}[f(\vect{x})] \\
+    k(\vect{x},\vect{x}') &=& \mathds{E}[(f(\vect{x}) - m(\vect{x})(f(\vect{x}') - m(\vect{x}')],
+\end{eqnarray}
+with $\vect{x}\in \mathds{R}^N$. We can then define a distribution over functions $f(x)$:
+\begin{equation}
+    f(\vect{x})\sim \mathcal{GP}(\mu(\vect{x}), k(\vect{x},\vect{x}'))
+\end{equation}
+For a collection of inputs $X = [\vect{x_1},... ,\vect{x_N}]^T$, the functions $[f(\vect{x_1}),... ,f(\vect{x_N})]^T$ follow a joint Gaussian distribution with mean vector $\vect{\mu}$ and $N \times N$ covariance matrix $\vect{K}$ (where the ($i,j$)-th element is $K_{ij}=k(x_i,x_j)$):
+\begin{equation}
+    [f(\vect{x_1}),... ,f(\vect{x_N})]^T \sim \mathcal{N}(\vect{\mu},\vect{K})
+\end{equation}
+It can be shown~\cite{chen2018priors} that the predictive distribution of the function values $\vect{f_*}$ at locations $X_*$ is given by
+\begin{equation}
+    p(\vect{f_*}| X,\vect{y},X_*) = \mathcal{N}(\hat{\mu},\hat{\Sigma}),
+\end{equation}
+where $\hat{\mu}$ and $\hat{\Sigma}$ are functions of $\vect{\mu}$ and $\vect{K}$. Therefore, the prior functions $\mu(\vect{x})$ and $k(x_i,x_j)$, play a critical role in the prediction capabilities of the model, as they contain our prior knowledge about the function we want to learn. $\mu(\vect{x})$ represents the mean prior, and is often disregarded and set to a constant value. $k(x_i,x_j)$, also denoted kernel, describes the covariance of the random variables. The most popular kernel is the Radial Basis Function kernel (RBF):
+\begin{equation}
+    k_{RBF}(\vect{x}, \vect{x}') = s^2_f\exp\left(-{\dfrac{||\vect{x} - \vect{x}'||^2}{2\ell^2}}\right)
+\end{equation}
+This kernel has two learnable parameters: $s^2_f$, which can be considered as an output-scale amplitude; and $\ell$, the input length scale.
+
+\subsection{Proposed method \JGT{Change title}}
+\label{sec:train_method}
+We propose a method that approaches the desired budget $B^*$ after a number of steps, starting with an initial $B_0 < B^*$ and $(C_0, S_0)$. Figure~\ref{fig:method} depicts the whole pipeline. At each iteration $i$ we perform the following steps:
+\begin{enumerate}
+    \item Sample the space $\{0,C_i\} \times \{0,S_i\}$, selecting $N$ points $X = [(c_1,s_1),...,(c_N,s_N)]^T$
+    \item Train a segmentation model on each one of the points and calculate its performance with any metric: $\vect{y} = [f_1(c_1,s_1),...,f_N(c_N,s_N)]^T$. Note tha+t although we chose Dice Score for our experiments, the method is independent of the metric
+    \item Fit a Gaussian process on $(X,\vect{y})$
+    \item Increase the budget by $\Delta B$ and extrapolate the Gaussian process beyond $(C_i, S_i)$
+    \item Select the point $(C_{i+1}, S_{i+1})$ with $B_{i+1} = B_i + \Delta B$ which maximizes the expected improvement.
+    \item Repeat from step 1 with $(C_i,S_i) :=(C_{i+1},S_{i+1})$ if $B_{i+1} < B^*$, otherwise $(C^*,S^*) :=(C_{i+1},S_{i+1})$
+\end{enumerate}
+
+{\bf Space sampling.} Inspired by~\cite{Zhang2016}, we use a pseudo-random strategy to sample the space. We assign to each point a sampling probability proportional to the inverse of its distance to $(C_i, S_i)$ and randomly select $N-1$ points. Then, we add $(C_i, S_i)$ to the list.
+
+{\bf Kernel.} The inputs are $\vect{x} = (c,s) \in \mathcal{Z}^2$, and we assume that both variables are independent. For this reason, we separate the kernel: 
+\begin{equation}
+    k(\vect{x}, \vect{x}') = k_{RBF}(c, c') + k_{RBF}(s, s')
+    \label{eq:kernel}
+\end{equation}
+However, according to eq.~\eqref{eq:budget}, one step in the segmentation axis increases the budget by $\alpha$, whereas the increase for classification is 1. This provokes iso-budget lines to not form $45^{\circ}$ with the axes, which could hinder the GP predictions. Hence, we renormalize the variables: $B'\equiv B/\alpha$, $C'\equiv C/\alpha$ and $S'\equiv S$, resulting in $B'=C'+S'$. Kernel~\eqref{eq:kernel} will be applied to these axes.
+
+{\bf Mean prior.} As stated above, the mean prior usually takes a constant value, therefore relying solely on the kernel to approximate the function. However, \textit{a priori} information can be incorporated to improves the capabilities of the model. In our method, we assume that the addition of new data points improve the performance logarithmically in both directions, so we assign the following prior:
+\begin{equation}
+    \vect{\mu}(\vect{x}) = \sum_{i=(c,s)}c_i \log(x_i w_i +1),
+\end{equation}
+where $\vect{c},\vect{w}\in\mathds{R}^2$ represent four learnable parameters.
+
+{\bf Budget increase.} We opt for a fixed $\Delta B$ determined experimentally. Gaussian processes tend to quickly revert to their mean outside the training zone, and this tendency is controlled by the length scale of the kernel. Therefore, the value for $\Delta B$ will be chosen to stay within the boundaries.  
+\fi

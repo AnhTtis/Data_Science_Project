@@ -1,0 +1,167 @@
+
+\section{The \textsf{AIOZ-GDANCE} Dataset}
+
+Since we want to develop a large-scale dataset with in-the-wild videos, setting up a MoCap system is not feasible. However, manually annotating 3D groundtruth for millions of frames from dancing videos is also an extremely tedious job. Therefore, we propose a semi-automatic labeling method with humans in the loop to produce a large-scale group dance dataset. 
+
+
+\subsection{Data Collection and Preprocessing}
+\label{sec:tracking}
+\textbf{Video Collection.} We collect the in-the-wild, public domain group dancing videos along with the music from Youtube, Tiktok, and Facebook.   
+All group dance videos are processed at $1920 \times 1080$ resolution and 30FPS.
+
+\textbf{Human Tracking.} We perform tracking for all humans in the videos using the state-of-the-art multi-object tracker~\cite{sun2022_dancetrack} to obtain the tracking bounding boxes. Note that although the tracker can produce reasonable results, there are failure cases in some frames. Therefore, we manually correct the bounding box of the incorrect cases. This tracking correction is crucial since we want the trajectory of each person to be accurately tracked in order to reconstruct their motion in latter stages.
+
+\textbf{Pose Estimation.} Given the bounding boxes of each person in the video, we leverage the recent 2D pose estimation method~\cite{alphapose1} to generate the initial 2D poses for each person. 
+In practice, there exist some inaccurately detected keypoints due to motion blur and partial occlusion. We manually fix the incorrect cases to obtain the 2D keypoints of each human bounding box. 
+
+
+\begin{figure*}[ht]
+    \centering
+    \includegraphics[width=\textwidth,keepaspectratio=true]{images/dataset_pipeline102.2.pdf}
+    \vspace{-3ex}
+    \caption{The pipeline of making our \textsf{AIOZ-GDANCE} dataset. Blue boxes denote manual correction/annotation steps.}
+    \vspace{-1ex}
+    \label{fig:overview_dataset_pipeline}
+\end{figure*}
+
+
+\subsection{Group Motion Fitting}
+To construct 3D group dance motion, we first reconstruct the full body motion for each dancer by fitting the 3D mesh. We then jointly optimize all dancer motions to construct the globally-coherent group motion. Finally, we post-process and remove wrong cases from the optimization results.
+
+\textbf{Local Mesh Fitting.}
+\label{sec:mesh-fitting} 
+We use SMPL model~\cite{SMPL:2015} to represent the 3D human. The SMPL model is a differentiable function that maps the pose parameters $\mathbf{\theta}$, the shape parameters $\mathbf{\beta}$, and the root translation $\mathbf{\tau}$ into a set of 3D human body mesh vertices $\mathbf{V}\in \mathds{R}^{6890\times3}$ and 3D joints $\mathbf{X}\in \mathds{R}^{J\times3}$, where $J$ is the number of body joints.
+Our optimizing motion variables for each individual dancer consist of a sequence of SMPL joint angles $\{\mathbf{\theta}_t\}_{t=1}^T$, a sequence of the root translation $\{\mathbf{\tau}_t\}_{t=1}^T$, and a single SMPL shape parameter $\mathbf{\beta}$. We fit the sequence of SMPL motion variables to the tracked 2D keypoints (obtained from Section \ref{sec:tracking}) by extending SMPLify-X~\cite{SMPL-X:2019} across the whole video sequence:
+\begin{equation}
+\label{eq:mesh_fitting}
+E_{\rm local} = E_{\rm J} + \lambda_{\theta}E_{\theta} + \lambda_{\beta} E_{\beta} + \lambda_{\rm S}E_{\rm S} + \lambda_{\rm F}E_{\rm F},
+\end{equation}
+where $E_{\rm J}$, $E_{\theta}$ and $E_{\beta}$ are as in~\cite{SMPL-X:2019} but calculated across every frames of the video sequence. The smoothness term $E_{\rm S} = \sum_{t=1}^{T-1}\Vert \mathbf{\theta}_{t+1} - \mathbf{\theta}_{t} \Vert^2 + \sum_{j=1}^J\sum_{t=1}^{T-1}\Vert \mathbf{X}_{j,t+1} - \mathbf{X}_{j,t} \Vert^2$ encourages the temporal smoothness of the motion. The term $E_{\rm F} =  \sum_{t=1}^{T-1} \sum_{j \in \mathcal{F}} c_{j,t}\Vert \mathbf{X}_{j,t+1} - \mathbf{X}_{j,t} \Vert^2$ ensures feet joints to stay stationary when in contact (zero velocity). $\mathcal{F}$ is the set of feet joint indexes, $c_{j,t}$ is the feet contact label of joint $j$ at time $t$ produced by a contact estimation network~\cite{zou2020contact_net}. 
+
+
+\textbf{Global Optimization.}
+Given the 3D motion sequence of each dancer $p$: $\{\mathbf{\theta}^p_t, \mathbf{\tau}^p_t\}$, we further resolve the motion trajectory problems in group dance by solving the following objective: 
+\begin{align}
+\label{eq:global_opt}
+E_{\rm global} &= E_{\rm J} + \lambda_{\rm pen}E_{\rm pen} + \lambda_{\rm reg}\sum_{p}E_{\rm reg}(p) \notag\\ &+ \lambda_{\rm dep}\sum_{p,p',t}E_{\rm dep}(p,p',t) + \lambda_{\rm gc}\sum_{p}E_{\rm gc}(p),
+\end{align}
+where 
+$E_{\rm pen}$ is the Signed Distance Function penetration term based on~\cite{jiang2020_coherent_reconstruction} to prevent the overlapping of reconstructed motions between dancers.
+${E_{\rm reg}(p) =\sum_{t=1}^T\Vert \mathbf{\theta}^p_t - \hat{\mathbf{\theta}}^p_t\Vert^2}$ is the regularization term that prevents the motion from deviating too much from the prior optimized individual motion $\{\hat{\mathbf{\theta}}^p_t\}$ obtained by optimizing Equation \ref{eq:mesh_fitting} for dancer $p$. 
+
+
+In practice, we find that the relative depth ordering of dancers in the scene can be inconsistent due to the ambiguity of the 2D projection. To ensure the group motion quality, we watch the videos and manually provide the ordinal depth relation information of all dancers in the scene at each frame $t$ as follows:
+\begin{equation}
+r_t(p,p') =
+\begin{cases}
+1, &\text{if dancer } p \text{ is closer than } p' \\ 
+-1, &\text{if dancer } p \text{ is farther than } p' \\
+0, &\text{if their depths are roughly equal}
+\end{cases}
+\end{equation}
+
+Given the relative depth information provided by human annotators, we derive the depth relation term $E_{\rm dep}$ inspired by~\cite{chen2016_depth_ranking}. This term encourages consistent ordinal depth relation between the motion trajectories of multiple dancers, especially when dancers partially occlude each other:  
+\begin{equation}
+\small
+\label{eq:global_depth1}
+E_{\rm dep}(p,p',t) =
+\begin{cases}
+     \log(1+\exp(z^p_t - z^{p'}_t)), &r_t(p,p')=1 \\
+     \log(1+\exp(-z^p_t + z^{p'}_t)), &r_t(p,p')=-1 \\
+     (z^p_t - z^{p'}_t)^2, &r_t(p,p')=0 \\
+\end{cases}
+\end{equation}
+where $z^p_t$ is the depth component of the root translation $\mathbf{\tau}^p_t$ of the person $p$ at frame $t$.
+
+Finally, we apply the global ground contact constraint $E_{\rm gc}$ to further ensure consistency between the motion of every person and the environment based on the ground contact information. This contact term is also needed to reduce the artifacts such as foot-skating, jittering, and penetration under the ground.
+\begin{equation}
+\label{eq_Egc}
+\small
+E_{\rm gc}(p) = \sum_{t=1}^{T-1} \sum_{j \in \mathcal{F}} c^p_{j,t}\Vert \mathbf{X}^p_{j,t+1} - \mathbf{X}^p_{j,t} \Vert^2 + c^p_{j,t} \Vert  (\mathbf{X}^p_{j,t} - \mathbf{f})^\top \mathbf{n}^* \Vert^2,
+\end{equation}
+where $\mathcal{F}$ is the set of feet joint indexes, $\mathbf{n}^*$ is the estimated plane normal and $\mathbf{f}$ is a 3D fixed point on the ground plane. The first term in Equation~\ref{eq_Egc} is the zero velocity constraint when the feet are in contact with the ground, while the second term encourages the feet position to stay near the ground when in contact. To obtain the ground plane parameters, we initialize the plane point $\mathbf{f}$ as the weighted median of all contact feet positions. The plane normal $\mathbf{n}^*$ is obtained by optimizing a robust Huber objective:
+\begin{equation}
+\small
+\mathbf{n}^* = \arg\min_{\mathbf{n}} \sum_{\mathbf{X}_{\rm feet}} \mathcal{H}\left((\mathbf{X}_{\rm feet} - \mathbf{f})^\top \frac{\mathbf{n}}{\Vert\mathbf{n}\Vert}\right) + \Vert \mathbf{n}^\top\mathbf{n} - 1 \Vert^2,
+\end{equation}
+where $\mathcal{H}$ is the Huber loss function~\cite{huber1992robust},  $\mathbf{X}_{\rm feet}$ is the 3D feet positions of all dancers across the whole sequence that are labelled as in contact (i.e., $c^p_{j,t} = 1$) . 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\textbf{Post Processing.}
+Although our optimization process produces relatively good results, there are some extreme cases that it fails to handle. We recheck all the results and fix the cases with minor problems. Other severely wrong cases are simply discarded. More details can be found in our Supplementary Material.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\begin{figure*}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{images/baseline.pdf}
+    \caption{
+    Architecture of our Music-driven 3D \textbf{G}roup \textbf{Dance} generato\textbf{r} (GDanceR). Our model takes in a music sequence and a set of initial positions, and then auto-regressively generates coherent group dance motions that are attuned to the input music.
+    }
+    \label{fig:GMG}
+\end{figure*}
+
+
+
+\subsection{How will \textbf{\textsf{AIOZ-GDANCE}} be useful to the community?}
+
+
+We bring up some interesting research directions that can be benefited from our dataset:
+
+\begin{itemize}
+    \item Group Dance Generation: While single-person choreography is a hot research topic~\cite{survey-dancing-deep-metaverse,li2021AIST++,siyao2022_bailando,li2022_phantomdance,chen2021_choreomaster}, group dance generation has not yet well investigated. We hope that the release of our dataset will foster more this research direction.
+    
+    
+    \item Human Pose Tracking: By having SMPL groundtruth motion, our dataset can be used in many human pose/motion tracking tasks such as in~\cite{yang2021learning,sun2022_dancetrack,doering2022posetrack21}. 
+    
+\end{itemize}
+
+Apart from these tasks, we believe our dataset can be used in other scenarios such as dance education~\cite{papillon2022pirounet,ferreira2021_learn2dance_gcn}, dance style transfer~\cite{zhang2021dance,yin2022dance,thangstyle}, or human behavior analysis~\cite{men2022gan,le2022global,lee2022human,le2023uncertainty}. The research community is free to explore other applications of our dataset.
+
+
+
+
+
+
+

@@ -1,0 +1,117 @@
+\section{Methods}
+
+\begin{figure}
+\centering
+\includegraphics[width=0.8\linewidth]{figures/sequence_reps.png}
+\caption{ \bf{Sequence representation of document layout.} } \label{fig: seq rep}
+\end{figure}
+
+\subsection{Diffusion for Layout Generation}
+
+
+\begin{comment}
+Change the wording to match to layout better, 
+MC figure ... tie it to layouts
+Starting at x_T with random (gaussian) drawn layout elements .... well ordered layout on the s node
+\end{comment}
+Our approach leverages recent advances in denoising diffusion applied to discrete sequences ~\cite{SongDenoising2020,DiffusionLM2022}. As Figure~\ref{fig: seq rep} shows, we consider a document layout of $N $ layout elements given by the $5-$tuples $S = \{s_i\}_{i=1}^N = \{(c_i, x_i, y_i, w_i, h_i)\}_{i=1}^N$, where $x_i$ is the upper-left $x-$coordinate, $y_i$ is the upper-left $y-$coordinate, $w_i, h_i$ specify the width and height of the box (all in pixel coordinates), and $c_i$ specifies the class (table, figure, formula, etc.) of the $i-$th box. Note that $x_i,y_i,w_i,h_i \in \mathbb{N}$ and $c \in [K]$ where $K$ is the number of layout classes. To process this data structure as a sequence, we serialize $S$ by flattening the sequence $\{c_0, x_0, y_0, w_0, h_0, c_1, \ldots \}$. Then the geometric entries are discretized and quantized to a fixed vocabulary $G$ of size $|G|$. We can offset the class index entries by $|G|$ to keep the class coordinates distinct, or simply use a unique token outside of the vocabulary for $G$. This yields a sequential representation of length $5N$ with a fixed vocabulary $V = G \cup [K]$. 
+
+The framework of our method is illustrated in Fig.~\ref{fig: diffsion model}. An embedding step $E$ is introduced to map the discrete sequence $s \in V^N$ to a feature vector $E(s) \in \mathbb{R}^{d \times N}.$ We extend the conventional denoising transition model $x_t \rightarrow x_{t-1} \rightarrow \ldots x_0$ with another transition $x_0 \rightarrow E(s)$. Recall that the learned parameters refine the transition probability estimates:
+\begin{align}
+p_\theta (x_{t-1} \vert x_t) = \mathcal{N}(x_{t-1} ; \mu_\theta (x_t; t), \Sigma_\theta (x_t, t))
+\end{align}
+by minimizing the variational upper bound of the negative log likelihood of the image over $\theta$. The analogy to sequential learning is the log likelihood of the sequence embedding, so we take $x_0 \sim E(s)$ following~\cite{DiffusionLM2022}. To close the loop with the original sequence, a rounding module is introduced $p_\theta(s | x_0)$ which estimates the token sequence from the embedding $E(s) \approx x_0.$ This is done by a rounding function with learned biases, call it $R$. So the (bidirectional) Markov chain is: 
+\begin{align}
+&s \overset{E}{\rightarrow} w \overset{q}{\rightarrow} x_1 \overset{q}{\rightarrow} \ldots x_T, \notag \\
+&s \overset{R}{\leftarrow} w \overset{p_\theta}{\leftarrow} x_1  \overset{p_\theta}{\leftarrow} \ldots x_T.
+\end{align}
+
+
+\begin{figure}
+\includegraphics[width=\linewidth]{figures/Diffusion.png}
+\caption{ \bf{Diffusion for Layout Generation.} }
+\label{fig: diffsion model}
+\end{figure}
+
+To solve for the reverse-process parameters several key simplifications were devised by ~\cite{ho2020denoising}. The end result was to reduce the full variational bound objective to a simpler mean squared loss. The initial variational bound objective is written
+\begin{equation}
+   L = \min_\theta \mathbb{E}  \left( -\log (p_\theta(x_T)) - \sum_{t \geq 1} \log\frac{p_\theta (x_{t-1} | x_t)}{q(x_t | x_{t-1})} \right).
+\end{equation}
+This can be rewritten as a series of KL-Divergences ~\cite{ho2020denoising}
+\begin{equation}
+   \min_\theta \mathbb{E}  \left( D_{KL}(q(x_T |x_0) || p_\theta(x_T)) + \sum_{t>1} D_{KL}(q(x_{t-1} | x_t, x_0) || p_\theta (x_{t-1} | x_t)) \right) \notag \\
+     - \log (p_\theta (x_0 | x_1) ) 
+\end{equation}
+and each term is a divergence between two Gaussian distributions except for the last. By regrouping terms and throwing out the constant $\log( x_T )$ term, the closed form divergence for each term results in a mean squared error loss
+\begin{equation}
+    L_2 = \sum_{t=1}^{T} \mathbb{E} \| \mu_{\theta} (x_t, t) - \hat{\mu} (x_t, x_0) \|^2. 
+\end{equation}
+$\hat{\mu}$ is the mean of the posterior and $\mu_\theta$ is the predicted mean of the reverse process computed by a model parameterized by $\theta$. In our implementation we use a transformer as $\mu_\theta$ and $T=2000$. Note that for $\hat{\mu}$ a closed form gaussian, the derivation of which can be found in~\cite{ho2020denoising}.
+
+
+
+\subsection{\textit{Doc-EMD}: Earth Mover's Distance as a Document Metric} \label{intro docemd}
+
+Document metrics are nontrivial because of the complex nature of documents~\cite{patil2020read}. Many metrics and similarities have been proposed, all with variation shortcomings that defy intuitive reasoning about the nature of document layouts. We propose to leverage the Earth-Movers distance, which has been deployed successfully in contour matching~\cite{grauman2004fast} as well as image matching~\cite{rubner2000earth}, to provide an underlying distance for document layouts. This allows us to leverage some useful properties of this well-established distance and we can leverage high quality existing open-source implementations to implement the Earth-Mover's distance~\cite{flamary2021pot}. 
+
+\subsubsection{Definitions and Formal Distance}
+
+Consider a layout of $N $ layout elements given by the $5-$tuples $S = \{s_i\}_{i=1}^N$. We call this the source layout, and $T= \{t_i\}_{i=1}^{M}$ is the target layout. In this metric, we consider layouts as consisting of the $2-$d points in the integer pixel coordinates falling inside of each layout box. Consider a single layout box $s=(c,x,y,w,h)$ we take $s \cong \rho(S) = \{ p : x < p_1 < x+w, y < p_2 < y+h\}$ which we take as equivalent to the uniform pointwise density generated by those points. Let $|\cdot|$ denote the number of point elements in this set. Then we define the earth-mover's distance as 
+\begin{align}
+EMD(s,t) &= EMD(\rho(s), \rho(T)) = \min_{F} \sum_{i,j} F_{ij} d(s_i, t_j) \\
+& s.t. \sum_{j} F_{i,j} \leq 1/{|s|}, \sum_{i} F_{i,j} \leq 1/{|t|}, \sum_{i,j} F_{i,j} = 1. \notag 
+\end{align}
+We conflate the EMD between class bounding box representation of $s$ with $\rho(s)$ so that the cost of matching the element scales up with the size of the element. 
+So now we have defined the data structure of the overarching layout $S$, each layout element $s$, and an element-to-element distance $EMD$ which allows us to compare elements from different layouts. 
+
+Now we define the distance between two layouts $S$ and $T$. First define the class function $C(s = (c,x,y,w,h)) = c$ and the set function $\hat{C}(S, c) = \{s \in S : C(s) = c\}$. Let $\kappa(cls; S, T)$ be the indicator function as to whether only one of $S$ and $T$ has elements of class $cls$ (the exclusive or). The \textit{Doc-EMD} is defined as 
+\begin{align}
+DOC_\lambda(S,T) &=\sum_{cls}  EMD(\cup_{\hat{C}(S,cls)} s, \cup_{\hat{C}(T,cls)} t) + \sum_{cls : \kappa(cls; S, T) = 1} \lambda,
+\end{align}
+where $\lambda$ is some positive factor used to penalize missing classes (we use $\lambda=1$).
+In language, $DOC$ is the sum of the earth-mover's distances between the sets of elements in $S$ and $T$ belonging to the same class plus a penalty term for each class that only appears in $S$ or $T$. Note that this is very different from the \textit{DocSim}~\cite{patil2020read} since we can avoid the computation of the size weightings in favor of the pointwise pmf contributions as well as skip the Hungarian matching step in favor of the earth-movers matching. Meanwhile, our method adds substance to the layout semantics which is missing from the Wasserstein sequence metrics~\cite{arroyo2021variational} as they only capture exact matchings in the location and weight location and class in a disproportionate manner.
+
+
+$DOC$ is clearly reflexive, symmetric, and positive. Note that each term consisting of the $EMD$ on subsets of $S, T$ is a metric. Then for the second term, note that this is 
+ the discrete metric on the projection of the pointset to the class it belongs to scaled by the penalty term $\lambda$. So $DOC_\lambda$ is a sum of metrics, which is also a metric, so it obeys the triangle inequality. This proof sketch shows that it enjoys all of the formal advantages of the Wasserstein distance.
+
+\begin{comment}
+On documents with common classes $S,T : \kappa(S,T,c) = 0 \forall c, \quad DOC$ obeys the triangle inequality. This can be seen by noting that the penalty term will be 0 and the DOC function reduces to a sum of earth-mover's distances. Each one obeys the triangle inequality, as it is a special case of the Wasserstein distance. Since for all $S,T,Y$ obeying the common class condition, the terms $EMD_c(S,T) \leq EMD_c(S,Y) + EMD_c(Y,T)$ will all be true, so the sum over all class also obeys $DOC(S,T) \leq DOC(S,Y) + DOC(Y,T)$. In the general case we can factor the layouts in overlapping classes and non-overlapping classes. If $S,T$ have non-overlapping classes in subsets $A, B$ respectively, then write $DOC(S,T) = DOC(S_0 \cup A, T_0 \cup B) = DOC(S_0, T_0) + \lambda (||A|| + ||B||)$.  
+\end{comment}
+
+\subsubsection{Qualitative Comparisons with other Document Metrics and Similarities}
+
+In this work we use several metrics to evaluate the performance of our proposed algorithm. We begin with a comment that document similarity (or distance) is a nontrivial problem. Documents are complex objects that can be represented in a number of ways and typically have no canonical underlying space from which they are drawn. Modeling that is the goal of generative layout algorithms, but how to measure the quality is directly related to the complexity of this problem. There is no perfect solution, so we develop an approach that covers some of the shortcomings of existing metrics, which we discuss now.
+
+First, \textit{DocSim}~\cite{patil2020read} proposes a Hungarian-matching based algorithm that uses a weighting term that scales linearly in the minimum area between boxes and exponentially in the size and shape difference. It has several major shortcomings
+\begin{enumerate}
+    \item Not having an open-sourced common implementation;
+    \item Not well normalized so may not compare well between datasets;
+    \item The "similarity" is not an inner-product, so may not behave well in some cases.
+\end{enumerate}
+We show qualitative examples highlighting each of these shortcomings.
+
+\begin{figure}
+\includegraphics[width=\linewidth]{figures/Docsim_metrics.png}
+\caption{ \bf{DocSim Similarities.} Visualization of how the \textit{DocSim}, Wasserstein Distance, and \textit{Doc-EMD} Distance vary across pairs of documents. The left image represents the source and the subsequent images are the targets. The metrics applied between them are shown below the target. The metrics shown below the source are the self-comparisons. \textit{DocSim} is not normalized, has no common "self-similarity" value (this depends on the document), and does not always vary intuitively across structures. Wasserstein Distance is overly sensitive to class mismatch and does not capture structural similarities well. Note that this metric is primarily meant for distribution comparison. Also, note that as it is a distance higher values mean farther away (unlike the similarity of \textit{DocSim}). For \textit{Doc-EMD} Distance, there is a clear separation between single- and multi-column when classes are similar, the distance is well bounded, and the self-comparison is standardized.}
+\end{figure}
+
+Second, the Wasserstein sequence distance is applied to the layout sequences as opposed to the layout geometry. This acts as a distributional distance between the empirical discrete class label (categorical) distribution and the continuous bounding box distribution (Gaussian). First, this does not explicitly model similarity between two documents well (here it suffers from confusion across variations of box instances in the individual layouts), but rather between the distributions of documents given from a corpus. This is the key strength of this distance: it is a natural measure of distributional match. This is why we see this used commonly in generative modeling ~\cite{arjovsky2017wasserstein}. Note that it does not allow for weighting by area in any conventional sense, an advantage of the \textit{DocSim} which is lost here.
+
+% \begin{figure}
+% \includegraphics[width=\linewidth]{figures/metric_comparisons/wass_snip.png}
+% \caption{ \bf{Wasserstein Distance.} Visualizations of how Wasserstein distance between pairs of documents changes. The leftmost image in each row represents the source and the subsequent images are the targets, with the Wasserstein distance between them shown below the target and the number below the source is the self-comparison..}
+% \end{figure}
+
+Finally, the \textit{Doc-EMD} distance is applicable both at the document pair level and at the distribution level. To compute the distributional similarity we take a similar approach to \textit{DocSim}. We first compute the pairwise distance matrix with our metric applied to each pair of images. Then we obtain a negative matching score to which we apply the Hungarian matching algorithm. Key advantages over the former approaches are: 
+\begin{enumerate}
+    \item It is well normalized, scaling from 0 to K (the class number) if the appropriate pixel coordinates are used;
+    \item It keeps the distance properties of the Wasserstein without losing the geometric specificity of \textit{DocSim};
+    \item It behaves predictably when comparing structurally and semantically different layouts due to the geometric specificity of the per-class EMD.
+\end{enumerate}
+Perhaps the greatest weakness of our method is that it requires greater runtime than the previous two in the pair-wise distance stage. However, as mentioned above, using open-sourced packages with hardware acceleration as well as optional speedups from approximations make it feasible even for very large datasets ~\cite{flamary2021pot}.
+
+% \begin{figure}
+% \includegraphics[width=\linewidth]{figures/metric_comparisons/docemd_snip.png}
+% \caption{ \bf{Doc-EMD Distance.} Visualizations of how Doc-EMD between pairs of documents changes. The leftmost image in each row represents the source and the subsequent images are the targets, with the Doc-EMD between them shown below the target and the number below the source is the self-comparison. Note that there is a clear separation between single- and multi-column when classes are similar, the distance is well bounded, and the self-comparison is standardized.}
+% \end{figure}

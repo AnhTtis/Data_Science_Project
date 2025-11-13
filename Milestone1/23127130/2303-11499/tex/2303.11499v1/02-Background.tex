@@ -1,0 +1,126 @@
+\section{Background and Related Work}
+\vspace{-1mm}
+\label{sec:background}
+\subsection{Einsums, Dataflows and Mappings}
+\vspace{-1mm}
+Tensor operations like convolutions and matrix multiplications can be concisely and precisely expressed using Einsum (Einstein summation) notation. Einsums are well-supported state-of-the-art tools like Python's numpy and the tensor algebra compiler TACO \cite{XXXTaco}. Compared to traditional mathematical matrix contraction notation, they have the advantage of explicitly describing the volume of data being operated on. For example, the equations below describe GEMM and CONV:
+
+\vspace{-3.5mm}
+
+\begin{equation}
+    Z_{m,n}=\sum_{k}A_{m,k}*B_{k,n}
+\end{equation}
+
+\vspace{-3.5mm}
+
+\begin{equation}
+    O_{n,h,w,k}=\sum_{c,r,s}I_{n,h+r,w+s,c}*W_{r,s,c,k}
+\end{equation}
+
+In equation (1), $A$, $B$ and $Z$ are the tensors and $m$,$n$ and $k$ are dimensions/ranks. $k$ is a \textit{contracted rank} and $m$ while $n$ are \textit{uncontracted ranks}. For brevity the summation can be omitted as the contracted ranks do not appear in the output tensor.
+
+Einsums can be straightforwardly implemented using loop nests, for example:
+%\begin{center}
+\vspace{-1mm}
+\begin{small}
+  \begin{verbatim}
+1 for m in range(M):       for m in range(M):
+2  for n in range(N):       for k in range(K):
+3   pfor k in range(K):      pfor n in range(N):   
+4    Z(m,n)+=A(m,k)*B(k,n)    Z(m,n)+=A(m,k)*B(k,n)
+\end{verbatim}  
+\end{small}
+\vspace{-1mm}
+%\end{center}
+
+\textit{Dataflow} refers to the loop transformations for staging the operations in compute and memory. A dataflow can affect compute utilization and the locality of tensors inside the memory hierarchy. Within the Einsum, an \textit{intra-operation} dataflow is determined by the loop order and the parallelism strategy. The code sequences above represent two different loop orders: the left is $MNK$, whereas the right is $MKN$. The \texttt{pfor} indicates that the rank is parallelized. Thus, the left sequence is \emph{K-parallel} and the right one is \emph{N-parallel}. The \textit{inter-operation} dataflow for multiple chained Einsums is one of the main contributions of this work, as discussed in detail in~\autoref{sec:dataflows} and~\autoref{sec:gogeta}.
+
+Another result of the loop order is the concept of stationarity~\cite{eyeriss2016isca}. An \emph{A-stationary}  dataflow signifies that $A$ is the tensor whose operands change slowest--therefore the $N$ rank is the fastest to change (as it does not index $A$). In GEMMs, there are two possible loop orders for \emph{A-stationary} dataflows, $MKN$ and $KMN$. Similarly, for \emph{Output-stationary} dataflows, the $K$ rank is the fastest to change, hence $MNK$ and $NMK$ are the two possible loop orders.
+
+Tiling refers to slicing the tensors, in order for sub-tensors to fit in local memory buffers to extract reuse. Note that typically partitioning any given rank can affect multiple tensors. An example code sequence for tiling is as follows:
+\vspace{-1mm}
+\begin{small}
+  \begin{verbatim}
+1 M1=M/M0; K1=K/K0; N1=N/N0
+2 for m1 in range(M1):    
+3  for k1 in range(K1):  
+4   for n1 in range(N1):
+5    for m0 in range(M0):
+      m = m1 * M0 + m0
+6     for k0 in range(K0):
+       k = k1*K0+k0
+7      pfor n0 in range(N0):
+        n = n1*N0+n0
+8       Z(m,n) += A(m,k) * B(k,n)  
+\end{verbatim}  
+\end{small}
+
+Note the interaction of parallelism and tiling: $N0$ is \texttt{pfor} in line 7. Thus in a tile, the $n0$ indices of $N$ are spatially mapped, resulting in $N1$ temporal tiles of size $N0$. 
+
+The combination of dataflow and tiling is called a \emph{mapping}: a schedule of the exact execution of the workload on a specific hardware accelerator. Mapping directly affects data movement, buffer utilization, memory bandwidth utilization, and compute utilization.
+
+\subsection{HPC Applications: Chains of Einsums}
+\label{sec:apps}
+
+Single Einsums are kernels, whereas the main loops of scientific applications consist of a chain of Einsums where tensors produced by earlier equations are consumed by later ones. This results in a \emph{tensor dependency graph} dictating the high-level production/consumption of data throughout the HPC region of code. Throughout this section we use Conjugate Gradient as a running example because its tensor dependency graph exhibits multiple kinds of reuse opportunities and challenges. We briefly discuss other scientific applications with similar patterns where our work is applicable in this section.
+
+\subsubsection{Block Conjugate Gradient}
+
+
+Iterative linear solvers solve the system of linear equations-
+
+\vspace{-2.5mm}
+\begin{equation}
+    A_{m, k} * X_{k} = B_{m}
+\end{equation}
+
+While traditional conjugate gradient considers b and x as vectors, block conjugate gradient works on multiple initial guesses simultaneously for faster convergence, thus making it a matrix multiplication problem:
+
+\vspace{-1mm}
+\begin{equation}
+    A_{m, k} * X_{k, n} = B_{m, n}
+\end{equation}
+\vspace{-1mm}
+%\input{algorithm/cg.tex}
+\input{algorithm/cg_einsum.tex}
+
+
+%\insertFigurePart{cg}{Block Conjugate Gradient Algorithm. 'prev' and 'cur' stand for previous and current variables.}
+
+
+%~\autoref{alg:cg} shows Conjugate Gradient and
+~\autoref{alg:cg_einsum} shows the Einsums in the Conjugate Gradient Algorithm. Intuitively, we start with an initial guess $X$ and we update $R$ which at any iteration is equal to $B-AX$. If $R$ is sufficiently small, then we have reached the solution. $P$ represents the search direction for the next iteration of the loop. We have validated the functional correctness of our Einsum representation against Python's \texttt{scipy.sparse.linalg.cg}.
+
+%\vspace{-3.5mm}
+
+
+From the perspective of tensors, $P$, $R$, $S$ and $X$ (named using English-letter variables except A) are highly skewed, for example $1000000\times 8$. In contrast, tensors like $\Delta$, $\Lambda$, $\Phi$ and $\Gamma$ (named using Greek letters) are small tensors, for example, of size $8\times8$ Also, $A$ is the only sparse tensor in CG with a maximum shape of, for example, $1000000\times1000000$ but with occupancy of 1-100 non-zeros per row. In~\autoref{alg:cg_einsum}, $M$ represents the large rank while $N$ represents the small rank. $N'$  is equivalent to $N$ but is used to differentiate between the dimensions of square matrices in an Einsum without accidentally contracting them. As a result, line 1 is a sparse SpMM operation while all the other matrix multiplication operations are dense. The inverse operations (lines 2 and 6) are insignificant in terms of the magnitude of computation but they do affect the dependency graph since they require the complete tensor to be produced for execution. As we discuss in ~\autoref{sec:ai}, these matrix operations have low arithmetic intensity. The only inputs from the application side are $A$, $B$ and the initial guess, which is the initial $X$, the final output is $X$ at convergence: all other tensors are intermediates not observable by the invoking context.
+
+Another peculiar feature about the dense matrix multiplications in Conjugate Gradient is that one matrix dimension is large.
+%In this work, we represent each matrix multiplication as $(M\times K)$.$(K\times N) = M\times N$, thus $K$ is the contracted rank while $M$ and $N$ are uncontracted.
+In operations denoted by lines 1, 3, 4 and 7, an uncontracted rank is the dominating rank (assuming $A$ has been compressed using a standard format like CSR). In matrix multiplication operations denoted by line 2 ($\Delta=P^TS$) and 5, a contracted rank is the dominating rank resulting in small outputs of the order 1$\times$1 to 16$\times$16. Contracted rank being dominating significantly diminishes the benefits of pipelining the entire CG application efficiently since most of the compute is spent in just large amounts of reduction to generate an output a usable output for the operation after it thus not exploiting the staging opportunity and affecting the overall utilization. 
+
+~\autoref{fig:dfg} shows the dependency graph between Einsum operations in CG. We observe that most tensor operands are not only reused in the immediate operation but also in some later operation (i.e., transitive edge) therefore having multiple reuse distances. This is unlike dependency graphs of applications like DNNs and GNNs where the output is mostly used immediately in the next operation, making fusion straightforward. One exception in Deep Learning is the skip connections in applications like ResNet.
+
+
+\insertFigure{dfg}{Tensor dependency graph of intermediates in Conjugate Gradient across first two iterations of the CG loop where a node's number corresponds to the line in~\autoref{alg:cg_einsum}.}
+
+\subsubsection{Other Applications with similar patterns}
+
+The pattern of variable reuse distance is commonly observed in Machine Learning models like Resnet~\cite{resnet} with skip connections, although ResNet has a high arithmetic intensity per Einsum. Its also observed in other solver methods like GMRES~\cite{gmres} and BiCGStab~\cite{van1992bi}. The problem of low arithmetic intensity individual \GEMM is common in workloads like Graph Neural Networks~\cite{kipf2017semisupervised}.
+
+For example, a layer of GCN (Graph Convolution Network) has the following Einsums (Only A is sparse).
+
+Variables: $A_{m,m}, ~~X0_{m,n}, ~~Z_{m,n}, ~~W_{n,o}, ~~X1_{m,o}$
+
+$Z_{m,n}=\sum_{k}A_{m,k}*X0_{k,n}$  and  $X1_{m,o}=\sum_{j}Z_{m,j}*W_{j,o}$
+
+\subsection{Related Work}
+
+\textbf{Conjugate Gradient Acceleration:} Cerebras~\cite{cerebras} proposes mapping BiCGStab on the wafer-scale engine specifically for stencil application where the matrix $A$ is structured. Plasticine~\cite{plasticine} has inherent support for Vector Parallelism and Pipelined Parallelism. ALRESCHA~\cite{asgari2020alrescha} proposes an accelerator for Preconditioned Conjugate Gradient (PCG) and optimizes the locality of the SpMM and the SymGS kernels, however, even at maximum reuse, single kernels have low arithmetic intensity. None of these works have identified and exploited \textit{inter-operation} reuse.
+
+\textbf{Dataflows and Mappers:} MAESTRO~\cite{kwon2019understanding}, Timeloop~\cite{timeloop}, Interstellar~\cite{interstellar}, GAMMA (Genetic Algorithm Mapper)~\cite{kao2020gamma}, CoSA~\cite{cosa} propose a mapping optimization search space, cost model or a mapping search algorithm for a single tensor operation at a time. Prior works like FLAT~\cite{flat} and TANGRAM~\cite{tangram} have proposed a new dataflow for pipelining between exactly two adjacent Einsums. Garg et al.~\cite{garg2021understanding} formulate the design-space for pipelined mappings for exactly two Einsums and propose a cost model OMEGA to evaluate those mappings. We identify reuse opportunities beyond pipelining between tensors and propose a systematic methodology to determine the dataflow of the whole dependency graph of tensor operations (including Einsums and tensor additions).
+
+%\subsubsection{Specialized Data Orchestration} Various spatial accelerators for Deep Learning~\cite{tpu-isca,nvdla,eie,kwon2018maeri,sigma,extensor,eie} use custom buffers tied to their compute. Buffets~\cite{buffets} is a storage idiom designed for Deep Learning Algorithms. It uses Explicit Decoupled Data Orchestration. Prior works have also proposed domain-specific cache replacement policies, for example P-OPT~\cite{popt-hpca21} proposes a replacement policy for Graph algorithms.
+
+

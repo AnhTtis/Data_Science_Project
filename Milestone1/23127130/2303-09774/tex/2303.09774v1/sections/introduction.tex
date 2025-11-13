@@ -1,0 +1,159 @@
+\section{Introduction}
+
+To accelerate query processing,
+        intermediate tables and (materialized) views---both of which we refer to as MVs---are 
+        frequently used
+        in databases~\cite{ahmad2012dbtoaster,mcsherry2013differential, zeng2016iolap, braun2015analytics, golab2009scheduling}.
+When there are dependencies among MVs,
+    updates follow their topological order
+        to minimize redundant computation,
+    which can be managed using tools
+        like Google Napa~\cite{agiwal2021napa}, 
+        dbt~\cite{dbt}, Apache Airflow~\cite{airflow}, LookML~\cite{lookml}, etc.
+Exploiting the widespread adoption and expressive semantics of SQL,
+    we can define both full refreshes
+        and incremental updates~\cite{ahmad2012dbtoaster, krueger2011fast}
+    for various data systems,
+        ranging from
+        a single-node database (e.g., PostgreSQL~\cite{postgresql}), 
+        to self-managed distributed data warehouses (e.g., Hive~\cite{hive}, SparkSQL~\cite{spark-sql}, Presto~\cite{prestosql}),
+        and to cloud-hosted data services (e.g., Snowflake~\cite{dageville2016snowflake}, Azure SQL~\cite{azure}).
+Database admins can obtain empirical performance metrics (e.g., elapsed time for updating each MV, the size of each MV) based on the recurrent runs of update pipelines,
+while the dependency relationships 
+    can easily be extracted from MV definitions.
+
+\subfile{plots/fig_intro}
+\subfile{plots/existing_work_table}
+
+
+\mypara{Missed Opportunity}
+
+When updating a set of MVs
+    that are dependent on one another,
+    existing data systems do not introduce special optimizations 
+        besides caching.
+Our idea is that
+    by exploiting (i) the explicit knowledge of dependency relationships among MVs
+        and (ii) the performance metrics observed from previous runs,
+    we can further improve data systems operations
+        to reduce the end-to-end MV refresh time.
+Among possible ways,
+    we pursue one significant optimization opportunity
+        based on the following observation:
+\emph{While persisting intermediate data might be unavoidable due to service level agreements (SLAs), writing/reading intermediate data can be short-circuited via bounded memory (if the data fits) 
+by letting a data system read input data directly from in-memory objects rather 
+    then reading from persisted tables.}
+\Cref{fig:intro} depicts our idea: by keeping \textsf{Table A} in memory after computation, the downstream tasks \textsf{SQL B} and \textsf{SQL C} can be executed with minimal delay in parallel with the materialization of \textsf{Table A}.
+Since the memory size is finite,
+    the intermediate data must be kept in memory
+        only when the benefits of doing so are significant.
+This approach is general because 
+    we make no assumptions about the content of computation tasks 
+    (i.e., full vs. incremental MV refresh) and 
+    how they are performed (i.e., single-node vs. distributed).
+Moreover, since some data systems 
+    allow explicit data placement (e.g., Presto~\cite{prestosql}, Spark~\cite{spark-sql}, Polars~\cite{polars}),
+    we can easily implement this optimization
+        using existing  features
+    without modifying their internals.
+Note that our approach still persists all intermediate tables;
+    we only reduce the wait times for subsequent updates
+        exploiting the dependency relationships.
+
+
+\mypara{Challenge} 
+
+Unfortunately,
+    achieving our goal is technically challenging
+        because na\"ive approaches (e.g., greedily caching as much data as possible and LRU for cache eviction) offer limited performance benefits (\cref{sec:experiments}).
+For significant gains,
+    we must consider several factors simultaneously.
+First, we must optimize the order of MV refresh, as it impacts which intermediate data we can keep and release from memory.
+Off-the-shelf topological sort algorithms~\cite{networkxbfs} may not produce an order optimized for 
+our problem.
+Second, we must determine which intermediate MVs to keep in bounded memory.
+A greedy approach (i.e., keep if there is available space) or a random selection performs poorly, according to our study.
+Third, we must develop an adaptable strategy based on user workloads and intermediate data sizes; a fixed, heuristic strategy may result in suboptimal solutions if users' workloads change.
+To overcome these challenges,
+we pursue a principled method by
+    representing MVs using a graph
+        and by investigating several optimization algorithms, as will be described below.
+
+
+
+\mypara{Our Approach}
+
+In this paper, 
+    we introduce a system (called Short-Circuit or S/C) that specializes in refreshing a graph of MVs.
+S/C speeds up end-to-end MV refresh using bounded memory by exploiting the dependency relationships among MVs and their observed performance metrics.
+The dependency relationships among MVs are modeled using an acyclic graph where nodes represent individual MV updates, and the edges represent dependencies.
+To optimize the end-to-end performance, \system solves the following problem at a high level:
+\begin{equation}
+\min_{O,\, U}  \; \sum_{n_i \in O} \text{data-access-time}(n_i; U),
+\label{sec:intro:objective}
+\end{equation}
+Where $O$ is an MV refresh order, $U$ is the set of nodes for which we temporarily keep their results in memory, and $n_i$ is the $i$-th node. 
+$U$ must be \emph{feasible}; that is,
+    the sum of all the intermediate data we keep in memory
+        cannot exceed a predefined limit
+            at any point in time while updating MVs\label{sec:intro_definition}.
+% and storing the results of nodes in $U$ is \textit{feasible} 
+%     under bounded memory managed according to the refresh order $O$.
+
+To solve the above problem,
+    we alternatively optimize $O$ and $U$, as follows:
+    first, we find $U$ that 
+        can minimize the objective function (\cref{sec:intro:objective}) for fixed $O$;
+    second, we find $O$ that
+        can lower overall memory usage,
+            expecting
+                such an order can lead to more optimal $U$ in the following iteration (\cref{sec:joint_optimization}). 
+While this approach may find locally optimal solutions,
+    our empirical study suggests that 
+        starting from a specialized designed variant of DFS (depth-first search)
+            can offer high-quality solutions (\cref{sec:exp_algm}). 
+
+
+\mypara{Comparison to Other Work}
+
+This work adopts mathematical optimization 
+for memory management and scheduling in data systems with a focus on reducing an end-to-end MV refresh time by exploiting observed performance data.
+While optimizations and statistical techniques for data systems have been explored in various related problems (e.g., incremental query processing~\cite{tang2019intermittent,wangtempura,deepola}, cache prefetching~\cite{jalaparti2018netco, yang2017mithril}, indexing~\cite{chockchowwat2022airphant, chockchowwat2022automatically}), they are aimed towards resource management for standalone queries.
+The problem addressed in this work is significantly different, notably including the joint scheduling of MV updates.
+%
+While optimizing MV updates via incremental updates~\cite{griffin1995incremental,palpanas2002incremental} and scheduling~\cite{golab2009scheduling,folkert2005optimizing, ahmed2020automated}
+    pursues the same high-level goal as ours 
+        because we aim to improve data preparation stages,
+    the specific problem we  address in this work
+        is largely orthogonal to them.
+Works in intermediate result reuse~\cite{yang2018intermediate, dursun2017revisiting, michiardi2019memory, park2017database} similarly selectively store items to speedup future workloads (i.e., MV refresh runs); however, to the best of our knowledge, we are the first work that considers both job execution (re)order as well as intermediate result caching with a bounded amount of memory.
+\Cref{tbl:existing_work} summarizes core differences.
+
+
+Our technical contributions
+    can potentially be applied to accelerating 
+        a wider class of workloads
+that consist of repetitive jobs with their dependencies 
+    expressed in a directed acyclic graph,
+such as Extract-Load-Transform (ETL) with Hadoop and Spark~\cite{spark-sql},
+    job coordination via Apache Airflow~\cite{airflow} and Apache Oozie~\cite{apacheoozie},
+        etc.,
+However, for concrete discussions, we focus on MV refresh in this work.
+
+\mypara{Contributions}
+
+Our contributions are as follows:
+\begin{itemize}
+    \item \textbf{System architecture.} We propose the architecture of a system (\system) aimed at reducing end-to-end runtimes of MV refresh workloads in data warehouses and provide an efficient Presto-based~\cite{prestosql} implementation. (\cref{sec:overview})
+
+    \item \textbf{Problem definition.} We propose and formally define an optimization problem (\optimizationproblem) on MV refresh workloads, namely selecting intermediate data to 
+        persist in bounded memory 
+        to maximize read/write time reductions. (\cref{sec:problem_setup})
+    
+    \item \textbf{Algorithm and Analysis.} We employ an alternating optimization algorithm to solve \optimizationproblem.
+    This algorithm decomposes \optimizationproblem into two subproblems, for which we provide efficient and empirically effective solutions. (\cref{sec:joint_optimization})
+    
+    \item \textbf{Experimental Analysis.} 
+    We verify the effectiveness of \system on improving MV refresh speed. We find that \system speedups end-to-end runtimes by 1.04$\times$--5.08$\times$
+    using 1.6GB \memory on TPC-DS datasets (up to 1TB).
+\end{itemize}

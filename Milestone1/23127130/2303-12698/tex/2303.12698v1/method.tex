@@ -1,0 +1,85 @@
+Given an input video, we aim to determine the predictive uncertainty of the detected actors with unknown actions.
+For open set inference, actions with high and low uncertainty can be regarded as unknown and known, respectively. 
+As illustrated in \Cref{fig:arch}, our method extracts Actor-Context-Object Relation (\sysnameacor{}) to train the Beta Evidential Neural Network (\sysnamemenn{}) with the Multi-label Evidence Debiasing Constraint (\sysnameedc{}). In the following, we describe each module in detail.
+
+\subsection{Actor-Context-Object Relation Modeling}
+\label{sec:ACOR}
+Similar to~\cite{sun-2018-ECCV,pan2020actorcontextactor}, we extract rich information (\ie, actors, objects, and context) from videos to predict actions in complex scenes.
+To reduce complexity, we can detect $N$ actors and $M$ objects for each input video clip based on the key frames.  
+Based on the off-the-shelf Faster R-CNN detector~\cite{ren-2015-faster}, actor features $\{A^i\}_{i=1}^N\in\mathbb{R}^C$ and object features $\{O^i\}_{i=1}^M\in\mathbb{R}^C$ are produced by applying RoIAlign~\cite{he-2017-ICCV} followed by spatial max pooling, each of which describes the spatio-temporal appearance and motion of one Region of Interest (RoI). 
+In addition, the SlowFast~\cite{DBLP:conf/iccv/Feichtenhofer0M19} backbone extracts a spatio-temporal feature volume from the input video. 
+Then we can obtain the context feature $X\in\mathbb{R}^{C\times H \times W}$ by performing average pooling along the temporal dimension, where $C,H,W$ represent channel, height, and width. 
+
+To model actor-context-object relations, we first concatenate all actor features to the context feature followed by object features to form a series of concatenated feature maps $\{F^i\}_{i=1}^{N\times M}\in\mathbb{R}^{3C\times H \times W}$. 
+Following a stack of transformer blocks~\cite{pan2020actorcontextactor}, we can obtain actor relational features $\{H^i\}_{i=1}^{N\times M}$ by calculating the higher-order relations between pairs of $\{F^i\}_{i=1}^{N\times M}$ at the same spatial location, where two actors can be associated via the same spatial context and different objects.
+
+\subsection{The Beta Evidential Neural Network}
+\label{sec:edl}
+As discussed in \Cref{sec:intro}, existing models~\cite{gal-2016-icml,liang2017enhancing,liu2020energy} typically rely on a softmax layer to perform multi-class classification. Since the softmax score is essentially a point estimation of a predictive distribution~\cite{sensoy-2018-nips,bao-2021-ICCV,gal-2016-icml}, the models cannot estimate the predictive uncertainty of out-of-distribution. 
+To tackle this limitation, evidential neural networks (ENNs)~\cite{sensoy-2018-nips} are developed to jointly formulate the multi-class classification and uncertainty modeling. 
+Specifically, ENNs~\cite{NEURIPS2020_aab08546, bao-2021-ICCV} 1) interpret the standard output of a classification network as the parameter set of a categorical distribution and 2) assume that class probability follows a prior Dirichlet distribution and replaces this parameter set with the parameters of a Dirichlet density for novelty detection.
+
+However, in our setting, the assumption of using Dirichlet distribution is not a good fit for an actor with multiple actions. It is because the predicted likelihood for each action class follows a binomial distribution whose conjugate prior is a Beta distribution rather than Dirichlet distribution. To this end, we design the \sysnamemenn{} to classify known and novel actions based on Beta distributions.
+
+\textbf{Beta distribution-based subjective opinions}. 
+According to the belief theory~\cite{yager-2008-classic}, it is more reasonable to predict subjective opinions rather than class probabilities in an open-set setting. We hence use the principles of evidential theory to quantify belief masses and uncertainty in the proposed \sysnamemenn{} through Subjective Logic (SL)~\cite{josang-2016-subjective}. 
+
+In multi-label action recognition, since each action follows a given binomial opinion towards the proposition, the subjective opinion $\omega_i=(b_i,d_i,u_i,a_i)$ for an action $i\in\{1,\cdots K\}$ of an actor is expressed by two belief masses, \ie, belief $b_i\in[0,1]$ and disbelief $d_i\in[0,1]$, and one uncertainty mass $u_i\in[0,1]$, where $b_i+d_i+u_i=1$. 
+The expected belief probability $p_i$ is defined as $p_i=b_i+a_i\cdot u_i$, where $a_i$ refers to a base rate representing prior knowledge without commitment, such as neither agree nor disagree.
+
+According to~\cite{sensoy-2018-nips}, a binomial opinion $\omega_i$ of action follows a Beta probability density function (pdf) denoted $\text{Beta}(p_i|\alpha_i,\beta_i)$, where $p_i\in[0,1]$ represents the action assignment probabilities. The Beta pdf is characterized by parameters $\alpha_i$ and $\beta_i$, where $\alpha_i$ and $\beta_i$ are viewed as positive and negative evidence of the observed action $i$, respectively. 
+The evidence indicates actions closest to the predicted ones in the feature space and is used to support the decision-making.
+Action labels are the same for positive evidence, but different for negative evidence.
+Specifically, for each action, the opinion $\omega_i$ is obtained based on its corresponding $\alpha_i$ and $\beta_i$ using the rule in SL:
+\begin{align}
+\small
+\label{eq:element-wise-sl}
+    b_i=\frac{\alpha_i-a_i W}{\alpha_i+\beta_i},\quad d_i=\frac{\beta_i-a_i W}{\alpha_i+\beta_i},\quad u_i=\frac{W}{\alpha_i+\beta_i},
+\end{align}
+where we set the non-informative prior weight $W=2$ and base rate $a_i=1$ for each binary action classification (known/unknown) empirically.
+
+Therefore, a collection of evidence pairs $\{(\alpha_i,\beta_i)\}_{i=1}^K$ of an actor is estimated to quantify the predictive uncertainty. An actor with multiple unknown actions would incur high uncertainty $u$ with low belief $b$ (see \Cref{sec:novelty_estimation}). 
+
+\textbf{Learning opinions through Beta loss}.
+In practice, for an actor $j$, its positive and negative evidence are estimated $\boldsymbol{\alpha}_j=s(h(\mathbf{x}_j;\boldsymbol{\theta}))+1$ and $\boldsymbol{\beta}_j=s(h(\mathbf{x}_j;\boldsymbol{\theta}))+1$, where $\boldsymbol{\alpha}_j=[\alpha_{1j},\cdots,\alpha_{Kj}]^T$ and $\boldsymbol{\beta}_j=[\beta_{1j},\cdots,\beta_{Kj}]^T$. 
+$\mathbf{x}_j$ denotes the input video, $h(\mathbf{x}_j;\boldsymbol{\theta})$ represents the evidence vector predicted by the network for the classification and, $\boldsymbol{\theta}$ represents parameters for \sysnameacor~modeling.
+Here $s(\cdot)$ is the evidence function (\textit{e.g.,} ReLU) to keep $\boldsymbol{\alpha}_j,\boldsymbol{\beta}_j\succcurlyeq \mathbf{1}$. 
+
+To learn the above opinions, we define the Beta loss function by computing its Bayes risk for the action predictor. For the binary cross-entropy loss for each action $i$ over a batch of actors, the proposed Beta loss takes
+\begin{align}
+\label{eq:beta-loss}
+    &\mathcal{L}_{Beta}(\boldsymbol{\theta})=\sum\nolimits_{j=1}^N\mathcal{L}_j(\boldsymbol{\theta}),
+\end{align}
+where $j\in\{1,\cdots,N\}$ denotes the index of an actor.
+\begin{align}
+\small
+\label{eq:beta-loss-1-actor}
+    \mathcal{L}_j(\boldsymbol{\theta}) \nonumber
+    =&\sum\nolimits_{i=1}^K \int\textbf{BCE}(y_{ij},p_{ij})\textbf{Beta}(p_{ij};\alpha_{ij},\beta_{ij})dp_{ij} \nonumber\\
+    % =&\sum\nolimits_{i=1}^K \int \Big[-y_{ij}\mathbb{E}_{p_{ij}\sim\textbf{Beta}}[\log(p_{ij})] \nonumber\\
+    % &-(1-y_{ij})\mathbb{E}_{p_{ij}\sim\textbf{Beta}}[\log(1-p_{ij})]\Big]\nonumber\\
+    =&\sum\nolimits_{i=1}^K \Big[y_{ij}\Big(\psi(\alpha_{ij}+\beta_{ij})-\psi(\alpha_{ij})\Big)\nonumber\\
+    &+(1-y_{ij})\Big(\psi(\alpha_{ij}+\beta_{ij})-\psi(\beta_{ij})\Big)\Big], 
+\end{align}
+% Note, each equation needs it own number according to CVPR style
+where $K$ is the number of actions, and $\textbf{BCE}(\cdot)$ is the binary cross-entropy loss, and $\psi(\cdot)$ is the \textit{digamma} function. The log expectation of Beta distribution derives the last equality. 
+$\mathbf{y}_j=[y_{1j},\cdots,y_{Kj}]\in\{0,1\}^K$ is the $K$-dimensional ground-truth action(s) label for $\mathbf{x}_j$.
+% , and $\boldsymbol{\alpha,\beta}\in\mathbb{R}^K$ is the parameters of the Beta density on the predictors.  
+
+\subsection{Multi-Label Evidence Debiasing Constraint}
+\label{sec:debias}
+For open set action recognition, static bias~\cite{li-2018-eccv} could result in a vulnerable model that falsely recognizes an action containing similar static features.  
+For example, the action of ``walking'' is easily recognized with ``road'' in the background, but it would be unable to recognize the same action with the ``treadmill'' scene.
+From the perspective of fairness-aware learning~\cite{Zhao-ICDM-2019,zhao-KDD-2021}, as indicated in \Cref{fig:arch}, this is due to the spurious dependency of the predictive outcome $Z$ (\textit{e.g.,} actions) onto sensitive features $X$ (\textit{e.g.,} background scene), and strong dependency indicates strong effects.
+
+To mitigate static bias, we introduce the evidence debiasing constraint in multi-label evidential learning. A fair prediction indicates no direct ($X\rightarrow Z$) or indirect ($X\rightarrow H \rightarrow Z$) dependency of $Z$ on the reduced $X$. These types of dependencies (direct and indirect) are supported by frameworks applied to large bodies of cases throughout statistical disparity~\cite{Barocas-CLR-2016}. 
+Consequently, debiasing through both the direct and indirect effects enforces procedural fairness in decision-making by statistically mitigating the dependency of the sensitive feature $X$ on the prediction $Z$. It therefore guarantees outcome fairness among sensitive groups~\cite{Zhang-AAAI-2018}.
+
+In particular, similar to~\cite{bahng-2020-ICML,bao-2021-ICCV}, the Hilbert-Schmidt Independence Criterion (HSIC) function measures the degree of independence between two continuous random variables. With radial basis function kernel $k_1$ and $k_2$, $\text{HSIC}^{k_1,k_2}(Z,\sigma(X))=0$ if and only if $Z\indep \sigma(X)$, where $\sigma(\cdot)$ is 2D average pooling operation. 
+As shown in \Cref{fig:arch}, $Z\equiv h(\mathbf{x};\boldsymbol{\theta})$ represents the evidence vector predicted by the network, and $X$ indicates the context feature from the backbone. 
+The debiasing constraint takes the form
+\begin{align}
+    g(\boldsymbol{\theta})\equiv \text{HSIC}\Big(h(\mathbf{x};\boldsymbol{\theta}),\sigma(X)\Big),
+    \label{eq:constraint}
+\end{align}
+which aims to reduce both direct and indirect dependency of predictive outcomes onto background context.

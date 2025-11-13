@@ -1,0 +1,237 @@
+
+
+\section{Background}
+%\vspace{-1mm}
+\label{sec:background}
+
+%\TK{@Raveesh - since intro changed - we shoud make sure we defined skewed GEMMs. can you make sure thats happening somewhere explicitly in intro and/or this section}
+
+%To begin, we discuss the basics of tensor algebra scheduling, and demonstrate the opportunity available for improvement.
+
+\begin{comment}
+
+\subsection{Caches and Scratchpads}
+
+Caches are widespread on-chip storage structures. These are implicit i.e., the placement and replacement of data is determined by the hardware policy, and coupled i.e., the requester of the data receives the response. However, cache policies often operate at a fine-grained line granularity rather than operating at a granularity of tensors or blocks of tensors. This results in cache policies often rejecting the data that may have high reuse frequency (by virtue of reuse of the whole block) but might not be the immediate vicinity (ie high reuse distance). Moreover, the tag matching area and energy overhead makes it less appealing for spatial accelerators which minimize energy, which is why these accelerators have used scratchpads.
+
+Prior works on scratchpads like buffets~\cite{buffets} make use of explicit (programmer-controlled data placement and replacement) decoupled data orchestration (fills are independent of the requester). While explicit decoupled orchestration works well for a single matrix multiplication at a time, it becomes hard to program every single tile into the buffer when considering the reuse of multiple tensor operations contending for a buffer. %Moreover, buffets also shrink the buffer from the head. However, if the layout of the tensor is preserved, then the piece of data that is written first would also be read first, which makes shrinking from the head sub-optimal.
+
+\end{comment}
+
+%\TK{This para may not be needed here. This is just on background and we havent highlighted the problems to start pushing for chord yet}
+%To this end, we propose~\SpadName, a buffer mechanism to improve data reuse of the tensors, while also making it easier on the programmers.
+%\vspace{-1mm}
+
+%One of the primary mechanisms for efficiency in Deep Learning accelerators comes from their ability to extract data reuse. 
+%On the algorithm end, reuse opportunities come from the \emph{arithmetic intensity}.
+%\emph{arithmetic intensity (AI)}, i.e., number of operations performed on each byte of data fetched from memory.
+%The most common operation in DNNs is matrix multiplication, which inherently offers reuse opportunities since a weight value gets multiplied by several inputs, and vice versa.
+%On the hardware end, 
+%these reuse opportunities are leveraged by buffering the operands to be reused within the accelerator's scratchpads which are programmed in an \textbf{\textit{explicit}} manner. 
+
+
+%Since the amount of on-chip scratchpad is finite, and cannot hold the entire model and all activations, the weights and activations are tiled, and staged through the on-chip memory hierarchy. This mechanism is called mapping (\textit{aka} scheduling). The mapping determines the order of tiles to fetch from memory, which tiles to keep \textit{stationary} and for how long. The number of legal mappings for any individual layer can be in the order of $10^{15}$~\cite{timeloop,gamma}, and different mappings trade-off the amount of data reuse they can extract and thereby performance and energy-efficiency. To this end, there has been a lot of work in searching for and determining optimal schedules for each layer of a DNN~\cite{timeloop,chatarasi2020marvel,gamma}. 
+
+\subsection{Intra-operation Scheduling}
+
+%\vspace{-1mm}
+%Tensor operations like convolutions and matrix multiplications can be concisely and precisely expressed using Einsum (Einstein summation) notation. Einsums are well-supported state-of-the-art tools like Python's numpy and the tensor algebra compiler TACO \cite{XXXTaco}. Compared to traditional mathematical matrix contraction notation, they have the advantage of explicitly describing the volume of data being operated on. 
+%For many DNN models, there is ample reuse within each layer. This has allowed DNN accelerators to successfully schedule each layer independently, one after the other, and achieve high utilization via an efficient mapping strategy~\cite{timeloop,gamma}. In fact, prior works have shown that several mapping strategies (including heuristics) can achieve high-utilization given the high AI within each layer~\cite{flexion}. 
+
+%For many DNN models, there is ample reuse within each layer. This has allowed DNN accelerators to successfully schedule each layer independently, one after the other, and achieve high utilization via an efficient mapping strategy~\cite{timeloop,gamma}.
+The following equation describes GEMM in the einsum representation~\cite{XXXTaco}:
+%\vspace{-1mm}
+%\begin{center}
+    $Z_{m,n}=\Sigma_{k}A_{m,k}*B_{k,n}$
+%\end{center}
+
+%This notation was greatly popularized by its adoption by the tensor algebra compiler TACO \cite{XXXTaco}. Its main advantage is that explicitly notates the dimensions in the subscript of the tensor, which precisely shows the volume of the tensors and which ranks are contracted, rather than relying on notions like ``rows'' or ``columns.''
+In equation (1), $A$, $B$ and $Z$ are the \emph{tensors} and $m$,$n$ and $k$ are \emph{ranks}. $k$ is a \emph{contracted dimension}, while $m$ and $n$ are \emph{uncontracted dimensions}. For brevity the summation $\Sigma$ can be omitted as the contracted ranks do not appear in the output tensor. 
+%
+Operations can be straightforwardly scheduled using concrete loop nests, for example:
+%\begin{center}
+%\vspace{-1mm}
+\begin{footnotesize}
+  \begin{verbatim}
+M1=M/M0
+//schedule A                 //schedule B
+1 for m1 in range(M1):       for m1 in range(M1):
+2  for n in range(N):         for k in range(K):
+3   pfor k in range(K):        pfor n in range(N):   
+4    pfor m0 in range(M0):      pfor m0 in range(M0):
+      m=m1*M0+m0                 m=m1*M0+m0
+5     Z(m,n)+=A(m,k)*B(k,n)      Z(m,n)+=A(m,k)*B(k,n)
+\end{verbatim}  
+\end{footnotesize}
+%\vspace{-1mm}
+%\end{center}
+
+These schedules apply a variety of loop transformations~\cite{timeloop} such as loop ordering, varying parallelization strategies and tiling (the tile size in the example is M0). The actual efficiency (datapath utilization and energy-efficiency) of each schedule depends on whether it can find enough reuse to reach the compute-bound regime of a given architecture.
+
+\subsection{Inter-operation Pipelining}
+\label{sec:inter-op-pipelining}
+Inter-operation pipelining is a form of scheduling adjacent dependent operators in workloads with chains of Einsums (e.g., DNNs) such a way that the intermediate tensor output is consumed on-chip without having to be written to and read from main memory. Inter-operation pipelining is currently an active area of research for memory-bounded workloads~\cite{fused,isosceles,tileflow,flat}. \autoref{fig:no-fusion}(a) shows pipelining between two operations.
+%Mathematically, \autoref{fig:ai2} shows how pipelining inherently increases the arithmetic intensity
+Unfortunately, simple pipelining is insufficient to capture more complex DAG dependencies as we motivate in the next section, and extend the state-of-the-art by broadening the scope of inter-operation scheduling to the entire DAG over multiple iterations.
+%Prior works have proposed inter-operation pipelining~\cite{fused,tangram,tileflow}, which is a form of inter-operation reuse. %As~\autoref{fig:ai2} shows, the part of the intermediate tensor that is produced, is consumed immediately. %\TK{explain what inter operation pipelining foes}
+
+%Whether such schedules find enough reuse to reach the compute-bound of any given architecture determines the resulting datapath utilization.
+ 
+%\textit{Mapping} refers to the loop transformations for staging the operations in compute and memory. Its the exact schedule of a workload on an accelerator A mapping can affect compute utilization and the locality of tensors inside the memory hierarchy. Within the Einsum, an \textit{intra-operation} dataflow is determined by the loop order and the parallelism strategy. The code sequences above represent two different loop orders: the left is $MNK$, whereas the right is $MKN$. The \texttt{pfor} indicates that the rank is parallelized. Thus, the left sequence is \emph{K-parallel} and the right one is \emph{N-parallel}. The \textit{inter-operation} dataflow for multiple chained Einsums is one of the main contributions of this work, as discussed in detail in~\autoref{sec:dataflows} and~\autoref{sec:gogeta}.
+
+%Another result of the loop order is the concept of stationarity~\cite{eyeriss2016isca}. An \emph{A-stationary}  dataflow signifies that $A$ is the tensor whose operands change slowest--therefore the $N$ rank is the fastest to change (as it does not index $A$). In GEMMs, there are two possible loop orders for \emph{A-stationary} dataflows, $MKN$ and $KMN$. Similarly, for \emph{Output-stationary} dataflows, the $K$ rank is the fastest to change, hence $MNK$ and $NMK$ are the two possible loop orders.
+
+\begin{comment}
+    
+
+Tiling refers to slicing the tensors, in order for sub-tensors to fit in local memory buffers to extract reuse. An example code sequence for tiling is as follows:
+
+%\vspace{-1mm}
+\begin{footnotesize}
+    
+  \begin{verbatim}
+1  N1=N/N0
+2  for n1 in range(N1):
+3   for m in range(M0):
+4    for k in range(K0):
+5     pfor n0 in range(N0):
+        n = n1*N0+n0
+6       Z(m,n) += A(m,k) * B(k,n)  
+\end{verbatim}  
+\end{footnotesize}
+
+%Note the interaction of parallelism and tiling: $N0$ is \texttt{pfor} in line 7. Thus in a tile, the $n0$ indices of $N$ are spatially mapped, resulting in $N1$ temporal tiles of size $N0$. 
+
+%The combination of dataflow and tiling is called a \emph{mapping}~\cite{timeloop,kwon2019understanding}: a schedule of the exact execution of the workload on a specific hardware accelerator. 
+Scheduling directly affects data movement, buffer utilization, memory bandwidth utilization, and compute utilization. 
+
+\end{comment}
+
+\input{tables/hpcg}
+
+
+\section{Motivation and Overview}
+
+\subsection{Problem Demonstration for Conjugate Gradient}
+\label{sec:apps}
+
+Tensor-algebra applications are chains of einsums where tensors produced by earlier equations are consumed by later ones. This results in a \emph{tensor dependency graph}, dictating the high-level production/consumption of data throughout the HPC region of code. As a running example of how this affects reuse and utilization, we use the HPCG benchmark~\cite{dongarra2015hpcg,hpcg2021}, which runs Conjugate Gradient (CG)---a widely used HPC solver application represented as a DAG of tensor operations.
+
+
+
+%\footnote{HPCG is a benchmark for supercomputers that runs CG. \MP{Footnote 1 adds no real information. Cut. }}
+As \autoref{tables:hpcg} shows, \textbf{\textit{CG achieves only 1-3\% of peak performance on top 7 supercomputers}}. 
+A key reason is due to these implementations relying on intra-operation reuse, and the skewed nature of the individual GEMM aspect ratios means they cannot find sufficient reuse. In the rest of this section we explain this phenomenon in detail.
+
+\insertWideFigureScaled{ai1}{Arithmetic intensity comparison and roofline plot for regular and skewed GEMMs. Word size = 32-bit and memory bandwidth  = 1TB/sec.}{0.8}
+
+
+\indent \textbf{Sparse and Skewed GEMMs in Conjugate Gradient:~}
+Iterative linear solvers solve the system of linear equations-
+
+\vspace{-3.5mm}
+\begin{equation}
+    A_{m, k} * X_{k} = B_{m}
+\end{equation}
+
+While traditional CG considers b and x as vectors, block CG works on multiple initial guesses simultaneously for faster convergence, thus making it a matrix multiplication problem:
+
+\vspace{-3.5mm}
+\begin{equation}
+    A_{m, k} * X_{k, n} = B_{m, n}
+\end{equation}
+%\vspace{-1mm}
+%\input{algorithm/cg.tex}
+\input{algorithm/cg_einsum.tex}
+
+%\insertFigurePart{cg}{Block Conjugate Gradient Algorithm. 'prev' and 'cur' stand for previous and current variables.}
+
+
+%~\autoref{alg:cg} shows Conjugate Gradient and
+\autoref{alg:cg_einsum} shows the tensor operations in the CG Algorithm. %Intuitively, we start with an initial guess $X$ and we update $R$ which at any iteration is equal to $B-AX$. If $R$ is sufficiently small, then we have reached the solution. $P$ represents the search direction for the next iteration.
+%\vspace{-3.5mm}
+
+From the perspective of tensors, $P$, $R$, $S$ and $X$ (named using English-letter variables except A) are highly skewed ($M\times N$), for example $1000000\times 8$. In contrast, tensors like $\Delta$, $\Lambda$, $\Phi$ and $\Gamma$ (named using Greek letters) are small tensors ($N\times N'$), for example, of size $8\times8$ Also, $A$ is the only sparse tensor in CG with a maximum shape($M\times M$),  for example, $1000000\times1000000$ but with occupancy of 1-100 non-zeros per row. As a result, line 1 is a sparse SpMM operation while all the other matrix multiplication operations are dense w.
+
+%\insertFigureRevision{class}{Classes of operations in CG and their effect on pipelining.}
+
+
+%~\autoref{fig:class} shows the shapes of operations in CG that can easily be obtained by just looking at the einsums. Dense GEMMs are skewed GEMMs where only one rank is dominant. 
+%
+
+Notably, in CG applications, we observe that one dimension is too large and other dimensions are too small, thus leading to skewed aspect ratios. These skewed GEMMs have low data reuse. We quantify data reuse by using the metric \emph{arithmetic intensity}\cite{roofline} which is defined as number of operations per byte of data moved. Thus, low arithmetic intensity implies that the data moved could not be reused for enough operations.
+
+In a GEMM where $M$ is the large dimension and $K=N$, the best possible arithmetic intensity can be calculated as follows:
+%\vspace{-5mm}
+
+\begin{equation}
+  AI_{best}  = \frac{Number~of~MACs}{Minimum~DRAM~Accesses}
+\end{equation}
+
+For an individual operation with no inter-operation reuse, all tensor operands begin and end in DRAM and are accessed atleast once.
+
+\begin{equation}
+  AI_{best}  =\lim_{K/M\to0} \frac{M\times K\times N}{M\times K\text{ + }K\times N\text{ + }M\times N} = \frac{N}{2} ops/word
+\end{equation}
+
+For workloads where N <= 16 (e.g. CG), this translates to <=2 ops/bytes for 32B word size, and therefore degrades to memory-bound performance in isolation (see \autoref{fig:ai1}). This motivates the need to exploit inter-operation reuse to increase intensity in scientific applications.
+\autoref{fig:ai1}(a) shows drastically lower arithmetic intensity for skewed GEMMs despite same number of multiplications. 
+
+Roofline model (\autoref{fig:ai1}(b)) is used to plot the variation in throughput with arithmetic intensity. Based on this plot, performance can be memory-bound ie limited by memory bandwidth or compute-bound limited by datapath resources. As \autoref{fig:ai1}(b) shows, CG is highly memory bound even in the best case. Even though prior works on individual GEMM mapping~\cite{kwon2019understanding,timeloop} or CG accelerators~\cite{asgari2020alrescha} optimize individual operations, to achieve the best possible arithmetic intensity and achieve the roofline performance, the roofline performance itself is orders of magnitude less than the arithmetic intensity. 
+
+Increasing "arithmetic intensity" ie reuse increases the performance until compute is fully utilized. Therefore, this motivates us to explore inter-operation reuse as intra-operation reuse alone is limited in case of CG.
+
+
+%\insertFigureRevisionMicro{heatmap}{\revision{Variation of arithmetic intensity with N and nz\textsubscript{av} for M=1000000 for SpMM, op-by-op execution of 10 iterations and ideal case for 10 iterations. Green line represents the maximum realistic value of N in CG.\vspace{-2mm}}}
+
+%\revision{Moreover, in the overall execution of Conjugate Gradient, sparsity does not affect the arithmetic intensity as much as the skewness due to lower N dimension as~\autoref{fig:heatmap} shows. This is true whether its the ideal case or an op-by-op execution. Therefore, regardless of the sparsity level, overall Moreover, in the overall execution of Conjugate Gradient, sparsity does not affect the arithmetic intensity as much as the N dimension as~\autoref{fig:heatmap} shows, whether its the ideal case or an op-by-op execution. Therefore, regardless of the sparsity, achieved arithmetic intensity can be improved via inter-operation reuse.achieved arithmetic intensity can be improved via inter-operation reuse.}
+
+%As a result, line 1 is a sparse SpMM operation while all the other matrix multiplication operations are dense. The inverse operations (lines 2 and 6) are insignificant in terms of the magnitude of computation but they do affect the dependency graph since they require the complete tensor for execution. As we discuss in ~\autoref{sec:ai}, these matrix operations have low AIs.
+%arithmetic intensities. %The only inputs from the application side are $A$, $B$ and the initial guess, which is the initial $X$, the final output is $X$ at convergence: all other tensors are intermediates not observable by the invoking context.
+
+%Another peculiar feature about the operations in CG is that one matrix dimension is large.
+%In this work, we represent each matrix multiplication as $(M\times K)$.$(K\times N) = M\times N$, thus $K$ is the contracted rank while $M$ and $N$ are uncontracted.
+%In operations denoted by lines 1, 3, 4 and 7, an uncontracted rank is the dominating rank (assuming $A$ has been compressed using a standard format like CSR). In operations denoted by line 2 ($\Delta=P^TS$) and 5, a contracted rank is the dominating rank. Contracted rank being dominating significantly diminishes the benefits of pipelining the entire CG application since most of the compute is spent in large amounts of reduction to just generate a usable output for the next operation, thus not exploiting the staging opportunity and affecting the overall utilization. 
+%\TK{@Raveesh - this para and the next seem to be repeating the same point. can you try to combine and merge}
+
+%These \GEMM can be uncontracted dominant or contracted dominant as~\autoref{fig:class} shows. The uncontracted dominant GEMMs are pipeline friendly since uncontracted rank can be staged into small stages. The contracted dominant GEMMs are not pipeline friendly since most of the compute is just spent into getting a usable output. This influences the inter-operation reuse patterns in~\autoref{sec:patterns} as it decides whether the operation can be pipelined or not.
+
+% We observe that most tensor operands do not only have adjacent consumers, but also have multiple of the downstream consumers, as explained in~\autoref{fig:no-fusion}, therefore leading to multiple reuse distances. Traditional adjacent pipelining which overwrites the producer cannot be applied and buffer mechanisms are needed, to enable on-chip reuse of the data between these operations.
+%This is unlike DNNs and GCNs where the output is mostly used immediately in the next operation, making fusion straightforward. One exception in DL is the skip connections in applications like ResNet.
+
+\insertFigure{no-fusion}{(a) Inter-operation pipelining (b) Challenges to applying inter-operation pipelining to complex DAGs - 1) Delayed downstream dependency, 2) varying shapes, 3) consumers at multiple reuse distances 4) need to preserve layout across consumers.}
+
+\begin{comment}
+\indent \textbf{Other applications as chains of tensor-operations:~}
+The pattern of variable reuse distance is commonly observed in DL models like Resnet~\cite{resnet} with skip connections, although ResNet has a high arithmetic intensity per tensor operation. Its also observed in other solver methods like GMRES~\cite{gmres} and BiCGStab~\cite{van1992bi}. The problem of low arithmetic intensity individual \GEMM is also common in Graph Convolution Network (GCN)~\cite{kipf2017semisupervised} which consists of an SpMM followed by a GEMM.
+
+%Variables: $A_{m,m}, ~~X0_{m,n}, ~~Z_{m,n}, ~~W_{n,o}, ~~X1_{m,o}$
+
+%$Z_{m,n}=\sum_{k}A_{m,k}*X0_{k,n}$  and  $X1_{m,o}=\sum_{j}Z_{m,j}*W_{j,o}$
+
+\end{comment}
+\begin{comment}
+
+\subsection{Related Work}
+\input{tables/related}
+\textbf{Conjugate Gradient Acceleration:} Cerebras~\cite{cerebras} proposes scheduling BiCGStab on the wafer-scale engine specifically for stencil application where the matrix $A$ is structured. Plasticine~\cite{plasticine} has inherent support for Vector Parallelism and Pipelined Parallelism. ALRESCHA~\cite{asgari2020alrescha} proposes an accelerator for Preconditioned Conjugate Gradient (PCG) and optimizes the locality of the SpMM and the SymGS kernels, however, we show that even at maximum reuse,  single kernels have low arithmetic intensity. None of these works have identified and exploited \textit{inter-operation} reuse.
+
+%\insertFigure{venn}{Our work on DAG-level dataflow covers a larger scope than works pipelining two tensor operations~\cite{flat,tangram,garg2021understanding} and works targeting operation by operation execution~\cite{kwon2019understanding,interstellar,timeloop,kao2020gamma,cosa}}.
+\textbf{Dataflows and Mappers:} MAESTRO~\cite{kwon2019understanding}, Timeloop~\cite{timeloop}, Interstellar~\cite{interstellar}, 
+GAMMA
+%(Genetic Algorithm Mapper)
+~\cite{kao2020gamma}, CoSA~\cite{cosa} propose a mapping optimization search space, cost model or a mapping search algorithm for a single tensor operation at a time. Prior works like FLAT~\cite{flat}, TANGRAM~\cite{tangram} and OMEGA~\cite{garg2021understanding} %have 
+proposed dataflows for pipelining between exactly two adjacent Einsums. 
+%Garg et al.~\cite{garg2021understanding} formulate the design-space for pipelined mappings for exactly two Einsums and propose a cost model OMEGA to evaluate those mappings.
+We identify reuse opportunities beyond pipelining adjacent operators and propose a systematic methodology to determine the dataflow of the whole dependency graph of tensor operations (including Einsums and tensor additions).
+%Our methodology is also applicable to %(and evaluated on) 
+%other applications with low intensity GEMMs like GNNs and transformers. %where our methodology is applicable,
+%However, we often refer to Conjugate Gradient as the application for demonstration purposes since its tensor dependency graph has the characteristics of low intensity Graph and ML workloads and also has additional unique characteristics providing opportunity to demonstrate different kinds of inter-operation reuse.
+\autoref{table:related} shows the scope of this work on generalized inter-operation dataflows compared to prior works.
+
+\end{comment}
+%focusing on op-by-op dataflows and traditional adjacent operation pipelining.
+
+%\subsubsection{Specialized Data Orchestration} Various spatial accelerators for Deep Learning~\cite{tpu-isca,nvdla,eie,kwon2018maeri,sigma,extensor,eie} use custom buffers tied to their compute. Buffets~\cite{buffets} is a storage idiom designed for Deep Learning Algorithms. It uses Explicit Decoupled Data Orchestration. Prior works have also proposed domain-specific cache replacement policies, for example P-OPT~\cite{popt-hpca21} proposes a replacement policy for Graph algorithms.
+
+

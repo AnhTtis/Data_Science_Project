@@ -1,0 +1,250 @@
+\section{Algorithms}\label{sec:Algorithms}
+In this section, we describe our algorithms for the training of the models for the personalization goal of clients. We will highlight the steps which have been designed to ensure high performance. As mentioned before, in PFSL, there are three types of entities: clients, offloading server, and client model averaging server. For ease of understanding, we have presented the relevant details of the algorithms run by each of them. These can also be thought of as APIs (and their implementation details) supported by these entities to coordinate with each other. Algorithm 1a describes the API provided by the secure client model averaging server that is responsible for averaging the weights of the client models calling it remotely. Each client participating in the training will run the APIs provided in Algorithm 1b. Offloading Server instances will run the APIs in Algorithm 1c.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Notations} & \textbf{\makecell{Meaning}} \\ \hline
+        $E$ & \makecell{Total global epochs of Phase-1} \\ \hline
+        n & \makecell{Total clients in a global epoch} \\ \hline
+        $E_i$ & \makecell{Epochs of $ith$ client in Phase-2}\\ \hline
+        $M_i^{CF}$, $M_i^{S}$, $M_i^{CB}$  & \makecell{Front, Central model, and Back model\\ of the $ith$ client} \\ \hline
+        $W_i^{CF}$, $W_i^{S}$, $W_i^{CB}$ & \makecell{Front, Central, and Back model's weights\\ of the $ith$ client} \\ \hline
+        $d_i$ & \makecell{Number of training instances \\ with the $ith$ client}\\ \hline
+        $A_{i,b}^{CF}$, $A_{i,b}^{S}$ & \makecell{Batch b activations of the Front \\ and central layers of $ith$ Client}\\ \hline
+        $\eta$ & \makecell{Learning rate}\\ \hline
+        $l_{i,b}$ & \makecell{Loss of batch b of $ith$ client}\\
+        \hline
+        $\frac{dl_{i,b}}{dA_{i,b}^S}$ & \makecell{Gradient of loss of batch b \\of $ith$ client with respect to $A_{i,b}^S$} \\ \hline
+        $B$ & \makecell{Total Batches present at any client}\\ \hline
+        $Y_{i,b}^{true}, Y_{i,b}^{pred}$ & \makecell{True and Predicted labels \\of the $ith$ client}\\ \hline
+        $UFL$ & \makecell{Unfrozen active layers} \\ \hline  
+        $V_{thres}$ & \makecell{Threshold validation accuracy}\\ \hline
+        $O_{i}$ & \makecell{ Work done by client $i$}\\ \hline
+        
+\end{tabular}
+\caption{Summary of Notations used in the paper, i in subscript refers to the $ith$ client}
+\label{tab:notations}
+\end{table} 
+
+For ease of understanding, Algorithms 1a, 1b, and 1c describe the details of what happens during a round. Each round comprises two phases. Firstly, all clients in our framework enter the generalization phase (1) consisting of many global epochs. This phase trains all the clients in parallel to make sure that each of their models becomes generalized, i.e. it can perform the given task on unseen test data coming from a general data distribution with high performance. This stage is essential for achieving good personalized performance and not doing it may lead to over-fitting and poor performance even on the specific data distribution at the client because of the small number of training instances present at a client. After the model performance has reached convergence on the validation dataset, the personalized phase (2) is triggered. In this phase, each client focuses only on its own personal objective and customizes its model to perform well on its own data distribution. To summarize, in phase 1, clients work for the common good and in phase 2, they maximize personal good. 
+
+The $ith$ client completes its local epoch by completing a forward and backward pass through the split layers and then updating its weights. This is followed by a call to the $ith$ offloading server instance to communicate this completion. The $ith$ client immediately calls the secure client model server with its client back layer weights. Both the averaging servers accept connections from their callers and wait for a timeout period, after which they average the weights of the connections and return them the averaged weight tensor. The $ith$ client waits for the confirmation of weight averaging from the offloading server before proceeding to its next local epoch.
+
+In Phase 1, we run a fixed upper limit of E global epochs at all clients (to limit resource utilization on the client's side) or stop when a convergence criterion is reached. At this point, all the participating clients have trained a global generalized model. They are now given a choice to leave or participate in further training in the Personalization Phase (2).  In Phase 2, we freeze all the layers of $ith$ client's central layers at the offloading server and only train the back layers with the client. In this phase, there is no synchronization step of weight merging at the clients and the server instances. This allows all the clients to train their models for different numbers of epochs ($E_i$) than other clients and thus be completely independent of one another.  This Phase trains only the $ith$ client's back layers on its personal dataset, thus achieving high performance.
+
+Weight averaging at the central and client back layers has been proposed previously \cite{split_fed}. We now describe some of the novel features of our algorithms in more detail. 
+\begin{itemize}
+    
+    \item {Our algorithm is flexible to allow clients to leave in between the phases or even inside a phase which makes it highly suitable for resource-constrained devices imposing no constraint on them to remain in training for long. It also gracefully handles client disconnects and failures.}
+    
+    \item{The use of a validation set to determine important parameters of a distributed learning process although essential has not been clearly defined before. By using a validation set, we dynamically change the duration of our generalized phase. If the average validation accuracy of all clients exceeds a validation threshold, we can stop the generalization phase for all clients and let them decide to continue to the next phase or leave. }
+    
+    \item{The procedure CB defines the details of training back layers that are private to the clients. These are the most crucial layers for personalization.  }
+
+\end{itemize}
+To the best of our knowledge, we are the first to incorporate seamless, personalized learning in a distributed split learning framework by introducing the concept of phased learning, where we optimize varying objectives of participating clients, ensuring their best interests. Existing works \cite{split_comp_fed, split_fed, split_main} train clients end-to-end for the generalized objective only, ignoring any specific requirements of a particular client for personalized models. On the other hand, our lightweight personalization phase decouples a client from the other clients and lets them use our framework to better their model's performance on their personal dataset independently.
+
+\begin{subalgorithms}
+
+\begin{breakablealgorithm}
+\caption{PFSL: Client Model Averaging Server}
+\label{alg:sec_cms}
+
+\begin{algorithmic}[1]
+
+\Procedure{MergeWeights\_Clients}{$W_i$, $V_i$}
+
+\noindent
+\colorbox{pink}{\parbox{8cm}{
+   \State \small{\textit{{/* Separate thread for each client connection */}}}
+   \State Wait(t)
+   \noindent
+
+    \State \small{\textit{ /* Assuming m connected clients after time t */}}
+    \State $ W_{avg} = (1/m) * \sum_{i=1}^{m} W_i $ 
+    
+    \For{$i=1$ to $m$} 
+        \State $W_i = W_{avg}$
+    \EndFor
+
+    \State \small{\textit{ /* Avg. validation accuracy of connected clients*/}}
+
+    \State $ V_{avg} = (1/m) * \sum_{i=1}^{m} V_i $ 
+
+    \If{$V_{avg} \geq V_{thres}$}
+        \State conv $=$ true
+    \EndIf
+    
+}}    
+
+    \State \textbf{Return $W_i$, conv}
+
+    
+\EndProcedure
+
+
+\end{algorithmic}
+\end{breakablealgorithm}
+
+
+
+\begin{breakablealgorithm}
+\caption{PFSL: Client}
+\label{alg:PSFL_client}
+
+\begin{algorithmic}[1]
+
+
+\Procedure{Init\_Client}{i}
+    \State Load pre-trained weights in $W_i^{CF}, W_i^{CB}$
+    \State Freeze all layers of $M_i^{CF}$
+\EndProcedure
+
+
+\Procedure{CF}{i, phase}
+    
+    \For {$b=1$ to B}
+       \State $A_{i,b}^{CF} = M_i^{CF}(b)$
+       \State \small{\textit{/* Wait below for ith server instance to return */}}
+        \State $val \gets offloading\_server.Forward(i,A_{i,b}^{CF}, phase)$ 
+    \EndFor 
+    \If{val}
+        \State \textbf{Return} true
+    \EndIf
+\EndProcedure
+
+\Procedure{CB}{i, $A_{i,b}^S$, phase}    
+
+\noindent
+\colorbox{pink}{\parbox{7cm}{    
+   \State $Y_{i,b}^{pred} \gets M_i^{CB}(A_{i,b}^S)$ 
+    \State Calculate $l_{i,b} = Loss(Y_{i,b}^{pred}, Y_{i,b}^{true})$
+   \State Calculate $\frac{dl_{i,b}}{dW_i^{CB}}$ and $\frac{dl_{i,b}}{dA_{i,b}^S}$ 
+   \State $W_i^{CB} = W_i^{CB} - \eta \frac{dl_{i,b}}{dW_i^{CB}}$
+   \If{phase is 1}
+        \State Calculate $\frac{dl_{i,b}}{dA_{i,b}^S}$
+        \State Send  $\frac{dl_{i,b}}{dA_{i,b}^S}$ to the offloading Server
+    \Else
+        \State \textbf{Return} true
+    \EndIf
+}}
+
+\EndProcedure
+
+
+\Procedure{Client}{i}
+
+    
+    \State Init\_Client(i)
+    \State Init\_offloading\_Server(i)
+     \State *** \textbf{Generalization Phase (1)} ***
+    \State Set phase = 1
+    \While{(e $=$ E) or conv}
+        \State val2 $\gets$ CF(i,phase)  \Comment{Wait for val2 $=$ true}
+        \State \small{\textit{/* Calculate validation set accuracy on a common validation set V*/}}
+        \State $V_i$ = val\_acc(V)
+        \If{val2}
+            \State offloading\_server.Server(i)  
+            \State $W_i^{CB}, conv = $MergeWeights\_Clients($W_i^{CB}$, $V_i$) 
+            \State val $\gets$ offloading\_server.Server(i, conv) \Comment{Wait here} \label{lst:line: server_complete}
+            \If{val}
+                \State Proceed
+            \EndIf 
+        \EndIf
+    \EndWhile
+
+    \State \small{\textit{/* Client i can leave now or continue */}}
+
+\noindent
+\colorbox{pink}{\parbox{8cm}{    
+    \State *** \textbf{Personalization Phase (2)} ***
+    \State Set phase = 2
+
+    \For {$e=1$ to $E_i$} 
+        \For{$i=1$ to $n$}
+            \State val $\gets$ CF(i, phase) \Comment{Wait here}
+            \If{val}
+                \State continue
+            \EndIf
+        \EndFor
+    \EndFor 
+}}
+
+    
+
+\EndProcedure
+
+\end{algorithmic}
+\end{breakablealgorithm}
+
+\hfill\vline\hfill
+
+\begin{breakablealgorithm}
+\caption{PFSL: Offloading Server}
+\label{alg:PSFL_server}
+\begin{algorithmic}[1]
+
+\Procedure{MergeWeights}{$W_i$}
+
+    \State \small{\textit{/* Wait below for time $t_1$ before proceeding */}}
+    \State Wait($t_1$)
+    \State \small{\textit{/* Assuming $k_1$ connected clients after time t1 */}}
+    \State $ W_{avg} = (1/k_1) * \sum_{i=1}^{k_1} W_i $ 
+    \For{$i=1$ to $k_1$} 
+        \State $W_i = W_{avg}$
+    \EndFor
+
+    \State \textbf{Return $W_i$}
+    
+    
+\EndProcedure
+
+
+\Procedure{Init\_Offloading\_Server}{i}
+        \State Load pre-trained weights in $W_i^{S}$
+        \State Freeze k layers from the start of $M_i^S$
+\EndProcedure
+
+
+\Procedure{Forward}{i,$A_{i,b}^{CF}$, phase}      
+
+
+   \State $A_{i,b}^S = M_{i}^{S}(A_{i,b}^{CF})$
+    \If{phase is 1}  
+        \State \small{\textit{/* Wait below for CB of ith client to return */}}
+        \State $\frac{dl_{i,b}}{dA_{i,b}^S} \gets client.CB(i,A_{i,b}^S, phase)$   
+        \State $ \frac{dl_{i,b}}{dW_{i,UFL}^S}  \gets $ Backprop($\frac{dl_{i,b}}{dA_{i,b}^S}$)  
+        \State $W_{i,UFL}^S = W_{i,UFL}^S - \eta \frac{dl_{i,b}}{dW_{i,UFL}^S}$ 
+        \State \textbf{Return} true
+    \Else
+        \State \small{\textit{/* Wait below for ith Client Back to return true */}}
+        \State $val = client.CB(i,A_{i,b}^S, phase)$ 
+        \If{val}
+            \State \textbf{Return} true
+        \EndIf
+    \EndIf
+\EndProcedure
+
+
+\Procedure{Server}{i}
+
+    \While{ (e $=$ E) or conv }
+        \State \small{\textit{/* Wait below for request from the client */}}
+        \State receive()
+        \State $W_i^{S} = $MergeWeights($W_i^{S}$)
+        \State \small{\textit{/* Wait below for request from the client */}}
+        \State conv $=$ receive(client, conv)
+        \State \textbf{Return} True to client
+    \EndWhile
+
+    \State Freeze all layers of $M_i^{S}$
+\EndProcedure
+
+
+\end{algorithmic}
+\end{breakablealgorithm}
+
+\end{subalgorithms}
+

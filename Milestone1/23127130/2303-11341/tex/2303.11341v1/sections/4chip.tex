@@ -1,0 +1,60 @@
+\section{On the chip}\label{s.onchip}
+In an NN training cluster, a large number of ML devices (each containing an ML chip, and connected to a ``host'' CPU chip) collaborate to simultaneously compute gradient updates.
+Large NNs have too many weights to fit in the high-bandwidth memory of a single ML device, so efficiently training a model requires splitting the model's weights
+into \emph{weight shards}, and placing a shard on each chip \cite{smith2022computation}.
+Each such shard is a vector of millions or billions of values.
+Shards are updated after each gradient step so that new gradients can always be computed with respect to the latest weight values.
+This means that at every timestep, the chip contains an up-to-date result from the training run, which we will show in Section \ref{s.datacenter} can serve as a type of checksum for the training run. \looseness=-1
+
+In this section, we will describe how it may be possible to have ML chips log the values of these weight-shard vectors, for Verifiers to retroactively inspect.
+We will assume the presence of certain hardware features\footnote{These include standard components of a hardware security module: firmware verification and attestation, firmware anti-rollback protection, and the ability to sign, authenticate, and encrypt messages.
+It also includs the ability for firmware to raise interrupts, read device memory, and (to efficiently hash weight snapshots) execute code on the chip's processor.}
+on the ML chip, though the details of the approach may need to be modified depending on the specifics of the device.
+For example, if the ML chip does not have the hardware required for remote firmware attestation, the chip may need to be permanently mated to a host CPU that does have such hardware, with the CPU then orchestrating the logging operations.
+
+A chip's weight-shards can be captured by \emph{snapshotting} the chip's high-bandwidth memory, which contains the weights.
+These snapshots must be saved at random times, as otherwise the Prover can swap out the true weights for a fake set of weights right before the scheduled logging.
+With some small probability at every clock cycle, the firmware present on each of the Prover's chips should raise an interrupt and briefly freeze the chip's operations.
+The chip should then send a copy of the weight shard regions $\omega$ to its host CPU to save in Prover-controlled long-term storage.
+The firmware also computes a hash $h = \hashfunction(\omega)$ of the relevant memory regions,
+\footnote{Such hashing can be done cheaply so long as the firmware can leverage the ML chip's processing power.}
+ using a publicly-agreed cryptographic hash function $\hashfunction$.
+This hash $h$ is then saved for the Verifier to find it later, either by having the firmware store it on-chip\footnote{Keeping the hash in local NVRAM is useful if the ML chip is in a secure data-center and is restricted from communication with the outside world, such as via air-gapping.} in nonvolatile memory writable only by the firmware, or by having the chip sign the hash with its private key and then sending it to a Verifier-trusted central server (which must return an acknowledgement of receipt before the chip can resume operating).
+Later, a Verifier can use $h$ to ask the Prover to provide them with the original weight shard $\omega$, as this is the only input to $\mathcal{H}$ whose hash matches $\hashfunction(\omega) = h$.
+
+More frequent snapshots mean more performance overhead for the Prover, especially if all the other synchronized chips in the training run must hang until the single chip's snapshotting concludes. 
+This freezing may become expensive if the rest of the training run must hang until it completes, especially if it's done by many chips.
+\footnote{A possible alternative would be to orchestrate less-frequent snapshots via a Verifier-trusted central server, though this would require a solution to the problem of the Prover swapping out the chip's weights before propagating the Verifier's signal.}
+The frequency of snapshots should be set as low as possible while still ensuring that used chips reliably contain a relevant weight snapshot if they were employed in a large-scale training run (see Eq. \eqref{eq:samplingrate}).
+
+Though the Prover may claim to have used firmware that logged snapshots as described above, the Verifier may not trust the Prover to have indeed used the appropriate logging firmware.
+For this reason, ML chips also need hardware mechanisms for enforcing that firmware be signed, and in turn, chipmakers will need to only sign firmware if it implements appropriate logging mechanisms.
+\footnote{A similar firmware mechanism was used by NVIDIA to enforce cryptocurrency mining limits on its GPUs \cite{gartenberg_2021}.}
+\footnote{Assuming that logging-free versions have been signed in the past, ML chips may need to include anti-rollback functionality \cite{krishnamurthy_odonoghue_bhatia}.
+The Prover might also delay updating the chip's firmware until shortly before inspection.
+To avoid this, ML chips may need to be made to remotely attest at an earlier time that their firmware has been updated.}
+\footnote{Additional challenges arise if the Verifier suspects that the chipmaker (who authors the firmware) and Prover have colluded to create firmware with backdoors that disable logging.
+Increasing Verifiers' confidence in the firmware may be an important consideration when verifying the operations of powerful nation-state Provers.}
+
+An obstacle to logging all weight-shards stored in ML device memory is that different ML training code will store a model's weights in different regions of memory.
+The chip's firmware must be able to determine which region of memory the weights are stored in.
+It may be possible to determine the weight-regions retroactively, by logging the regions of memory claimed to correspond to the weights, along with a copy of the compiled on-device code, which can then be matched to Prover-provided source code and its memory allocation pattern analyzed.
+\footnote{It may even be possible to modify standard libraries for generating chip-level ML training code (e.g., PyTorch-generated CUDA) to make their memory allocation processes more easily checkable by a subsequent Verifier.}
+\footnote{Revealing the Prover's source code to the Verifier directly may be unacceptable, demanding a more complicated verification procedure like that described in Section \ref{s.realworld}.}
+As a more invasive alternative, the Prover could proactively certify that its chip-level ML training code stores the weights in a specific memory region, by having its chip-code verified and then signed by a Verifier-trusted server before it can be executed by the firmware.
+\footnote{The iOS App Store uses a similar method to ensure Apple devices only run signed programs \cite{codesigning}.}
+
+%so they'd ideally happen less than once per week on average, but they must still be frequent enough for sampled chips to reliably contain weight snapshots from any large-scale training runs (see Eq. \ref{eq:samplingrate}).
+
+A more challenging problem is that ``ML chips'' are general-purpose hardware accelerators, and thus are frequently used for other high-performance computing workloads like climate modeling.
+There is no straightforward way to determine whether an ML chip is running a neural network training job (and therefore should log weight snapshots), or an unrelated type of job exempt from Verifier oversight.
+\footnote{Potential avenues for addressing this may include be requiring non-ML-training code compilers to also sign their results, or improving methods for distinguishing between ML training code and other code.
+If the types of code can be retroactively distinguished, then ML chips could all occasionally save memory/code snapshots, and then retroactively determine whether they belonged to a large-scale training run and thus deserve further scrutiny.
+One particularly straightforward to address case is ML inference: the model's in-memory weights could be snapshotted and retroactively verified in a similar way to that described in Section \ref{s.datacenter}.
+} 
+Relatedly, it would also be desirable to be able to exempt a fraction of chips from monitoring, for use in education or small-scale R\&D where the overhead of compliance would be prohibitive.
+\footnote{This might be addressable by having these ML chips' interconnect topology restricted to prevent their use in large-scale training.
+However, methods for Verifiers to retroactively confirm the topology that ML chips were configured in at a data-center are beyond the scope of this work.}
+Until we find methods for reliably distinguishing large-scale ML training, some fraction of ML chips must be exempted from using weight-logging firmware.
+The larger system's guarantee would then be that \emph{for those of the Provers' chips that the Prover allows the Verifier to monitor}, no rule-violating training occurred.
+The Verifier may then use their leverage to incentivize Provers into opting-in a larger and larger fraction of their chips over time.

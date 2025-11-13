@@ -1,0 +1,348 @@
+\section{Overview} \label{sec:motivation}
+In this section, we present an overview of \name via two examples. The first example provides a detailed description of the \lstinline{push} method
+for a singly-linked list, whereas the second shows a snippet from a real-world benchmark.
+
+    
+        
+        
+
+\begin{figure}
+    \centering
+        \begin{subfigure}[t]{0.3\textwidth}
+            \begin{lstlisting}[language=c, numbers=left, firstnumber=1, mathescape=true, basicstyle=\tiny\ttfamily]{Name}
+struct Node {
+    int data;
+    struct Node * next;
+};
+    
+struct List {
+    Node * head; 
+};
+
+void push(struct List* list, int new_data) {
+    struct Node* new_node = (struct Node*) malloc(sizeof(struct Node));
+    new_node->data  = new_data;
+    new_node->next = list->head;
+    list->head    = new_node;
+}
+            \end{lstlisting}
+            \caption{C code}
+            \label{fig:llist-constr-c}
+        \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.3\textwidth} %
+      \begin{lstlisting}[language=Rust, numbers=left, firstnumber=1, mathescape=true, basicstyle=\tiny\ttfamily]{Name}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Node {
+    pub data: i32,
+    pub next: *mut Node,
+}
+        
+#[repr(C)]
+#[derive(Copy, Clone)]      
+pub struct List {
+    pub head: *mut Node,
+} 
+      
+pub unsafe extern "C" fn push(mut list: *mut List, mut new_data: i32) {
+    let mut new_node = malloc(::std::mem::size_of::<Node>() as libc::c_ulong) as *mut Node;
+    (*new_node).data = new_data;
+    (*new_node).next = (*list).head;
+    (*list).head = new_node;
+}
+        \end{lstlisting}
+        \caption{\crust result}
+        \label{fig:llist-constr-rust}
+        \end{subfigure}
+        \hfill
+        \begin{subfigure}[t]{0.3\textwidth}
+        \begin{lstlisting}[language=Rust, numbers=left, firstnumber=1, mathescape=true, basicstyle=\tiny\ttfamily]{Name}
+#[repr(C)]
+pub struct Node {
+    pub data: i32,
+    pub next: Option<Box<Node>>,
+}
+        
+#[repr(C)]   
+pub struct List {
+    pub head: Option<Box<Node>>,
+}
+
+pub unsafe extern "C" fn push(mut list: Option<&mut List>, mut new_data: i32) {
+    let mut new_node = Some(Box::new(<Node as Default>::default()));
+    (*new_node.as_deref_mut().unwrap()).data = new_data;
+    (*new_node.as_deref_mut().unwrap()).next = (*list.as_deref_mut().unwrap()).head.take();
+    (*list.as_deref_mut().unwrap()).head = new_node;
+}
+        \end{lstlisting}
+        \caption{\name result}
+        \label{fig:llist-constr-crown}
+        \end{subfigure}
+        \caption{Pushing into a singly-linked list}
+        \label{fig:llist-constr}
+
+\end{figure}
+
+
+\subsection{Pushing into a singly-linked list}
+
+The C code of function \lstinline{push} in figure~\ref{fig:llist-constr-c} allocates a new node where it stores the data received as argument.  The new node subsequently becomes the head of \lstinline{list}. This code is translated by \lstinline{c2rust} to the Rust code in figure~\ref{fig:llist-constr-rust}. Notably, the \lstinline{c2rust} translation is syntax-based and
+simply changes all the C pointers to \lstinline{*mut} raw pointers. Given that
+dereferencing raw pointers is considered an unsafe operation in Rust (e.g. the dereferencing of \lstinline{new_node} at line 16 in figure~\ref{fig:llist-constr-rust}), method
+\lstinline{push} must be annotated with the \lstinline{unsafe} keyword.
+Additionally, \lstinline{c2rust} introduces two directives for the two struct definitions, 
+\lstinline{#[repr(C)]} and \lstinline{#[derive(Copy, Clone)]}. The former keeps the data
+layout the same as in C for possible interoperation, and the latter instructs that the corresponding type can only be duplicated through copying.
+
+
+
+
+While \lstinline{c2rust} uses raw pointers in the translation, the ownership scheme in figure~\ref{fig:llist-constr-rust} obeys the Rust ownership model, meaning that
+the raw pointers could be translated to safe ones.
+A pointer to a newly allocated node is assigned to \lstinline{new_node} at line 15. This allows us to infer that the ownership of the newly allocated node belongs to \lstinline{new_node}.
+Then, at line 18, the ownership is transferred from \lstinline{new_node} to \lstinline{(*list).head}.
+Additionally, if \lstinline{(*list).head} owns any memory object prior to line 17, then its ownership is transferred to
+\lstinline{(*new_node).next} at line 17.
+This ownership scheme corresponds to safe pointer use:
+(i) each memory object is associated with a unique owner and (ii) it is dropped 
+when its owner goes out of scope. As an illustration for (i), when the ownership of the newly allocated memory is transferred from \lstinline{new_node} to  \lstinline{(*list).head} at line 18,  \lstinline{(*list).head} becomes the unique owner, whereas \lstinline{new_node} is made invalid and it is no longer used.
+For (ii), given that argument \lstinline{list} of \lstinline{push} is an output parameter (i.e. a parameter that can be accessed from outside the function),
+we assume that it must be owning on exit from the method. 
+Thus, no memory object is dropped in the \lstinline{push} method, but rather returned to the caller.
+
+
+
+
+
+
+
+
+
+
+
+
+
+\name infers the ownership information of the code translated by \lstinline{c2rust}, and uses it to translate the code to safer Rust in figure~\ref{fig:llist-constr-crown}.
+As explained next, \name first retypes raw pointers into safe pointers based on the ownership information, and then rewrites their
+uses.
+
+{\bf Retyping pointers in \name.} %
+If a pointer owns a memory object at \emph{any point within its scope},
+\name retypes it into a \boxptr pointer. %
+For instance, in figure~\ref{fig:llist-constr-crown}, local variable \lstinline{new_node} is retyped to be \optionboxptr{Node} (safe pointer types are wrapped into Option to account for null pointer values).
+Variable \lstinline{new_node} is non-owning
+upon function entry, becomes owning at line 13 and ownership is transferred out again at line 16. 
+
+For struct fields, \name considers all the code in the scope of the struct declaration.
+If a struct field owns a memory object at \emph{any point within the scope of its struct declaration}, then it is retyped to \lstinline{Box}.
+In figure~\ref{fig:llist-constr-rust}, fields \lstinline{next} and \lstinline{head} are accessed via access paths \lstinline{(*new_node).next} and  \lstinline{(*list).head}, and given ownership at lines 17 and 18, respectively. Consequently, they are retyped to \lstinline{Box} at lines 4 and 9 in figure~\ref{fig:llist-constr-crown}, respectively. 
+
+
+A special case is that of output parameters, e.g. \lstinline{list} in our example. 
+For such parameters, although they may be owning, %
+\name retypes them to \lstinline{&mut} in order to enable borrowing.
+In \lstinline{push}, the input argument \lstinline{list} is retyped
+to \optionmutref{List}.
+
+
+
+
+
+
+{\bf Rewriting pointer uses in \name.} After retyping pointers,
+\name rewrites their uses. The rewrite process takes into consideration both their new type and the context in which they are being used.
+Due to the Rust semantics, the rewrite rules are slightly intricate (see section~\ref{sec:translation}).
+For instance, the dereference of \lstinline{new_node} at line 14 is rewritten
+to \lstinline{(*new_node).as_deref_mut().unwrap()} as it needs to be mutated and the optional part of the \boxptr needs to be unwrapped.
+Similarly, at line 15, \lstinline{(*list).head} is rewritten to be \lstinline{((*list.as_deref_mut()).unwrap()).head.take()} as the LHS
+of the assignment expects a \boxptr pointer. %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Freeing an argument list in bzip2} \label{sec:overview-loop}
+We next show the transformation of a real-world code snippet with a loop structure:
+a piece of code in \lstinline{bzip2} that frees argument lists.
+\begin{figure}
+    \centering
+        \begin{subfigure}[t]{0.3\textwidth}
+        \begin{lstlisting}[language=c, numbers=left, firstnumber=1, mathescape=true, basicstyle=\tiny\ttfamily]{Name}
+typedef
+struct zzzz {
+    Char        *name;
+    struct zzzz *link;
+}
+Cell;
+[...]
+Cell* aa = argList;
+while (aa != NULL) {
+    Cell* aa2 = aa->link;
+    if (aa->name)
+        free(aa->name);
+    free(aa);
+    aa = aa2;
+}
+        \end{lstlisting}
+        \caption{C definition}
+        \label{fig:cell-c}
+        \end{subfigure}
+    \hfill
+        \begin{subfigure}[t]{0.3\textwidth}
+        \begin{lstlisting}[language=Rust, numbers=left, firstnumber=1, mathescape=true, basicstyle=\tiny\ttfamily]{Name}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct zzzz {
+    pub name: *mut Char,
+    pub link: *mut zzzz,
+}
+pub type Cell = zzzz;
+[...]
+let mut aa = argList;
+while !aa.is_null() {
+    let mut aa2 = (*aa).link;
+    if !(*aa).name.is_null() {
+        free((*aa).name as *mut libc::c_void);
+    }
+    free(aa as *mut libc::c_void);
+    aa = aa2;
+}
+        \end{lstlisting}
+        \caption{\crust result}
+        \label{fig:cell-rust}
+        \end{subfigure}
+        \hfill
+        \begin{subfigure}[t]{0.3\textwidth}
+        \begin{lstlisting}[language=Rust, numbers=left, firstnumber=1, mathescape=true, basicstyle=\tiny\ttfamily]{Name}
+#[repr(C)]
+pub struct zzzz {
+    pub name: *mut /* owning */ Char,
+    pub link: Option<Box<zzzz>>,
+}
+pub type Cell = zzzz;
+[...]
+let mut aa = argList;
+while !aa.as_deref().is_none() {
+    let mut aa2 = (*aa.as_deref_mut().unwrap()).link.take();
+    if !(*aa.as_deref().unwrap()).name.is_null {
+        free((*aa.as_deref().unwrap()).name as *mut libc::c_void);
+    }
+    aa = aa2;
+}
+        \end{lstlisting}
+        \caption{\name result}
+        \label{fig:cell-crown}
+        \end{subfigure}
+        \caption{Freeing an argument list}
+        \label{fig:cell-declaration}
+\end{figure}
+\lstinline{bzip2} defines a singly-linked list like structure, \lstinline{Cell}, that holds a list of
+argument names. In figure~\ref{fig:cell-declaration}, we extract
+from the source code a snippet that frees the argument lists.
+Here, the local variable \lstinline{argList} is an already constructed argument list,
+and \lstinline{Char} is a type alias to C-style characters.
+
+
+\name accurately infers an ownership scheme for this snippet. Firstly, ownership of \lstinline{argList}
+is transferred to \lstinline{aa}, which is to be freed in the subsequent loop. Inside the loop, ownership of
+\lstinline{link} accessed from \lstinline{aa} is firstly transferred to \lstinline{aa2}, then
+ownership of \lstinline{name} accessed from \lstinline{aa} is released in a call to \lstinline{free}.
+After the loop, ownership of \lstinline{aa} is also released.
+Last of all, \lstinline{aa} regains ownership from \lstinline{aa2}. 
+
+{\bf Handling of loops.} For loops, \name only analyses their body once as that will already expose all the ownership information.
+For inductively defined data structures such as \lstinline{Cell}, while further unrolling of loop bodies explores the data structures deeper, it does not expose
+any new struct fields: pointer variables and pointer struct fields do not change ownership between loop iterations.
+Additionally,
+\name emits constraints that equate the ownership of all local pointers at 
+the loop entry and exit. 
+For example, the ownership statuses of \lstinline{aa} and \lstinline{aa2} 
+at loop entry are made equal with those at loop exit, and inferred to be owning and non-owning, respectively.
+
+{\bf Handling of null pointers.}
+It is a common C idiom for pointers to be checked against null after malloc or before
+free: \lstinline$if !p.is_null() { free(p); }$. This could be problematic since the then-branch and the else-branch
+ would have conflicting ownership statuses for \lstinline{p}. We adopt a similar solution as 
+\cite{DBLP:conf/pldi/HeineL03}: we insert an explicit null assignment in the null branch
+\lstinline$if  !p.is_null()  { free(p); } else { p = ptr::null_mut(); }$.
+As we treat null pointers
+as both owning and non-owning, the ownership of  \lstinline{p}
+will be dictated by the non-null branch, enabling \name to infer the correct ownership
+scheme.
+
+
+{\bf Translation.} With the above ownership scheme, \name performs the rewrites as in \autoref{fig:cell-crown} . Note that we do not attempt to rewrite \lstinline{name}
+since it is an array pointer (see \autoref{sec:discussion} for limitations).
+
+
+
+                
+                
+
+            
+            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

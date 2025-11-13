@@ -1,0 +1,145 @@
+\label{sec:unit_scaling}
+
+Based on our analysis of the scaling within typical models and the limitations of existing methods for managing scale, we present \textit{unit scaling}. A model is said to be unit-scaled if its activations, weight and gradients have approximately unit variance at initialisation.
+
+We achieve this by inserting scaling factors into the forward and backward passes. Like loss scaling, our modification of the backward pass still ensures correct gradients up to a constant multiplicative factor. However, unlike loss scaling, unit scaling determines these scales based on a set of rules for each operation, rather than a single hyperparameter to be found empirically, or via an adaptive algorithm.
+
+The scales chosen enable each operation to approximately preserve the variance of its inputs. This effect then propagates through the model, giving global unit-scaling. By concentrating values in approximately the centre of the exponent range at initialisation, we give tensors headroom to potentially shift during training without going out-of-range.
+
+Unit scaling does not address the issue of adapting scales during training. We anticipate that unit scale is sufficient to avoid numerical instability for many models, and observe this in all our experiments. We leave to further work a full investigation of where dynamic re-scaling is required, and how to integrate such a scheme into unit scaling.
+
+\subsection{A framework for scaling computational graphs}
+
+\paragraph{Computational Graphs}
+
+We take our model to be represented by the differentiable function $f_{\textrm{model}}(x_1, \dots, x_m)$, itself a composition of differentiable functions $f_1, \dots, f_n$.
+
+We can describe the structure of such a model using a directed acyclic graph (DAG) denoted $\mathcal{G} = (\mathcal{V}, \mathcal{E})$, with the property that the vertex $v_i \in \mathcal{V}$ corresponds to the function $f_i$ for each $i \in \{1, \dots n\}$, and where the vector-valued output of function $f_a$ used as an input to function $f_b$ is represented by the edge $(v_a, v_b) \in \mathcal{E}$.
+
+This kind of graph is commonly known as a \textit{computational graph}, with vertices as \textit{nodes} and their corresponding functions as \textit{ops}.
+
+\paragraph{Forward and backward graphs}
+
+We refer to the computational graph corresponding to $f_{\textrm{model}}$ as the \textit{forward graph}.
+
+In deep learning we typically apply reverse-mode automatic differentiation to the forward graph to create a second computational graph whose output nodes represent the partial derivatives of the model with respect to its inputs: $\pdv{f\textrm{model}}{x_i}, \; \forall i \in [1..m]$. We call this the \textit{backward graph}.
+
+The backward graph mirrors the structure of the forward graph, but with edge directions reversed. Thus each op $f$ in the forward graph corresponds to a new op $f_{\text{grad}}$ in the backward graph. This op computes the gradient of the model up to $f$ by calculating the product of the incoming gradient $g$ from the previous grad op and the partial derivatives of $f$ evaluated at its inputs: $f_{\text{grad}}(x_1, \dots, x_k, g)_j \triangleq g^{\top} \pdv{f}{x_j} (x_1, \dots, x_k), \; \forall j \in [1..k]$.
+
+\paragraph{Scaled ops}
+
+Given an op $f(x_1, \dots, x_k)$, we define the \textit{scaled op} $f^{*}(x_1, \dots, x_k, \alpha, \beta_1, \dots, \beta_k)$ with \textit{scaling factors} $\alpha, \beta_1, \dots, \beta_k \in \mathbb{R}^+$, such that:
+\begin{align*}
+    f^* &\triangleq \alpha \cdot f(x_1, \dots, x_k), \\
+    f^*_\text{grad}(x_1, .. x_k, g)_i &\triangleq \beta_i \cdot f_{\text{grad}}(x_1, .. x_k, g)_i, \forall i \in [1..k].
+\end{align*}
+
+\begin{proposition}
+\label{theorem:dynamics}
+For any scaled op, there is an equivalent unscaled op with the same training dynamics under a first-order optimiser.
+\end{proposition}
+
+We demonstrate this for SGD and Adam in Appendix~\ref{app:theory_dynamics}.
+
+\paragraph{Scaled computational graph}
+
+A scaled computational graph is one where every op $f$ in the forward graph is replaced by a scaled equivalent $f^*$, with the backward graph then generated to produce $f^*_\text{grad}$ for each $f_{\text{grad}}$, using any choice of scaling factors.
+
+If we can show that a scaled computational graph represents a scaled op, by Proposition~\ref{theorem:dynamics}, we are within a reparameterisation of regular training. Unfortunately, this is not true for scaled computational graphs in general, for example $h^*(x) \triangleq x + f^*(x, \alpha, \beta)$ is not a scaled op for some choices of the scaled op $f^*$ and when $\alpha \neq \beta$ (see Appendix~\ref{app:theory_scaled_graph_example}).
+
+\paragraph{Constraint-scaled computational graphs}
+
+We denote the set of edges in the forward graph that are cut-edges\footnote{A cut-edge is an edge in the equivalent undirected graph where the number of connected components increases upon its deletion.} as $\mathcal{C} \subseteq \mathcal{E}$. A constraint-scaled computational graph is a scaled computational graph where we restrict the scaling factors of ops that consume non-cut-edge variables in the following way: for any edge $e \not\in \mathcal{C}$, we require the op consuming the variable $x_e$ to have scaling factors $\alpha = \beta_e$.
+
+\begin{theorem}
+\label{theorem:constraintgraph}
+A constraint-scaled computational graph itself represents a scaled op.
+\end{theorem}
+Proven in Appendix~\ref{app:theory_constraint_graph}. This is sufficient to show that we've achieved the property we set out to: valid gradients, up to a constant multiplicative factor.
+
+\subsection{A scaling strategy for unit variance}
+\label{sec:scaling_strategy}
+
+\paragraph{Unit scaled computational graphs}
+
+We define a unit-scaled computational graph as an instance of a constraint-scaled computational graph, with scales selected via the following:
+\begin{enumerate}[itemsep=-0.2em]
+    \item Initially set aside any scale constraints, and calculate the scaling factors that give each op expected unit variance outputs (this process is covered below).
+    \item Now resolve any scale constraints by taking each constrained group $\{\alpha, \beta_1, \dots, \beta_l\}$ and selecting the geometric mean $(\alpha \cdot \beta_1 \cdot \ldots \cdot \beta_l)^{\frac{1}{l+1}}$.
+\end{enumerate}
+
+This compromise is necessary to ensure valid gradients, but diverges from strict unit scale. In practice though, we observe that the scales going into our geometric mean are often similar enough to preserve approximate unit variance.
+
+\paragraph{Selecting scaling factors}
+
+Assuming unit-scaled inputs to $y = f(x_i, \dots, x_k)$, derive the output scale $\sigma_Y$ and set the forward scaling factor $\alpha = 1/\sigma_Y$. Repeat this process for $x_i^{\prime} = f_{\textrm{grad}}(\dots)_i$, $\forall i \in [1..k]$, to obtain the gradient scale $\sigma_{x_i^\prime}$ and set the backward scaling factor $\beta_i = 1/\sigma_{x_i^\prime}$. (See Table~\ref{tab:ops_compendium} for the scaling factors of common ops.)
+
+Note that our assumption of unit-scaled inputs above is justified by inductive reasoning: we assume that a given op has unit-scaled inputs, which allows us to unit scale its outputs. In this way, unit scale propagates through the graph. The base-cases here are the model's initial inputs, corresponding to parameters and input data. As we initialise parameters to have unit scale, the only extra step we require is to normalise the input data.
+
+\begin{figure*}[tb]
+\begin{minipage}[t]{.325\textwidth}
+\codefig{projection.py}
+\end{minipage}\hfill
+\begin{minipage}[t]{.325\textwidth}
+\codefig{ffn.py}
+\end{minipage}\hfill
+\begin{minipage}[t]{.325\textwidth}
+\codefig{ffn_scaled.py}
+\end{minipage}
+\caption{PyTorch examples. \textit{Left:} Scaled projection op, which implicitly constrains $\beta_{X}$. \textit{Center vs Right:} Unscaled vs scaled Transformer FFN layers. Changes: a) initialise weights with unit scale, b) replace unscaled with scaled ops, c) replace residual add with interpolation according to $\tau$, moving the backward pass scale as in Section~\ref{sec:scaling_strategy}. See Figure~\ref{code:appendix} for the implementation of \texttt{scaled} and further ops.}
+\label{code:main}
+\end{figure*}
+
+\subsection{Weighted addition}
+\label{sec:weighted_addition}
+
+For the most part, the scale of tensors at initialisation in unscaled deep learning models does not play a critical role. A notable exception is when tensors of different scales are added, for example residual layers, losses and positional encodings.
+
+If we na\"ively convert these \texttt{add} ops to unit-scaled equivalents, they place equal weight on their inputs, which can be detrimental to performance. We propose using \texttt{weighted\_add} (Table~\ref{tab:ops_compendium}) to resolve this. This introduces new hyperparameters into the model, which can be chosen by design principle, empirically by sweep, or selected to match a reference model (see Appendix~\ref{app:aligning}).
+
+For residual layers, there are existing design principles in literature. We consider the following residual layers based on NF-ResNets \citep{Brock21}:
+
+\textit{default:} $x_{l+1} = x_l + f(x_l)$ (not suitable for unit scaling)
+
+\textit{fixed ($\tau$):} $x_{l+1} = \sqrt{1-\tau} \cdot x_l + \sqrt{\tau} \cdot f(x_l)$
+
+\textit{running-mean:} $x_{l+1} = \sqrt{l/(l\!+\!1)} \cdot x_l + \sqrt{1/(l\!+\!1)} \cdot f(x_l)$
+
+An issue with these weighting rules is that they may produce small gradient scales in the residual branch, which isn't a cut-edge so can't be independently rescaled. To resolve this, we perform a special-case rewrite to replace $\gamma \cdot f(x)$ with  $\mathrm{id}^*(f(\mathrm{id}^*(x, 1, \gamma)), \gamma, 1)$, where $\mathrm{id}^*(x, \alpha, \beta)$ is the scaled identity function. This maintains unit scale for the backward pass $f_{\mathrm{grad}}$, while preserving $\mathcal{G}$ as a scaled op.
+
+\subsection{Recipe}
+\label{sec:recipe}
+
+We now outline a high-level recipe for a unit-scaled model:
+\begin{enumerate}
+    \item Initialise non-bias parameters with unit variance.
+    \item Calculate scaling factors for all scaled ops.
+    \item Identify non-cut-edges, and constrain the ops consuming them to have $\alpha = \beta$ by taking the geometric mean.
+    \item Replace adds with weighted adds.
+\end{enumerate}
+
+Unconstrained scaling factors are as outlined in Appendix~\ref{app:ops_compendium}. Identifying cut-edges may sound challenging, but in practice is similar across models. The set of cut-edges commonly contains parameters and any encoder/decoder layers (anything before/after a stack of residual layers). After applying this recipe, training and inference proceed as usual.
+
+To align a unit-scaled model with an existing model, there are some additional considerations. We cover these in Appendix~\ref{app:aligning}. One notable difference is that unit scaled models have different effective optimiser step sizes across their parameters versus unscaled models.\footnote{For instance, a larger effective step size for bias parameters when using unit scaling. \textit{Effective step size} considers the effect of an optimiser update on model output, rather than parameters.} While this difference can be compensated by per-tensor step size modifiers, it means that the training dynamics may be different by default.
+
+\subsection{Example}
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=8.2cm]{figures/char_sweep.pdf}
+\caption{Character language modelling, showing validation bits per character over a wide range of models. Each point represents one combination of: \{Conv, RNN, Attention\}, \{Pre, Post, No norm\}, \{Fixed, Running-mean residual\}, \{SGD, Adam\}, \{2, 8 Layers\}. Each point is the best final value over a learning rate sweep.}
+\label{fig:char_sweep}
+\vspace{-1.2em}
+\end{figure}
+
+Using the unit scaling recipe, we first build a scaled op, and then a full scaled layer. Consider a scaled projection op with learnable weights:
+\begin{align*}
+    \textrm{matmul}^*(X,W) &= \alpha \cdot X \, W \\
+    \textrm{matmul}^*_{\textrm{grad}}(X,W,G)_1 &= \beta_1 \cdot G \, W^\top \\
+    \textrm{matmul}^*_{\textrm{grad}}(X,W,G)_2 &= \beta_2 \cdot X^\top G \,,
+\end{align*}
+for input $X \in \mathbb{R}^{b \times m}$, weight $W \in \mathbb{R}^{m \times n}$, output $\mathbb{R}^{b \times n}$ and incoming gradients $G \in \mathbb{R}^{b \times n}$.
+
+Assuming large $b$, $m$, $n$, the analysis of Appendix~\ref{app:scaling_example} gives unconstrained scaling factors $\alpha = m^{-\frac{1}{2}}$, $\beta_1 = n^{-\frac{1}{2}}$, $\beta_2 = b^{-\frac{1}{2}}$. Typically, the edge connecting the weights $W$ is a cut-edge, while the edge connecting in the inputs $X$ is not. Given that assumption, we constrain $\alpha = \beta_1$, satisfied by setting both to the geometric mean of the unconstrained values: $\alpha = \beta_1 = (m \cdot n)^{-\frac{1}{4}}$. We leave $\beta_2$ unchanged.
+
+We show code for the above in Figure~\ref{code:main}, which also gives a scaled layer for the Transformer FFN of Figure~\ref{fig:illustration}.

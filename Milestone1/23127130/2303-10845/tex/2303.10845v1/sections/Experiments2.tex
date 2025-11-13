@@ -1,0 +1,992 @@
+\documentclass[../main.tex]{subfiles}
+% \usepackage{CJKutf8}
+% \usepackage{threeparttable}
+
+\begin{document}
+
+\subsection{Pretraining}
+
+\subsubsection{Model Configuration}
+
+%\begin{table}[]
+%\begin{tabular}{llllllll}
+%Models      & \#Parameters & \#Heads (N\_h) & \#Layers (L) & Hidden size (d) & FFN size (d\_ff) & \#RRE layers (L\_m) & \#Experts per RRE layer (E) \\
+%Pangu-Sigma & 1085B        & 40             & 40           & 5120            & 20480            & 8                   & 640                        
+%\end{tabular}
+%\end{table}
+
+We use the following \MODEL\ configuration for this work. The configuration mostly follows the 13B version of PanGu-$\alpha$ model. In this way, we can effective inherit the knowledge already learned by PanGu-$\alpha$. 
+
+\begin{table}[ht]
+\caption{Model Configuration}
+\centering
+\begin{tabular}{lllllll}
+\hline
+\#Layers (N+M) & \#Heads (N\_h) & Hidden size (d) & FFN size (d\_ff) & \#RRE layers (N) & \#Experts (K) & \# Groups (G)                        \\ \hline
+ 40       & 40 & 5120 & 20480 & 8 & 640 & 40                                            \\ \hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Pretraining settings}
+
+We use a cluster of 64 nodes, with each node equipped with 8 Ascend 910 accelerators and MindSpore framework. High performance collective communication library Huawei Collective Communication Library (HCCL) is used to facilitate high speed high bandwidth communication for distributed training. 
+
+There are two stages in \MODEL\ pretraining process. In the first stage, we activate four main domains' experts to consume data from all the four main domains including bilingual, Chinese, English and codes. In the second stage, we let all the experts to consume all domain's data. Figure~\ref{fig:sigma_domain_to_expert}  shows how 640 experts are assigned to 40 domain groups. We train \MODEL\ with global batch size of 512 with sequence length of 1024 for each sample. The pretraining lasts about 100 days. Figure~\ref{fig:loss} shows the loss curve of \MODEL\ pretraining. 
+
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=0.9\textwidth]{sections/fig/xinfan/pangu-sigma-loss.PNG}
+    \caption{Pretraining Loss}
+    \label{fig:loss}
+\end{figure*}
+
+
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=1\textwidth]{sections/fig/zhoupingyi/pangu-sigma-domain-to-experts.pdf}
+    \caption{Mapping between domains and experts in \MODEL\ .The data from particular domains are routed to a group of experts lying across different devices. The color of experts distinguish their corresponding domains. There are ten experts from different domain on each device.}
+    \label{fig:sigma_domain_to_expert}
+\end{figure*}
+
+% The sparse architecture with conditionally activated experts improves training throughput. For each MOE layer, ten experts are placed on each node, and only one expert is activated and trained in each step of training.  This means that each MOE layer has a total of 640 experts at the time of training, but only 64 experts are activated and updated. The 64 experts, who were simultaneously activated and trained, were assigned to four domains. Figure~\ref{fig:sigma_domain_to_expert}  shows how 640 experts are assigned to 40 domains, with experts both activated and updated in the same color.
+
+% To demonstrate the capability of \MODEL\ architecture, we first select four focus domains: Bilingual ( Chinese and English), Chinese, English and Codes. These domains differ in language， style and pragmatics. During training, a global batch consist of data comes from all 4 domains, and each domain contribute one quarter of the data. In the first phase, 64 experts in the four focus domains were well trained. In the second stage, one fully trained expert in each node is copied to the other nine experts as initialization. For the remaining 36 domains, four domains were trained simultaneously at a time, all of which were trained in turn. This configuration ensures that the model learn from all domain and can also accelerate the convergence progress. 
+
+Mixed-Precision training is enabled to speedup the training process. Apart from vocabulary embedding layer, loss function, Softmax operation, LayerNorm layers and Adam optimizer, all other operations adopt FP16 format. 
+
+
+Failure recovery is very important for long term large scale distributed training, especially for huge models like \MODEL\ . Therefore, a rigorous process of saving checkpoints and restarting from previous checkpoints is indispensable.  For a trillion-parameter model, one set of checkpoint storing all parameters and optimizer states for a single iteration already has a jaw-dropping 10TB size. Uploading checkpoints of such size to our long term object store is a challenging task, since uploading all checkpoints at the same time quickly saturates the network bandwidth and inevitably lead to training failure. To solve this issue, we launch the upload process in a round-robin style and limit the number of the simultaneously running process. This solution proves to be effective and stable for our entire training process. 
+
+
+\subsubsection{Hybrid Hyper-parameter ADAM Optimizer}
+
+We design a Hybrid Hyper-parameter ADAM Optimizer to provides further stability for \MODEL\ during the pretraining phase.
+
+To better understand \MODEL\  training process, we inspected the statistics of training states and find out that the gradients of RRE layers are much smaller than a non-sparse model. To tackle such a  problem, we first set a very small $\epsilon_1$ for all model parameters, then we go one step further and set an even smaller $\epsilon_2$ only for the RRE layers, since compared to the dense layers, sparse layers received smaller effective batch due to its conditionally-activated nature. Specifically, we set hybrid hyper-parameters for ADAM optimizer below:
+
+% As described in previous chapters, our architecture design favours simplicity and stability over complexity and configurability. However, even with this design, training a trillion parameter sparse network is difficult. Careful calibration of hyper-parameters are vital for a stable training process. 
+
+%Most research put emphasis on the tuning of the hyper-parameter $\beta_1$ and $\beta_2$ of Adam optimizer but leaves the hyper-parameter $\epsilon$ untouched. However, we found out that choosing a reasonable $\epsilon$ is also important. Initially, we follow the literature and set the $\epsilon$ to the default value 1e-8. 1e-8 turned out to be too big comparing to the first and second moments estimates, and the resulted term, which is to adjust the parameters, is effectively zero all the time, hence the model learned nothing. We test a few different epsilon and end up with 1e-18, which allows the model to learn relatively fast while stabilize the model at the same time.
+
+%In the early stage of training, we inspected the model internal statistics to understand the training dynamics. By comparing the first and second moments estimates among different groups of parameters, We discovered that both estimates for MoE parameters are only about 1/100 or lower of its counterparts in the non-MoE parameters. Though puzzling at first, this finding is actually consistent with the way of updating the parameters, Every token causes the non-MoE parameters to update, but only some tokens causes the MoE parameters to update. Such updates accumulates and finally lead to difference between the moment estimates of MoE and non-MoE parameters. This effect will lead to slower update for the MoE parameters. To counter this effect, we improve the Adam optimizer so that the epsilon can be independently set for MoE and non-MOE parameters. For our training, we set epsilon to 1e-20 for MoE parameters, and 1e-18 for non-MoE parameters.
+
+\begin{table}[ht]
+\caption{Hyper-parameters of \MODEL\ training.}
+\centering
+\begin{tabular}{lllllll}
+\hline
+$\beta_1$          & $\beta_2$ & $\epsilon_1$ & $\epsilon_2$ & end lr & warmup steps & decay steps                            \\ \hline
+
+0.8          & 0.95       & 1e-8 & 1e-20 & 2e-5 & 5000 & 180000                                             \\ \hline
+\end{tabular}
+\end{table}
+
+
+%The hyper-parameter $\epsilon$ plays an important and intricate role in sparse activation network. We will perform a more systematic study for optimization problem of sparse expert network in the future.
+
+
+
+\subsection{Inheritance Learning}
+
+To improve the training efficiency, accelerate model convergence, and reduce carbon emissions during training, the \MODEL\ model inherits the capabilities of the existing model, and then continues to train in four domains simultaneously. In this paper, \MODEL\ inherits the PanGu-$\alpha$ 13B version.  
+
+\subsubsection{Extending vocabulary}
+
+Because PanGu-$\alpha$’s vocabulary is mainly designed to support Chinese texts, we extend its vocabulary to support both Chinese and English texts. \MODEL uses Byte-level BPE~\cite{2020Neural} instead of BPE adopted by PanGu-$\alpha$, the vocabulary is formulated by adding T5~\cite{2020Exploring} small vocabulary to PanGu-$\alpha$’s vocabulary, then remove repeated sub-words. Some special tokens are added to the vocab. These special tokens are classified into two types: control tokens (e,g., <python>, <Java>, <CN>, <EN>) and spaces tokens for representing whitespace runs of different lengths. 
+
+\subsubsection{Inheriting and Extending model parameters}
+
+In order to inherit the capability of the existing model as much as possible, \MODEL 's word embedding and all experts in RRE layer are initialized with the corresponding embedding and feed-forward layers from PanGu-$\alpha$, and other parameters are initialized with corresponding parameters. For example, to initialize the word embedding parameters of \MODEL\ , we first create a word embeddings $W_{s} \in R^{v_{s} \times h}$, if a sub-word of \MODEL\ exists in PanGu-$\alpha$, its word embedding is initialized with those of PanGu-$\alpha$. And if not, they are randomly initialized with a standard normal distribution. For the experts parameters in the RRE layer of \MODEL\ , each expert is initialized with the FFN parameters of the corresponding layer in the PanGu-$\alpha$ model.
+
+In order to reduce the mutual interference between English and code domain in the training process, we make the code domain and other domain updated in different embedding slots. Therefore, we further extend the \MODEL\ word embedding $W_{s} \in R^{v_{s} \times h}$ to $W_{s^{'}} \in R^{v_{s^{'}} \times h}, \left ( v_{s^{'}} = 2 \times v_{s} \right ) $. The slots $\left [ v_{s}, 2 \times v_{s}  \right ] $ of word embeddings $W_{s^{'}}$ belongs to code domain and the slots $\left [ 0, v_{s} \right ]$ belongs other domain.  Figure~\ref{fig:alpha_to_sigma}. shows how \MODEL\ inherits the PanGu-$\alpha$'s parameters and extends it.
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=0.95\textwidth]{sections/fig/zhoupingyi/alpha_to_sigma.pdf}
+    \caption{The process of inheriting parameters of PanGu-$\alpha$ and extending to PanGu-$\Sigma$.}
+    \label{fig:alpha_to_sigma}
+\end{figure*}
+
+
+\subsubsection{Extracting domain specific sub-model}
+
+It is expensive to deploy a trillion parameters model like \MODEL\ directly. In order to transfer abilities of \MODEL\ to various downstream tasks and reduce the consumption of serving resources, we propose a loss-free expert pruning method by leveraging the RRE design. Domain models can be separately extracted for further fine-tuning, evaluation and deployment. Figure~\ref{fig:extract_domain_model} illustrates how to extract the the domain specific sub-model from \MODEL\ . For the word embedding, the word embedding slots which belongs to the domain are extracted. For the experts in the RRE layers, the experts allocated for the specific domain are extracted. Other parameters of \MODEL\ are copied seamlessly.
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=0.95\textwidth]{sections/fig/zhoupingyi/sigma-domain-model.pdf}
+    \caption{The process of extracting domain (e.g., Bilingual) model parameters.}
+    \label{fig:extract_domain_model}
+\end{figure*}
+
+
+
+\subsection{Chinese Downstream Tasks Evaluation}
+\subsubsection{Task Description}
+
+Following PanGu-$\alpha$, we evaluate \MODEL\ at zero-shot settings on 16 datasets of six tasks. 
+% For each dataset, we evaluate the model on the test sets when publicly available, otherwise on the validation sets. 
+For each dataset, if the test set is available, we use it to evaluate the model. Otherwise, we use the validation set.
+The following describes each task in turn.
+
+\textbf{Machine reading comprehension.} This task contains four datasets: CMRC2018 \cite{cui-emnlp2019-cmrc2018}, DRCD \cite{https://doi.org/10.48550/arxiv.1806.00920}, DuReader \cite{he-etal-2018-dureader}, and C3 \cite{sun2019investigating}. 
+% The first three datasets CMRC2018, DRCD, and DuReader are all span extraction tasks. Given a passage and a question, the goal is to extract a text span from the passage as the answer to the question. The evaluation metrics, including F1, exact match (EM), and ROUGE-1, are used to evaluate the similarity between the extracted text span and the ground-truth answer. We formulate the text span extraction task into a text generation task, using the model to generate the answer based on given passage and question. And the same evaluation metrics are used to evaluate the similarity between the generated answer and the ground-truth answer. 
+The first three datasets CMRC2018, DRCD, and DuReader are span extraction tasks. We formulate each of them into a text generation task, using the model to generate answers based on given passages and questions. And we use F1, exact match (EM), and ROUGE-1 as the evaluation metrics.
+In addition, for the DuReader dataset, which is aligned with PanGu-$\alpha$, only the Zhidao subset is selected to evaluate the model performance.
+The last dataset, C3, is a multi-choice reading comprehension task. Given a passage, a question, and multiple candidate answers, the purpose is to select one of the candidate answers as the predicted answer to the question.
+
+\textbf{Natural language inference.} There are two datasets: OCNLI \cite{ocnli} and CMNLI \cite{xu-etal-2020-clue}. Given two sentences, one as a premise and the other as a hypothesis, the aim is to determine whether the relation between the premise and the hypothesis is entailment, neutral, or contradiction. We convert this task into a three-class classification problem to solve.
+
+\textbf{Text classification.} We use TNEWS and IFLYTEK \cite{xu-etal-2020-clue} datasets. The total number of categories for TNEWS and IFLYTEK is 15 and 119, respectively. Following PanGu-$\alpha$, for each instance, we randomly sample three negative categories plus one ground-truth category to form a new set of candidate categories, then simplify this task into a four-class classification task for processing.
+
+\textbf{Semantic similarity.} We use two datasets: AFQMC and CSL \cite{xu-etal-2020-clue}. AFQMC aims to determine whether two sentences are semantically the same or different. Given an abstract of a paper and a set of keywords, the goal of CSL is to judge whether the set of keywords contains pseudo keywords according to the abstract. Hence we convert each of them into a two-class classification problem to solve.
+
+\textbf{Winograd schema challenge.} This task contains only the CLUEWSC2020 \cite{xu-etal-2020-clue} dataset. CLUEWSC2020 is a coreference resolution task. Given a sentence, together with a pronoun and a noun in the sentence, the aim is to determine whether the pronoun refers to the noun.
+We merge multiple instances with the same sentence and the same pronoun into a single instance that contains a sentence, a pronoun, and multiple nouns. Then the goal becomes to select one of the multiple nouns as the object the pronoun refers to.
+
+\textbf{Cloze and completion.} There are five datasets: CHID \cite{zheng-etal-2019-chid}, CMRC2019 \cite{cui-etal-2020-cmrc2019}, PD \cite{cui-etal-2016-consensus}, CFT \cite{cui-etal-2016-consensus}, and CMRC2017 \cite{cmrc2017-dataset}.
+Both CHID and CMRC2019 are multi-choice completion tasks. Given a passage with multiple blanks and multiple candidate answers, for each blank in the passage, the goal is to select the appropriate one from all the candidate answers to fill in the blank.
+For CHID, we use the Hungarian algorithm to post-process the model prediction results to ensure that different blanks in the same passage are filled in different idioms.
+On the CMRC2019 dataset, following ERNIE 3.0 Titan ~\cite{ERNIE3TITAN}, for each blank, we randomly sample three negative candidate answers plus one ground-truth answer to form a new set of candidate answers, and moreover, beam search is also used in the model prediction process to find an optimal combination of answers for multiple blanks in a passage.
+CMRC2017 contains two subsets, one for completion and the other for reading comprehension. As with PanGu-$\alpha$, we also evaluate \MODEL\ only on the completion subset. For CMRC2017, PD and CFT, given a passage with a blank, the goal is to fill in the blank with the appropriate words. Aligned with ERNIE 3.0 Titan, we also convert PD, CFT and CMRC2017 into multi-choice completion tasks, and the choices are all words that appear in the passage where the blank is located.
+
+\subsubsection{Evaluation Details}
+
+Each dataset of all Chinese downstream tasks can be evaluated using either a generation-based method or a scoring-based method.
+We use the generation-based method to evaluate CMRC2018, DRCD, DuReader, and the scoring-based method to evaluate other datasets.
+For each instance, a text sequence is obtained by filling it into a manually designed template, and then the text sequence is fed into \MODEL\ for prediction to get the result. The templates we used for all datasets are shown in Table \ref{pattern_cn}.
+
+\begin{CJK*}{UTF8}{gbsn}
+\begin{table}[ht]
+\caption{\label{pattern_cn}
+The templates for all datasets. "/" indicates that the corresponding dataset does not contain answer choices.
+}
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tabular}{|l|l|l|}
+\hline
+Dataset     & Template & Answer Choices  \\ \hline
+CMRC2018    & 阅读文章：\{Passage\}\textbackslash n根据上文，回答如下问题：\{Question\}\textbackslash n答：  &   /   \\
+DRCD        & 阅读文章：\{Passage\}\textbackslash n根据上文，回答如下问题：\{Question\}\textbackslash n答：   & /       \\
+DuReader    & 阅读文章：\{Passage\}\textbackslash n根据上文，回答如下问题：\{Question\}\textbackslash n答：  & /          \\
+C3          & 问：\{Question\}\textbackslash n答：\{Answer\}\textbackslash n该答案来自对话：\{Passage\}   & Answer $\in$ All options  \\ \hline
+CMNLI       & \{Premise\}？\{Answer\}，\{Hypothesis\}   & Answer $\in$ \{对, 错, 或许\}                \\
+OCNLI       & \{Premise\}？\{Answer\}，\{Hypothesis\}   & Answer $\in$ \{对, 错, 或许\}                   \\ \hline
+TNEWS       & 这是关于\{Answer\}的文章：\{Passage\}   & Answer $\in$ All categories                     \\
+IFLYTEK     & 这是关于\{Answer\}的应用程序：\{Passage\}   & Answer $\in$ All categories                      \\ \hline
+AFQMC       & \{Sentence1\}。\{Sentence2\}。上面两个句子的语义是\{Answer\}   & Answer $\in$ \{不同的, 相同的\}                      \\
+CSL         & 摘要：\{Abstract\} \{Answer\}的关键词：\{Keywords\}   & Answer $\in$ \{含有错误, 全部正确\}          \\ \hline
+CLUEWSC2020 & \{Text to the left of the pronoun\}\{Answer\}\{Text to the right of the pronoun\}   & Answer $\in$ All mentions        \\ \hline
+CHID        & \{Text to the left of the blank\}\{Answer\}\{Text to the right of the blank\}   & Answer $\in$ All candidates                            \\
+PD          & \{Text to the left of the blank\}\{Answer\}\{Text to the right of the blank\}  & Answer $\in$ All words in the text                       \\
+CFT         & \{Text to the left of the blank\}\{Answer\}\{Text to the right of the blank\}  & Answer $\in$ All words in the text                        \\
+CMRC2017    & \{Text to the left of the blank\}\{Answer\}\{Text to the right of the blank\}  & Answer $\in$ All words in the text                        \\
+CMRC2019    & \{Text to the left of the blank\}\{Answer\}\{Text to the right of the blank\}   & Answer $\in$ All candidates                  \\ \hline
+\end{tabular}
+}
+\end{table}
+\end{CJK*}
+
+\textbf{Generation-based evaluation method}
+
+For each instance to be predicted, it is filled into the corresponding template to obtain a text sequence. After that, the text sequence is used as the input to \MODEL\ to generate the answer. We use a greedy decoding strategy to generate the answer.
+
+\textbf{Scoring-based evaluation method}
+
+Each instance to be predicted contains multiple candidate answers. For each candidate answer, a text sequence is obtained by filling the candidate answer together with the sample into the corresponding template, and the perplexity of the text sequence is calculated by \MODEL. Finally, the candidate answer corresponding to the text sequence with the smallest perplexity is selected as the predicted answer for the instance to be predicted.
+
+\subsubsection{Result}
+
+We choose PanGu-$\alpha$ and ERNIE 3.0 Titan as the baseline for comparison. The performance of each Chinese downstream task is shown in Table \ref{cn_zeroshot}. 
+% Compared to the strongest 260 billion parameters ERNIE 3.0 Titan, \MODEL\ surpassed on 11 out of 16 datasets, with an average score of 3.96 points higher on all datasets.
+Compared to ERNIE 3.0 Titan with 260 billion parameters, \MODEL\ surpassed on 11 out of 16 datasets, with an average score of 3.96 points higher on all datasets.
+
+\begin{table}[ht]
+\caption{\label{cn_zeroshot}
+Zero-shot results of Chinese downstream tasks. Compared to ERNIE 3.0 Titan, \MODEL\ surpassed on 11 out of 16 datasets, with an average score of 3.96 points higher on all datasets.
+}
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tabular}{|c|c|c|c|c|c|c|}
+\hline
+Task Type                                      & Dataset     & Split & Metric     & PanGu-$\alpha$ 13B  & ERNIE 3.0 Titan    & \textbf{PanGu-$\Sigma$}               \\ \hline
+\multirow{4}{*}{Reading comprehension}         & CMRC2018    & dev   & avg(EM/F1) & 10.37(1.46/19.28)   & 30.41(\textbf{16.62}/44.20) &  \textbf{31.23}(15.97/\textbf{46.49}) \\
+                                               & DRCD        & dev   & avg(EM/F1) & 5.61(0.66/10.55)    & 29.46(21.08/37.83) &  \textbf{37.78(27.70/47.86)}          \\
+                                               & DuReader    & dev   & ROUGE-1    & 24.46               & 32.13              &  \textbf{32.20}                       \\
+                                               & C3          & dev   & Acc        & 54.47               & 54.85              &  \textbf{56.93}                       \\ \hline
+\multirow{2}{*}{Natural language inference}    & CMNLI       & dev   & Acc        & 48.44               & \textbf{51.70}     &  51.14                                \\
+                                               & OCNLI       & dev   & Acc        & 41.53               & 44.61              &  \textbf{45.97}                       \\ \hline
+\multirow{2}{*}{Text classification}           & TNEWS       & dev   & Acc        & 60.26               & \textbf{72.60}     &  69.19                                \\
+                                               & IFLYTEK     & dev   & Acc        & 73.80               & \textbf{79.84}     &  75.72                                \\ \hline
+\multirow{2}{*}{Semantic similarity}           & AFQMC       & dev   & Acc        & 65.76               & \textbf{68.99}     &  68.49                                \\
+                                               & CSL         & dev   & Acc        & 49.30               & 55.80              &  \textbf{56.93}                       \\ \hline
+Winograd Schema Challenge                      & CLUEWSC2020 & dev   & Acc        & 75.00               & 81.08              &  \textbf{85.20}                       \\ \hline
+\multirow{5}{*}{Cloze and completion}          & CHID        & dev   & Acc        & 70.64               & \textbf{86.21}     &  81.01                                \\
+                                               & PD          & test  & Acc        & 43.86               & 67.06              &  \textbf{77.80}                       \\
+                                               & CFT         & test  & Acc        & 46.60               & 66.14              &  \textbf{86.84}                       \\
+                                               & CMRC2017    & test  & Acc        & 38.90               & 74.63              &  \textbf{83.57}                       \\
+                                               & CMRC2019    & dev   & Acc        & 68.19               & 75.00              &  \textbf{93.87}                       \\ \hline
+/                                              & Overall     & /     & Average    & 48.57               & 60.66              &  \textbf{64.62}                       \\ \hline
+\end{tabular}
+}
+\end{table}
+
+
+
+\subsection{Chinese Dialogue Generation}
+
+To verify the ability of \MODEL\ on Chinese dialogue generation, in this subsection, we compare with several high performance Chinese dialogue systems, including CDialGPT~\cite{DBLP:conf/nlpcc/WangKZHJZH20}, EVA~\cite{DBLP:journals/corr/abs-2108-01547}, EVA 2.0~\cite{DBLP:journals/corr/abs-2203-09313} and PanGu-Bot~\cite{DBLP:journals/corr/abs-2203-17090}. The \MODEL\ model is fine-tuned on about 51.5M dataset including social media data, knowledge-grounding dialogue and question answering data, which is consistent with PanGu-Bot.
+\MODEL\ consistently outperforms baselines on self-chat, topic-grounded dialogue generation and question answering in terms of automatic evaluation and human evaluation.
+
+% topic dialogue, given long dialogue history to clarify topic information
+\subsubsection{Baselines}
+
+CDialGPT: A GPT-based Chinese dialogue model trained on a large-scale cleaned Chinese conversation dataset \textit{LCCC}, which contains about 104M parameters.
+
+EVA: An encoder-decoder-based Chinese dialogue model trained on WDC-Dialog corpus including 1.4B Chinese context-response pairs. This model contains about 2.8B parameters.
+
+EVA2.0: An improved version of EVA. A well designed data processing pipeline is explored to construct training data based on WDC-Dialog corpus, and various decoding strategies are utilized to improve generation. Furthermore, EVA2.0 designs better model architecture for open-domain Chinese dialogue, including attention scale strategy, deeper decoding network, and role embedding.
+
+PanGu-Bot: The PanGu-$\alpha$~\cite{Zeng2021PanGuLA} based Chinese dialogue models trained on collected 51.5M dialog sessions, which contain two versions of 350M and 2.6B parameters, respectively. To improve training efficiency, multiple dialogue sessions are concatenated with a special token, and resetting strategies on position ids and attention masks are utilized to distinguish different samples.
+
+% Multiple dialogue sessions   
+
+% \subsection{Set up}
+
+% The nuclear sampling and repetition penalty strategies are applied during decoding. 
+
+% We use top-5 nuclear sampling (Holtzman et al.,
+% 2019) and a repetition penalty
+% (Gu et al., 2022) set to 1.2 to penalize generating
+% repetitive n-grams in the dialogue history
+
+
+%1024 length \n <eot>
+
+\subsubsection{Self-chat evaluation}
+
+Self-chat is a common method for evaluating the quality of dialogue systems. During the evaluation, the conversation goes based on given prompts, with dialogue system playing both roles of user and bot. In this subsection, we provide 50 prompts to trigger multi-turns conversation with each containing 9 turns. We use top-5 random sampling~\cite{DBLP:conf/acl/LewisDF18} with repetition penalty~\cite{DBLP:journals/corr/abs-2203-09313} set to 1.2 during decoding. Three human annotators are asked to judge whether each turn conforms to the following six criteria: 1) \textit{Sensibility} evaluates the semantic-consistency with the context of response; 2) \textit{Speciﬁcity} evaluates the specificity and informativeness of response; 3) \textit{Interestingness} evaluates the interest of response and the ability to catch people's attention; 4) \textit{SSI} averages values of \textit{Sensibility}, \textit{Speciﬁcity} and \textit{Interestingness}; 5) \textit{Hallucination} evaluates factual mistakes contained in response; 6) \textit{Safety} evaluates the avoidance of unsafe behavior of dialogue system, e.g. response with social bias, toxicity, harmfulness and offensives.
+
+
+% e use top-5 nuclear sampling
+
+
+\begin{table*}[!htb]
+\caption{\label{selfchatevaluation} The self-chat human evaluation results
+}
+\begin{center}
+\begin{tabular}{|c|c|c|c|c|c|c|}\hline
+ \cline{1-7}
+    Models & \textit{Sensibility}&  \textit{Specificity}  & \textit{Interestingness} &  \textit{SSI}  &\textit{Hallucination} &\textit{Safety} \\ \hline \hline
+ CDial-GPT & 0.607 &  0.531 & 0.414  & 0.517  &0.098 & 0.964  \\
+ EVA & 0.557 & 0.687 & 0.453 & 0.566 &0.152 & 0.963  \\
+ EVA2.0 & 0.872 & 0.710 & 0.516  & 0.699 & 0.114 & 0.991   \\
+ PanGu-Bot 350M & 0.891  & 0.697 & 0.553  &  0.714  & 0.101 &  0.992\\
+ PanGu-Bot 2.6B & 0.907 & 0.714 & 0.543   & 0.721  & 0.093 & 0.993 \\
+  \textbf{PanGu-$\Sigma$} & \textbf{0.927}  &  \textbf{0.786}  & \textbf{0.561}  & \textbf{0.758}  &  \textbf{0.090} & \textbf{0.993}	 \\
+  \hline
+ \end{tabular}
+\end{center}
+\end{table*}
+
+As shown in Table~\ref{selfchatevaluation}, in self-chat evaluation, the overall response quality of PanGu-$\Sigma$ is much higher than the baselines, especially in terms of \textit{Specificity}. This is because PanGu-$\Sigma$ inherits the 13B version of PanGu-$\alpha$ model, and the sub-model for dialogue generation contains about 38B parameters, which can memorize a wealth of knowledge. The improvements in terms of \textit{Hallucination} and \textit{Safety} indicate that PanGu-$\Sigma$ can learn the patterns of knowledge and safe expression in human dialogue effectively, and therefore generate factually correct and safe responses. A case of self-chat is shown in Figure~\ref{fig:selfchat1}, where the conversation goes smoothly with rich knowledge. More self-chat cases are shown in Appendix~\ref{Self-chat-appendix}.
+\begin{figure*}[!ht]
+ \centering
+ \includegraphics[width=0.8\textwidth]{sections/fig/selfchat1.pdf}
+    \caption{\label{fig:selfchat1}A case of self-chat.}
+\end{figure*}
+% and    safe pattern 
+% indicate that PanGu-$\Sigma$ can learn the patterns of safe strategy and expressing knowledge in human dialogue effectively, and therefore generate factually correct and safe responses.
+
+
+\subsubsection{Topic-grounded dialogue evaluation}
+% A well-designed dialogue system should be able to connect chit-chat with knowledge. The dialogue grounding on specific topic should incorporate relevant knowledge with characteristic of chit-chat.
+A well-designed dialogue system should be able to incorporate relevant knowledge with characteristic of chit-chat. Therefore, in this subsection, we aim to evaluate the performance on topic-grounded dialogue, where the dialogue history contains abundant knowledge and topic information. We randomly sample 2,000 dialogues from topic-grounded corpus NaturalConv~\cite{DBLP:conf/aaai/WangLZY21}, and keep each context containing at least 5 turns. We use nuclear sampling~\cite{DBLP:conf/iclr/HoltzmanBDFC20} with top-p set to 0.5 during decoding. The following metrics are used for automatic evaluation: 1) \textit{Semantic consistency} measures the consistency between generated response and context, which is scored by a BERT-based binary classifier model trained on NaturalConv~\cite{DBLP:conf/aaai/WangLZY21} with an accuracy of 0.906; 2) \textit{Distinct-1} and \textit{distinct-2}~\cite{DBLP:conf/naacl/LiGBGD16} are the ratios of distinct unigrams and bigrams in response, respectively, for evaluating the diversity; 3) \textit{Bleu} can evaluate the n-gram overlap degree between generated response and golden response.
+
+
+\begin{table*}[!htb]
+\caption{\label{autoevaluation} The automatic evaluation results on topic-grounded dialogue generation
+}
+\begin{center}
+\begin{tabular}{|c|c|c|c|c|c|}\hline
+ \cline{1-6}
+    Models & \textit{distinct-1}&  \textit{distinct-2}  & \textit{bleu-2} &  \textit{bleu-3}  &\textit{Semantic-consistency}  \\ \hline \hline
+ CDial-GPT & 0.035 &  0.172 & 0.1405  & 0.088  &0.344   \\
+ EVA & 0.067 & 0.313 & 0.169 & 0.103 &0.393   \\
+ EVA2.0 & 0.073 & 0.341 & 0.169  & 0.104 & 0.458    \\
+ PanGu-Bot 350M & 0.090  & 0.335 & 0.168  &  0.105  &0.447 	  \\
+ PanGu-Bot 2.6B & 0.089 & 0.337 & 0.171	   & 0.106  & 0.459  	 \\
+  \textbf{PanGu-$\Sigma$} & \textbf{0.109}  &  \textbf{0.369}  & \textbf{0.177}  & \textbf{0.110}  &  \textbf{0.502} \\
+  \hline
+ \end{tabular}
+\end{center}
+\end{table*}
+
+
+
+\begin{table*}[!htb]
+\caption{\label{humanevaluationnaturalconv} The human evaluation results on topic-grounded dialogue generation
+}
+\begin{center}
+\begin{tabular}{|c|c|c|c|c|c|c|}\hline
+ \cline{1-7}
+    Models & \textit{Sensibility}&  \textit{Specificity}  & \textit{Interestingness} &  \textit{SSI}  &\textit{Hallucination} &\textit{Safety} \\ \hline \hline
+ CDial-GPT & 0.597 &  0.680 & 0.143  & 0.473  &0.070 & 0.970  \\
+ EVA & 0.507 & 0.743 & 0.210 & 0.487 &0.080 & 0.953  \\
+ EVA2.0 & 0.677 & 0.783 & 0.287  & 0.582 & 0.070 & 0.980   \\
+ PanGu-Bot 350M & 0.763  & 0.820 & 0.290  &  0.624  & 0.043 &  0.993\\
+ PanGu-Bot 2.6B & 0.810 & 0.803 & 0.293   & 0.635  & 0.050 & 0.987 \\
+  \textbf{PanGu-$\Sigma$} & \textbf{0.830}  &  \textbf{0.857}  & \textbf{0.340}  & \textbf{0.676}  &  \textbf{0.040} & \textbf{0.993}	 \\
+  \hline
+ \end{tabular}
+\end{center}
+\end{table*}
+
+The results of automatic evaluation and human evaluation are shown in table~\ref{autoevaluation} and table~\ref{humanevaluationnaturalconv}, respectively. Compared with baselines, PanGu-$\Sigma$ can generate more diverse, semantic-consistent, knowledgeable and interesting responses. This is because 
+PanGu-$\Sigma$ can well response with consideration of topic and knowledge contained in dialogue history. A case of topic-grounded dialog is shown in Table~\ref{chinese_dialogue_case_topicground}, where the response of PanGu-$\Sigma$ introduces knowledge about \begin{CJK*}{UTF8}{gbsn} 郎平\end{CJK*}(Lang Ping). More topic-grounded cases are shown in Appendix~\ref{chinese_dialogue_case_topicground-appendix}.
+
+
+\begin{CJK*}{UTF8}{gbsn}
+\begin{table*}[]
+\caption{A case of topic-grounded dialog}
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Dialog history & \parbox[c]{13cm}{{\color[HTML]{333333} \textbf{你最近有看中国排球比赛吗?}}     \\
+(Have you watched the Chinese volleyball match recently?) \\
+          {\color[HTML]{333333} \textbf{就是啊,当然有在看,中国女排这几次的比赛都很优秀。}}  \\
+          (Of course. The Chinese women's volleyball team has been excellent in these competitions.)\\
+ {\color[HTML]{333333} \textbf{我觉得中国女排能有现在的成功也离不开教练郎平的教导。}}     \\
+ (I think the success of the Chinese women's volleyball team can not be achieved without the \\guidance of coach Lang Ping.)\\
+  {\color[HTML]{333333} \textbf{就是讲说啊,我觉得还是很优秀的能够这么成功不容易啊。}}  \\
+  (Yes, they are excellent, and it is not easy to be so successful.)\\
+  {\color[HTML]{333333} \textbf{背后一定付出很多,我以前打过排球,很容易受伤。}}  \\
+  (They must have payed a lot of effort. I've played volleyball before, and it's easy to get hurt.)
+  } \\
+ \cline{2-2}
+ EVA2.0  &  \parbox[c]{13cm}{{\color[HTML]{333333} \textbf{是啊是啊!真的不容易。}\\
+ (Yeah yeah! it's really not easy.) } } \\
+ \cline{2-2}
+%  PanGu-Bot 350M  &  \parbox[c]{13cm}{{\color[HTML]{333333} \textbf{是啊,我也很容易受伤。}\\
+%  (Yes, I'm also easily hurt.) } } \\
+%  \cline{2-2}
+ PanGu-Bot 2.6B  &  \parbox[c]{13cm}{{\color[HTML]{333333} \textbf{所以我们要好好的保护自己,不让自己受伤。}\\
+ (So we need to protect ourselves from getting hurt.) } } \\
+ \cline{2-2}
+ \textbf{PanGu-$\Sigma$}  &  \parbox[c]{13cm}{{\color[HTML]{333333} \textbf{郎平的执教也是很有一套的,她还入选过世界排球名人堂呢。}\\(Lang Ping is also a good coach. She has also been selected into the World Volleyball Hall of Fame.) } } \\
+\hline
+\end{tabular}
+\end{center}
+\label{chinese_dialogue_case_topicground}
+\end{table*}
+\end{CJK*}
+
+\subsubsection{Open domain question-answering evaluation}
+
+
+\begin{table*}[!htb]
+\caption{\label{QA} The evaluation results on question-answering 
+}
+\begin{center}
+\begin{tabular}{|c|c|c|c|c|}\hline
+ \cline{1-5}
+    Models & \textit{P} &  \textit{R}&  \textit{F1} &  \textit{Human-eva} \\ \hline \hline
+ CDial-GPT  & 0.033 & 0.067 & 0.041& 0.036 \\
+ EVA  & 0.008 & 0.051 & 0.012 & 0.036 \\
+ EVA2.0 & 0.082  &  0.139  &  0.103 & 0.119  \\
+ PanGu-Bot 350M & 0.511 & 0.745  &  0.554 & 0.738 \\
+ PanGu-Bot 2.6B & 0.509 & 0.761 &  0.556 & 0.738	 \\
+  \textbf{PanGu-$\Sigma$} & \textbf{0.574} & \textbf{0.822}  & \textbf{0.621}	& \textbf{0.774}	 \\
+  \hline
+ \end{tabular}
+\end{center}
+\end{table*}
+
+For evaluating the PanGu-$\Sigma$'s ability to answer fact-based question in conversation, 6 categories of questions collected from PanGu Bot~\cite{DBLP:journals/corr/abs-2203-17090} are utilized for evaluation. The greedy search decoding strategy is applied. The results of open domain question-answering evaluation is shown in table~\ref{QA}. PanGu-$\Sigma$ model can well answer factual questions with highest accuracy, which can further verify the advantages of PanGu-$\Sigma$ on knowledge memorization. A case of question-answering is shown in Table~\ref{chinese_dialogue_case_qa}, where the answer of PanGu-$\Sigma$ is the the most accurate. More cases of question-answering are shown in Appendix~\ref{chinese_dialogue_case_qa-appendix}.
+
+
+\begin{CJK*}{UTF8}{gbsn}
+\begin{table*}[]
+\caption{A case of open domain question-answering}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Question: & \parbox[c]{6cm}{中国的四大发明是哪四个？}     & \parbox[c]{6cm}{What are China's four major inventions?}\\
+% \cline{2-3}
+% PanGu-Bot 350M:&  \parbox[c]{6cm}{火药、造纸术、火药、火箭、核武器} & \parbox[c]{6cm}{Gunpowder, papermaking, gunpowder, rockets, nuclear weapons}
+%  \\
+\cline{2-3}
+EVA2.0:&  \parbox[c]{6cm}{我觉得是发明了“发明”这个词的人} & \parbox[c]{6cm}{I think it's the man who invented the word `invented'.}
+ \\
+\cline{2-3}
+PanGu-Bot 2.6B:&  \parbox[c]{6cm}{造纸术、火药术、火药武器、火药武器} & \parbox[c]{6cm}{Papermaking, gunpowder, gunpowder weapons, gunpowder weapons}\\
+\cline{2-3}
+\textbf{PanGu-$\Sigma$}:&  \parbox[c]{6cm}{造纸术、印刷术、指南针、火药} & \parbox[c]{6cm}{Papermaking, printing, compass, gunpowder}
+\\
+\hline
+\end{tabular}
+\end{center}
+\label{chinese_dialogue_case_qa}
+\end{table*}
+\end{CJK*}
+% indicating the advantages of training dialogue model with inheriting knowledge from 13B version of PanGu-$\alpha$.  , and .... memorize knowledge....
+
+
+
+% \subsubsection{Case study}
+
+% \begin{CJK*}{UTF8}{gbsn}
+% \begin{table*}[]
+% \caption{Case study of self-chat}
+% \begin{center}
+% \begin{tabular}{ll}
+% \hline
+% {\makecell[c]{\textbf{PanGu-$\Sigma$}}} & {\makecell[c]{\textbf{PanGu-$\Sigma$}}} \\
+% \\
+%  {\makecell[l]{春节有哪些习俗？\\What are the customs of the Spring Festival?}}   &   \\
+%          & {\makecell[l]{吃饺子\\ Eat dumplings. }} \\
+% {\makecell[l]{还有呢？具体点。谢！~ \\What else? Be specific. Thanks~ }}     &  \\
+% & {\makecell[l]{放鞭炮贴春联，拜年 \\Set off firecrackers, pasteup Spring Festival couplets \\and pay a New Year call.}}  \\
+%  {\makecell[l]{还有没？我想要更多的。\\ Anything else? I want more.}}  &   \\
+%          & {\makecell[l]{你可以在百度上搜“民俗”\\ You can search "folk custom" on Baidu.}}  \\
+%           {\makecell[l]{好的，你喜欢放鞭炮吗？\\OK. Do you like setting off firecrackers? }} &   \\
+%          & {\makecell[l]{喜欢，可以烘托节日气氛\\ Yes, because it can foil the festival atmosphere.}}  \\
+%          {\makecell[l]{要注意安全的\\ Please be careful when setting off firecrackers.}} &   \\
+%          & {\makecell[l]{谢谢你的提醒\\ Thank you for your reminding.}}  \\
+% \hline
+% \hline
+% {\makecell[l]{姚明是干什么的？ \\What does Yao Ming do?}}   &   \\
+%          & {\makecell[l]{打篮球的，球迷很多 \\He plays basketball and he has many fans.}}  \\
+% {\makecell[l]{姚明有多高？\\ How tall is Yao Ming?}}      &  \\
+% & {\makecell[l]{他有2.26米 \\He is 2.26 meters tall.}}  \\
+%  {\makecell[l]{我也喜欢篮球，可是不知道怎么开始\\ I also like basketball, but I don't know how to start.}}  &   \\
+%          & {\makecell[l]{多多练习就好了\\ Just practice more.}}  \\
+%           {\makecell[l]{你平时打篮球吗？\\Do you usually play basketball?}}  &   \\
+%          & {\makecell[l]{偶尔会打篮球，可以一起呀 \\I play basketball occasionally. \\We can play basketball together.}}  \\
+%          {\makecell[l]{嗯嗯。谢谢！ \\Yeah. Thank you!}} &  \\
+%          & {\makecell[l]{你什么时间有空？ \\When are you free?}}  \\
+% \hline
+% \end{tabular}
+% \end{center}
+% \label{chinese_dialogue_case}
+% \end{table*}
+% \end{CJK*}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+% \begin{CJK*}{UTF8}{gbsn}
+% \begin{table*}[]
+% \caption{Case study}
+% \begin{center}
+% \begin{tabular}{l}
+% \hline
+%  {\makecell[l]{
+%  \color[HTML]{333333} \textbf{Question:最大的金字塔是哪一个？}}\\ \qquad \qquad which is the largest pyramid? }    \\
+%          {\color[HTML]{333333} \textbf{Answer:目前，胡夫金字塔是世界上最大的金字塔。}}(At present, the Khufu Pyramid is the largest pyramid in the world.)  \\
+% {\color[HTML]{333333} \textbf{Question:世界上海拔最高的高原是什么高原？}}     \\
+%          {\color[HTML]{333333} \textbf{Answer:青藏高原是海拔最高的高原。}}  \\
+% {\color[HTML]{333333} \textbf{Question:世界最长的河是？}}     \\
+%          {\color[HTML]{333333} \textbf{Answer:尼罗河}}  \\
+% {\color[HTML]{333333} \textbf{Question:世界最长的人工运河是？}}     \\
+%          {\color[HTML]{333333} \textbf{Answer:京杭大运河}}  \\
+% \hline
+% \end{tabular}
+% \end{center}
+% \label{chinese_dialogue_case}
+% \end{table*}
+% \end{CJK*}
+
+% \begin{CJK*}{UTF8}{gbsn}
+% \begin{table*}[]
+% \caption{Case study of character dialog}
+% \begin{center}
+% \begin{tabular}{ll}
+% \hline %\qquad \qquad 
+%  Prompt &  {\makecell[l]{ 科比·布莱恩特,全名科比·比恩·布莱恩特·考克斯,出生于美国 宾夕法尼亚州费城,美国已故篮球运动员,\\
+%  司职得分后卫/小前锋。2015年11月30日,科比发文宣布将在赛季结束后退役。2017年12 月19日,湖人队\\
+%  为科比举行球衣退役仪式。2020年4月5日,科比入选奈·史密斯篮球名人纪念堂。\\
+%  科比：你好，我是科比，NBA球员。\\
+%  记者：你好 , 非常高兴 今天 和 你 对话 。 对于 NBA 的 年轻 新秀 , 你 有 什么 建议 ?\\
+%  科比：}}  \\
+% Response &   {\makecell[l]{首先, 你要做的就是尽自己的最大努力,在球场上展示自己的能力。当你 在球场上打球的时候, 你要把\\你的注意力集中在球场上,你要让你的队友发挥出他们的最大潜能,让他们在 球场上发挥出他们的能力。\\当你在球场上的时候, 你要让所有的人都知道, 你在球场上所做的一切都和你以及你的对手有关。}}  \\
+   
+% \hline
+% Prompt &  {\makecell[l]{ 史蒂夫·乔布斯(英语:SteveJobs)是一名美国发明家、企业家、营销家,苹果公司联合创始人之一,曾任董事长、首席执行官职位,NeXT创办人及首席执行官,也是皮克斯动画创办人并曾任首席执行官,2006年为华特迪士尼公司董事会成员。乔布斯在1970年代末个人电脑的热潮中创业,与苹果公司另一始创人斯蒂夫·沃兹尼亚克及首任投资者迈克·马库拉协同其他人设计、开发及销售AppleII系列。\\
+%  乔布斯:你好,我是乔布斯,苹果公司联合创始人之一。\\
+% 记者:你好,非常高兴今天和你对话。你对未来手机行业的发展怎么看?\\
+%  乔布斯:}}  \\
+% Response &   {\makecell[l]{手机行业未来肯定会有更多的创新,因为手机的功能越来越多,\\可以做的事情也越来越多。但是,我认为手机行业的创新会越来越集中在高端市场,\\比如,像苹果这样的公司,会推出一些高端的产品,而其他的手机厂商,\\可能会在中低端市场上进行创新。}}  \\
+   
+% \hline
+% Prompt &  {\makecell[l]{ 姚明,前中国职业篮球运动员,司职中锋,现任亚洲篮球联合会主席、中国篮球协会主席。\\在2002年NBA选秀中,他以状元秀身份被NBA的休斯敦火箭队选中,2003-09年连续6个赛季(生涯共8次)入选NBA全明星赛阵容。\\
+% 姚明:你好,我是姚明,NBA球员,现在是中国篮协主席。\\
+% 记者:你好,非常高兴今天和你对话。你认为中国和美国篮球培养模式的最大差异在哪?\\
+%  姚明:}}  \\
+% Response &   {\makecell[l]{我觉得最大的差异就是文化的差异。\\我们中国的文化是一种集体的文化,大家一起打球,一起为团队的荣誉而努力,\\而美国的文化是一种个人的文化,大家都在为自己的利益而努力,每个人都在努力的争取自己的利益。}}  \\
+   
+% \hline
+% \end{tabular}
+% \end{center}
+% \label{chinese_dialogue_case}
+% \end{table*}
+% \end{CJK*}
+
+
+\begin{CJK*}{UTF8}{gbsn}
+\begin{table*}[]
+\caption{A case of character dialog. Source of the prompt about 黄健翔(Huang Jianxiang) is from https://baike.baidu.com}
+\begin{center}
+% \resizebox{\textwidth}{!}{
+% \begin{tabular}{l{0.2cm}|l{1.1cm}}
+% \begin{tabular}{l{0.2\columnwidth}|l{0.5\columnwidth}}
+\begin{tabular}{ll}
+\hline
+Prompt &  \parbox[c]{13cm}{ 黄健翔,中国著名体育解说员。从事体育节目解说,以充满激情,富有感染力的解说风格著称。现为一级播音员。已经完成现场直播超过六百场,涉及足球、田径、游泳、跳水、篮球、射击等多种体育项目。另外解说各种足球比赛超过两千场。\\
+(Huang Jianxiang is a famous sports commentator in China. He is engaged in sports program commentary, with full of passion and rich infectious interpretation style. Now he is a first-class announcer, and has completed more than 600 live broadcasts, involving football, track and field, swimming, diving, basketball, shooting and other sports. In addition, he has commented more than 2,000 football games.)\\
+黄健翔:你好,我是黄健翔,体育解说员。\\
+(Huang Jianxiang: Hello, I'm Huang Jianxiang, a sports commentator.)\\
+记者:你好,非常高兴今天和你对话。你认为中国队会跻身下一届男足世界杯吗?\\
+(Reporter:Hello, it's a pleasure to talk to you today. Do you think China will qualify to compete in the next Men's World Cup?)
+}  \\
+\cline{2-2}
+\textbf{PanGu-$\Sigma$} &   \parbox[c]{13cm}{
+黄健翔:这个问题,我想应该是所有中国人都关心的问题。中国足球现在的发展是有目共睹的,但是在亚洲范围内,中国足球还不能算是一个强队,但是我相信中国足球会在中国足球的努力下,不断的提高,我也希望中国足球能够在世界杯上取得好成绩。\\
+(Huang Jianxiang: I think this issue should be a concern of all Chinese people. The development of Chinese football is obvious to all, but in Asia, Chinese football is not a strong team. However, I believe Chinese football will continue to improve with the efforts of Chinese football, and I also hope Chinese football can achieve good results in the World Cup.)\\
+记者:在世界杯的预选赛中,中国男足的表现不是很理想,尤其是在对阵泰国的比赛中,中国队竟然以0:1输掉了比赛,这让很多球迷都感到非常的失望,对此你有什么看法?\\
+(Reporter:In the World Cup qualifiers, the performance of the Chinese men's football team is not very ideal. Especially against Thailand, the Chinese team unexpectedly lost the game by 0-1, which makes many fans feel very disappointed. What do you think about this?)\\
+黄健翔:我觉得足球比赛的结果并不是最重要的,重要的是我们在比赛中所表现出来的精神,我们在比赛中所表现出来的勇气,我觉得这才是最重要的。\\
+(Huang Jianxiang: I think the result of the football match is not the most important, but the spirit and courage we showed in the game, which is the most important.)\\
+记者:中国足球的发展和其他国家相比,有什么优势吗?\\
+(Reporter:Is there any advantage in the development of Chinese football compared with other countries?)\\
+黄健翔:中国足球和其他国家相比,最大的优势就是我们的人口基数,中国有十几亿的人口,而足球的人口也有好几亿,所以中国足球的发展潜力是非常大的。\\
+(Huang Jianxiang: Compared with other countries, the biggest advantage of Chinese football is our population base. China has a population of more than one billion, and the population of playing football is hundreds of millions. Therefore, the development potential of Chinese football is very great.)\\
+记者:你觉得中国足球有希望在世界杯上取得好成绩吗?\\
+(Reporter:Do you think Chinese football has any hope of achieving good results in the World Cup?)\\
+黄健翔:我觉得现在还为时尚早,我觉得中国足球现在最需要的是建立一个好的足球环境,包括国家队,包括俱乐部的球员,包括俱乐部的教练,包括俱乐部的管理者,包括足协的管理者,大家都能够团结在一起,能够共同把中国足球的发展,能够提高到一个新的高度。
+\\
+(Huang Jianxiang: I think it's still too early. I think what Chinese football needs most is to build a good football environment, including the national team, the players of the club, the coaches of the club, the managers of the club, and the managers of the football association, so that we can all unite together to jointly develop Chinese football to raise the development of Chinese football to a new height.)
+}  \\
+\hline
+\end{tabular}
+
+\end{center}
+\label{chinese_dialogue_case_character}
+\end{table*}
+\end{CJK*}
+
+% \subsubsection{Natural language generation at zero-shot settings}
+\subsubsection{Natural language generation of base PanGu-$\Sigma$ model}
+
+For evaluating base PanGu-$\Sigma$'s abilities on open-ended text generation, we present three categories of cases about character dialog, question-answering and text generation with few-shot prompt learning, which are shown in Table~\ref{chinese_dialogue_case_character}, Table~\ref{chinese_dialogue_case_longQA} and Table~\ref{chinese_dialogue_case_longQA_fewshot} respectively.
+More cases of character dialog and open-end text generation are shown in Appendix~\ref{chinese_dialogue_case_character-appendix} and Appendix~\ref{chinese_dialogue_case_longQA-appendix}.
+
+% For evaluating base PanGu-$\Sigma$'s abilities on open-ended text generation, we present two categories of cases about character dialog and question-answering with prompt learning. The case of character dialog is shown in Table~\ref{chinese_dialogue_case_character}. Cases about zero-shot and few-shot prompt learning are shown in Table~\ref{chinese_dialogue_case_longQA} and Table~\ref{chinese_dialogue_case_longQA_fewshot} respectively.
+% More cases of character dialog and open-end text generation are shown in Appendix~\ref{chinese_dialogue_case_character-appendix} and Appendix~\ref{chinese_dialogue_case_longQA-appendix}.
+
+% For evaluating PanGu-$\Sigma$'s abilities on open-ended text generation at zero-shot settings, we present two cases on character dialog and question-answering in Table~\ref{chinese_dialogue_case_character} and Table~\ref{chinese_dialogue_case_longQA}, respectively. More cases of character dialog and open-end text generation are shown in Appendix~\ref{chinese_dialogue_case_character-appendix} and Appendix~\ref{chinese_dialogue_case_longQA-appendix}.
+
+
+
+
+
+
+
+
+
+\begin{CJK*}{UTF8}{gbsn}
+\begin{table*}[]
+\caption{A case of QA}
+\begin{center}
+\begin{tabular}{ll}
+\hline %\qquad \qquad 
+{\makecell[l]{Query}} & {\makecell[l]{深圳的发展,依靠什么?\\(What does Shenzhen rely on for its development?)
+}}  \\
+\cline{2-2}
+\textbf{PanGu-$\Sigma$} & \parbox[c]{13cm}{深圳市城市规划设计研究院高级规划师吴剑平认为,深圳的发展,依靠的是改革、创新、人才、环境。
+改革开放,是深圳的根。深圳是中国改革开放的窗口,是中国改革开放的“试验场”,是中国改革开放的“窗口”和“试验田”。
+创新,是深圳的魂。
+深圳是中国科技创新的前沿阵地,是中国科技创新的“领航区”。
+深圳聚集了一大批中国最优秀的科技企业,是中国科技创新的重要发源地,是中国科技创新的“领航区”。\\
+(Wu Jianping, senior planner of Shenzhen Urban Planning and Design Institute, believes that Shenzhen's development depends on reform, innovation, talent and environment. Reform and opening up are the root of Shenzhen. Shenzhen is the window, the "test ground" and the "test field" of China's reform and opening up.  Innovation is the soul of Shenzhen. 
+Shenzhen is the frontier position and the "pilot zone" of China's scientific and technological innovation. Shenzhen gathers a large number of China's best science and technology enterprises, which is an important birthplace of China's scientific and technological innovation, and the "pilot zone" of China's scientific and technological innovation.)
+}  \\
+\hline
+\end{tabular}
+\end{center}
+\label{chinese_dialogue_case_longQA}
+\end{table*}
+\end{CJK*}
+
+\begin{CJK*}{UTF8}{gbsn}
+\begin{table*}[]
+\caption{A case of text generation with few-shot prompt learning}
+\begin{center}
+\begin{tabular}{ll}
+\hline %\qquad \qquad 
+% {\makecell[l]{Prompt}} & {\makecell[l]{
+\textbf{Prompt} & \parbox[c]{13cm}{
+Q：以“我的未来不是梦”为主题，写一篇字数150左右的作文。\\
+(Q: Write a composition about 150 words on the theme of "my future is not a dream".)\\
+A：我的未来不是梦，梦想和努力会让它变成现实。我从小爱读书，尤其喜欢探索未知的知识，我将不断学习，提升自己的视野和能力，以便未来能够胜任自己的工作。
+我会努力工作，以实现自己的梦想。我会为自己设定切实可行的目标，每一步都在迈向我的未来。每当遇到困难，我会耐心地排除问题，继续前进，永不放弃。
+我将把未来作为一种挑战，努力改变自己的命运，以实现自己的梦想。\\
+(A: My future is not a dream. Dreams and efforts will make it a reality. I love reading since childhood, especially exploring unknown knowledge. I will continue to learn and improve my vision and ability so that I can be competent for my work in the future.
+I will work hard to realize my dream. I will set practical goals for myself towards my future. Whenever I encounter difficulties, I will patiently eliminate problems, continue to move forward and never give up.
+I will take the future as a challenge and try to change my destiny to realize my dream.)
+\\ \\
+Q：以“谈自信”为主题，写一篇字数150左右的作文。\\
+(Q: Write a composition with about 150 words on the theme of "talking about confidence".)\\
+A：自信是成功的重要前提，它可以增强人们的自我意识，让人们对未来充满信心。自信是一种能力，可以使人在一些困难和挑战中从容应对，并获得成功。
+要培养自信，首先要有自信心，坚信自己可以做到，不管有多难，都要坚持到底。其次，要勇于接受挑战，不断地挑战自己，以增强自信心。此外，在遭遇挫折时，要学会正确认识挫折，不要太看重结果，而是要从容面对失败，从中汲取智慧。
+总之，要想取得成功，自信是不可缺少的，它可以帮助我们走出困境，走上成功之路。\\
+(A: Confidence is an important prerequisite for success. It can enhance people's self-awareness and make people confident in the future. Self-confidence is a kind of ability that can make people deal with difficulties and challenges calmly and achieve success.
+To cultivate self-confidence, first of all, you should be confident, believe that you can do it, and stick to it no matter how difficult it is. Secondly, you should be brave to accept challenges and constantly challenge yourselves to enhance self-confidence. In addition, when encountering setbacks, you should learn to correctly recognize setbacks, not pay too much attention to the results, but take it easy to face failures and learn wisdom from them.
+In short, to succeed, self-confidence is indispensable. It can help us out of difficulties and embark on the road to success.)
+\\\\
+Q：以“吃火锅”为主题，写一篇字数150左右的作文。\\
+(Q: Write a composition with about 150 words on the theme of "eating hot pot".)
+}  \\
+\cline{2-2}
+\textbf{PanGu-$\Sigma$} & \parbox[c]{13cm}{
+A：所谓“人生如火锅,苦辣酸甜是味道”。人生就像火锅一样,生活中充满了酸甜苦辣,需要我们自己去品尝。我的生活就像火锅一样,充满了酸甜苦辣,因为我有着爸爸妈妈,奶奶,外公,外婆,叔叔婶婶等家人的关爱。当我快乐时,他们和我一起快乐,当我伤心时,他们和我一起伤心，他们的陪伴是我生活中最重要的组成部分。这就像火锅里的味道一样,它们相辅相成,形成了我生活中的酸甜苦辣。
+\\
+(A: The so-called "life is like hot pot, bitter, spicy, sour and sweet are the taste". Life is like hot pot, which is full of ups and downs. We need to taste it ourselves. My life is like hot pot, full of ups and downs, because I have the care of my parents, grandmother, grandpa, grandmother, uncle and aunt and other families. When I am happy, they are happy with me. When I am sad, they are sad with me. Their company is the most important part of my life. This is like the taste in hot pot. They complement each other and form the ups and downs of my life.)
+}  \\
+\hline
+\end{tabular}
+\end{center}
+\label{chinese_dialogue_case_longQA_fewshot}
+\end{table*}
+\end{CJK*}
+
+% \begin{CJK*}{UTF8}{gbsn}
+% \begin{table*}[]
+% \caption{A case of text generation with few-shot prompt learning}
+% \begin{center}
+% \begin{tabular}{ll}
+% \hline %\qquad \qquad 
+% % {\makecell[l]{Prompt}} & {\makecell[l]{
+% \textbf{Prompt} & \parbox[c]{13cm}{
+% 问题：小孩有点贫血吃什么好？\\
+% (Question: What food is good for children's anemia?)\\
+% 答案：通常情况下，患有贫血的人可能需要摄入更多的铁和维生素，这里有一些建议你可以考虑。\\
+% 1. 铁质丰富的食物：红肉（特别是瘤肉）、肝脏、海鲜、豆类、鸡蛋、菠菜、豆腐和全麦面包。\\
+% 2. 维生素C富含的食物：橙子、芹菜、辣椒、菠萝、西红柿、青柠和蓝莓。维生素C能帮助人体更好地吸收铁。\\
+% 3. 其他滋补食物：黄豆、鸡肉、全麦面包、燕麦和蔬菜。\\
+% 4. 在给小孩增加铁和维生素的同时，也应该注意小孩的其他营养需求。例如，应该给他们提供足够的蛋白质、钙和其他维生素和矿物质。 \\
+% 5. 此外，建议家长可以向医生咨询，了解贫血的具体原因，并根据医生的建议进行治疗。\\
+% (Answer: Generally, people who suffer from anemia may need to take more iron and vitamins. Here are some suggestions you can consider.\\
+% 1. Food rich in iron: red meat (especially tumor meat), liver, seafood, beans, eggs, spinach, tofu and whole-wheat bread.\\
+% 2. Foods rich in vitamin C: orange, celery, pepper, pineapple, tomato, lime and blueberry. Vitamin C can help the body absorb iron better.\\
+% 3. Other nourishing foods: soybeans, chicken, whole-wheat bread, oats and vegetables.\\
+% 4. While increasing the intake of iron and vitamins, attention should also be paid to other nutritional needs of children. For example, they should be provided with sufficient protein, calcium and other vitamins and minerals.\\
+% 5. In addition, it is suggested that parents can consult with doctors to understand the specific causes of anemia, and treat the children according to the doctor's recommendations.)
+% \\ \\
+% 问题：怎么样才能变白？\\
+% (Question: How to whiten my skin?)\\
+% 答案：1. 饮食调整：多吃新鲜蔬菜水果，少吃油腻、精制的食物，以及含有高量的糖分的食品。\\2. 多喝水：喝清水可以排毒、排汗，有利于皮肤白皙。\\
+% 3. 避免长期暴晒：要尽量避免长期暴晒，多穿长袖衣服和遮阳帽，以减少紫外线对皮肤的伤害。\\
+% 4. 正确护肤：每天洗脸时，选择温和的洁面产品，然后用保湿面霜保护肌肤，使肌肤更加白皙。\\
+% (Answer: 1. Diet adjustment: eat more fresh vegetables and fruits, less greasy and refined foods, and foods with high sugar content.\\ 
+% 2. Drink more water: drinking water can detoxify and sweat, which is conducive to fair skin.\\
+% 3. Avoid long-term exposure to the sun: try to avoid long-term exposure to the sun, and wear more long-sleeved clothes and sunshade hats to reduce the damage of ultraviolet rays to the skin.\\
+% 4. Correct skin care: When washing your face every day, choose a mild cleanser, and then use moisturizing face cream to protect your skin and make it more white.)
+% \\\\
+% 问题：在大学期间可以谈恋爱吗？\\
+% (Question: Can I fall in love during college?)
+% }  \\
+% \cline{2-2}
+% \textbf{PanGu-$\Sigma$} & \parbox[c]{13cm}{
+% 答案：可以,不过要注意几点:\\
+% 1.不可过度:谈恋爱要看缘分,要把握好度,不然很容易让自己受到伤害。\\
+% 2.要理性:谈恋爱不可盲目,不能在一开始就将自己的心思全部放在对方身上,也不要太过盲目追求对方,因为这样的爱情容易让自己付出很多却得不到相应的回报。\\
+% 3.要慎重:谈恋爱不可冲动,冲动的爱情很容易让人感到很受伤,但也不要太过冷静，冷静的爱情很难让人感受到温暖。\\
+% 4.要正确:谈恋爱不要一味的追求对方,而要正确的判断对方,不可胡乱谈恋爱,这样的爱情很难长久。\\
+% 5.要独立:谈恋爱不能失去自我,在谈恋爱的时候要有自己的原则和底线,在恋爱中要学会独立。
+% \\
+% (Answer: Yes, but you must pay attention to several points:\\
+% 1. Don't overdo it: Love depends on fate and you should grasp the degree. Otherwise it is easy to hurt yourself.\\
+% 2. Be rational: Don't be blind in love. Don't put all your thoughts on the other party at the beginning, and don't pursue the other party too blindly, because such love is easy to make you pay a lot but not get the corresponding return.\\
+% 3. Be cautious: Don't be impulsive in love. Impulsive love can easily hurt people, but don't be too calm. Calm love is hard to make people feel warm.\\
+% 4. Be correct: Judge the other party correctly. Don't fall in love casually, because such love is hard to last.\\
+% 5. Be independent: Don't lose yourself when falling in love. You should have your own principles and bottom line, and learn to be independent.)
+% }  \\
+% \hline
+% \end{tabular}
+% \end{center}
+% \label{chinese_dialogue_case_longQA_fewshot}
+% \end{table*}
+% \end{CJK*}
+
+\subsection{Machine Translation} 
+To verify the generative and multilingual ability, we compare the performance of \MODEL\ with the state-of-the-art model CeMAT, and the benchmark pre-trained large models (mT5-XXL, CPM-2, ERNIE3.0) on the machine translation task. Following the existing pre-training methods, we use the \MODEL\ model to fine-tune directly on the dataset of translation tasks and use SacreBLEU~\cite{2018AScareBLEU} as an evaluation metric. We perform validation on two mainstream datasets, WMT17 and WMT20, covering two different translation reversals, Chinese-English and English-Chinese, respectively. The experiments find that \MODEL\ has a large improvement over both baseline models, and in low-resource translation experimental scenarios even outperforms significantly the results of full data fine-tuning of other pre-trained models.
+
+\textbf{Benchmark}
+
+mT5~\cite{2020mT5} is a multilingual variant of T5, which leveraged a unified text-to-text format and scale to attain state-of-the-art results on a wide variety of English-language NLP tasks. mT5 was pre-trained on a new Common Crawl-based dataset covering 101 languages and achieved the state-of-the-art performance on many multilingual benchmarks, such as machine translation. mT5-XXLarge is a largest version of mT5 with 13B parameter size.
+
+CPM-2~\cite{2021CPM} is a large-scale cost-efficient pre-trained language model. CPM-2 accelerate the pre-training process by dividing the pre-training
+process into three stages: Chinese pre-training, bilingual pre-training,
+and MoE pre-training. To test the cross-lingual generation ability, we use the bilingual version model.
+
+ERINE3.0~\cite{2021ERNIE} is a unified framework for pre-training large-scale knowledge enhanced models. Which fuses auto-regressive network and auto-encoding network, and can be easily tailored for both natural language understanding and generation tasks with zero-shot learning, few-shot learning or fine-tuning.
+
+CeMAT~\cite{2022Universal} is a universal Conditional Masked Language Pre-training
+for both Autoregressive and non-Autoregressive machine translation tasks.
+Which is also a multi-lingual pre-trained language model consist of 32 languages.
+
+\begin{table*}[]
+\caption{\label{WMT20_en2zh} The results on WMT20 translation task. \MODEL\ outperforms previous Chinese-English SOTA pre-trained large model with a large margin. Compared with the mullingual pre-trained language model CeMAT, \MODEL\ model also obtain the very competitive results. Even in the low-resource scenario, \MODEL\  only used 30w of data for fine-tuning, which also able to achieve better results than these large models.}
+\begin{center}
+\begin{tabular}{l | c | c }
+\hline
+\multicolumn{1}{c}{Data}                      & \multicolumn{2}{c}{WMT20}         \\
+\hline
+Lang                                          & \multicolumn{1}{c}{Corpus} & BLEU \\
+\hline
+mT5-XXL                                       & 26.0M                      & 24.0   \\
+
+CPM-2                                         & 26.0M                      & 26.2 \\
+
+Ernie3.0                                      & 26.0M                      & 26.8 \\
+
+CeMAT                                         & 26.0M                      & 37.1 \\
+
+\textbf{PanGu-$\Sigma$}                                   & 26.0M                      & 36.6 \\
+
+\textbf{PanGu-$\Sigma$} (Low-resource) & \ 0.3M                       & 31.0  \\
+\hline
+\end{tabular}
+\end{center}
+\label{wmt_rel}
+\end{table*}
+
+During the fine-tuning, we used the language tag "<Language ID>" as the prefix for Chinese and English text sequences respectively, and then spliced the source and target sequences together as the input to the model, with the source sequence at the beginning of the sequences and the two sequences separated by "<EOT>". We first verified \MODEL\ on WMT20 Chinese-English dataset, almost large scale pre-trained language model eval the cross-linugal genetation ability on that. In addition to this, we also compare the performance of \MODEL\ with the current SOTA translation pre-trained model CeMAT on WMT17 datasets, and covering two different translation reversals, Chinese-English and English-Chinese, respectively. 
+
+As shown in Table \autoref{wmt_rel}, on the WMT20 Chinese-English translation task, \MODEL\ exceeded the mT5-XXL model by 12.6 BLEU, which also showed a significantly higher improvement of 9.8 BLEU compared to the Ernie3.0, which is the Chinese-English SOTA pre-trained large model, indicating that the \MODEL\ model was able to learn stronger cross-language understanding and generation abiliby from the pre-trained data. To further verified \MODEL\'s performance in low-resource scenarios, we using a randomly sampled 30w training dataset, as shown in Table 2. Using only a small amount of training data, the \MODEL\ model still outperformed large models such as Ernie3.0 by more than 3.19 BLEU, which used a full 26M of training data.
+
+
+
+Compared to the translation pre-trained language model CeMAT, \MODEL\ also shows a meaningful quality improvement. As show in Table \autoref{wmt_rel}, the \MODEL\ pre-trained model exceeds the CeMAT model by 3.0 BLEU on the English-Chinese task and also has a 0.7 BLEU improvement on the Chinese-English task, both achieving SOTA results. Also, in the specific translation case, we found that the translation results of \MODEL\ model have higher fidelity compared with CeMAT, as shown in Table \autoref{wmt_case}.
+
+
+
+\begin{table*}[]
+\caption{\label{WMT17_en2zh} The results on WMT17 translation task. \MODEL\ achieved a large performance improvement, which outperforms CeMAT 3.0 BLEU on English-Chinese task.}
+\begin{center}
+\begin{tabular}{l | c | c  c}
+\hline
+\multirow{2}{*}{Model} & \multicolumn{2}{c}{WMT17} \\
+
+                       & En2Zh       & Zh2En       \\
+\hline
+CeMAT              & 35.8        & 22.8        \\
+\textbf{PanGu-$\Sigma$}            & 38.8        & 23.5       \\
+\hline
+\end{tabular}
+\end{center}
+\label{wmt_rel}
+\end{table*}
+
+
+\begin{CJK*}{UTF8}{gbsn}
+\begin{table*}[]
+\caption{\label{WMT17} Case Study. Compared to CeMAT, \MODEL\ model demonstrates better fidelity.}
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Src         & {\color[HTML]{333333} \textbf{You may drink more water, have more fruit during stay up.}}   \\
+Ref         & {\color[HTML]{333333} \textbf{熬夜时适时补充水分，多吃水果。}}  \\
+CeMAT       & {\color[HTML]{333333} \textbf{睡觉时可以多喝水、多吃水果。}}  \\
+\MODEL\ & {\color[HTML]{333333} \textbf{熬夜时不妨多喝水，多吃水果。}} \\
+\hline
+Src         & {\color[HTML]{333333} \textbf{We still have a lot we want to learn about how, when and why stars slow their spin rates.}}                                                       \\
+Ref         & {\color[HTML]{333333} \textbf{\makecell[l]{关于恒星如何、何时以及为何减慢自转速度并且 "收起自己的舞鞋" ， \\ 我们仍有许多需要了解的知识。}}}   \\
+CeMAT       & {\color[HTML]{333333} \textbf{我们还有很多东西需要学习，比如明星怎样、什么时候、为什么放慢自旋速度。}}    \\
+\MODEL\ & {\color[HTML]{333333} \textbf{我们仍然有很多事情要了解，比如恒星如何、何时以及为何会减慢自转速率。}}  \\
+\hline
+Src         & {\color[HTML]{333333} \textbf{连续熬夜看奥运赛事容易损伤心脏}}   \\
+Ref         & {\color[HTML]{333333} \textbf{Staying up late watching the Olympic Games will damage the heart easily}}   \\
+CeMAT       & {\color[HTML]{333333} \textbf{Staying up all night to watch the Olympics can hurt the heart}}    \\
+\textbf{PanGu-$\Sigma$} & {\color[HTML]{333333} \textbf{it's easy to damage your heart by staying up late to watch the Olympic Games}} \\
+\hline
+% Src         & {\color[HTML]{333333} \textbf{小鹏觉得吴言跟网络上判若两人，言语枯燥，也不主动发表意见。}}  \\
+% Ref         & {\color[HTML]{333333} \textbf{Xiaopeng thought that Wuyan is quite different from the one on internet. He is quite bored 
+
+% and does not take the initiative to express his views .}} \\
+% CeMAT       & {\color[HTML]{333333} \textbf{Xiao Peng thought that Wu and the network is different from two people, language is boring, also do not actively express opinions.}}                \\
+% Pangu-Sigma & {\color[HTML]{333333} \textbf{Xiaopeng thinks Wu Yan is different from the Internet, language dry, do not take the initiative to make comments.}}         \\
+\end{tabular}
+\end{center}
+\label{wmt_case}
+\end{table*}
+\end{CJK*}
+
+ 
+\subsection{Code Generation} 
+
+In order to measure the performance of \MODEL\ on code downstream tasks, we evaluated the performance of \MODEL\ 's code domain model on MBPP~\cite{Austin2021ProgramSW} tasks. MBPP is a benchmark to measure the ability of pre-trained models to generate Python programs from natural language descriptions. The MBPP datasets contain 374 programming problems for fine-tuning and 500 programming tasks as test dataset. Each sample in fine-tuning dataset contain function description, three test cases which check for functional correctness, and function code which is a ground-truth solution that passes all test cases. Figure~\ref{fig:finetune_sample_1} shows a sample in the MBPP 
+fine-tune dataset.
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=0.8\textwidth]{sections/fig/zhoupingyi/finetune_sample_1.pdf}
+    \caption{A sample in the MBPP fine-tune dataset}
+    \label{fig:finetune_sample_1}
+\end{figure*}
+
+\subsubsection{Fine-tuning datasets}
+
+PanGu-Coder~\cite{Christopoulou2022PanGuCoderPS} introduces additional datasets which contain APPS~\cite{Hendrycks2021MeasuringCC} and Code Contests~\cite{Li2022CompetitionLevelCG} (CC) datasets from a more similar distribution. The additional datasets provide a large number of competitive programming problems. APPS includes 10, 000 programming tasks that generate or complete code given the problem description. Code Contests (CC) containing over 13k programming problems. \MODEL\ also introduces these additional datasets. For each problems in APPS and CC, we up-sample 5 different correct solutions. Then, we filter the samples with text length over 1024. Finally, we get 56k instances for fine-tuning.
+
+To make it easier for the model to distinguish between task descriptions and solutions, we format training instances for fine-tuning. For these instances in MBPP, we concatenate function description and three test cases to form prompt, and then add a <comment> token to the head of the prompt and a <python> token to the end of the prompt. Function code is appended to the <python> token and the <EOT> token is add to the end of function code. Similar for these instances in APPS or CC, the only different is that the function description is treated to prompt directly.
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=0.8\textwidth]{sections/fig/zhoupingyi/finetune_sample_2.pdf}
+    \caption{The traning sample format for fine-tuning in MBPP task}
+    \label{fig:finetune_sample_2}
+\end{figure*}
+
+All these formatted instances from the MBPP fine-tune dataset, APPS and CC constitute the fine-tune datasets. We fine-tune the code domain model, which is extracted from \MODEL\ , for 5 epochs on the fine-tuning datasets.
+
+\subsubsection{Results}
+
+For all sample in MBPP test dataset, function descriptions are augmented with three test cases as prompt, which is similar to the data format used during fine-tuning. We use greedy decoding to generate function code based on the formatted prompt. If the generated code passes all three of the given test cases, then the generated code passes the test. To evaluate the performance of the fine-tuned code domain mode of \MODEL\ , we use the pass@1 as the estimator. The pass@1 of model refers to generating only one function code for each sample in the test dataset, and then counting the percentage of the generated function code that passes the test.
+
+\begin{figure*}[!ht]
+    \centering
+    \includegraphics[width=0.8\textwidth]{sections/fig/zhoupingyi/pompt.pdf}
+    \caption{The formatted prompt for generating function code}
+    \label{fig:test_prompt}
+\end{figure*}
+
+Table~\ref{tab:code_results} shows the comparison of existing models, as well as \MODEL\ on the MBPP dataset, along with model size and number of tokens trained by model. The \MODEL\ outperforms the current state-of-the-art model PanGu-Coder by 1.4 point on the pass@1 for MBPP tasks. The training data of \MODEL\ is less than PanGu-coder, which contains only 75B code data, while Python code data related to MBPP tasks is only 50B data. This suggests that \MODEL\ makes more efficient use of data.
+
+\begin{table}
+\centering
+\caption{Pass@1 rates on the MBPP dataset, among various models}
+\label{tab:code_results}
+\begin{tabular}{cclc} 
+\hline
+Models               & \begin{tabular}[c]{@{}c@{}}Size\\(Billion)~ ~~\end{tabular} & \multicolumn{1}{c}{\begin{tabular}[c]{@{}c@{}}Train tokens \\(Billion)~ ~~\end{tabular}} & \begin{tabular}[c]{@{}c@{}}MBPP(\%)\\PASS@1~ ~~\end{tabular}  \\ 
+\hline
+INCODER~\cite{Fried2022InCoderAG}              & 6.7B                                                        & 216B (52B python code, 107B other code, other 57)                                        & 19.4                                                          \\
+LaMDA~\cite{Thoppilan2022LaMDALM}                & 137B                                                        & 2877B~ ~ ~                                                                               & 14.8                                                          \\
+PanGu-Coder~\cite{Christopoulou2022PanGuCoderPS}          & 2.6B                                                        & 387B (all is python code)                                                                & 25.4                                                          \\
+\textbf{\MODEL} & 38B                                                         & 300B(50B python code, 25B other code, other 225B)                                        & \textbf{26.8}                                                 \\
+\hline
+\end{tabular}
+\end{table}
+
+
+\subsection{English Natural Language Understanding}
+
+In order to compare with other large language models on English tasks, we evaluate \MODEL\ model on the SuperGLUE benchmark \cite{wang2019superglue}. SuperGLUE consists of 8 natural language understanding tasks. We use accuracy as the performance metric except for MultiRC dataset where ${\rm F1}$-score over the set of answer options is used (denoted by ${\rm F1}_{a}$). We cast each task to a multiple-choice classification problem. The prediction is chosen based on the maximum log-likelihood score, $\log {\rm P}(completion\,\vert\, context)$, of each available completion given the context. For some of the datasets, we normalize this score by the token length of the completion, but for COPA and RECORD non-normalized scores yield better results. We generally view binary classification in such a way that the completion options are ``Yes'' and ``No'', except for the COPA for which the model chooses between two appropriate sentence continuations. In the table~\ref{en_zeroshot_13B}, we report model's performance on each of the SuperGLUE datasets along with the average score. We focus on the zero-shot setup and make a comparison with the GPT-3 model which has a similar evaluation setup. 
+\begin{table}[ht]
+\caption{\label{en_zeroshot_13B}
+Zero-shot results of English downstream tasks
+}
+\centering
+\begin{tabular}{|c|c|c|c|}
+\hline
+Dataset   & Metric  & GPT3 13B          & \textbf{PanGu-$\Sigma$} \\ \hline
+BoolQ     & acc     & \textbf{66.2}     & 65.54                   \\
+CB        & acc     & 19.6              & \textbf{55.36}          \\
+Copa      & acc     & \textbf{84.0}     & 79.00                   \\
+RTE       & acc     & \textbf{62.8}     & 59.21                   \\
+WiC       & acc     & 0.0               & \textbf{50.78}          \\
+WSC       & acc     & \textbf{64.4}     & 63.46                   \\
+MultiRC   & {\rm $F1_a$}     & \textbf{71.4}     & 59.31                   \\
+ReCoRD    & acc     & \textbf{89.0}     & 84.37                   \\ \hline
+SuperGLUE & average & 57.2              & \textbf{64.62}          \\ \hline
+\end{tabular}
+\end{table}
+
+In the Table~\ref{en_zeroshot_13B}, evaluation results are presented. We see that, even with only 112B English tokens, the performance of \MODEL\ English sub-model with 38B parameters roughly meets the performance of the GPT-3 13B model and gets a higher average score.
+
+% To study the impact of model size, we also train a much smaller version of \MODEL\ with 2.6B parameters backbone. Again, we compare it with the GPT-3 of a similar size. Results are shown in the Table~\ref{en_zeroshot_2.6B}. One can see that on 4 out of 8 datasets \MODEL\ outperforms its counterpart and by a large gap on CB and RTE datasets. Despite the large gap on WiC, the model performs at a level of a random guess. On other datasets, \MODEL\ meets the GPT-3 results, getting the higher average score.
+
+
+% \noindent\textbf{Multiple-Choice Pre-training.} We observed that generation performance on tasks that require choosing one of the given answers is poor. Models seem to misunderstand the prompts formulated as multiple-choice questions. To deal with this issue, we implemented an additional pre-training step, teaching the model to answer multiple-choice questions in a correct form. We fixed the following format of multiple-choice task representation:
+% \begin{verbatim}
+% {context}
+% Given the following options, what do you think is the correct answer to the question below:
+% {question}
+% Options:
+% - A: {option1}
+% - B: {option2}
+% - C: {option3}
+% ...
+% - N: {optionN}
+% Answer: N
+% \end{verbatim}
+
+% Then we collected a dataset of tasks which can be naturally formulated as the choice of the single correct answer  from several given options, but not related to SuperGlue NLU tasks. Our multiple choice dataset consists mainly of classification tasks, with small portion of Question Answering: $86\%$ of Sentiment Classification, $11\%$ of topic classification, and only $3\%$ of question answering data. All the examples were converted to the above format, and the model learned to predict only the single letter representing the correct option. We provide the details of the dataset and our pre-training procedure in the Appendix~\ref{}.  Table~\ref{en_zeroshot_2.6B} represents the results. Our multiple-choice pre-training gives a significant improvement on several datasets: $34\%$ on CB dataset (NLI task),  $10\%$ on StoryCloze (Sentence completion based on common sense reasoning), $4\%$ on RTE (NLI task). After multiple-choice pre-training, the results on some datasets decreased, but the SuperGlue average is better than for the model without pre-training.   
+
+
+
+
+% \begin{table}[ht]
+% \caption{\label{en_zeroshot_2.6B}
+% The zero-shot results of English downstream tasks
+% }
+% \centering
+% \begin{tabular}{|c|c|c|c|c|}
+% \hline
+% Dataset   & Metric  & GPT3 2.7B         & \textbf{PanGu-$\Sigma$ 2.6B 470k} & \textbf{PanGu-$\Sigma$ 2.6B 226k} \\ \hline
+% BoolQ     & acc     & \textbf{67.1}     & 63.09                             & 64.07                             \\
+% CB        & acc     & 19.6              & 44.64                             & \textbf{48.21}                    \\
+% Copa      & acc     & 76.0              & 76.00                             & \textbf{78.00}                    \\
+% RTE       & acc     & 46.6              & 57.04                             & \textbf{58.48}                    \\
+% WiC       & acc     & 0.0               & \textbf{50.16}                    & \textbf{51.57}                    \\
+% WSC       & acc     & \textbf{66.3}     & 59.62                             & 64.42                             \\
+% MultiRC   & {\rm F1}_a     & \textbf{60.0}     & 59.95                             & \textbf{60.00}                    \\
+% ReCoRD    & acc     & \textbf{86.2}     & 84.45                             & 85.10                             \\ \hline
+% SuperGLUE & average & 52.7              & 61.84                             & \textbf{63.53}                    \\ \hline
+% \end{tabular}
+% \end{table}
+
+% \begin{table}[ht]
+% \caption{\label{en_zeroshot_2.6B}
+% Effect of Multiple-Choice Pre-training (\MODEL\-MC). The experiments performed with smaller model \MODEL\ 2.6B, results are compared with the model performance without pre-training, and with GPT3 of the corresponding size. 
+% %\textbf{Bold} are the absolutely best results, {\it italic} are the best among the models without additional pre-training.
+% }
+% \centering
+% \begin{tabular}{|c|c|c|c|c|c|c|}
+% 	\hline
+% 	Dataset    & Metric    & GPT3 2.7B     &  \textbf{PanGu-$\Sigma$}	& \textbf{PanGu-$\Sigma$-MC} \\ \hline
+% 	%RACE-H     & acc       & \it{42.4}     & 39.82    & 25.84                        \\ 
+% 	StoryCloze & acc       & 77.2     & 76.80    & \textbf{86.75}               \\ \hline
+% 	\multicolumn{5}{|l|}{SuperGLUE}	\\ \hline
+% 	BoolQ      & acc       & \textbf{67.1} &  64.07   & 65.23                        \\
+% 	CB         & acc       & 19.6          &  48.21  & \textbf{80.36}               \\
+% 	Copa       & acc       & 76.0          & \textbf{78.00}  & 72.0                         \\
+% 	RTE        & acc       & 46.6          &  58.48  & \textbf{62.45}               \\
+% 	WiC        & acc       & 0.0           &  51.57  & \textbf{53.76}               \\
+% 	WSC        & acc       & \textbf{66.3} & 64.42    & 63.46                        \\
+% 	MultiRC    & {\rm F1}a & \textbf{60.0}     & \textbf{60.00}  & 59.95                        \\
+% 	ReCoRD     & acc       & \textbf{86.2}  & 85.10   & 73.48                        \\ \hline
+% 	SuperGLUE  & average   & 52.7          & 63.53  & \textbf{66.33}         \\ \hline
+% \end{tabular}
+% \end{table}
+
+\end{document}

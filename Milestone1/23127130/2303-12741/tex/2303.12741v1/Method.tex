@@ -1,0 +1,273 @@
+
+\begin{figure*}[h]
+  \centering
+  \includegraphics[width=\linewidth]{images/pipeline.png}
+  \caption{An overview of the drawing-to-animation pipeline. Given an input drawing, the human figure within it is identified and used to crop the image. From the cropped image, the human figure segmentation mask and joint locations are obtained and used to create a character rig. Motion capture data is then retargeted onto the character rig to produce animations.}
+  \Description{Overview Stand In.}
+  \label{fig:overview}
+\end{figure*}
+
+Our goal is a system that generates an animation from a single drawing of a human figure.
+To make the experience as simple and accessible as possible, we take the input to be a single in-the-wild photograph of a drawing, as might be captured with a mobile phone camera.
+While vector drawings from tablet-based interfaces can provide stroke-level information, previous in-classroom research has found tablet-based drawing interfaces to be more fatiguing and difficult to use than their analog counterparts\,\cite{picard2014ipads}; we therefore assume the input to be a raster image.
+
+Starting with the single image, we structure the task as a series of sub-tasks: human figure  detection, segmentation, pose estimation, and animation (Figure \ref{fig:overview}).
+The first step is to identify the human figure within the drawing and predict a bounding box that tightly encompasses it.
+Second, we use the contents of the bounding box to obtain a segmentation mask, separating pixels belonging to the human figure from those belonging to the background.
+Third, we use the contents of the bounding box to perform pose estimation on the figure, identifying a series of skeletal joints.
+With the original image, segmentation mask, and joint locations, we generate a character rig suitable for animation.
+Finally, we animate the character rig by retargeting motion capture data onto it.
+
+In the following sections, we describe the steps in more detail and provide examples of common failures that can occur.
+We end by describing how the system is framed within the publicly released \AD Demo and how the user interface is structured to allow users to modify the model predictions as needed.
+
+\subsection{Figure Detection}
+\label{sec:character_detection}
+% Why is this step necessary
+We first detect a bounding box around the human figure within the drawing.
+This step is necessary because many children's drawings portray human figures as part of a larger scene \cite{kellogg1967rhoda} and because the photograph may include background  either drawn or outside the bounds of the piece of paper such as a table surface.
+
+
+% How do we perform this step?
+We make use of a state-of-the-art object detection model, Mask R-CNN\,\cite{MaskRCNNhe2017mask}, with the ResNet-50+FPN backbone.
+We utilize pretrained weights derived from the MS-COCO dataset, one of the largest publicly available semantic segmentation datasets\,\cite{lin2014microsoft}. 
+However, MS-COCO is comprised primarily of photographs of real-world objects, not artistic renderings, and does not contain a category for \textit{drawings of human figures}. Therefore, we fine-tune the model.
+The model's backbone weights are frozen and attached to a head, which predicts a single class, \textit{human figure}. 
+The weights of the head are then optimized using cross-entropy loss and stochastic gradient descent with an initial learning rate of 0.02, momentum of 0.9, weight decay of 1e-4, and minibatches of size 8.
+Training was conducted using OpenMMLab Detection Toolbox \cite{mmdetection}; all other hyperparameters were kept at the default values provided by the toolbox.
+Each model was trained until convergence on a server with eight Tesla V100-SXM2 GPUs.
+
+In Figure \ref{fig:maskrcnn_before_after}, we show representative example predictions. 
+See supplemental material for additional examples.
+For an exploration of the amount of training data necessary to achieve acceptable results, see Section \ref{sec:effect_of_training_sample_size}.
+
+
+\begin{figure*}[h]
+  \centering
+  \includegraphics[width=\linewidth]{images/detection_comparisons.png}
+  \caption{
+  Row 1 shows representative detection failures from pretrained Mask R-CNN (left) that were corrected after model fine-tuning (right): 
+    excluding hollow parts of a figure (a),
+    false negatives (b),
+    incorrectly detecting objects in the background (c),
+    and detecting and incorrectly classifying parts of figures (c, d).
+  Row 2 contains examples of successful detections from the fine-tuned model. 
+  Row 3 contains representative examples of failures: 
+    false negatives (m, n),
+    false positives (o, q),
+    multiple detections of the same figure (l),
+    and detections that cut off figure parts (p, r).
+    Additional examples are shown in the supplemental material.
+}
+\Description{Mask R-CNN before and after fine-tuning.}
+\label{fig:maskrcnn_before_after}
+  
+\end{figure*}
+
+
+\subsection{Figure Segmentation}
+\label{sec:character_segmentation}
+% Why is this step necessary
+With the bounding box identified, we next obtain a segmentation mask, separating the figure from the background.
+This step is surprisingly difficult; there is a great deal of variation in figure appearance and in photograph quality.
+Additionally, texture and color, two attributes that are useful for segmentation in photographs, are of limited value here: they are a function of the artist's drawing style and their available drawing tools.
+While Mask R-CNN does predict a segmentation mask for each detection, we found them to be inadequate in many cases. 
+Because this mask will be used to create a 2D textured mesh of the figure, it must be a single polygon that tightly conforms to the edges of the figure, includes all body parts, and excludes extraneous background elements.
+
+We therefore use a classical, image processing-based approach for extracting masks (see Figure \ref{fig:segmentation-flowchart}). 
+First, we resize the bounding box-cropped image to a width of 400 pixels while preserving the aspect ratio.
+Next, we convert the image to grayscale and perform adaptive thresholding, where the threshold value is a Gaussian-weighted sum of the neighborhood pixel values minus a constant \textit{C} \cite{gonzalez2008digital}.
+Here, we use a distance of 8 pixels to define the neighborhood and a value of 115 for \textit{C}.
+To remove noise and connect foreground pixels, we next perform morphological closing, followed by dilating, using 3x3 rectangular kernels.
+We then flood fill from the edges of the image, ensuring that any closed groups of foreground pixels are solid and do not contain holes.
+Finally, we calculate the area of each distinct foreground polygon and retain only the one with the largest area.
+
+\begin{figure*}[h]
+  \centering
+  \includegraphics[width=\linewidth]{images/segmentation-flowchart.png}
+  \caption{
+We use an image processing-based approach to extract the figure mask. Beginning with the contents of the detected bounding box (a), we convert to grayscale and apply adaptive thresholding (b), perform morphological closing (c) and dilating (d), flood filling (e), and retain only the largest polygon (f). The resulting mask tightly conforms to the original figure (g). 
+}
+\Description{Segmentation Flowchart}
+\label{fig:segmentation-flowchart}
+  
+\end{figure*}
+
+
+
+% what do the results from this step look like?
+While this method is straightforward, we nonetheless found it to be an effective method for extracting useful and precise figure masks.
+However, it will fail when body parts are drawn separated, limbs are drawn touching at points other than the joints, the figure is not fully contained by the bounding box, or the outline of the figure is not completely connected.
+For examples comparing the Mask R-CNN segmentation predictions to the image-based processing approach, see Figure~\ref{fig:segmentation_comparison}.
+
+\begin{figure*}[h]
+  \centering
+  \includegraphics[width=\linewidth]{images/segmentation_comparisons2.png}
+  \caption{Given the bounding boxes shown in the top row, the image processing-based segmentation method computes the masks shown in the middle row. The bottom row shows the masks predicted by the fine-tuned Mask R-CNN model. 
+  Often the image processing method gives usable results while the Mask R-CNN model excludes or detaches body parts (a, b, g, h), improperly attaches limbs to the body or head (c, d, e, f,) or includes non-figure elements (f, h).
+  Columns i and j show examples in which the image processing method fails to extract a good mask, which can occur when the limbs of the figure are not drawn attached to the body (i) or the strokes outlining the figure are not connected (j). Note that (j) is an example of a figure for which the Mask R-CNN segmentation prediction is more suitable for animation than the mask obtained through our image processing-based segmentation method.
+  }
+  \Description{Segmentation Comparison}
+  \label{fig:segmentation_comparison}
+\end{figure*}
+
+
+%\begin{figure}[h]
+%  \centering
+%  \includegraphics[width=\linewidth]{images/segmentation_comparison.png}
+%  \caption{Composites of image processing-based segmentation masks (left), contents of Mask R-CNN predicted character bounding box (middle), %and Mask R-CNN predicted segmentation mask (right).
+%The first four rows depict an example where the predicted mask is unsuitable for animation because it excludes or detaches body parts (a, b, %h, i), improperly attached limbs to the body (f, g, c, d), or included non-character elements (g, i).
+%The last row shows examples in which the image processing method fails to extract a good mask, which occurs when the strokes outlining the %character are not connected (e) or when limbs of the character are not drawn attached to the body (j).
+%  }
+%  \Description{Segmentation Comparison}
+%  \label{fig:segmentation_comparison}
+%\end{figure}
+
+
+
+\subsection{Pose Estimation}
+\label{sec:joint_detection}
+
+% Why is this step necessary
+To allow the character to perform complex motions, we need an understanding of its proportions and pose.
+However, a fine-grained analysis of a figure's body parts is tricky, due to the sparse and abstract way in which they can be represented;
+a single line may be the edge of an arm (Figure \ref{fig:pose_examples}.l), an entire arm (Figure \ref{fig:pose_examples}.k), a design on the figure's shirt (Figure \ref{fig:pose_examples}.e), a background element (Figure \ref{fig:maskrcnn_before_after}.f), or a preexisting print upon the page (Figure \ref{fig:maskrcnn_before_after}.l),
+
+
+Discerning exactly what each stroke of a drawing is can be difficult, even for humans.
+To make this task more tractable, we instead only seek to identify a small set of keypoints that can be used as joints during the animation step.
+We assume the presence of the 17 keypoints used by MS-COCO \cite{lin2014microsoft} (see Figure \ref{fig:rigged_character_creation}) and use a pose estimation model to predict their locations.
+
+% How do we perform this step?
+While there are many pose estimation models suitable for photographs of people, they do not perform well upon images of drawn human figures, which are quite different in appearance.
+We therefore train a custom pose estimation model utilizing a ResNet-50 backbone, pretrained on ImageNet, and a top-down heat map keypoint head that predicts an individual heatmap for each joint location. 
+The cropped human figure bounding box is resized to 192x256 and fed into the model, and the highest-valued pixel in each heatmap is taken as the predicted joint location.
+Mean squared error is used for joint loss, and optimization is performed using Adaptive Momentum Estimation with learning rate of 5e-4 and minibatches of size 512.
+Training was conducted using the OpenMMLab Pose Toolbox \cite{mmpose2020}; all other hyperparameters were kept at the default values provided by this toolbox.
+The model was trained on a server with eight Tesla V100-SXM2 GPUs until convergence.
+
+We provide representative examples of successful and unsuccessful pose estimation examples in Figure \ref{fig:pose_examples}.
+See the supplemental material for additional examples.
+As with the detection, see Section \ref{sec:effect_of_training_sample_size} for an exploration of the amount of training data necessary to achieve acceptable results.
+
+\begin{figure*}[h]
+  \centering
+  \includegraphics[width=\linewidth]{images/pose_examples.png}
+  \caption{Examples of successful and unsuccessful pose estimations. Frequent causes of failure include limb confusion caused by background elements (k), limb confusion caused by other figure parts (h, m, n), and objects held by the figure (i, l). Human figures not drawn facing forward, while infrequent, also result in failure (j).
+  Additional examples are shown in the supplemental material.
+  }
+  \Description{Examples of successful and unsuccessful pose estimations.}
+  \label{fig:pose_examples}
+  
+\end{figure*}
+
+
+
+\begin{figure*}[h]
+  \centering
+  \includegraphics[width=\linewidth]{images/twisted_perspective__character_rig.png}
+  \caption{\textit{Left:} Given the predicted joint keypoints (left), we create a skeletal rig used to animate the character (right).
+  \textit{Right:} 
+  In this example, we take the original pose from a motion capture actor and project the torso and upper limb joint locations onto a frontal plane, while projecting the lower limb joint locations onto a sagittal plane (left).
+  We then find the global orientations of the bones within their respective planes and rotate the character's bones to match, resulting in the retargeted pose (right).}
+  \Description{Rigged Character Creation}
+  \label{fig:rigged_character_creation}
+\end{figure*}
+
+
+\subsection{Animation}
+
+We next create a rigged character, suitable for animation, from the mask and joint predictions.
+From the segmentation mask, we use Delaunay Triangulation to generate a 2D mesh and texture it with the original drawing.
+Using the joint locations, we construct a character skeleton.
+We use the predicted positions of the left and right shoulders, elbows, wrists, hips, knees, ankles, and nose.
+We average the position of the two hips to obtain a root joint and average the position of the two shoulders to obtain the chest joint.
+We connect these joints to create the skeletal rig as shown in Figure \ref{fig:rigged_character_creation} (left).
+Finally, we assign each mesh triangle to one of nine different body part groups (left upper leg, left lower leg, right upper leg, right lower leg, left upper arm, left lower arm, right upper arm, right lower arm, and trunk) by finding the closest bone to each triangle's centroid.
+During the animation step, different body part groups can be rendered in different orders, giving the illusion of limbs being in front of or behind the body.
+
+We animate the character rig by translating the joints and using as-rigid-as-possible (ARAP) shape manipulation\,\cite{igarashi2005asrigidaspossible} to repose the character mesh. 
+To make the process simple for the user, we drive the character rig using a library of preselected motion clips obtained from human performers.
+Because the human figures are 2D and often have very different proportions and appearances from those of real humans, care must be taken when deciding how to best utilize the 3D motion data.
+We retarget the motion in the following manner.
+
+% preprocessing clip, decoupling global translation and rotation
+We initially preprocess a motion clip by subtracting, per frame, the X and Z position of the root joint from the motion caption actor's skeleton, such that the skeleton's root joint is always located above the origin. 
+We also rotate the skeleton about the vertical axis such that its forward vector (defined as the vector perpendicular to the average of the vector connecting the shoulder joints and the vector connecting the hip joints) is facing along the positive X axis.
+We then project the skeleton's joint locations onto a 2D plane (shortly, we will describe how to select the 2D plane).
+
+% retargeting via matching global orientation upon plane
+Next, for the bones of the upper arms, lower arms, upper legs, lower legs, neck, and spine, we compute the global orientation of each bone within the 2D projection plane.
+We then rotate the corresponding bones of the character rig so as to match these global orientations.
+Using the new joint positions as ARAP handles, we repose the mesh.
+When the character rig is reposed this way, the lengths of the character's bones are never foreshortened.
+This is an intentional design decision; foreshortening is quite rare in children's drawings \cite{willats2006making}, and we therefore opted for a method of animation that does not introduce it.
+
+To apply root motion, we compute the per-frame root offset of the human actor and
+ scale it by the constant ratio of the actor's average leg length to the character’s average leg length. 
+The resulting offset is applied to the character rig, moving it horizontally across the screen. 
+
+% global orientation with one plane not ideal. so we twist perspective.
+When projecting the actor's 3D joint locations onto a 2D plane, there are multiple planes from which to choose.
+Which plane to select depends upon the motion:
+jumping jacks will be most recognizable when projected onto a frontal plane, while the hip hop dance \textit{running man} will be most recognizable when projected onto a sagittal plane. 
+In order for the motion to remain recognizable, the choice of projection plane should preserve as much joint position variance as possible. 
+
+We automatically compute the plane as a function of the motion.
+After preprocessing the motion data (as described above), we plot the joint positions over the entire motion clip as a point cloud and perform principal component analysis upon it.
+The first two principal components define a 2D plane upon which joint position maximally varies.
+The third principal component defines a vector normal to this plane. 
+We select as the 2D projection plane either the skeleton's frontal plane or sagittal plane, depending upon which has a normal vector with a higher cosine similarity to the third principal component. 
+
+This projection technique, as described above, will work well when the source 3D motion primarily occurs on a single plane (such as jumping jacks or a cartwheel).
+However, some motions do not cleanly fall onto a single plane, and are therefore more difficult to recognize after being projected to 2D.
+
+To increase the number of motions that remain recognizable, we do not restrict ourselves to using the same 2D plane for the entire skeleton.
+Rather, we independently create joint point clouds, perform principal component analysis, and select the projection plane for the upper limbs and the lower limbs (see Figure \ref{fig:rigged_character_creation}, right). 
+
+While mixing perspectives in this manner might result in undesirable motion on a realistic figure, many children's drawings already employ the technique of \textit{twisted perspective}, drawing different parts of a human figure from different points of view\,\cite{dziurawiec1992twisted}.
+As a result, mixing perspectives when retargeting matches the motion style and drawing style, increasing the appeal of the final animation as we demonstrate with a user study (see Section \ref{sec:twisted_perspective_perceptual_study}).
+
+
+
+
+
+
+
+\subsection{User Interface}
+\label{sec:UI}
+
+\begin{figure*}[h]
+  \centering
+  \includegraphics[width=\linewidth]{images/UI.png}
+  \caption{User interface within the \AD Demo. After uploading a drawing (a), users can observe and optionally modify the predicted bounding box (b), modify the segmentation mask (c), and reposition joints (d) prior to selecting a motion to apply to the character rig (e).}
+  \Description{fig:UI}
+  \label{fig:UI}
+  
+\end{figure*}
+
+The purpose of the system is to empower users to create appealing animations from their children's drawings.
+To increase the chance of a successful outcome, we make certain assumptions about the input image and expose a simple user interface that allows for step-by-step corrections, if needed.
+
+For the detection step, we assume a single human figure to be present within the scene.
+If multiple human figures are detected by the model, we return a single bounding box encompassing all detected bounding boxes. 
+If no human figures are detected, we return a single bounding box containing the entire image.
+Users are prompted to drag the edges of the bounding box to fit to their human figure as needed before continuing to the segmentation step (Figure \ref{fig:UI}.b).
+
+In the segmentation step, users are presented with a visualization of the segmentation mask overlaid on the original image. 
+Users can use a pencil and eraser tool to add and subtract pixels from the mask (Figure \ref{fig:UI}.c).
+After the user has modified the mask, it is again flood filled and the largest polygon is retained to ensure the mask is a single, solid region (steps e and f in Figure \ref{fig:segmentation-flowchart}).
+
+% Pose Estimation
+In the pose detection step, users are shown the predicted joint locations overlaid upon their drawing. 
+If a joint is incorrectly positioned, the user can drag it to a more appropriate location (Figure \ref{fig:UI}.d).
+Users cannot add or delete joints, but are instructed to drag joints far away from the human figure to avoid using them for animation.
+
+% Animation
+Finally, users are shown a gallery of preselected motions performed by an example character;
+clicking on a motion applies it to the user's character rig (Figure \ref{fig:UI}.e).
+The gallery of preselected motions is static and does not vary depending upon the uploaded image or annotations.
+
+% Runtime
+\hjs{The demo is deployed on Amazon Web Services using a combination of g4dn.2xlarge and c5.4xlarge servers.
+If the user makes no annotation modifications, the entire image-to-animation user flow takes less than 10 seconds.}

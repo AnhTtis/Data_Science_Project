@@ -1,0 +1,153 @@
+\section{Approach}
+
+\begin{figure}
+    \includegraphics[width=0.9\linewidth]{figures/cloze_apr.pdf}
+    \caption{\Csapr}
+    \label{fig:csapr}
+\end{figure}
+
+\begin{figure*}
+    \includegraphics[width=0.8\linewidth]{figures/overview.pdf}
+    \caption{\ourtech overview}
+    \label{fig:overview}
+\end{figure*}
+
+In this section, we describe our approach to incorporate the plastic surgery hypothesis for \llm-based \apr. While our overall idea is general for \llm-based \apr approaches, we mainly focus on \csapr since it has been demonstrated to be the state-of-the-art for \llm-based \apr~\cite{xia2023repairstudy}. Figure~\ref{fig:csapr} shows the overview of \csapr where we aim to directly generate the correct code in place given the original context, where the model has to "fill in the blanks" of the missing code line/hunk (represented by \CodeIn{<SPAN>}) given the buggy context. However, prior \csapr tools largely ignore the rich project-specific and bug-specific information which has been demonstrated by the plastic surgery hypothesis~\cite{barr2014plastic, legoues2012genprog} to be critical in helping to generate a correct fix. \llm presents an exciting opportunity to automatically leverage the idea of the plastic surgery hypothesis via its powerful ability to both directly learn from the buggy project (fine-tuning) and use relevant code context clues (prompting) to generate correct fixes. In this work, we explore using \llm{s} to automatically capture project-specific information via both fine-tuning and prompting. 
+
+
+%
+
+
+We propose a novel approach -- \ourtech to combine the direct usage of \plm in \csapr with knowledge gained from the plastic surgery hypothesis.
+% 
+\ourtech first trains two separate models with two novel fine-tuning strategies:
+\textbf{1) \epfinetune} -- we use the source files of the original buggy project to construct a similar dataset to pre-training by aggressively masking out large portions (50\%) of the code tokens, which allows \plm to learn project-specific code tokens and programming styles; and% 
+\textbf{2) \rofinetune} -- we fine-tune another model using the original buggy project to construct a more repair-oriented dataset by masking out only a single continuous code sequence per training sample,
+% 
+which makes the fine-tuned model become more prepared for the repair task where only a single continuous code sequence needs to be generated. 
+Additionally, we propose a novel prompting strategy, \textbf{3) \idprompting}, by obtaining a list of relevant/rare identifiers that are not seen by the model in its immediate context using information retrieval and static analysis.%
+%
+%
+
+
+
+While our approach can be extended to different \plm{s}, in this paper, we use \ctfive~\cite{wang2021codet5}, an encoder-decoder \plm for code trained using \mspfull (\msp) objective. \msp replaces continuous tokens with a single masked span token (\CodeIn{<SPAN>}) and the pre-training task is to recover masked-out code sequences given the surrounding context. Given a sequence of tokens $X = \{x_1, ..., x_n\}$, random sequences of tokens are replaced with a masked span token to produce $X_{masked} = \{x_1, ..., \CodeIn{<SPAN>}, x_n\}$. Let $M = \{m_1, ..., m_k\}$ be the tokens masked out, $M_{<g} = \{m_{1}, m_{2}, ..., m_{g-1}\}$ be token sequence predicted so far where $g \leq k$, $P$ be the predictor (model) which outputs the probability of a token. The \msp loss function can be described as: 
+
+
+\begin{equation}
+\mathcal{L}_{\msp} = -\frac{1}{k}\sum_{i=1}^{k} log\;(P\;(m_i\;|\;X_{masked},\;M_{<i})
+\end{equation}
+
+
+To employ \ctfive for \csapr using \msp, we follow previous work~\cite{xia2022alpharepair} and use repair templates to generate mask lines where we replace the entire or parts of the buggy line with a single masked span token. We then use \ctfive to generate the correct code to replace the masked span and create a patch for the bug. Figure~\ref{fig:overview} shows the overview of our approach: 
+
+
+
+
+\begin{itemize}[noitemsep, leftmargin=*, topsep=0pt]
+	\item \textbf{\circled{1} (Section~\ref{sec:ki_finetune})}: We use \epfinetune to build a training dataset by extracting functions from buggy project source code. We fine-tune the original \ctfive model by first using a high masking rate to aggressively learn project-specific tokens. 
+	\item \textbf{\circled{2} (Section~\ref{sec:ro_finetune})}: We use \rofinetune  strategy to fine-tune another model by constructing another training dataset from the buggy project where only a single or partial code line is masked out based on the repair templates. We train the model until convergence and obtain the \rofinetune model. 
+        \item \textbf{\circled{3} (Section~\ref{sec:idprompting})}: We use \idprompting strategy to extract relevant identifiers via information retrieval and static analysis. We then create individual prompts with instructions for the model to use the extracted identifiers during patch generation. 
+	\item \textbf{\circled{4} (Section~\ref{sec:patch_gen})}: We perform \csapr by using the repair templates from previous work~\cite{xia2022alpharepair} and generate patches by separately using the 4 models (original \ctfive, \epfinetune model, \rofinetune model, and original \ctfive with prompting). Each patch generated is then validated against the test suite to find the list of plausible patches.
+    
+	
+\end{itemize}
+
+%
+
+\subsection{Knowledge-Intensified Fine-tuning}\label{sec:ki_finetune}
+
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figures/ki_finetune_overview.pdf}
+    \caption{\epfinetune overview}
+    \label{fig:ki_overview}
+\end{figure}
+
+To facilitate the learning of project-specific information, we use \epfinetune by constructing a training dataset using the buggy project itself. % 
+Figure~\ref{fig:ki_overview} shows the  \epfinetune process. We first extract the source code functions from the project code base where the bug is from and apply \msp objective -- masking out multiple spans of code tokens, used to pre-train the original \ctfive model. Traditionally, \msp objective will mask out only a small portion of the original code tokens (e.g., 15\%~\cite{wang2021codet5}). However, in this step, we employ a much higher masking rate (50\%) which means the model is tasked with recovering more masked-out code tokens with less context. This approach is motivated by a recent study~\cite{wettig2022mask15} on \plm{s} for natural languages where better representation and downstream performance can be achieved by increasing the pre-training masking rate of \mlm and \msp objectives. The study found that higher masking rates make the learning tasks more challenging and can force the model to learn more aggressively, which helps improve the performance of \plm{s} on various downstream tasks. In this paper, we leverage this idea of more aggressive training to force the model to learn more project-specific knowledge by trying to recover more code tokens given limited context.
+
+
+However, one limitation with fine-tuning the model on the buggy project itself is the relatively small number of training samples (e.g., thousands of functions) especially compared with the large amount of open-source pre-training data used in \ctfive (millions of functions). As a result, we \textit{reapply} the \msp objective across iterations to augment the fine-tuning dataset with more training samples. Following the example in Figure~\ref{fig:ki_overview}, we start by creating one set of training data by masking out 50\% of the training tokens to create masked spans. In the next iteration, we reapply this masking strategy to create a new set of training data by randomly choosing another 50\% to mask out again. In this process, we essentially create new training data for each subsequent iteration. While the number of tokens masked out is the same, the specific masked locations can be different which provides further augmentation on the training dataset allowing the model to learn more project-specific tokens.
+%
+
+During the fine-tuning process when using \epfinetune, \ourtech is able to learn project-specific knowledge such as commonly used methods or variables that are specifically defined in the current project. These pieces of project-specific knowledge are especially important for repair as many bugs can be fixed by applying code snippets found in other parts of the source file or project, according to the plastic surgery hypothesis~\cite{barr2014plastic}. Due to the limited context window size (e.g., 512 tokens for \ctfive), \ctfive cannot encode all of the surrounding contexts during inferencing, which leads to the base \ctfive model missing variable names and method calls used in other parts of the context that are actually necessary to be used as part of the patch. \epfinetune can partially alleviate this by learning these missing variable names and method calls as part of the fine-tuning such that when used for \csapr, the fine-tuned model can predict these useful tokens with a higher probability compared to the model without fine-tuning. While \epfinetune can help with better learning of project-specific details, we next introduce \rofinetune which produces another model that aims to optimize for the repair task. 
+
+
+
+\subsection{Repair-Oriented Fine-tuning}\label{sec:ro_finetune}
+
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figures/ro_finetune_overview.pdf}
+    \caption{\rofinetune overview}
+    \label{fig:ro_overview}
+\end{figure}
+
+
+In the previous step, we use \epfinetune to generate more code that uses project-specific variables, method calls, and structures. \Csapr frames the problem of patch generation by asking the model to fill in the correct code given the buggy context. This is achieved by exploiting the similarity between the pre-training objective and final inference setup to generate patches. Furthermore, \csapr is not limited to only generating a complete line but additionally using repair templates (e.g. replaces only method call name) which keeps part of the buggy line to create patches by generating partial lines~\cite{xia2022alpharepair}. However, both the \epfinetune \ctfive and the original \ctfive suffer from the same limitation: \textit{the training process is not designed for repair}. Both the original pre-training and \epfinetune use \msp which masks out multiple disjointed code token spans. The goal of the model during training is to recover the original tokens for all the masked spans. However, for \csapr, only a single code line or a part of the code line is usually masked out and the model only has to predict the correct code for that single span. 
+
+%
+
+To address such limitations, we use \rofinetune which fine-tunes with a training setup that is similar to the repair inference task. Figure~\ref{fig:ro_overview} shows the detailed \rofinetune process. We again first use the original buggy project as the source of our training data by extracting source code functions. We pick a single code line in each training sample to mask out with a single span token. One can think of this chosen code line as the buggy line in the final repair scenario. To model the impact of eventually using template-based repair inputs, we randomly select a repair template that can be applied on this line to mask out only a part of the line. These repair templates are taken directly from previous \csapr work~\cite{xia2022alpharepair} and can be categorized into 3 different types of repair templates: \textbf{1) Complete mask} -- replace the entire buggy line with a single span token or add the span token to before/after the buggy line, \textbf{2) Partial mask} -- keep some original buggy line tokens at the end or beginning of the line and replace the rest with a span token, and \textbf{3) Template mask} -- target specific code line types by replacing the method call, method parameters, and Boolean expression or operator with a span token.% 
+In this fine-tuning process, our training samples are closely similar in their setup compared with the \csapr task that we want the model to perform. Using \rofinetune, we can produce a fine-tuned model which aims to follow closely with the final repair task. 
+
+\subsection{Relevant-Identifier Prompting}
+\label{sec:idprompting}
+
+
+Two previous fine-tuning strategies aim to fine-tune the model towards generating more project-specific tokens and get used to repair-oriented inputs, in both cases, using the original buggy project as the fine-tuning dataset. However, this means that the two fine-tuned models have been geared toward the entire buggy project rather than the specific bug within the project. For specific bugs, the relevant code ingredients may be drastically different depending on the bug file, location, and type of buggy line. These ingredients can be possibly far away from buggy locations, making it hard for them to be included in the input context due to the \textbf{limited context window size} of \plm{s} (e.g. the limit of context window size of \ctfive is 512 tokens).
+
+We use \idprompting on the base \ctfive model to directly prompt the model with relevant code ingredients. Algorithm \ref{algo:ri_strategy} shows the overview of our prompting strategy. Given the buggy line information, we first extract the certain file containing the bug and separate it into individual code lines (Line \ref{algo:extractcodelines}). Prior work has found that a significant percentage of the correct code to fix the bug can be found within the same file~\cite{barr2014plastic}. We then use Levenshtein Distance Ratio~\cite{levenshtein1966binary} (other string comparison methods~\cite{ratcliff1988pattern, jaro1989advances, winkler1990string} provide similar results) to measure the similarity between each line compared with the buggy line (Line \ref{algo:calsim}). The hypothesis is that useful identifiers can be obtained from lines that are very similar to the buggy line~\cite{asad2019impact}. We rank each code line based on its string similarity score from high to low to get a ranked list of code lines (Line \ref{algo:rerankcodelines}).
+Since we want to provide the model with identifiers to help generate the correct fix, we extract identifiers from each line (Line~\ref{algo:extractid}), which provides us with a ranked list of identifiers. After that, we perform further filtering by first removing any common/simple identifiers (e.g., \CodeIn{length} and \CodeIn{node}) (Line \ref{algo:simplefilter}) and then using static analysis (Line \ref{algo:accessible}) to remove any identifiers that are unaccessible within the buggy method (Line \ref{algo:remove}). Next, we extract the useful type information for each identifier to indicate the type/return type and if it is a method invocation or a variable (Line \ref{algo:typeinfo}). Finally, we obtain a ranked list of complex identifiers that come from similar lines within the same file. 
+
+Using the ranked identifier list, we then generate the prompts to instruct the model to use these extracted identifiers to generate patches (Line \ref{algo:prompt}). \llm{s} are able to understand natural language instructions in the form of prompts to perform specific tasks. In \idprompting, we construct a prompt in the form of \CodeIn{/* use \{\} in the next line */} where we replace \CodeIn{\{\}} with an identifier with type information (e.g., \CodeIn{(Plot) getParent()}). This prompt is then appended before the masked span token during inference which allows the model to directly use this identifier information provided in its generation. Since we have a ranked list of identifiers, we generate multiple unique prompts, each including one of the top \(N\) highest-ranked identifiers. By directly providing these extracted bug-specific identifiers in prompts, the model can use these identifiers which previously are outside of its immediate context to generate the correct fix. 
+
+\begin{algorithm}[t]
+    \caption{Relevant-Identifier Prompting Strategy}
+    \label{algo:ri_strategy}
+    \begin{algorithmic}[1]
+    {\small{
+    \item[\textbf{Inputs:}] Buggy project $Proj$, Buggy file $File$, Buggy line $buggy\_line$.
+    \item[\textbf{Output:}] Relevant-Identifier $prompts$.
+    
+    \STATE $lines$ $:=$ \textsc{ExtractLines}\ ($File$)  \label{algo:extractcodelines}
+    \STATE $similarities,\; identifiers$ $:=$ $[], []$ 
+    \FOR{\ $line$\ \  in\ \  $lines$\ }
+        \STATE $similarities$.append\ (\textsc{LevenshteinRatio}\ ($buggy\_line$,\; $line$)) \label{algo:calsim}
+    \ENDFOR
+    \STATE $lines\_ranked$ $:=$ \textsc{RankLines}\ ($lines$,\; $similarities$) \label{algo:rerankcodelines}
+    \FOR{\ $line$\ \  in\ \  $lines\_ranked$\ }
+        \STATE $line\_identifiers :=$ \textsc{ExtractIds}\ ($line$) \label{algo:extractid}
+        \STATE $identifiers$.extend\ (\textsc{SimpleFilter}\ ($line\_identifiers$)) \label{algo:simplefilter}
+    \ENDFOR
+    \STATE $accessibles$ $:=$ \textsc{FindAccessibleIds}\ ($Proj$,\; $File$,\; $buggy\_line$) \label{algo:accessible}
+    \STATE $relevants := identifiers\; \cap\; accessibles$ \label{algo:remove}
+    \STATE $type\_infos$ $:=$ \textsc{FindTypeInfo}\ ($Proj$,\; $relevants$) \label{algo:typeinfo}
+    \STATE $prompts := $ \textsc{BuildPrompts}\ ($relevants$,\; $type\_infos$) \label{algo:prompt}
+    }}
+    
+    \end{algorithmic}
+\end{algorithm}
+
+
+
+
+\subsection{Patch Generation, Ranking, and Validation}
+\label{sec:patch_gen}
+
+We directly use the base \ctfive model (with and without prompting) and the two fine-tuned models generated from previous steps for patch generation. To generate patches to replace the buggy lines, we apply repair template inputs from previous work~\cite{xia2022alpharepair} and ask each model to fill in the masked-out span token with generated correct code. Following prior work~\cite{prenner2021codexws, xia2023repairstudy, kolak2022patch}, we sample each model in parallel to generate its own set of patches. In total, for each bug, we generate four lists of potential patches using the four models.
+
+
+The rankings of patches are computed based on the outputs of each model. We follow the same process as previous work~\cite{xia2022alpharepair} and compute the entropy score using the model. For each candidate patch, we want to provide a likelihood score (entropy) that can accurately reveal the extent to which \ctfive will generate this patch. Let $T = \{t_1, t_2, ..., t_n\}$ be the list of tokens generated for a patch and $C(t_i)$ be the probability of generating token $t_i$ according to \ctfive, then the likelihood score is defined as: $score(T)=\frac{1}{n}\sum_{i=1}^{n}\log\;(C(t_i))$.
+
+
+We compute this likelihood score for all the patches generated across all the templates and re-rank patches from the highest score to the lowest score. We then validate each candidate patch in accordance with the ranking results. Since each model (two fine-tuned models, base \ctfive with and without prompting) generates its own separate list of patches, we also perform the patch validation in parallel. As such, we can reduce the patch validation time by stopping after any one of the models found a correct patch according to manual inspection by developers. For one bug, \ourtech aims to produce a list of plausible patches that pass the entire test suite and a correct patch that correctly fixes the underlying bug. Since developers can stop this validation process whenever they find a patch to be the correct fix, the overall correct patch ranking is the \emph{minimum} ranking of the correct patches in the ranked patch lists produced by the four models. 
+
+
+
+ 
+
+
+
+

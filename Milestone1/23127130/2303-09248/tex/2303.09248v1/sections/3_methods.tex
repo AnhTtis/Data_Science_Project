@@ -1,0 +1,134 @@
+Given a posed image sequence $\mathbf{I}$, our goal is to extract an accurate 3D mesh model that can represent both the 3D geometry and 3D object category information, i.e., 3D meshing with vertices $\mathcal{K}\in\mathbb{R}^3$, surfaces $\mathcal{G}\in\mathbb{R}^3$, and  its corresponding 3D semantic labeling $\mathcal{S}\in \mathbb{N}$, 
+% where $\mathcal{S}$ is the category label sets with 
+a set of finite natural numbers indicating categories. Meanwhile, our proposed method aims at creating a real-time capable deep learning model for these two main 3D perception tasks. Therefore, we define a 3D perception efficiency metric $\eta_{3D}$ by involving frames per second (FPS) in runtime, to quantitatively evaluate the capability and efficiency of conducting 3D perception tasks. Details of the metric are shown in Sec.  \ref{subsec:eval_results}.
+
+In Sec. \ref{subsec:fragment}, we introduce the joint fragment learning on TSDF, initial depth, 2D semantic category, and occupancy with key frames input, for the following cross-dimensional refinement. In addition, we also introduce the learning in a coarse-to-fine hierarchy to progressively extract the geometrical features in scales, for building the learned representations of 3D reconstruction.
+Sec. \ref{subsec:cdr} describes the cross-dimensional refinement for 3D features that refines 3D features with anchored features and semantic pixel-to-vertex correspondences enabled by depth and 2D semantic predictions, which helps not only the TSDF value from the latent geometric information in the extracted features, but also the 3D semantic labeling in a sparsified manner. We also present the implementation details including loss design in Sec. \ref{subsec:implementations}. The entire network architecture is illustrated in Fig. \ref{fig:arch}. Details of the network is elaborated in the supplement.
+
+\subsection{Joint Fragment Sparse Learning in a Coarse-to-Fine Manner}\label{subsec:fragment}
+Given the inherent nature of great sparsity in the ordinary real-world 3D scene, we utilize sparse 3D convolutions to efficiently extract the 3D feature from each input scene.
+Inspired by~\cite{murez2020atlas, gu2020cascade, sun2021neuralrecon, stier2021vortx, rich20213dvnet}, we adopt a coarse-to-fine learning paradigm for the sparse 3D convolutions to exploit the representation of 3D features in multiple scales. 
+\PAR{FBV Construction by Image Features.}
+The input sequences of monocular RGB video is first processed into frames. Following~\cite{wang2018mvdepthnet, sun2021neuralrecon}, we select a set of key frames out of the input sequences $\mathbf{I}$ by querying on each frame's pose, namely the relative translation and optical center rotation with empirical thresholds, $\theta_{key}$ and $t_{key}$. We further wrap them into a fragment $\mathbf{F}_i=\{\mathbf{I}_{i,j},\mathbf{T}_{i,j} \}_{j=1}^{N_k}$ as the input to the network, where $i$ and $j$ denote the fragment and key frame index respectively, and $N_k$ is the number of key frames in the fragment. 
+
+Once the fragment $\mathbf{F}_i$ is constructed, it is processed by a 2D image backbone network to extract image features. In the decoder part of the backbone network, three different resolutions of feature maps are extracted from the pyramid sequentially as $\mathcal{P}_s\in\{P_2, P_3, P_4\}$, where the suffix notation of $P$ denotes the scaling ratio level in $\log_2$ similar to~\cite{lin2017feature}. The extracted feature $\mathcal{P}_s$ is then back projected into a local 3D volume, according to the projection matrix of each frame. We refer the local feature volume that is conditioned on the pyramid layers $\mathcal{P}_s$ as FBV, $\mathcal{F}_i=\{T_i^{x\times y\times z}, S_i^{x\times y\times z}\}$, where all the 3D voxels that are casted in the view frustums of each frame in $\mathcal{F}_i$ are merged.
+For each voxel, it contains TSDF value $T\in [-1, 1]$ and semantic label $S\in\mathbb{N}$.
+
+With the fine feature $P_2$, we build up the differentiable homography fronto-parallel planes for depth hypothesis prediction and a decoder for 2D semantics, whose scale are both at the coarse level for the best generality. Such initial \textbf{depth estimation} and \textbf{2D semantic segmentation} are retrieved from the features using a light-weight multi-view stereo network via plane sweep~\cite{yao2018mvsnet}. For each source feature map $x$ in $P_4$, we conduct the planar transformation $\mathbf{x}_j \sim \mathbf{H}_j(d) \cdot x$, where ``$\sim$" denotes the projective equality and $\mathbf{H}_j(d)$ is the homography of the $j^{th}$ key frame at depth $d$. For a given fragment input $\mathbf{F}_i$, the homography \footnote{For simplicity, the transformation from homogeneous coordinates to Euclidean coordinates in the camera projection is omitted here.} is defined as:
+\begin{equation}
+	\mathbf{H}_j(d)
+	= d \cdot \mathbf{K}_j \cdot \Big( \mathbf{T}_j \cdot \mathbf{T}_1^{-1} \Big) \cdot \mathbf{K}_1^T
+    \enspace,
+\end{equation}
+where $\mathbf{T}\in SE(3)$ denotes the transform matrix inversed from pose. To measure the similarity after conducting homography warping, we calculate the variance cost of $\mathbf{x}_j$ and further process it with an encoder-decoder-based cost regularization network. The output logit from the regularization network is treated as the depth probability on each hypothesis plane and we conduct the same \textit{soft argmin} in~\cite{yao2018mvsnet} to have the initial depth prediction.
+
+\PAR{Geometric and Semantic GRU Fusion.}
+Once the 2D features are extracted in different resolutions, they are back-projected from each of the pyramid level in $\mathcal{P}_s$ as the raw geometrical 3D features, $\mathcal{V}_s\in\{V_2, V_3, V_4\}$, which are further processed by sparse 3D convolutions.
+
+In order to improve the global coherence and temporal consistency of the reconstructed 3D mesh, following~\cite{sun2021neuralrecon}, we first correlate the local geometrical information in $\mathcal{V}_s$ given the current $\mathcal{F}_i$ with the previous fragments $\mathcal{F}_{i^\prime}, i^\prime<i$ by creating a fused feature volume with GRU. Unlike~\cite{sun2021neuralrecon}, we reuse the same parameters in GRU to process the back-projected and upsampled 3D semantics to achieve higher generality for the current FBV's component $S$.
+% The current geometric feature $g_i$ and semantic feature $s_i$ 
+The current hidden state with geometric and semantic information for will be conditioned on the previous reconstructed volume in the hidden state $H_{i-1}$ from $\mathcal{F}_{i-1}$. The resulting feature will be stored in the global hidden state $H_i$ in each stage and passed to the 2D-to-3D CDR.
+
+For the sake of learning these logits consistently in different scales, we conduct the fusion with hidden states at each stage of $\mathcal{V}_s$. Inspired by the \textit{meta data} mechanism proposed in ~\cite{sayed2022simplerecon}, we further concatenate sparse feature, with these logits after masking with the dense occupancy prediction $\hat{o}_i$, as a meta feature to the next stage. However, to achieve higher granularity learning in the next stage while maintaining coherence, the meta feature will be upsampled into the particular resolution that is matched to the resolution of the next stage $\mathcal{V}_{s-1}$ in Fig. \ref{fig:arch}. We found that the inclusion of semantic information in the hidden state of GRU helps build up a good starting raw feature for CDR, which is verified in the ablation.
+
+\subsection{2D-to-3D Cross-Dimensional Refinement}\label{subsec:cdr}
+The raw coherent features from GRU lack detailed geometrical descriptions, leading to unsatisfactory meshing and semantic labeling results. 
+% To this aim, 
+To overcome these issues, we propose to leverage the 2D feature that is latent after incorporating the learning of depth and semantic frame for the refinements on the 3D geometry and semantics.
+
+\PAR{2D-to-3D Prior Knowledge.}
+Consider a probabilistic prior on the latent space of the output coherent feature coming from GRU. It accounts for the prior knowledge that the pixel information in both depth predictions and 2D semantic predictions should produce high confidence matching with regard to its 3D representation. The prior conditioned 3D feature for both perception tasks is defined as: 
+\begin{equation}
+% \nonumber\\[-37pt]
+\label{eq:x-prior}
+    X_{prior} = f(H_i(\mathcal{V}_s\mid\mathcal{F}_i))
+	 \enspace,
+\end{equation}
+where $f(\cdot)$ is the 2D-to-3D feature refinement process for either 3D meshing or 3D semantic labeling, whose input is the hidden state at stage $s$ within the FBV $\mathcal{F}_i$. For each voxel in $\mathcal{F}_i$, both TSDF and semantic labeling predictions can be formulated with a weighted average:
+\begin{equation}
+% \nonumber\\[-37pt]
+\label{eq:prior-both}
+\hat{I} = \epsilon H_i(\mathcal{V}_s\mid\mathcal{F}_i) + (1-\epsilon)X_{prior} 
+% \\\mathcal{L} = & \zseta_2 H_i + (1-\zeta_2)X_{prior-semseg}
+	 \enspace,
+\end{equation}  % is it \times symbol here? Relate with the supplement derivation, and highlight the derivation will be in the supplement, here.
+where $\hat{I}\in\mathcal{F}_i$ is the refined prediction and $\epsilon$ is the respective random variable for the respective prior, which is implicitly learnt by the respective feature refinement introduced below.
+
+The intuition is that the anchored voxel back-projected from depth prediction and semantic label prediction of the input images has strong evidence on its 3D counterparts, since 3D reconstruction is essentially an inverse problem. We propose two progressive feature refinement components to learn the confidence of refined features on the latent space such that $\hat{I}$ can be extracted with the help of 2D-to-3D prior knowledge.
+
+% below section, need to first highlight that what is the difference between our proposed anchored based method and 3dvnet. Just see 
+\PAR{Depth-Anchored Occupancy Refinement.} % title needed to be changed here, make it TRILINEAR interpolation, but not "pointflow"
+Unlike the volumetric methods~\cite{murez2020atlas, sun2021neuralrecon} that directly regress on the TSDF volume, we design an auxiliary module in each stage $\mathcal{V}_s$ that can explicitly predict depth and anchored features. We design an anchored feature on $o_i$ by adopting 3D sparse convolution on an anchored voxel in the original FBV.
+
+Intuitively, the anchored voxel will have higher confidence of achieving a valid $o_i$ and $T$ closed to zero. We imposed the anchored feature on occupancy feature to reinforce the occupancy information brought by the depth prior.
+Inspired by~\cite{chen2019point, rich20213dvnet}, we conduct PointFlow algorithm for each stage in the coarse-to-fine structure $\mathcal{V}$ to determine the depth displacement on the initial depth prediction such that finer depth prediction can be achieved. 
+% We define $h$ hypothesis points for each depth pixel. 
+Different from the PointFlow algorithm used in~\cite{rich20213dvnet}, we further utilized the back-projected depth points from all $N_k$ views in the fragment to query an anchored voxel, which can be further aggregated with $o_i$. Fig. \ref{fig:pointflow} illustrates how these hypothesis points are selected and turned into depth displacement prediction, such that the anchored voxel can be generated.
+% \textbf{(Define anchor points $x_m \in \mathbb{R}^3$ $\{x_m\}^M_{m=1}$ for $\mathbf{M}$ back projected voxels from depth pts. Different from the occupancy (from feature) above.)}
+We hereby define anchored voxels $a_i$, as those voxels in $\mathcal{F}_i$ that are incorporating all the back-projected depth points.
+% and unique. 
+The anchored voxel index in the 3D volume is sparsified as a mask to update the occupancy volume as $\hat{o}_i$ in the following:
+\begin{equation}
+    \hat{o}_i = o_i \wedge a_i
+    \enspace.
+\end{equation}
+The enhanced occupancy prediction $\hat{o_i}$ is used to condition on the TSDF volume at the current stage to generate the refined $\hat{T}_i$. It is further sparsified and processed into a sparse 3D feature with a light-weight point-wise convolution and upsampled to concatenate with $\mathcal{V}_{s-1}$.
+
+\PAR{Pixel-to-Vertex Matching Semantic Refinement.}
+In addition to the cross-dimensional refinement from depth prediction to $T$, we also utilize the semantic prior that lies in the 2D semantic prediction to have a refined 3D voxel semantic labeling prediction.
+
+To predict the 2D frame semantic labeling, we conduct a point-wise 2D convolution on the fine feature map $P_2$. By incorporating the learning of 2D frame semantic labeling, the 2D feature extractor pyramid will learn the 2D semantic priors that is useful for 3D voxel semantic labeling learning.
+Similarly, the sparse 3D feature in each stage will be passed into point-wise 3D convolution layers respectively, and come up with the initial 3D voxel semantic labeling predictions in respective scales.
+For each pixel on a 2D semantic prediction in $\mathcal{F}_i$, there is one and only one 3D voxel counterpart in $\mathcal{F}_i$, since by definition of TSDF, the surface edges are encoded as vertices, i.e., the voxels whose TSDF values equal to 0. We define these vertices as the one-on-one matching correspondences to their camera-projected pixels. Such pixel-vertex pairs can be used for feature refinement in nature.
+
+% The upper part of Fig.
+The upper part of Fig. \ref{fig:cdr_matching} illustrates the design of the matching matrix that is used to correlate the pixel-vertex pairs. We create a matching matrix for each frame $\mathbf{I}_{i,j}$ in the fragment. To conduct the semantic feature refinement, we first construct a matching matrix $\mathbf{M}=\{\mathbf{m_i}\}^N_{i=1}$ for each semantic labeling frame, where $N$ is the number of the vertices in the volume $\mathcal{F}_i$. Each column of the matching matrix $\mathbf{M}$ is defined as:
+\begin{equation}
+    \mathbf{M}(i) = \mathbf{m_i} = 
+    \begin{bmatrix}
+        u_i \\
+        v_i \\
+        \text{mask}
+    \end{bmatrix}.
+\end{equation}
+For each column, i.e., each pixel-vertex pair recorded in the matching matrix, a vertex $i^{th}$ in the 3D volume on the right hand side of the lower part of Fig. \ref{fig:cdr_matching} and its correspondence pixel on the left hand side are utilized. The last entry of the pixel-vertex pair represents a mask which is valid if and only if the 2D correspondence for $\mathbf{M}$ is in the current view frustum of the frame.
+\input{figs/pointflow_tex}
+\input{figs/cdr_semseg_link_tex}
+
+After the matching matrix $\mathbf{M}$ is constructed, it will be used for masking each of the feature map $\mathcal{P}_s$ with the $\log_2$ scale of $s$ to create a refined cross-dimensional feature, whose voxel number is the same as the number of sparse 3D features, 
+% and the channel number is the same as the number of pixels in the entire fragment $\mathcal{F}_i$, 
+as shown in the lower part of Fig. \ref{fig:cdr_matching}. Meanwhile, the coordinates of the sparse 3D features in the corresponding stage $\mathcal{V}_s$ will be mapped as the coordinate of the cross-dimensional feature as a sparse tensor. Then we use the sparse point-wise convolution to extract its underlined feature from 2D semantics, and concatenated it with the sparse 3D features in $\mathcal{V}_s$ to create the semantic features for refinement
+in the next finer stage, 
+so as to ensure the 2D semantic priors to have reliable refinement on the sparse coherent features.
+
+\subsection{Implementation Details}\label{subsec:implementations}
+Our model is implemented in PyTorch, trained and tested on a single RTX3090 graphics card. We empirically set the optimizer as Adam without weight decay~\cite{loshchilov2018decoupled}, with an initial learning rate as 0.001, which goes through 3 halves throughout the training. First momentum and second momentum are set to 0.9 and 0.999, respectively.
+For key frame selection, following~\cite{wang2018mvdepthnet, sun2021neuralrecon}, we set thresholds $\theta_{key}$, $t_{key}$ and fragment input number $N_k$ as 15 degrees, 0.1 meter and 9, respectively.
+A fraction of FPN~\cite{lin2017feature} is adopted as the 2D backbone with its classifier as MNasNet~\cite{tan2019mnasnet}.
+MinkowskiEngine~\cite{choy20194d} is utilized as the sparse 3D tensor library. More details are introduced in the supplement.
+
+\PAR{Loss Design.}
+Our model is trained in an end-to-end fashion. Since our target is to learn the 3D geometry and semantic segmentation of the surrounding scene given posed images input, we regress the TSDF value with the L1 norm, classify the occupancy value with the binary cross-entropy (BCE) loss and the semantic labeling with cross entropy (CE) loss as:
+% \vspace{-0.2cm}
+\begin{align}
+% \nonumber\\[-37pt]
+\label{eq:loss-3D}
+\mathcal{L}_{3D} = &\sum^{4}_{s=2}
+	\alpha_s \mathcal{L}_1(T_s, \hat{T}_s) + 
+	\lambda \alpha_s \mathcal{L}_{BCE}(O_s, \hat{O}_s)\nonumber \\ & + 
+	\beta_s \mathcal{L}_{CE}(S_s, \hat{S}_s)
+	\enspace,
+\end{align}
+% \vspace{-0.1cm}
+where $T$, $S$, and $O$ denote TSDF value, semantic labeling, and occupancy predictions. $\alpha_s$, $\beta_s$, and $\lambda$ are the weighting coefficients in different stages for TSDF volume, semantic volume and positive weight for BCE loss, respectively. By doing so, the learning process stays most sensitive and relevant to the supervisory signals in the coarse stage, and less fluctuating as the 3D features become finer with the upsampling, after log-transforming the predicted and ground-truth TSDF value following~\cite{murez2020atlas}.
+
+To conduct cross-dimensional refinement, we regress the depth estimation with the L1 norm and classify the 2D semantic segmentation with cross entropy loss:
+\begin{align}
+\label{eq:loss-2D-total}
+    \mathcal{L}_{2D} = & \mathcal{L}_1(d_{init}, \hat{D}_{init}) + 
+    \mathcal{L}_{CE}(S^{2D}_2, \hat{S}^{2D}_2)\nonumber \\ & + 
+    \sum^{4}_{s=2} \gamma_s \mathcal{L}_1(D_s, \hat{D}_s)
+	 \enspace,
+ \end{align}
+where $D$ and $\gamma_s$ denote depth and the weighting coefficient for depth estimation in different stages. We further wrap the losses into an overall loss $\mathcal{L}= \mathcal{L}_{3D} + \mu \mathcal{L}_{2D}$, where $\mu$ is the coefficient to balance the joint learning of 2D and 3D. Detailed setup of all hyperparameters in loss can be found in the supplement.
+\input{figs/eval_3d_mesh}

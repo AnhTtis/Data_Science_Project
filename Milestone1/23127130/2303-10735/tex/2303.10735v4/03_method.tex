@@ -1,0 +1,102 @@
+\section{Method}
+\label{sec:method}
+
+\begin{figure*}[t]
+\centering
+  \includegraphics[width=0.9\linewidth]{figs/pipeline_final.jpg}
+
+  \captionsetup{font=small}
+  \caption{An overview of SKED. We render the base NeRF model $\basenerf$ from at least two views and sketch over them ($C_i$). The input to the editing algorithm is these sketches preprocessed to masks ($M_i$) and a text prompt. In each iteration similar to DreamFusion \cite{poole2022dreamfusion}, we render a random view and apply the Score Distillation Loss to semantically align with the text prompt. Additionally, we compute $\mathcal{L}_{pres}$ to preserve the base NeRF by constraining $\edittednerf$'s density and color output to be similar to $\basenerf$ away from the sketch regions. Finally, we use the object mask renderings of the sketch views to define $\mathcal{L}_{sil}$. This loss ensures that the object mask occupies the sketch regions.}
+  \label{fig:overview}
+\end{figure*}
+
+
+
+In this section, we present our approach to performing text-based NeRF editing, controlled by a few given sketches. Our approach to addressing this issue involves dividing the problem into two substantially easier tasks. First, a rough 3D space that necessitates adjustment is defined using the provided sketches, which helps in guiding the geometry modifications.
+Second, we use the score distillation sampling method~\cite{poole2022dreamfusion} on a text-to-image latent diffusion model to generate fine-detailed and realistic edits based on the text prompt given to the model (see Fig.~\ref{fig:overview}).
+
+To produce meaningful edits that adhere to the sketches, we design two novel objective functions: one to preserve the original density and radiance fields, and the second to alter the added mass in a way that respects the given sketches. In the following, we describe our loss functions and provide details on how to apply sketch-based text-guided editing. We include a background on Latent diffusion models~\cite{rombach2021highresolution} and Score distillation sampling (SDS)~\cite{poole2022dreamfusion} which our method is built upon, in the supplementary material.
+
+\subsection{SKED}
+\label{subsec:sked}
+%Here we describe our algorithm to generate coherent edits on a neural volumetric radiance field using multiview sketches and a text prompt. 
+As demonstrated in Fig.~\ref{fig:overview}, the starting point of our algorithm is a base NeRF model, $\basenerfFull$, which maps 3D coordinates and unit rays to color and volumetric density. $\basenerf$ is obtained through either reconstruction from multiview images \cite{mueller2022instant}, or a text-to-3D pipline \cite{poole2022dreamfusion}. One can use $\basenerf$ to render multiple views of the neural field and sketch over them to specify spatial cues of their desired edits. Let $\{C\}_{i=1}^N$ be renderings of $\basenerf$ from $N$ different views, on which we have drawn sketches. These sketches could be masks specifying the region of edit, or closed curves specifying the outer edges of the region of edit. Either way, the input to our algorithm would be preprocessed to masks $\{M\}_{i=1}^N$ where $M_i = \{m_1, m_2, ..., m_S\}$ are a set of pixels which are inside the sketch region. We call these renderings \emph{sketch canvases}, and the views they were rendered from \emph{sketch views}. Additionally, the algorithm takes as input a text prompt $T$ which defines the semantics of the edit. Similar to DreamFusion, our method is an iterative algorithm. We begin by initializing an editable copy of the base neural field, $\edittednerf=\basenerf$. At each iteration, we sample a random view and use $\edittednerf$ to render the 3D object from that view. We use the rendered image to calculate the gradient of the SDS loss and push $\edittednerf$ to the high-density regions of the probability distribution function $\mathbb{P}(\edittednerf | T)$ i.e. a NeRF model which its underlying 3D object adheres to text $T$. However, through our experiments, we found that simply using this process with only text as guidance would drastically change the original field outside of the sketched region. Therefore through two novel loss functions, we attempt to control the editing process in a way that the final output coresponds to the sketches is semantically meaningful and is faithful to the base neural field.
+\vspace{-15pt}
+\paragraph{Preservation Loss:} One of the main criteria of a good 3D editing algorithm is that the geometry and color of the base object are preserved through the editing process. We encourage this by utilizing an objective we call the preservation loss $\mathcal{L}_{pres}$. At each iteration of the algorithm, we render an image with $\edittednerf$ from a random camera viewpoint. We modify the raymarching algorithm of NeRF such that when sampling points $\coord \in {\reals}^{3}$, to query $\edittednerf$ for density and color values, we also compute a per-coordinate sketch-weight denoted as $\preservationweight$.
+% During the process of rendering, we sample multiple points from the 3D space to query their density and color from the NeRF model. 
+The key idea of our algorithm is that for each point $\coord$, we decide whether it should be changed by calculating a distance from the point to the sketch masks. We aim to modify the density and radiance only when $\coord$ is in the proximity of the sketched regions while retaining the original density and radiance for points that are far from the sketched region.
+Therefore, we first need to define a method for computing the distance of a 3D point to multiview $2D$ sketches. We do so by projecting $\coord$ to each of the sketch views and computing a per-view distance of projected points to sketch regions as:
+\begin{equation}
+    d_j(\coord) = \min_k{|| \left \lfloor \Pi(\coord, C_j) + \frac{1}{2} \right \rfloor - m_k|| ^ 2},
+    \label{eq:per_view_dist}
+\end{equation}
+where $d_j(\coord)$ is the per-view distance function and $\Pi(\coord, C_j)$ is the projection of 3D point $p_i$ to sketch view $C_j$, rounded to the nearest integer (Fig.~\ref{fig:fig3}). This expression computes the minimum distance of the projection of point $p_i$ to the sketch regions in view $j$. By taking the mean of all the per-view distances, we can define the distance of point $p_i$ to the multiview sketches $D(\coord)~=~\frac{1}{N}\sum_{j=1}^N{d_j(\coord)}$. We use the mean of distances, as it relaxes the constraint when sketches are not fully aligned, and introduces additional smoothness to the function.
+% \begin{equation}
+%     D(\coord) = \frac{1}{N} \sum_{j=1}^N{d_j(\coord)}.
+% \end{equation}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figs/pipeline_3.jpg}
+    \captionsetup{font=small}
+    \caption{3D points $\coord$ sampled at random views are projected to the sketch views $C_j$ to obtain $\Pi(\coord, C_j)$. In each $C_j$, distance $d_j$, between projected points and the pixels containing the sketch masks is computed. The red color in $C_1$ and $C_2$ demonstrates $d_1(\textbf{p})$ and $d_2(\textbf{p})$ in image space respectively. Finally, for each 3D point, $d_j(\coord)$s are averaged to get the distance $D(\coord)$ to all sketch views. $D(\coord)$ is used as the weights of the points $w_i$ in $\mathcal{L}_{pres}$. }
+    \label{fig:fig3}
+\end{figure}
+
+
+Now that we have established the distance function, we can define $\mathcal{L}_{pres}$. Using $\basenerf$, the base NeRF instance with frozen parameters, we define $\mathcal{L}_{pres}$ as:
+
+\begin{equation}
+    \begin{split}
+          \mathcal{L}_{pres} = \frac{1}{K}\sum_{i=1}^K w_i [CE(\outeditalpha, \overbar{\outbasealpha})
+    + \lambda_{c}\overbar{\outbasealpha}||\outeditcolor - \outbasecolor|| ^ 2],
+    \end{split}
+\end{equation}
+where $\overbar{\outbasealpha}$ is the occupancy of the base object derived from $\basenerf$ by thresholding the ground truth density of $\basenerf(\coord ; \theta)$. Following \cite{mildenhall2020nerf}, we have $\outeditalpha=1-exp(-\outeditdensity\delta)$, such that $\outeditdensity$ is the edited neural field density $\edittednerf(\coord ; \phi)$, and $\delta$ is the step distance between samples along a ray. $CE$ is the cross entropy loss. Furthermore, $\outeditcolor$ and $\outbasecolor$ are the color and ground truth color of $\coord$ derived from $\edittednerf$ and $\basenerf$ respectively, and $\lambda_{c}$ is a hyperparameter controlling the importance of color preservation in the editing process. We limit color preservation to the occupied region of $\basenerf$. Tightly constraining the color may drive the model to diverge, hence $\lambda_{c}$ is chosen such that density preservation takes higher priority.
+% While we offer optional color preservation in our system, we found that tightly constraining the color may occasionally lead to incoherent and adversarial edits. 
+% An important part of this equation is $\preservationweight$ which is calculated as:
+The preservation strength of each coordinate is modulated by: 
+\begin{equation}
+    \preservationweight = 1 - \exp(-\frac{D(\coord) ^ 2}{2\sensitivity^2}).
+    \label{eq:modulate}
+\end{equation}
+% \begin{equation}
+%     \preservationweight = 1 - \exp(-\frac{D(\coord) ^ 2}{2\sensitivity^2}).
+% \end{equation}
+Intuitively, $\preservationweight$ controls the importance of the loss for each point based on the distance $D(\coord)$. The sensitivity of $\preservationweight$ to $D(\coord)$ is controlled by the hyperparameter $\sensitivity$, where lower values tighten the constraint on the optimization such that only the sketch region is modified. Higher values allow for a softer falloff region, which allows the optimized volume to better blend with the base model.
+
+
+
+
+
+\vspace{-15pt}
+\paragraph{Silhouette Loss:} Another essential criterion is to respect the sketched regions, i.e. the new density mass added to $\edittednerf$ should occupy the regions specified by the sketches. We enforce this by rendering the object masks of all sketch views. We then maximize the values of the object masks in the sketched regions by minimizing the following loss: 
+
+\begin{equation}
+    \mathcal{L}_{sil} = \frac{1}{H.W.N}\sum_{j=1}^{N} \sum_{i=1}^{H. W} -\mathbb{I}_{M_{j}}(\pixel) \log C_{j}^{\alpha}(\pixel).
+\end{equation}
+In this equation, $H$ and $W$ are the dimensions of the rendered object masks, $\mathbb{I}_{M_{j}}$ is an indicator function that is equal to 1 if pixel $\pixel \in \reals^2$ is in a sketched region and 0 otherwise and $C_{j}^{\alpha}$ is the alpha object mask rendered with $\edittednerfFull$ from each sketch view.
+
+\vspace{-10pt}
+\paragraph{Optimization:} Similar to prior generative works on NeRFs ~\cite{ jain2021dreamfields, lin2022magic3d, poole2022dreamfusion} we use an additional objective $\mathcal{L}_{sp}$ to enforce sparsity of the object by minimizing the entropy of the object masks in each view. Therefore the final objective of our editing process is:
+\begin{equation}
+\begin{split}
+        \mathcal{L}_{total} = \mathcal{L}_{SDS} + \lambda_{pres}\mathcal{L}_{pres} + \lambda_{sil}\mathcal{L}_{sil} + \lambda_{sp}\mathcal{L}_{sp},
+\end{split}
+\end{equation}
+where $\lambda_{pres}, \lambda_{sil}$ and $\lambda_{sp}$ are the weights of the different terms in our objective.
+
+We use Instant-NGP~\cite{mueller2022instant} as our neural renderer for its performance and memory efficiency. To avoid sampling empty spaces, this framework keeps an occupancy grid for tracking empty regions. The occupancy grid is used during raymarching to efficiently skip samples in empty spaces. In addition, the grid is periodically pruned during training to keep it aligned with the hashed feature structure. In our editing process, if the occupancy grid of $\basenerf$ is used without change, the model may initially avoid sampling points in the sketch regions, preventing correct gradient flow and forcing our framework to rely on random alterations of the occupancy grid.
+
+To alleviate this problem, we find the bounding boxes of the sketch masks $M$ and intersect them in $\reals^3$ to define a coarse editing region in 3D space. We manually turn on the occupancy grid bits of $\edittednerf$ within the sketch intersection region. In addition, we define a warm-up period at the beginning of optimization, where we avoid pruning the occupancy grid to help the model solidify the edited region, and prevent it from culling it as empty space.
+
+
+
+
+
+
+
+%\am{We use Instant-NGP~\cite{mueller2022instant} as our NeRF framework for faster rendering and to better regulate and localize edits. It has a grid of density values to speed up rendering by skipping sampling in empty spaces, which is progressively updated during training. However, using the base NeRF's density field in the editing process prevents proper gradients and leads to random alterations and collisions in Instant-NGP. To solve this, we find the bounding boxes of sketch masks to define a coarse region in 3D space and turn on the density field in that region, while also implementing a warm-up period to solidify the editing region and prevent pruning as empty space.} \ali{you are allowed to rephrase this but you cannot go over the number of lines that I used here :) It's a challenge}%
+%We use Instant-NGP~\cite{mueller2022instant} as our NeRF framework for its fast rendering. We additionally use some of the features of this framework to further regularize and localize our edits. More specifically, Instant-NGP keeps a grid of density values to specify empty and occupied regions of the space. This grid is used in the rendering process to skip sampling points in empty spaces to accelerate training and inference and it is updated progressively during training (for more details see~\cite{mueller2022instant}). If the base NeRF's density field is used without change in the editing process, then during rendering, the model would not sample points in the sketch regions, preventing gradients to flow correctly and making the model rely on random alterations of the density field and collisions in the hash-table of the Instant-NGP features.
+%To alleviate this problem, we find the bounding boxes of the sketch masks in each sketch view and use the intersection of those bounding boxes in the 3D space to define a coarse region in the 3D space and manually turn on the density field in that region. Additionally, we define a warm-up period where we do not update the density field. This trick helps solidify the editing region and prevents the updating procedure to prune it as empty space.
+

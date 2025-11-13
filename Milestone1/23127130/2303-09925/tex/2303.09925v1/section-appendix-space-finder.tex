@@ -1,0 +1,1350 @@
+% % !TEX options=--shell-escape
+% \documentclass[12pt]{iopart}
+% \pdfoutput=1 % go for pdflatex
+
+% % == Standard packages ==
+% \usepackage{iopams}
+% \input{packages}
+
+% % == Theorem environments ==
+% \theoremstyle{definition}
+% % A definition introduces a new concept rigorously:
+% \newtheorem{definition}{Definition}[section]
+% % A remark introduces tangential considerations: 
+% \newtheorem{remark}{Remark}[section]
+% % A theorem is a key result:
+% \newtheorem{theorem}{Theorem}[section]
+% % A proposition is a result requiring explicit proof:
+% \newtheorem{proposition}[theorem]{Proposition}
+% % A lemma is an intermediate result for a theorem or a proposition, requiring explicit proof:
+% \newtheorem{lemma}[theorem]{Lemma}
+% % An observation is a result not requiring explicit proof:
+% \newtheorem{observation}[theorem]{Observation}
+% % A corollary is a result directly following from a previous result:
+% \newtheorem{corollary}[theorem]{Corollary}
+
+% % == Macros ==
+% \input{macros}
+% \newcommand{\TODO}[1]{{\marginpar{\color{gray}\textsf{[TODO]}} \color{gray}\textsf{[#1]}}}
+% \newcommand{\NOTE}[1]{{\marginpar{\color{gray}\textsf{[NOTE]}} \color{gray}\textsf{[#1]}}}
+
+% \begin{document}
+
+% % == Dummy Sections ==
+
+% \section{Introduction}
+% \label{section: introduction}
+
+% \section{Causal orders}
+% \label{section:causal-orders}
+
+% \section{Spaces of input histories}
+% \label{section:spaces}
+
+% \section{The topology of causality}
+% \label{section:topology-causality}
+
+% \section{The geometry of causality}
+% \label{section:geometry-causality}
+
+% \section{Conclusions}
+% \label{section:conclusions}
+
+% % == Dummy Biblio ==
+
+% % \bibliographystyle{iopart-num}
+% % \bibliography{biblio}
+% % \nocite{*}
+
+% \appendix
+
+% \section{Causally Complete Spaces on 3 Events with Binary Inputs}
+% \label{appendix:all-spaces-ABC}
+
+% \newpage
+
+% === COMMENT ABOVE BEFORE COMPILING MAIN FILE ===
+
+
+\section{Algorithm to Find Causally Complete Spaces}
+\label{appendix:space-finder-algo}
+
+In the sub-sections below, we break down the algorithm that was used to enumerate the hierarchies of causally complete spaces on binary inputs that were presented in this work.
+Each sub-section start by presenting a full listing for a block of related code, typically a single function or class method, and then proceeds to explain how the various parts work.
+
+The algorithm is limited to the binary case, for added efficiency, but can be easily extended to arbitrary input combinations.
+The algorithm can also be extended to find causally complete sub-spaces of a given space, but this requires non-trivial modification (because of the layered approach, which presumes that all histories in a layer of recursion have same-sized domains).
+
+All code is written for Python 3.10, using PEP484 type hints.
+It has been checked with the Mypy static type-checker and it has been linted with with Pylint.
+% The source code is part of the \href{https://github.com/hashberg-io/qcaus}{qcaus} library.
+
+\subsection{Imports and utilities}
+
+Imports for the whole file, all from standard libraries.
+
+\begin{minted}[firstnumber=1]{python}
+from collections import deque
+from collections.abc import Collection, Iterable, Iterator, Mapping, Set
+from functools import cache
+from itertools import chain, combinations, islice, permutations, product
+from logging import Logger
+from math import ceil
+from numbers import Number
+import sys
+from time import perf_counter
+from typing import (Any, BinaryIO, cast, Literal, Optional,
+                    Sequence, TypeVar, Union)
+\end{minted}
+
+\noindent Below is a snippet for recursive memory size calculation of Python objects, courtesy of a StackOverflow answer.
+
+\begin{minted}[firstnumber=last]{python}
+def getsize(obj_0: Any) -> int:
+    """
+    Recursively iterate to sum size of object & members.
+    Courtesy: https://stackoverflow.com/questions/449560/
+              how-do-i-determine-the-size-of-an-object-in-python#answer-30316760
+    """
+    _seen_ids = set()
+    def inner(obj: Any) -> int:
+        obj_id = id(obj)
+        if obj_id in _seen_ids:
+            return 0
+        _seen_ids.add(obj_id)
+        size = sys.getsizeof(obj)
+        if isinstance(obj, (str, bytes, Number, range, bytearray)):
+            pass # bypass remaining control flow and return
+        elif isinstance(obj, (tuple, list, Set, deque)):
+            size += sum(inner(i) for i in obj)
+        elif isinstance(obj, Mapping) or hasattr(obj, 'items'):
+            size += sum(inner(k) + inner(v) for k, v in getattr(obj, 'items')())
+        # Check for custom object instances - may subclass above too
+        if hasattr(obj, '__dict__'):
+            size += inner(vars(obj))
+        if hasattr(obj, '__slots__'): # can have __slots__ with __dict__
+            size += sum(inner(getattr(obj, s))
+                        for s in obj.__slots__ if hasattr(obj, s))
+        return size
+    return inner(obj_0)
+\end{minted}
+
+\noindent The \mintinline{python}{powerset} function takes an iterable of elements some generic type \mintinline{python}{_T_co} and iterates through all possible subsets of those elements, yielded as \mintinline{python}{tuple}s of elements (rather than sets).
+
+\begin{minted}[firstnumber=last]{python}
+_T_co = TypeVar("_T_co")
+def powerset(iterable: Iterable[_T_co]) -> Iterable[tuple[_T_co, ...]]:
+    """
+    Courtesy: https://docs.python.org/3/library/itertools.html#itertools-recipes
+    powerset([1,2,3]) --> () (1,) (2,) (3,) (1,2) (1,3) (2,3) (1,2,3)
+    """
+    s = list(iterable)
+    return chain.from_iterable(combinations(s, r) for r in range(len(s)+1))
+\end{minted}
+
+
+\subsection{Bitvectors}
+
+We encode sets of non-negative in a memory-efficient way, as bitvectors.
+Python natively supports bitwise operations on \mintinline{python}{int} objects, so we use those for our bitvector implementation.
+The \mintinline{python}{bitvec} function takes an iterable of non-negative integers and returns the bitvector corresponding to the set of its elements, where $x_1,...,x_n \geq 0$ are encoded as $\sum_{j=1}^n 2^{x_j} \geq 0$.
+
+\begin{minted}[firstnumber=last]{python}
+Bitvec = int
+""" Type alias for a bitvector, as a non-negative integer. """
+
+def bitvec(elements: Iterable[int]) -> Bitvec:
+    """
+    Creates a bitvector representing the set of given
+    non-negative integers.
+    """
+    v = 0
+    for el in elements:
+        assert el >= 0, f"Found negative integer {el}."
+        v |= 2**el
+    return v
+\end{minted}
+
+\noindent As an example, below is the encoding of the set $\{1, 3, 5, 8\}$ as a bitvector, coinciding with the number $128 = 2^8+2^5+2^3+2^1$ (bits read right-to-left).
+
+\begin{minted}[linenos=false]{python}
+bv = bitvec({1, 3, 5, 8})
+print(f"{bv = } = {bv:b}")
+# bv = 298 = 100101010
+\end{minted}
+
+\noindent The \mintinline{python}{sub} function takes the bitvector representations of two sets and returns the bitvector corresponding to their set difference.
+
+\begin{minted}[firstnumber=60]{python}
+def sub(u: Bitvec, v: Bitvec) -> Bitvec:
+    """
+    Returns the bitvector containing the elements that are
+    in ``u`` but not in ``v``.
+    """
+    assert u >= 0, "Invalid bitvector."
+    assert v >= 0, "Invalid bitvector."
+    return u^(u&v)
+\end{minted}
+
+\noindent The \mintinline{python}{is_subset} function takes the bitvector representations of two sets are returns a \mintinline{python}{bool} value (\mintinline{python}{True} or \mintinline{python}{False}) stating whether the first set is a subset of the second set.
+
+\begin{minted}[firstnumber=last]{python}
+def is_subset(u: Bitvec, v: Bitvec) -> bool:
+    """
+    Returns whether the bitvector ``u`` is a subset of
+    the bitvector ``v``.
+    """
+    return u == u&v
+\end{minted}
+
+\noindent The \mintinline{python}{iter_bitvec} function takes the bitvector representation of a set and iterates through the elements in the set, in strictly increasing order.
+
+\begin{minted}[firstnumber=last]{python}
+def iter_bitvec(u: Bitvec) -> Iterator[int]:
+    """
+    Iterates over the elements in a bitvector.
+    """
+    assert u >= 0, "Invalid bitvector."
+    el = 0
+    while u > 0:
+        u, b = divmod(u, 2)
+        if b == 1:
+            yield el
+        el += 1
+\end{minted}
+
+\noindent The \mintinline{python}{bitvec2set} function takes the bitvector representation of a set and returns the corresponding \mintinline{python}{set} instance.
+
+\begin{minted}[firstnumber=last]{python}
+def bitvec2set(u: Bitvec) -> set[int]:
+    """
+    Turns a bitvector into the corresponding set of non-negative integers.
+    """
+    return set(iter_bitvec(u))
+\end{minted}
+
+
+\subsection{Histories}
+
+The code below supports histories up to 26 events, labelled by uppercase Latin alphabet letters (\mintinline{python}{"A"} to \mintinline{python}{"Z"}), with binary input values (\mintinline{python}{0} or \mintinline{python}{1}).
+A ``history item'' is an event-input pair and a history is a set of such pairs, encoded as a bitvector.
+
+\begin{minted}[firstnumber=last]{python}
+Event = Literal["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+                "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+""" Type alias for events (single char "A" to "Z"). """
+
+InputValue = Literal[0, 1]
+""" Type alias for input/output values (binary 0 or 1). """
+
+HistoryItem = tuple[Event, InputValue]
+""" Type alias for an item (event-value pair) in an (ext) input history. """
+
+HistoryItems = tuple[HistoryItem, ...]
+""" Type alias for a variable length tuple of history items. """
+
+History = Bitvec
+"""
+    Type alias for an history, a bitvector of integers indicating its items.
+"""
+\end{minted}
+
+\noindent The functions \mintinline{python}{event2idx} and \mintinline{python}{idx2event} convert between events and non-negative integers in the range $0-25$:
+\begin{itemize}
+    \item \mintinline{python}{0} $\leftrightarrow$ \mintinline{python}{"A"}
+    \item \mintinline{python}{1} $\leftrightarrow$ \mintinline{python}{"B"}
+    \item ...
+    \item \mintinline{python}{25} $\leftrightarrow$ \mintinline{python}{"Z"}
+\end{itemize}
+
+\begin{minted}[firstnumber=last]{python}
+@cache
+def event2idx(e: Event) -> int:
+    """ Turns an event into the corresponding index. """
+    idx = ord(e)-ord("A")
+    return idx
+
+@cache
+def idx2event(idx: int) -> Event:
+    """ Turns a index into the corresponding event. """
+    assert 0 <= idx <= 25, "Events indexes be 0-25."
+    return cast(Event, chr(ord("A")+idx))
+\end{minted}
+
+\noindent The functions \mintinline{python}{item2idx} and \mintinline{python}{idx2item} convert between history items (event-input pairs) and non-negative integers in the range $0-51$:
+\begin{itemize}
+    \item \mintinline{python}{0} $\leftrightarrow$ \mintinline{python}{("A", 0)}
+    \item \mintinline{python}{1} $\leftrightarrow$ \mintinline{python}{("A", 1)}
+    \item \mintinline{python}{2} $\leftrightarrow$ \mintinline{python}{("B", 0)}
+    \item \mintinline{python}{3} $\leftrightarrow$ \mintinline{python}{("B", 1)}
+    \item ...
+    \item \mintinline{python}{51} $\leftrightarrow$ \mintinline{python}{("Z", 1)}
+\end{itemize}
+
+\begin{minted}[firstnumber=last]{python}
+@cache
+def item2idx(item: HistoryItem) -> int:
+    """ Turns an history item into the corresponding index. """
+    e, v = item
+    return 2*event2idx(e)+v
+
+@cache
+def idx2item(idx: int) -> HistoryItem:
+    """ Turns a index into the corresponding history item. """
+    assert 0 <= idx <= 51, "Item indexes must be 0-51."
+    return (idx2event(idx//2), cast(InputValue, idx%2))
+\end{minted}
+
+\noindent The \mintinline{python}{history} function creates a history bitvector from an event-input mapping or an iterable of history items, by first encoding the event-input pairs to non-negative integers using \mintinline{python}{item2idx}.
+
+\begin{minted}[firstnumber=last]{python}
+def history(h_items: Union[Mapping[Event, InputValue],
+                           Iterable[HistoryItem]]) -> History:
+    """
+    Creates a history from an event-value mapping
+    or an iterable of event-value pairs.
+    """
+    if isinstance(h_items, Mapping):
+        h_items = h_items.items()
+    return bitvec(item2idx(item) for item in h_items)
+\end{minted}
+
+\noindent For example, the history $\hist{A/0, B/1, D/1}$ on 4 events $\ev{A}, \ev{B}, \ev{C}, \ev{D}$ is first turned into the set \mintinline{python}{{("A", 0), ("B", 1), ("D", 1)}} of event-input, then turned into the set \mintinline{python}{{0, 3, 7}} of corresponding indices, and finally encoded into a bitvector, as the number $137 = 2^7+2^3+2^0$.
+
+\begin{minted}[linenos=false]{python}
+h = history({"A": 0, "B": 1, "D": 1})
+print(f"{h = } = {h:b}")
+# h = 137 = 10001001
+\end{minted}
+
+\noindent Given a history bitvector, the \mintinline{python}{history2items} function returns the corresponding immutable sequence (a \mintinline{python}{tuple}) of history items, in increasing order.
+
+\begin{minted}[firstnumber=138]{python}
+def history2items(h: History) -> HistoryItems:
+    """
+    Turns a history into the tuple of its items, in order of increasing index.
+    """
+    assert h >= 0, "Invalid history."
+    return tuple(idx2item(idx) for idx in iter_bitvec(h))
+\end{minted}
+
+\noindent Given a history bitvector, the \mintinline{python}{history2items} function returns the corresponding event-input dictionary.
+
+\begin{minted}[firstnumber=last]{python}
+def history2dict(h: History) -> dict[Event, InputValue]:
+    """
+    Turns a history into the corresponding event-value mapping,
+    with events in order of increasing index.
+    """
+    d: dict[Event, InputValue] = {}
+    for idx in iter_bitvec(h):
+        e, v = idx2item(idx)
+        assert e not in d, f"History has multiple values for event {e}."
+        d[e] = v
+    return d
+\end{minted}
+
+\noindent Given a history bitvector, the \mintinline{python}{dom} function returns the \mintinline{python}{frozenset} of events in the history's domain.
+
+\begin{minted}[firstnumber=last]{python}
+def dom(h: History) -> frozenset[Event]:
+    """
+    Returns the domain of a history, as a frozenset of events.
+    """
+    assert h >= 0, "Invalid history."
+    d = set()
+    idx = 0
+    while h > 0:
+        h, b = divmod(h, 2)
+        if b != 0:
+            d.add(idx2item(idx)[0])
+        idx += 1
+    return frozenset(d)
+\end{minted}
+
+\noindent Given a history bitvector, the \mintinline{python}{domsize} function returns the size of the history's domain.
+
+\begin{minted}[firstnumber=last]{python}
+def domsize(h: History) -> int:
+    """
+    Returns the size of the domain of a history.
+    """
+    assert h >= 0, "Invalid history."
+    size = 0
+    idx = 0
+    while h > 0:
+        h, b = divmod(h, 2)
+        if b != 0:
+            size += 1
+        idx += 1
+    return size
+\end{minted}
+
+\noindent Given a history bitvector, the \mintinline{python}{history_sort_key} function returns a corresponding sorting key, for use with the builtin \mintinline{python}{sorted} function.
+Using this key, histories are first sorted by length, and then by the items they contain (according to the sorting rules for \mintinline{python}{tuple}).
+
+\begin{minted}[firstnumber=last]{python}
+def history_sort_key(h: History) -> tuple[int, HistoryItems]:
+    """
+    Returns a sorting key for histories,
+    sorted first by length and then by content.
+    """
+    h_items = history2items(h)
+    return (len(h_items), tuple(sorted(h_items)))
+\end{minted}
+
+\noindent The \mintinline{python}{max_histories} function returns the sequence of maximal extended input histories on a given number of events.
+The events are selected starting from \mintinline{python}{"A"}, in order.
+
+\begin{minted}[firstnumber=last]{python}
+def max_histories(num_events: int) -> tuple[History, ...]:
+    """
+    Returns the sequence of maximal extended input histories on a given number
+    of events. Events are selected in order, starting from ``"A"``.
+    """
+    dom_events = tuple(idx2event(idx) for idx in range(num_events))
+    return tuple(
+        history(zip(dom_events, input_choices))
+        for input_choices in product(cast(Sequence[InputValue], [0,1]),
+                                     repeat=num_events)
+    )
+\end{minted}
+
+\noindent Given a history bitvector, the \mintinline{python}{child_histories} function returns the immutable sequence of bitvectors for the history's children, the histories obtained by removing each individual event in the history's domain in turn.
+
+\begin{minted}[firstnumber=last]{python}
+def child_histories(h: History) -> tuple[History, ...]:
+    """
+    Given a history, returns the sequence of child histories,
+    obtained by removing a single event (in turn).
+    """
+    h_dict = history2dict(h)
+    if len(h_dict) <= 1:
+        return tuple()
+    return tuple(
+        history((e, v) for e, v in h_dict.items() if e != removed_e)
+        for removed_e in reversed(h_dict)
+    )
+\end{minted}
+
+\noindent Given a sequence of history bitvectors, the \mintinline{python}{sub_histories} function returns the immutable sequence of bitvectors for all sub-histories for the given histories, in the order discovered by breadth-first search of history children.
+
+\begin{minted}[firstnumber=last]{python}
+def sub_histories(hs: Sequence[History]) -> tuple[History, ...]:
+    """
+    Given an ordered set of histories, returns the sequence of sub-histories,
+    in order of breadth-first discovery and including the initial histories.
+    """
+    visited = set()
+    q = deque(hs)
+    sub_hs = []
+    while q:
+        h = q.popleft()
+        if h not in visited:
+            sub_hs.append(h)
+            visited.add(h)
+        for k in child_histories(h):
+            if k not in visited:
+                q.append(k)
+    return tuple(sub_hs)
+\end{minted}
+
+
+\subsection{Event-input Permutation}
+
+Given a sequence of events $\underline{e} = (e_1,...,e_n)$ without repetition, the elements
+\[
+\underline{g} = (g_E,g_{I_{e_1}},...,g_{I_{e_n}}) \in S(E) \times \prod_{j=1}^n S(\{0,1\})
+\]
+of the event-input permutation group on $E = \{e_1,...,e_n\}$ with binary inputs are uniquely represented by the element-wise action of $g_E$ on the sequence of events $\underline{e}$ and the action of each $g_{I_{e_j}}$ on the input value $0$:
+\[
+\Bigg(
+    \Big(g_E(e_1),...,g_E(e_n)\Big),\,
+    \Big(g_{I_{e_1}}(0),...,g_{I_{e_n}}(0)\Big)
+\Bigg)
+\]
+
+\begin{minted}[firstnumber=last]{python}
+PermGroupEl = tuple[Sequence[Event], Sequence[InputValue]]
+"""
+Type alias for elements of the event-value permutation group on a given ordered
+set of events (as a unique sequence, or sequence without repetitions).
+Group elements are represented by pairs:
+
+1. an ordered set of permuted events (represented by a unique sequence),
+   defining the permutation action on events
+2. a sequence of values, one for each event,
+   defining the permutation action on values (by bitwise XOR)
+"""
+\end{minted}
+
+\noindent The \mintinline{python}{iter_perm_group} function iterates through the permutation group elements for a given sequence of unique events.
+
+\begin{minted}[firstnumber=last]{python}
+def iter_perm_group(events_list: Sequence[Event]) -> Iterator[PermGroupEl]:
+    """
+    Iterates through the elements of the event-value permutation group on the
+    given events to permute.
+    """
+    num_events = len(events_list)
+    assert len(set(events_list)) == num_events, "Events must not be repeated."
+    for events_perm in permutations(events_list):
+        for value_perm in product(cast(Sequence[InputValue], [0,1]),
+                                  repeat=num_events):
+            yield (events_perm, value_perm)
+\end{minted}
+
+\noindent Given a history bitvector and an event-input permutation group element, the \mintinline{python}{permute_history} function returns the bitvector for the permuted history.
+
+\begin{minted}[firstnumber=last]{python}
+def permute_history(h: History, g: PermGroupEl) -> History:
+    """
+    Given a history, returns the history obtained by applying the given
+    element of the event-value permutation group.
+    """
+    h_dict = history2dict(h)
+    events_perm, value_perm = g
+    return history({
+        e_perm: cast(InputValue, h_dict[e]^value_perm[e_idx])
+        for e_idx, (e, e_perm) in enumerate(zip(sorted(events_perm),
+                                                events_perm))
+        if e in h_dict
+    })
+\end{minted}
+
+\noindent Given a history bitvector and an iterable of event-input permutation group elements, the \mintinline{python}{history_perms} function efficiently iterates through all group elements and bitvectors of the corresponding permuted histories.
+
+\begin{minted}[firstnumber=last]{python}
+def history_perms(h: History,
+                  perm_group: Iterable[PermGroupEl]
+                  ) -> Iterator[tuple[PermGroupEl, History]]:
+    """
+    Given a history and an iterable of event-value permutation group elements,
+    iterates through all pairs of permutation group element and corresponding
+    permuted history.
+    """
+    h_dict = history2dict(h)
+    for events_perm, value_perm in perm_group:
+        yield (events_perm, value_perm), history({
+            e_perm: cast(InputValue, h_dict[e]^value_perm[e_idx])
+            for e_idx, (e, e_perm) in enumerate(zip(sorted(events_perm),
+                                                    events_perm))
+            if e in h_dict
+        })
+\end{minted}
+
+\noindent Given a history bitvector and an iterable of event-input permutation group elements, the \mintinline{python}{history_perms} function returns the sequence of group elements stabilizing the history, in the order they are encountered and without repetition.
+
+\begin{minted}[firstnumber=last]{python}
+def stabiliser(h: History,
+               perm_group: Iterable[PermGroupEl]) -> Sequence[PermGroupEl]:
+    """
+    Given a history and an iterable of event-value permutation group elements,
+    returns the stabiliser subgroup for the history,
+    as sequence of group elements.
+    """
+    orbit = list(history_perms(h, perm_group))
+    return tuple(perm for perm, h_perm in orbit if h_perm == h)
+\end{minted}
+
+
+\subsection{Utilities for the \mintinline{python}{SpaceFinder} Class}
+\label{appendix:space-finder-algo:section:utilities}
+
+
+The \mintinline{python}{SpaceFinder} class encapsulates the data and code necessary to search for causally complete spaces on a given number of events.
+Some of the required functionality is independent of the search state, and is implemented by the utilities functions below.
+Given a collection of history bitvectors (as a sequence, without repetition), the \mintinline{python}{parents} function computes the mapping of histories to their sets of parents in the collection.
+
+\begin{minted}[firstnumber=288]{python}
+def parents(hs: Sequence[History]) -> dict[History, frozenset[History]]:
+    """
+    Given an ordered set of histories, returns the mapping of
+    each history to the set of its parent histories (those of
+    which they are a child history) in the set.
+    """
+    ps: dict[History, set[History]] = {h: set() for h in hs}
+    for h in hs:
+        for k in sorted(child_histories(h), key=history_sort_key):
+            if k not in ps:
+                ps[k] = set()
+            ps[k].add(h)
+    return {h: frozenset(ks) for h, ks in ps.items()}
+\end{minted}
+
+\noindent The \mintinline{python}{time_str} function provides a friendly representation of a time quantity, for use in search status updates.
+
+\begin{minted}[firstnumber=last]{python}
+def time_str(time: Union[int, float]) -> str:
+    """ Formats a given time value in seconds, for printing. """
+    # pylint: disable = too-many-return-statements
+    assert time >= 0
+    if time == 0:
+        return "0s"
+    if time < 1e-6:
+        return f"{time*1e9:.2f}ns"
+    if time < 1e-3:
+        return f"{time*1e6:.2f}us"
+    if time < 1:
+        return f"{time*1e3:.2f}ms"
+    if time < 60:
+        return f"{time:.2f}s"
+    time = int(time)
+    if time < 60*60:
+        return f"{time//60}m{time%60}s"
+    if time < 24*3600:
+        return f"{time//3600}h{(time%3600)//60}m"
+    return f"{time//86400}d{(time%86400)//3600}h{(time%3600)//60}m"
+\end{minted}
+
+\noindent The \mintinline{python}{memory_str} function provides a friendly representation of a memory quantity, for use in search status updates.
+
+\begin{minted}[firstnumber=last]{python}
+def memory_str(mem: int) -> str:
+    """ Formats a given memory value in bytes, for printing. """
+    assert mem >= 0
+    if mem < 1024:
+        return f"{mem}B"
+    if mem < 1024**2:
+        return f"{mem/1024:.2f}KiB"
+    if mem < 1024**3:
+        return f"{mem/(1024**2):.2f}MiB"
+    return f"{mem/(1024**3):.2f}GiB"
+\end{minted}
+
+
+\subsection{The \mintinline{python}{SpaceFinder} Class}
+
+The \mintinline{python}{SpaceFinder} class encapsulates the data and code necessary to search for causally complete spaces on a given number of events.
+This Appendix presents a simplified version of the class, with no state serialisation and no symmetry optimisaton of the top-level children subsets: for the advanced version, used in the search for causally complete spaces on 4 events, see \ref{appendix:space-finder-algo-adv} (p.\pageref{appendix:space-finder-algo-adv}).
+To keep line numberings consistent with the advanced version, code omitted in the simplified version has been replaced by blank comment lines.
+
+An object of the class is instantiated by passing a number \mintinline{python}{num_events} of events---exposed by the homonymous property---and the constructor pre-computes certain data for use during the search.
+The optional \mintinline{python}{verbose} keyword argument (kwarg) determines whether status updates will be printed/logged;
+the optional \mintinline{python}{update_period} kwarg determines the frequency of the updates (as a minimum number of equivalence classes discovered in between updates);
+
+\begin{minted}[linenos=false]{python}
+class SpaceFinder:
+    def __init__(self, num_events: int, *,
+                 verbose: bool = True,
+                 update_period: Optional[int] = None) -> None:
+        ...
+    @property
+    def num_events(self) -> int:
+        ...
+    ...
+\end{minted}
+
+\noindent Calling the \mintinline{python}{blank_state} method initialises the finder for a new search.
+
+\begin{minted}[linenos=false]{python}
+class SpaceFinder:
+    ...
+    def blank_state(self) -> None:
+        ...
+    ...
+\end{minted}
+
+\noindent After the search state has been set---to a blank state or to the state loaded from a file---the \mintinline{python}{find_eq_classes} method can be called to start the search, which will run until completion.
+
+\begin{minted}[linenos=false]{python}
+class SpaceFinder:
+    ...
+    def find_eq_classes(self) -> None:
+        ...
+    ...
+\end{minted}
+
+\noindent Below is a minimal example searching for causally complete spaces on 2 events: 
+
+\begin{minted}[linenos=false]{python}
+finder2 = SpaceFinder(2)
+finder2.blank_state()
+finder2.find_eq_classes()
+\end{minted}
+
+\noindent Basic benchmarking quantities are made available through public properties:
+the \mintinline{python}{time_elapsed} property exposes the time elapsed since \mintinline{python}{find_eq_classes} was called;
+the \mintinline{python}{memsize} property exposes an estimate of the amount of memory currently occupied by temporary data structures and discovered spaces;
+the \mintinline{python}{perc_completed} property exposes an estimate of the percentage of search space explored so far.
+
+\begin{minted}[linenos=false]{python}
+class SpaceFinder:
+    ...
+    @property
+    def time_elapsed(self) -> float:
+        ...
+    @property
+    def memsize(self) -> int:
+        ...
+    @property
+    def perc_completed(self) -> float:
+        ...
+    ...
+\end{minted}
+
+\noindent Below is the final portion of the output for the \mintinline{python}{finder2} 2-event example presented above, showing the time, memory and completion metrics as the algorithm progressed.
+
+\begin{minted}{text}
+[...]
+      time       spaces    eq. cls     memory  completed
+    2.75ms            4          1   14.20KiB   16.6667%
+    2.87ms            5          2   14.22KiB   33.3333%
+    2.96ms            5          2   14.22KiB   66.6667%
+    3.04ms            5          2   14.22KiB   83.3333%
+    3.13ms            7          3   14.25KiB  100.0000%
+Found 7 spaces in 3 equivalence classes.
+\end{minted}
+
+\noindent The search process progressively uncovers equivalence classes of causally complete spaces under event-input permutation symmetry.
+For reasons of memory efficiency, a single representative---the bitvector for the set of input histories in the space---is stored for each equivalence class: these representatives can be iterated using the \mintinline{python}{iter_eq_classes} property (with no guarantees on order), while their number is efficiently exposed by the \mintinline{python}{num_eq_classes} property.
+The search process also efficiently computes the total number of causally complete spaces in the equivalence classes discovered so far, which is exposed by the \mintinline{python}{num_spaces} property.
+The \mintinline{python}{iter_spaces} property, finally, iterates through all causally complete spaces discovered so far, by iterating through all equivalence classes and iterating over all spaces in each class by applying the event-input permutation group elements to the representative (without repetition of spaces); for each space, a pair is yielded, with the equivalence class representative as the first element and the permuted space as the second element.
+
+\begin{minted}[linenos=false]{python}
+class SpaceFinder:
+    ...
+    @property
+    def num_eq_classes(self) -> int:
+        ...
+    @property
+    def iter_eq_classes(self) -> Iterator[HistorySet]:
+        ...
+    @property
+    def num_spaces(self) -> int:
+        ...
+    @property
+    def iter_spaces(self) -> Iterator[tuple[HistorySet, HistorySet]]:
+        ...
+    ...
+\end{minted}
+
+\noindent In the \mintinline{python}{finder2} 2-event example presented above, there are 7 causally complete spaces in 3 equivalence classes.
+Below we list both the equivalence class representatives and all spaces, using colours to highlight spaces in the same equivalence class.
+
+\begin{minted}[linenos=false]{python}
+print(f"Eq Classes = {list(finder2.iter_eq_classes)}")
+print(f"All Spaces = {[space for _, space in finder2.iter_spaces]}")
+\end{minted}
+
+\begin{minted}[escapeinside=||]{text}
+Eq Classes = [|\colorbox{evred}{1362}|, |\colorbox{evgreen}{1638}|, |\colorbox{evblue}{278}|]
+All Spaces = [|\colorbox{evred}{1362, 820, 1558, 358}|, |\colorbox{evgreen}{1638, 1904}|, |\colorbox{evblue}{278}|]
+\end{minted}
+
+\noindent To understand which spaces were discovered, we look at the bitvector for each space (from \mintinline{python}{finder2.iter_spaces}), we extract the \mintinline{python}{int} representation of the bitvectors for the histories within (using \mintinline{python}{iter_bitvec}), and we then extract the event-input pairs for each history from the corresponding bitvector (using \mintinline{python}{history2dict}).
+
+\begin{minted}[linenos=false]{python}
+curr_eq_class_repr = None
+for eq_class_repr, space in finder2.iter_spaces:
+    if eq_class_repr != curr_eq_class_repr:
+        curr_eq_class_repr = eq_class_repr
+        print(f"Eq. class of space {eq_class_repr}:")
+    print(f"  Input histories for space {space}:")
+    for h in iter_bitvec(space):
+        print(f"    {history2dict(h)}")
+\end{minted}
+
+\noindent The first equivalence class discovered contains the 4 spaces in the middle layer of the hierarchy of causally complete spaces on 2 events with binary inputs.
+
+\begin{minted}[escapeinside=||]{text}
+Eq. class of space |\colorbox{evred}{1362}|=10101010010:
+  Input histories for space |\colorbox{evred}{1362}|=10101010010:
+     1=0001 -> {'A': 0}
+     4=0100 -> {'B': 0}
+     6=0110 -> {'A': 1, 'B': 0}
+     8=1000 -> {'B': 1}
+    10=1010 -> {'A': 1, 'B': 1}
+  Input histories for space |\colorbox{evred}{820}|=01100110100:
+     2=0010 -> {'A': 1}
+     4=0100 -> {'B': 0}
+     5=0101 -> {'A': 0, 'B': 0}
+     8=1000 -> {'B': 1}
+     9=1001 -> {'A': 0, 'B': 1}
+  Input histories for space |\colorbox{evred}{1558}|=11000010110:
+     1=0001 -> {'A': 0}
+     2=0010 -> {'A': 1}
+     4=0100 -> {'B': 0}
+     9=1001 -> {'A': 0, 'B': 1}
+    10=1010 -> {'A': 1, 'B': 1}
+  Input histories for space |\colorbox{evred}{358}|=00101100110:
+     1=0001 -> {'A': 0}
+     2=0010 -> {'A': 1}
+     5=0101 -> {'A': 0, 'B': 0}
+     6=0110 -> {'A': 1, 'B': 0}
+     8=1000 -> {'B': 1}
+\end{minted}
+
+\noindent The second equivalence class discovered contains the 2 spaces in the top layer of the hierarchy of causally complete spaces on 2 events with binary inputs, i.e. the spaces for the 2 total orders.
+
+\begin{minted}[escapeinside=||]{text}
+Eq. class of space |\colorbox{evgreen}{1638}|=11001100110:
+  Input histories for space |\colorbox{evgreen}{1638}|=11001100110:
+     1=0001 -> {'A': 0}
+     2=0010 -> {'A': 1}
+     5=0101 -> {'A': 0, 'B': 0}
+     6=0110 -> {'A': 1, 'B': 0}
+     9=1001 -> {'A': 0, 'B': 1}
+    10=1010 -> {'A': 1, 'B': 1}
+  Input histories for space |\colorbox{evgreen}{1904}|=11101110000:
+     4=0100 -> {'B': 0}
+     5=0101 -> {'A': 0, 'B': 0}
+     6=0110 -> {'A': 1, 'B': 0}
+     8=1000 -> {'B': 1}
+     9=1001 -> {'A': 0, 'B': 1}
+    10=1010 -> {'A': 1, 'B': 1}
+\end{minted}
+
+\noindent The third equivalence class discovered contains the space in the bottom layer of the hierarchy of causally complete spaces on 2 events with binary inputs, i.e. the discrete space.
+
+\begin{minted}[escapeinside=||]{text}
+Eq. class of space |\colorbox{evblue}{278}|=00100010110:
+  Input histories for space |\colorbox{evblue}{278}|=00100010110:
+     1=0001 -> {'A': 0}
+     2=0010 -> {'A': 1}
+     4=0100 -> {'B': 0}
+     8=1000 -> {'B': 1}
+\end{minted}
+
+\noindent In the coming sub-subsections, we will review the entire code for the \mintinline{python}{SpaceFinder} class.
+
+
+\subsection{\mintinline{python}{SpaceFinder} Class -- Constructor}
+
+The constructor accepts some search options (already discussed above) and pre-computes some data, to improve the time performance of the search process.
+Data pre-computed includes:
+the sequence \mintinline{python}{self._events} of events;
+the sequence \mintinline{python}{self._max_histories} of maximal extended input histories;
+the sequence \mintinline{python}{self._perm_group} of event-input permutation group elements;
+a dictionary \mintinline{python}{self._histories_perm_dict} mapping permutation group elements to their action on histories (as a history-history mapping);
+a dictionary \mintinline{python}{self._children_set} mapping histories to the \mintinline{python}{frozenset} of their children;
+a dictionary \mintinline{python}{self._children} mapping histories to the list of their children;
+a dictionary \mintinline{python}{self._parents} mapping histories to the \mintinline{python}{frozenset} of their parents;
+a dictionary \mintinline{python}{self._domsize} mapping histories to the size of their domain;
+a boolean \mintinline{python}{self._initialised} indicating whether the search state has been initialised (by calling the \mintinline{python}{blank_state} or \mintinline{python}{load_state} method);
+the maximum number \mintinline{python}{self._max_space_size} of bytes occupied by the bitvector for a space of input histories;
+the number \mintinline{python}{self._fixed_memsize} of bytes occupied by the data structures computed above.
+
+\begin{minted}[firstnumber=371]{python}
+
+class SpaceFinder:
+    # pylint: disable = too-many-instance-attributes
+    """
+    An instance of this class encapsulates all the data used in the
+    search for causally complete spaces on a given number of events.
+    """
+
+    # Options:
+    _num_events: int
+    _verbose: bool
+    _update_period: Optional[int]
+#
+#
+#
+
+    # Pre-computed data:
+    _events: tuple[Event, ...]
+    _max_histories: Sequence[History]
+    _perm_group: tuple[PermGroupEl, ...]
+    _histories_perm_dict: dict[PermGroupEl, dict[History, History]]
+    _children_set: dict[History, frozenset[History]]
+    _children: dict[History, tuple[History, ...]]
+    _parents: dict[History, frozenset[History]]
+    _domsize: dict[History, int]
+    _max_space_size: int
+    _initialised: bool
+    _fixed_memsize: int
+
+    def __init__(self, num_events: int,
+                 *, verbose: bool = True,
+                 update_period: Optional[int] = None) -> None:
+#
+#
+#
+        """
+        Creates a new space finder instance, which will search for causally
+        complete spaces on the given number of events.
+
+        :param num_events: the number of events
+        :param verbose: whether to print status updates, defaults to True
+        :param update_period: how frequently to print status updates
+                              (min number of equivalence classes discovered
+                              between updates), defaults to None (print update
+                              after every each top-level cycle)
+        :param filename: internal state is regularly saved to a binary file with
+                         this name, defaults to None (don't save internal state)
+        :param save_period: how frequently to save internal state (min number of
+                            equivalence classes discovered between saves),
+                            defaults to None (save only once, at the end)
+        """
+        assert update_period is None or update_period > 0
+        self._num_events = num_events
+        self._verbose = verbose
+        self._update_period = update_period
+#
+#
+#
+#
+#
+#
+#
+        self._max_histories = max_histories(num_events)
+        self._events = tuple(idx2event(idx) for idx in range(num_events))
+        self._perm_group = tuple(iter_perm_group(self._events))
+        hs = sorted(sub_histories(self._max_histories),
+                    key=history_sort_key)
+        _histories_perm_dict = {
+            h: dict(history_perms(h, self._perm_group))
+            for h in hs
+        }
+        self._histories_perm_dict = {
+            p: {
+                h: _histories_perm_dict[h][p]
+                for h in hs
+            }
+            for p in self._perm_group
+        }
+        self._children_set = {
+            h: frozenset(child_histories(h))
+            for h in hs
+        }
+        self._children = {
+            h: tuple(sorted(self._children_set[h]))
+            for h in hs
+        }
+        self._parents = parents(hs)
+        self._domsize = {h: domsize(h) for h in hs}
+        self._max_space_size = sys.getsizeof(2**(2**(2*len(self._events)))-1)
+        self._initialised = False
+        self._fixed_memsize = getsize(self)
+\end{minted}
+
+
+\subsection{\mintinline{python}{SpaceFinder} Class -- Spaces}
+
+As new equivalence classes of causally complete spaces are discovered during the search, a single representative for the equivalence class is added to \mintinline{python}{self._eq_classes}, a mutable \mintinline{python}{set}, and the number of spaces in the equivalence class is added to \mintinline{python}{self._num_spaces}.
+The \mintinline{python}{num_events}, \mintinline{python}{num_eq_classes} and \mintinline{python}{num_spaces} properties expose read-only access to the number of events, of equivalence classes discovered so far, and of spaces discovered so far.
+The \mintinline{python}{iter_eq_classes} property exposes an iterator over the set of representatives for equivalence classes discovered so far, while the \mintinline{python}{iter_spaces} property exposes an iterator over all causally complete spaces discovered so far (computed on the fly by permuting each equivalence class representative in turn).
+
+\begin{minted}[firstnumber=last]{python}
+    _eq_classes: set[HistorySet]
+    _num_spaces: int
+
+    @property
+    def num_events(self) -> int:
+        """
+        Number of events.
+        """
+        return self._num_events
+
+    @property
+    def num_eq_classes(self) -> int:
+        """
+        Number of equivalence classes of causally complete spaces,
+        discovered so far.
+        """
+        return len(self._eq_classes)
+
+    @property
+    def iter_eq_classes(self) -> Iterator[HistorySet]:
+        """
+        Iterate over the equivalence classes of causally complete spaces
+        discovered so far, yielding a representative space for
+        each equivalence class.
+        """
+        return iter(self._eq_classes)
+
+    @property
+    def num_spaces(self) -> int:
+        """
+        Number of causally complete spaces discovered so far.
+        """
+        return self._num_spaces
+
+    @property
+    def iter_spaces(self) -> Iterator[tuple[HistorySet, HistorySet]]:
+        """
+        Iterate over the causally complete spaces discovered so far.
+        """
+        for eq_class_repr in self.iter_eq_classes:
+            space_set = bitvec2set(eq_class_repr)
+            eq_class = set()
+            for g in self._perm_group:
+                g_action = self._histories_perm_dict[g]
+                space_set_perm = {g_action[h] for h in space_set}
+                space_perm = bitvec(space_set_perm)
+                if space_perm not in eq_class:
+                    eq_class.add(space_perm)
+                    yield eq_class_repr, space_perm
+\end{minted}
+
+
+\subsection{\mintinline{python}{SpaceFinder} Class -- Search Metrics}
+
+The search algorithm is recursive and operates by levels, corresponding to histories with progressively decreasing number of events in their domain.
+At the top level, the algorithm iterates through sets of children for the maximal extended input histories.
+After an initial step, the number of sets of children to be iterated over is stored in \mintinline{python}{self._num_todo}, while \mintinline{python}{self._num_done} is increased by one after each top-level search step is completed: the ratio \mintinline{python}{self._num_done/self._num_todo} is used as a rough estimate of completion, exposed by the \mintinline{python}{perc_completed} property.
+Note that this estimate is very rough: most spaces are discovered at the beginning, so that later iterations are likely to proceed significantly faster than early ones.
+We'll explore precisely how this subset selection is done later on, when talking about the search logic.
+
+\begin{minted}[firstnumber=last]{python}
+    _num_done: int
+    _num_todo: int
+
+    @property
+    def perc_completed(self) -> float:
+        """
+        Percent estimate of search completion.
+        """
+        return self._num_done/self._num_todo
+\end{minted}
+
+\noindent The search status printouts also include time and memory columns.
+The memory size of fixed data structures is computed exactly by the class constructor, stored in \mintinline{python}{self._fixed_memsize}, while the size of variable data structures is given as an upper-bound, computed from their length and the maximum size of a history space bitvector for the given number of events.
+
+\begin{minted}[firstnumber=542]{python}
+    _start_time: float
+    _partial_spaces_visited: set[HistorySet]
+
+    @property
+    def time_elapsed(self) -> float:
+        """
+        Time elapsed since search started.
+        """
+        return perf_counter()-self._start_time
+
+    @property
+    def memsize(self) -> int:
+        """
+        An estimate of memory currently occupied by the auxiliary data (bytes).
+        """
+        partial_visited = self._partial_spaces_visited
+        full_visited = self._eq_classes
+        child_choices_list = self._child_choices_list
+        remaining_children_list = self._remaining_children_list
+        max_space_size = self._max_space_size
+        memsize = self._fixed_memsize
+        memsize += (sys.getsizeof(partial_visited)
+                    +len(partial_visited)*max_space_size)
+        memsize += (sys.getsizeof(full_visited)
+                    +len(full_visited)*max_space_size)
+        memsize += (sys.getsizeof(child_choices_list)
+                    +len(child_choices_list)*max_space_size)
+        memsize += (sys.getsizeof(remaining_children_list)
+                    +len(remaining_children_list)*max_space_size)
+        return memsize
+\end{minted}
+
+\noindent Finally, some utility functions are implemented to print and log all status data.
+
+\begin{minted}[firstnumber=last]{python}
+    def _print(self, *args: str, **kwargs: Any) -> None:
+        """ Prints to console. """
+        print(*args, **kwargs)
+#
+#
+
+    def _print_status_header(self) -> None:
+        if self._verbose:
+            header = (f"{'time': >10} {'spaces': >12} {'eq. cls': >10}"
+                      f" {'memory': >10} {'completed': >10}")
+#
+            self._print(header, flush=True)
+
+    def _print_status_line(self) -> None:
+        if self._verbose:
+            time = time_str(self.time_elapsed)
+            spaces = str(self.num_spaces)
+            eq_classes = str(self.num_eq_classes)
+            memory = memory_str(self.memsize)
+            completed = f"{self.perc_completed:.4%}"
+#
+#
+            line = (f"{time: >10} {spaces: >12} {eq_classes: >10}"
+                    f" {memory: >10} {completed: >10}")
+#
+            self._print(line, flush=True)
+
+    def _describe(self) -> None:
+        """
+            If in verbose mode,
+            prints a summary description of the search results (so far).
+        """
+        if self._verbose:
+            self._print(f"Found {self.num_spaces} spaces in "
+                       f"{self.num_eq_classes} equivalence classes.")
+\end{minted}
+
+
+\subsection{\mintinline{python}{SpaceFinder._find_eq_classes}}
+
+The private \mintinline{python}{_find_eq_classes} method contains the main space-finding logic.
+It operates recursively by levels, each level corresponding to a set of histories \mintinline{python}{set(new)_hs} with a fixed number of events: 
+\begin{enumerate}
+    \item The \mintinline{python}{new_hs} sequence contains the candidate input histories for this level: in the search on $n$ events, level $l$ corresponds to input histories with $n-l$ events (where $l=0, ..., n-2$).
+    \item The \mintinline{python}{hs} sequence contains all candidate input histories thus far, excluding those in \mintinline{python}{new_hs}.
+    \item The \mintinline{python}{hs_rest} sequence has the same length as \mintinline{python}{hs} and it contains the difference between each history in \mintinline{python}{h in hs} and all the sub-histories \mintinline{python}{k in sub_histories([h])} which have been discovered so far. If this difference becomes empty, the history \mintinline{python}{h} is guaranteed to not be $\vee$-prime, and hence is removed from the candidate input histories (later on, we refer to this process as ``winnowing'').
+\end{enumerate}
+In the top-level (\mintinline{python}{level=0}) call to \mintinline{python}{_find_eq_classes} that starts the search, \mintinline{python}{new_hs} is set to the maximal extended input histories on the given number of events, while \mintinline{python}{hs} and \mintinline{python}{hs_rest} are set to empty.
+
+\begin{minted}[firstnumber=691]{python}
+    def _find_eq_classes(self, new_hs: Sequence[History],
+                         hs: Sequence[History] = tuple(),
+                         hs_rest: Sequence[History] = tuple(),
+                         level: int = 0) -> Iterator[HistorySet]:
+        # pylint: disable = too-many-locals
+        hs_so_far = tuple(chain(new_hs, hs))
+        hs_perm_dict = self._histories_perm_dict
+        partial_spaces_visited = self._partial_spaces_visited
+        spaces_visited = self._eq_classes
+#
+#
+#
+#
+        for child_subset in self._iter_child_subsets(new_hs):
+            child_subset_sorted = sorted(child_subset, key=history_sort_key)
+            hs_so_far_rest = list(chain(new_hs, hs_rest))
+            for k in child_subset_sorted:
+                for j, h in enumerate(hs_so_far):
+                    if is_subset(k, h):
+                        hs_so_far_rest[j] = sub(hs_so_far_rest[j], k)
+            winnowed_hs = tuple(h for j, h in enumerate(hs_so_far)
+                                       if hs_so_far_rest[j])
+            winnowed_hs_rest = tuple(
+                h for h in hs_so_far_rest if h)
+            partial_space = set(chain(child_subset_sorted, winnowed_hs))
+            partial_space_bitvec = bitvec(partial_space)
+            already_seen = (partial_space_bitvec in partial_spaces_visited
+                            or partial_space_bitvec in spaces_visited)
+            if not already_seen:
+                eq_class = set()
+                for p in self._perm_group:
+                    p_action = hs_perm_dict[p]
+                    perm_partial_space_bitvec = bitvec(p_action[h]
+                                                       for h in partial_space)
+                    eq_class.add(perm_partial_space_bitvec)
+                    if (perm_partial_space_bitvec in partial_spaces_visited
+                        or perm_partial_space_bitvec in spaces_visited):
+                        already_seen = True
+                        break
+            if not already_seen:
+                if all(self._domsize[h] == 1 for h in child_subset_sorted):
+                    self._num_spaces += len(eq_class)
+                    yield partial_space_bitvec
+                else:
+                    partial_spaces_visited.add(partial_space_bitvec)
+                    yield from self._find_eq_classes(child_subset_sorted,
+                                                     winnowed_hs,
+                                                     winnowed_hs_rest,
+                                                     level+1)
+\end{minted}
+
+\noindent At the start of the method, the sequence \mintinline{python}{hs_so_far} of all current candidate input histories is computed, and some persistent data structures are accessed and given shorter names.
+
+\begin{minted}[firstnumber=696]{python}
+        hs_so_far = tuple(chain(new_hs, hs))
+        hs_perm_dict = self._histories_perm_dict
+        partial_spaces_visited = self._partial_spaces_visited
+        spaces_visited = self._eq_classes
+\end{minted}
+
+\noindent The rest of the method iterates over all subsets of child histories for the histories in \mintinline{python}{new_hs}.
+Two different methods are used: the symmetry-optimised \mintinline{python}{self._iter_child_subsets_toplevel} is used at top-level (\mintinline{python}{level=0}), while the general purpose \mintinline{python}{self._iter_child_subsets} is used for all other levels.
+In principle, the \mintinline{python}{self._iter_child_subsets} method could be used to iterate over child subsets at all levels, but the added efficiency of the \mintinline{python}{self._iter_child_subsets_toplevel} is helpful in the search on 4 events (plus, the symmetry argument is interesting in itself).
+Each child subset yielded is sorted to make the search deterministic.
+
+\begin{minted}[firstnumber=700]{python}
+#
+#
+#
+#
+        for child_subset in self._iter_child_subsets(new_hs):
+            child_subset_sorted = sorted(child_subset, key=history_sort_key)
+\end{minted}
+
+\noindent For each chosen subset \mintinline{python}{child_subset} of child histories, we wish to compute the part of each candidate input history in \mintinline{python}{hs_so_far} that is not covered by any sub-history discovered so far.
+Excluding any sub-histories in \mintinline{python}{child_subset}, the entirety of each history in \mintinline{python}{new_hs} is uncovered---because we haven't seen any of their sub-histories yet---while the ``uncovered'' part for the histories in \mintinline{python}{hs} is given by \mintinline{python}{hs_rest}.
+Hence, we initialise the sequence of ``uncovered'' parts for \mintinline{python}{hs_so_far} to \mintinline{python}{hs_so_far_rest}.
+For each child history \mintinline{python}{k in child_subset}, we then proceed to subtract \mintinline{python}{k} from all its super-histories in \mintinline{python}{hs_so_far}, updating the corresponding ``uncovered'' part in \mintinline{python}{hs_so_far_rest}.
+At the end, \mintinline{python}{winnowed_hs} contains the histories that have non-empty ``uncovered'' part (i.e. those which might still be $\vee$-prime), and \mintinline{python}{winnowed_hs_rest} contains the corresponding ``uncovered'' parts, to be used by recursive calls to \mintinline{python}{_find_eq_classes}.
+
+\begin{minted}[firstnumber=706]{python}
+            hs_so_far_rest = list(chain(new_hs, hs_rest))
+            for k in child_subset_sorted:
+                for j, h in enumerate(hs_so_far):
+                    if is_subset(k, h):
+                        hs_so_far_rest[j] = sub(hs_so_far_rest[j], k)
+            winnowed_hs = tuple(h for j, h in enumerate(hs_so_far)
+                                       if hs_so_far_rest[j])
+            winnowed_hs_rest = tuple(
+                h for h in hs_so_far_rest if h)
+\end{minted}
+
+\noindent The new set of candidate input histories contains the currently selected subset of child histories together with the histories that survived the winnowing step above: taken together, they form \mintinline{python}{partial_space}, a ``partial'' space of input histories so far (which is not causally complete unless we are at the bottom level $l=n-2$).
+Before proceeding, we check whether we have already encountered this ``partial'' space, or any of its permutations under event-input permutation symmetry; in the process, we also compute its equivalence class.
+
+\begin{minted}[firstnumber=715]{python}
+            partial_space = set(chain(child_subset_sorted, winnowed_hs))
+            partial_space_bitvec = bitvec(partial_space)
+            already_seen = (partial_space_bitvec in partial_spaces_visited
+                            or partial_space_bitvec in spaces_visited)
+            if not already_seen:
+                eq_class = set()
+                for p in self._perm_group:
+                    p_action = hs_perm_dict[p]
+                    perm_partial_space_bitvec = bitvec(p_action[h]
+                                                       for h in partial_space)
+                    eq_class.add(perm_partial_space_bitvec)
+                    if (perm_partial_space_bitvec in partial_spaces_visited
+                        or perm_partial_space_bitvec in spaces_visited):
+                        already_seen = True
+                        break
+\end{minted}
+
+\noindent If \mintinline{python}{partial_space} was not encountered before, we proceed.
+If we reached the bottom level---i.e. if all child histories have exactly 1 event---then \mintinline{python}{partial_space} is a representative in a newly discovered equivalence class of causally complete spaces, so we update the total number of spaces and we yield the representative.
+If we instead haven't reached the bottom level, then we register the ``partial'' space \mintinline{python}{partial_space} as visited and recurse to one level below.
+
+\begin{minted}[firstnumber=730]{python}
+            if not already_seen:
+                if all(self._domsize[h] == 1 for h in child_subset_sorted):
+                    self._num_spaces += len(eq_class)
+                    yield partial_space_bitvec
+                else:
+                    partial_spaces_visited.add(partial_space_bitvec)
+                    yield from self._find_eq_classes(child_subset_sorted,
+                                                     winnowed_hs,
+                                                     winnowed_hs_rest,
+                                                     level+1)
+\end{minted}
+
+
+\subsection{\mintinline{python}{SpaceFinder.find_eq_classes}}
+
+The \mintinline{python}{find_eq_classes} method checks that the finder instance has been initialised, sets start time and the \mintinline{python}{self._num_eq_classes_since_last_save} counter, and then starts the search by calling \mintinline{python}{_find_eq_classes} on the maximal extended input histories for the chosen number of events.
+For each equivalence class discovered, the representative yielded by \mintinline{python}{_find_eq_classes} is added to the set of equivalence classes, the \mintinline{python}{self._num_eq_classes_since_last_save} counter is increased, and a new line in the search status table is printed (if required).
+When all equivalence classes have been discovered, a final line in the search status table is printed (if required), the state is saved (if required) and the number of discovered spaces and equivalence classes is printed (if required).
+
+\begin{minted}[firstnumber=740]{python}
+    def find_eq_classes(self) -> None:
+        """
+            Start the search for equivalence classes.
+        """
+        if not self._initialised:
+            raise Exception("Must initialise using blank_state() "
+                            "or load_state(file).")
+        update_period = self._update_period
+        self._start_time = perf_counter()
+        self._num_eq_classes_since_last_save = 0
+        init_histories = max_histories(self.num_events)
+        for eq_class_repr in self._find_eq_classes(init_histories):
+            self._eq_classes.add(eq_class_repr)
+            self._num_eq_classes_since_last_save += 1
+            if (update_period is not None
+                and self.num_eq_classes % update_period == 0):
+                self._print_status_line()
+        if update_period is not None:
+            self._print_status_line()
+        self._partial_spaces_visited.clear()
+#
+        self._describe()
+\end{minted}
+
+
+\subsection{\mintinline{python}{SpaceFinder._iter_child_subsets}}
+
+Given a sequence \mintinline{python}{hs} of histories, the private \mintinline{python}{_iter_child_subsets} method iterates through all subsets \mintinline{python}{child_subset} of \mintinline{python}{child_histories(hs)} such that each history in \mintinline{python}{h in hs} has at least one of its child histories in \mintinline{python}{child_subset}.
+This is done by sorting all child histories and then iterating through all bitvectors \mintinline{python}{child_subset_bitvec} for their non-empty subsets: for each bitvector, the call to the \mintinline{python}{_child_subset} returns the corresponding subset if it satisfies the condition above, or \mintinline{python}{None} if it doesn't.
+
+\begin{minted}[firstnumber=last]{python}
+    def _iter_child_subsets(self,
+                            hs: Sequence[History]
+                            ) -> Iterator[set[History]]:
+        child_hists: list[History] = sorted(
+            {k for h in hs for k in self._children[h]},
+            key=history_sort_key)
+        num_child_subsets = 2**len(child_hists)
+        for child_subset_bitvec in range(1, num_child_subsets):
+            child_subset = self._child_subset(hs, child_hists,
+                                              child_subset_bitvec)
+            if child_subset is not None:
+                yield child_subset
+\end{minted}
+
+\noindent In principle, this method could be used to iterate over child subsets at all levels.
+However, the simplicity of its logic is paid for by the unnecessary inefficiency at the top level, where event-input permutation symmetry can be used to reduce the number of subsets that need to be explored.
+For 2 events, symmetry reduces the number of subsets by about 3 times, from 16 to 6;
+for 3 events, it reduces the number by about 4 times, from 4096 to 922;
+for 4 events, it reduces the number by about 13 times, from 4294967296 to 315981136.
+For 5 events, symmetry reduces the number of subsets by 58 times or more; however, this doesn't really matter, since the number of top-level subsets to iterate over has in excess of 20 decimal digits, making a search on 5 events impossible with our algorithm anyway.
+
+
+\subsection{\mintinline{python}{SpaceFinder._child_subset}}
+
+The private \mintinline{python}{_child_subsets} method takes as its arguments a sequence \mintinline{python}{hs} of histories, a sequence \mintinline{python}{child_hists} of their children and the bitvector for a non-empty subset of children.
+
+\begin{minted}[firstnumber=last]{python}
+    def _child_subset(self,
+                      hs: Sequence[History],
+                      child_hists: Sequence[History],
+                      child_subset_bitvec: int,
+#
+#
+                      ) -> Optional[set[History]]:
+        # pylint: disable = too-many-arguments
+        hs_still_to_cover = set(hs)
+        child_subset = set()
+        idx = 0
+        while child_subset_bitvec > 0:
+            child_subset_bitvec, b = divmod(child_subset_bitvec, 2)
+            if b:
+                k = child_hists[idx]
+                child_subset.add(k)
+                if hs_still_to_cover:
+                    hs_still_to_cover -= self._parents[k]
+            idx += 1
+        if not hs_still_to_cover:
+            return child_subset
+        return None
+\end{minted}
+
+\noindent The method starts by creating a set \mintinline{python}{hs_to_cover} of histories in \mintinline{python}{hs} still to be ``covered''---i.e. where at least one child has to yet appear in the subets---and a set \mintinline{python}{child_subset} of children extracted from the bitvector.
+
+\begin{minted}[firstnumber=782]{python}
+        hs_still_to_cover = set(hs)
+        child_subset = set()
+\end{minted}
+
+\noindent The method then proceeds to iterate through the bits in the subset bitvector, including into \mintinline{python}{child_subset} any child history \mintinline{python}{k} whose bit is set to 1.
+The parents of \mintinline{python}{k} are then subtracted from \mintinline{python}{hs_still_to_cover} (unnecessary if it's already empty).
+
+\begin{minted}[firstnumber=784]{python}
+        idx = 0
+        while child_subset_bitvec > 0:
+            child_subset_bitvec, b = divmod(child_subset_bitvec, 2)
+            if b:
+                k = child_hists[idx]
+                child_subset.add(k)
+                if hs_still_to_cover:
+                    hs_still_to_cover -= self._parents[k]
+            idx += 1
+\end{minted}
+
+\noindent After all children indicated by the bitvector have been added to \mintinline{python}{child_subset}, we check whether there are any histories in \mintinline{python}{hs_still_to_cover}: if not, the subset is yielded; if so, \mintinline{python}{None} is yielded instead, to indicate that the subsets should not be explored.
+
+\begin{minted}[firstnumber=793]{python}
+        if not hs_still_to_cover:
+            return child_subset
+        return None
+\end{minted}
+
+
+
+% === COMMENT BELOW BEFORE COMPILING MAIN FILE ===
+
+% \newpage
+
+% \section{Advanced Algorithm to Find Causally Complete Spaces}
+% \label{appendix:space-finder-algo-adv}
+
+% \end{document}

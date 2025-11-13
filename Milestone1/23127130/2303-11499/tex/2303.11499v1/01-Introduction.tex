@@ -1,0 +1,142 @@
+\vspace{-2mm}
+\section{Introduction}
+\label{sec:introduction}
+
+%\SR{I am not a fan of the title (too wordy and confusing) and the abbreviation (too contrived)}\RG{I wanted to convey that the main contribution is a general inter-operation dataflow for arbitrary graph of tensors/einsums, hence I though the title precisely defines the contributions...}%\RG{ Note: Actually, I had some other abbreviations in mind in, in comments within cmds.tex but the names are already in arch literature (DAGGER) or could be sensitive to use (GOD), so GOGETA seemed like the next best permutation of all the things i thought are important in the title}
+
+Sparse and Dense matrix multiplications are prime operations for a variety of applications spanning Graph Analytics~\cite{kipf2017semisupervised,hamilton2017inductive}, High-Performance Computing~\cite{cools2017communication,cerebras} and Artificial Intelligence~\cite{resnet,nlp}. The GEMM operations used in DNNs offer vast reuse opportunities~\cite{kwon2019understanding,interstellar,timeloop,eyeriss2016isca} owing to their high \textit{arithmetic intensity}.
+This has led to a plethora of spatial accelerators for DNN applications~\cite{eyeriss2016isca,kwon2018maeri,tpu-isca,nvdla} that extract reuse via customized dataflow strategies~\cite{eyeriss2016isca,kwon2019understanding}.
+%Moreover, due to their domain-specificity, accelerator compute units have lower area which enables higher parallelism within the same area budget. 
+Prior works have also looked at the accelerators for sparse tensor workloads~\cite{sigma,eie,extensor,eyeriss2} which eliminate irrelevant multiplications and memory accesses. 
+%\TK{@Raveesh - I think we can move this para to para 3. Basically start with current para 2 on GEMMs, reuse and spatial accelerators. Then introduce CG. So intersperse this para with current para 3}
+
+Iterative linear solvers are key to several HPC applications ranging from chemistry to fluid dynamics. These solver applications have been slow on traditional CPUs and GPUs due to high data movement. Conjugate Gradient (CG)~\cite{hestenes1952methods} is a popular example of an iterative linear solver. In CG, most of the operations are matrix multiplications, which intuitively should comfortably compute bound.
+%
+However, for TOP500 supercomputers, the HPCG benchmark\footnote{HPCG is a benchmark for supercomputers that runs CG.}\cite{dongarra2015hpcg,hpcg2021} utilizes a fraction of compute compared to Linpack. The main reason for this is costly data movement and communication between compute clusters/pods.
+This is because \GEMM\footnote{We use the term Skewed GEMMs to refer to SpMMs/GEMMs which have operands with extreme aspect ratios -- approaching vectors in the limit.} used in various HPC applications/kernels like CG have orders of magnitude lower arithmetic intensity compared to SpMMs/GEMMs in DNNs and offer less reuse opportunities within one operation\footnote{In this work, by 'operation', we refer to a single tensor multiplication.} as~\autoref{fig:ai}~(\autoref{sec:ai}) discusses later in the paper. Thus, executing CG at the granularity of a GEMM, reading tensors from DRAM and writing the output of each GEMM to DRAM, makes it extremely memory bound leading to severe compute under-utilization. 
+%making inter-operation reuse essential.
+
+%This work explores inter-operation reuse opportunities for kernels like CG to enhance its arithmetic intensity.
+
+In this work, we identify various \textit{inter-operation} reuse opportunities for kernels like CG to enhance its arithmetic intensity.
+Our proposed \textit{inter-operation reuse} is a wider generalization of traditional \textit{inter-operation pipelining}, which is the idea of consuming the portion of the tensor as it is produced\footnote{Note that by inter-operation pipelining in this paper, we mean pipelining between matrix multiplications which is a lot more challenging~\cite{dnnfusion,flat} and has a larger design-space~\cite{garg2021understanding} than straightforward element-wise fusion done by ML compilers today, for example, matrix-multiplication and ReLU fusion.}. This has been shown to be beneficial for accelerators for applications like Graph Neural Networks~\cite{garg2021understanding,yan2020hygcn,liang2020engn} and in Transformers~\cite{flat} where the intermediate tensor is reused between a SpMM/GEMM and GEMM,  reducing  intermediate output data movement to and from DRAM.
+%Unfortunately, \textit{traditional inter-operation pipelining} often consumes the intermediate data and does not keep it in the memory. 
+
+%Traditionally, \textit{inter-operation pipelining} has been exploited in prior works~\cite{tangram,garg2021understanding,yan2020hygcn,flat} %across various application domains 
+%to reduce the data movement to DRAM, by consuming the portion of the tensor as it is produced 
+
+Unfortunately, scientific applications introduce additional challenges that make it hard to directly apply inter-operation pipelining.
+They often require the output data from one operation in future tensor operations which may not be consecutive, due to which the data must remain resident in the memory hierarchy. As we discuss in detail in ~\autoref{sec:background}, in CG these tensor operands have multiple downstream consumers---resulting in multiple \textit{tensor operand reuse distances} that confound attempts at traditional GEMM fusion.
+This complex dependency graph can often complicate the optimization of loop orders and tiling strategies to determine efficient intra-operation and inter-operation dataflows.
+
+
+Another challenge is that these solver applications have tensor operations with contracted rank being dominant, which does not pipeline with the next operation due to the significant number of partial sums contributing to each output element; therefore, it is not possible to simply fuse the entire CG application. ~\autoref{fig:no-fusion} shows a part of the CG graph and dependency of output of node 1 in multiple operations. 
+%\TK{the following line seems out of place - since its one of many techniques we propose. Should maybe remove it}
+%We propose \textit{pipelining with writeback}, which involves traditional pipelining and writing back the intermediate data to the buffer, hence incurring only write accesses and avoiding the read accesses for the intermediate matrix.
+
+\insertFigure{no-fusion}{A part of the CG tensor dependency graph where a node represents the equation in~\autoref{alg:cg_einsum} and edge represents the output of the source node equation. The data cannot be consumed and be shielded from memory hierarchy since its reused again in another tensor. Please refer to ~\autoref{fig:dfg} for complete graph of CG.}%\RG{contraction heavy}}
+
+\insertFigure{venn}{Our work on DAG-level dataflow covers a larger scope than works pipelining two tensor operations~\cite{flat,tangram,garg2021understanding} and works targetting operation by operation execution~\cite{kwon2019understanding,interstellar,timeloop,kao2020gamma,cosa}.%\TK{In figure, change purple description to Prior work on DNN dataflow modeling and mapping. And I think you have GAMMA(ICCAD) to differentiate from the Daniel's paper, but looking odd to me. Just call it GAMMA and the citation here will anyway point to the mapper one}
+}
+
+Moreover, given that the graph of tensor operations becomes more complex, it is important to make sure that the loop order choice minimizes the transformation of data layouts of these tensors across various operations where that tensor is used. We use the term \textit{swizzling} for the layout transformation. Thus we need to minimize swizzling.
+
+
+%In this work, we identify various \textit{inter-operation} reuse opportunities which are not limited to \textit{inter-operation pipelining}.
+%Please note that \textit{inter-operation reuse} is a wider generalization of \textit{traditional inter-operation pipelining} here, since inter-operation pipelining only exploits reuse between consecutive operations. \autoref{fig:venn} shows the scope of our work on inter-operation dataflows compared to prior works on acceleration.
+%One example is \textit{pipelining with writeback}
+
+%Moreover, it is important to focus on leveraging the knowledge of future occurrence of the tensor beyond the immediate tensor. In CG, these tensor operands have variable \textit{tensor operand reuse distances}. This pattern is frequent in various scientific applications as~\autoref{sec:background} shows. This complex dependency graph can often complicate the determination of loop orders and tiling strategies to determine efficient intra-operation and inter-operation dataflows.
+
+%Also, given that the graph of tensors becomes more complex, it is important to make sure that the loop order choice minimzes the transformation of layouts of these tensors across various operations where that tensor is used. We use the term \textit{swizzling} for the layout transformation. Thus we need to minimize swizzling.
+
+Based on such insights from the tensor dependency graphs of various applications, we propose a systematic methodology to identify, classify and exploit reuse opportunities in an arbitrary graph of tensor operations targeting spatial accelerators. This also involves deriving the loop orders and tile sizes for individual operations since the ability to exploit the inter-operation reuse can also depend on the individual operation's dataflow.
+%Some other applications which have individual \GEMM of low arithmetic intensity include Graph Neural Network, Transformers etc. where our methodology is applicable, however, we often refer to Conjugate Gradient for demonstration purposes in this paper since its tensor dependency graph already has the characteristics of low intensity Graph and ML workloads but also has additional unique characteristics providing opportunity to demonstrate different kinds of inter-operation reuse.
+We also propose scalable tiling strategies for applications where individual \GEMM have low arithmetic intensity. Prior works on pipelining~\cite{flat,tangram,garg2021understanding,yan2020hygcn} always consider the entire tensor to be local in space. However, the tiling we propose involves splitting a memory bound GEMM by the dominating rank into sub-tensors and reusing the data in a fine-grained manner between the sub-tensors.% (shown later in~\autoref{fig:spacetime})\TK{not sure if we need to cite a figure that'll come this late. Might be better to point to the section that will discuss this}. 
+%
+ As a result of the methodology, we propose \DataflowName\footnote{\TitleExpansion. % Its a fusion reference.
+}, a new mapping strategy for arbitrary graphs of tensor operations which exploits reuse opportunities between operations. We also propose heuristics for allocating tensors inside the buffer based on tensor-level reuse distance and reuse frequency.
+
+Our methodology is also applicable to %(and evaluated on) 
+other applications which have individual \GEMM of low arithmetic intensity, including Graph Neural Networks and Transformers. %where our methodology is applicable,
+However, we often refer to Conjugate Gradient as the application for demonstration purposes in this paper since its tensor dependency graph not only has the characteristics of low intensity Graph and ML workloads but also has additional unique characteristics providing opportunity to demonstrate different kinds of inter-operation reuse.
+\autoref{fig:venn} shows the scope of our work on inter-operation dataflows compared to prior works on accelerator dataflow.
+%Our proposed \textit{inter-operation reuse} is a wider generalization of \textit{traditional inter-operation pipelining} here, since inter-operation pipelining only exploits reuse between consecutive operations.
+%\autoref{fig:venn} shows the scope of our work on inter-operation dataflows compared to prior works on acceleration.
+
+%Therefore data orchestration which accounts for such reuse is critical for HPC workloads. Cache replacement policies often have a global view of an individual line rather than a tensor as a whole, which limits the applicability for such algorithms. Moreover, LRU replacement does not see the future reuse of the tensor and replaces it if it has not been used recently. Belady's optimal replacement policy requires knowledge of future accesses for each line and often requires additional structures and meta data accesses to replace one line which is costly to implement~\cite{popt-hpca21}. Scratchpads, on the other hand provide ability to the programmer to have control over data orchestration. However, these scratchpads are often over-provisioned for the worst case applications.
+
+%To this end, we propose \DataflowName data orchestration that analyzes the tensor operand-level reuse patterns in the algorithm and the dataflows of the individual GEMMs to manage the data in the memory hierarchy. \DataflowName also enables efficient prefetching for these HPC algorithms due to the knowledge of the future tensor reuse pattern and dataflows.
+
+ %Some other applications with low arithmetic intensity include Graph Neural Network, Transformers etc., however, we often refer to Conjugate Gradient for demonstration purposes in this paper since its DAG already has the characteristics of Graph and ML workloads but also has additional unique characteristics providing opportunity to demonstrate different kinds of inter-operation reuse.
+
+
+\noindent  \textbf{\textit{The key contributions of this paper are:}}
+%\begin{itemize}
+\squishlist
+\item We introduce the challenge of skewed GEMMs/SpMMs in several HPC applications, including CG (\autoref{sec:background}).
+\item  We identify the reuse opportunities in solver HPC applications which extend beyond the intra-operation reuse and traditional pipelining proposed by prior works (\autoref{sec:ai}).
+%We also observe that these patterns are frequent across other HPC workloads which we discuss in ~\autoref{sec:background}.
+\item We propose a systematic methodology to formulate the data reuse opportunities in an arbitrary DAG of tensor operations. Then we propose a systematic way of determining the loop orders and the tile sizes in order to leverage reuse from both traditional inter-operation pipelining and distance based inter-operation reuse (\autoref{sec:dataflows}).
+%\item We co-optimize the loop orders and tiling strategies for the GEMM operations in order to leverage reuse from both traditional inter-operation pipelining and distance based inter-operation reuse.
+\item We propose a scalable inter-operation tiling strategy which splits a tensor by the dominant rank and has a finer-grained inter-operation spatial communication keeping the communication in-cluster. Based on the dataflow and tiling methodology, we propose \DataflowName, a mapping that reduces memory accesses and communication at the tensor dependency graph level.
+%\end{itemize}
+We also propose the notion of Tensor-operand level reuse distance for such patterns and a tensor organization strategy inside the buffer hierarchy (\autoref{sec:gogeta}).
+\item Our mapping strategy \DataflowName reduces the memory accesses by geomean 6.7x (range: 1.19x to 23.8x) for HPC Solver workloads. %This, coupled with our data organization strategy reduces the communication overhead by \TODO{xx times}.
+%\item We propose a novel data orchestration technique \DataflowName which allows for efficient replacement, placement and prefetching of data for applications with variable reuse distance patterns. Since reuse distance is a generalization, \DataflowName can be used for applications with only intra-operation reuse and inter-operation pipelining opportunities as well.
+%\item We propose a novel buffer idiom \TODO{name} which improves performance and energy over caches and scratchpads by \TODO{xx} and \TODO{xx}
+
+\squishend
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\begin{comment}
+\section{Problem and Motivation}
+\label{sec:introduction}
+
+Sparse and Dense matrix multiplications are prime operations for a variety of applications spanning Graph Analytics~\cite{kipf2017semisupervised,hamilton2017inductive}, High-Performance Computing~\cite{cools2017communication,cerebras} and Artificial Intelligence~\cite{resnet,nlp}. The GEMM operations used in DNNs offer vast reuse opportunities~\cite{kwon2019understanding,interstellar,timeloop,eyeriss2016isca} owing to their high arithmetic intensity. This has led to a plethora of spatial accelerators for DNN applications~\cite{eyeriss2016isca,kwon2018maeri,tpu-isca,nvdla,shi}. Prior works have also looked at the acceleration for Sparse workloads~\cite{sigma,eie,extensor,eyeriss2} by eliminating redundant matrix multiplications and memory accesses.
+
+However, certain PDE solver algorithms used scientific applications like the Conjugate Gradient~\cite{hestenes1952methods} have SpMM/SpMV and GEMM/GEMV operations with low arithmetic intensity~\cite{cerebras}. The best supercomputers ranked on High-Performance Linpack benchmark are able to achieve only upto 3\% of the performance on the HPCG benchmark~\cite{cerebras,osti_1089988}.
+~\autoref{alg:cg_einsum} shows the Block Conjugate Gradient Algorithm. ~\autoref{fig:results}a) and b) show maximum achievable arithmetic intensity of individual operations. Please note that instead of counting multiplications and additions separately, we count MAC as a unit of computation. We also consider matrix addition of, for example, $X^{k-1}$ with $P^{k-1}.\alpha^{k-1}$ in the equation $X^{k}=X^{k-1}+P^{k-1}\alpha^{k-1}$ to be done immediately after the MAC and we absorb the addition in same operation. Therefore, effectively we count number of multiplications per memory access of an element (independent of the bit precision). Please note, here number of RHS is a parameter with values 1,8,16,32 and 64. 
+
+\insertFigure{cg}{Block CG Algorithm.}
+
+
+~\autoref{fig:results}a) shows the maximum achievable arithmetic intensity for individual SpMM operations for the suitesparse CG matrices. We note that the SpMMs, especially the highly sparse ones like barth4 have extremely low arithmetic intensity even for RHS=64.
+~\autoref{fig:results}b) shows the maximum achievable arithmetic intensity of dense GEMMs in an individual operation in terms of number of multiplications per memory access. We notice that the arithmetic intensity of the DenseGEMMs is severely limited by the number of RHS (ie. the number of problems solved simultaneously.) Therefore traditional DNN accelerators~\cite{eyeriss2016isca,kwon2018maeri,tpu-isca} do not help accelerate these workloads due to fundamentally low reuse.
+
+~\autoref{fig:results}c) shows the arithmetic intensity for one iteration of the CG loop. Please note that for matrix inverse, we consider LU factorization followed by Triangular Solve. Also, we conservatively count accesses to $P$ and $P^T$ separately owing to different layout in the memory. We note that the amount of reuse that can be extracted between the operations is high and this motivates us to design a new dataflow for HPCG workloads which tries to maximize inter-operation rather than optimizing for inter-operation reuse.
+
+\end{comment}

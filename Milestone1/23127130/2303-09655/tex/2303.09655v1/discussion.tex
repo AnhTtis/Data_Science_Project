@@ -1,0 +1,47 @@
+\subsection{Hardware Limitations}
+A major disadvantage of using RT cores to accelerate distance computations is that the dimensionality of the dataset can be at most three. Indeed, the RT cores themselves expect the dataset to be {\em exactly} three dimensions. Despite this limitation, we note that there are many important real-world 2D and 3D datasets such as Geospatial data, point clouds, and object geometries, and important distance algorithms such as DBSCAN, computing normals, and filtering point cloud noise that use distance searches over these datasets. Indeed, we note that most of the prior DBSCAN works evaluate their approaches on 2D geospatial datasets~\cite{cuda-dclust,DBLP:journals/corr/abs-2103-05162,dbscan-compare}. It is possible to reduce the number of dimensions in the dataset using dimensionality reduction techniques such Principal Component Analysis, though this introduces approximation.
+
+%Our current implementation also requires that the entire set of points fit in GPU memory so that they can be represented as a single scene for the ray tracing reduction. Extending DART to handle larger data sets transparently is an important avenue of future work; we note that our core $\mathit{findNeighborhood}$ query is associative, so running the query on a partitioned data set and unioning the results will produce the correct answer. We note that despite this limitation, DART's implementation of RT-DBSCAN was, in several cases, able to handle data sets larger than the comparison work.
+
+\subsection{Impact of early traversal termination} \label{sec:early_term}
+FDBSCAN uses an optimization where it stops BVH traversal when {\em minPts} neighbors are found in the {\tt FindNeighbors} function\cite{DBLP:journals/corr/abs-2103-05162}. However, the Optix API, based on which OWL is built, does not allow BVH traversal termination unless the {\tt Intersection} kernel makes an additional call to the {\tt AnyHit} kernel. As this can incur significant overhead, RT-DBSCAN does not attempt to perform early traversal termination. 
+
+Though the early exit optimization works very well for cases where the user is only expected to run DBSCAN {\em once}, it is, in practice, more useful to record the number of neighbors of every point by allowing the BVH traversal to run its course. By saving the number of neighbors of each point, we do not have to re-run core point identification phase (Stage-1 of Algorithm~\ref{alg:parallel_dbscan}) for any subsequent DBSCAN runs where the user changes the {\em minPts} parameter. 
+
+%Since typical DBSCAN users are expected to run DBSCAN multiple times till meaningful clusters emerge, the user might be better off not terminating the traversal early. This way, the user can vary the {\em minPts} parameter multiple times and perform the first round of distance computations only once.
+\begin{figure*}
+     \centering
+     \begin{subfigure}[b]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/earlyexit-porto.pdf}
+         \caption{3DRoad}
+         \label{fig:porto_early-exit}
+     \end{subfigure}    
+     \hfill
+     \begin{subfigure}[b]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/earlyexit-3droad.pdf}
+         \caption{Porto}
+         \label{fig:3droad_early-exit}
+     \end{subfigure}
+          \hfill
+     \begin{subfigure}[b]{0.32\textwidth}
+         \centering
+         \includegraphics[width=\textwidth]{figures/earlyexit-ngsim.pdf}
+         \caption{NGSIM}
+         \label{fig:ngsim_early-exit}
+     \end{subfigure}      
+        \caption{Impact of early traversal termination on execution time}
+        \label{fig:early-exit}
+        \vspace{-1.5em}
+\end{figure*}
+In Figs~\ref{fig:early-exit}, we compare RT-DBSCAN to FDBSCAN {\em with} early termination, as well as FDBSCAN {\em without} while varying dataset size for fixed ({\em minPts}, $\varepsilon$) values. As expected, using early termination guarantees better performance as it often performs orders of magnitude fewer distance computations. This is especially true when {\em minPts} is very small and BVH traversal can stop very early. From our experiments, it is evident from Fig~\ref{fig:porto_early-exit} that for the Porto dataset, using early exit improves performance of FDBSCAN-EarlyExit by 3x compared to FDBSCAN {\em without} and by 1.5x compared to RT-DBSCAN for larger dataset sizes.
+
+However, in other cases, even the early-exit optimization is not enough to overcome RT-DBSCAN's superior performance. For example,  note that RT-DBSCAN outperforms FDBSCAN-EarlyExit on the 3DRoad dataset (Fig~\ref{fig:3droad_early-exit}) and vastly outperforms it on the NGSIM dataset (Fig~\ref{fig:ngsim_early-exit}). We explain our findings by noting that the cost of additional intersection tests is hidden by the acceleration from RT cores. We especially note that even though the early exit optimization is able to leverage the density of the NGSIM dataset to improve performance substantially, RT-DBSCAN's ability to massively prune the search space is even more useful.
+
+\subsection{Extensions to the Ray Tracing API}\label{sec:extend-optix-api}
+We believe that it would be advantageous to have a certain degree of control over the hardware BVH traversal. For applications such as Barnes-Hut \cite{barnes86a}, it is necessary to access and update the intermediate nodes of the BVH to estimate the effect of the enclosed volumes and this is not possible with the current setup of the Optix API. We leave the Barnes Hut implementation as future work.
+
+In this work, we leveraged the acceleration from the hardware BVH build and traversal. However, from Section~\ref{sec:rtx}, we know that the RT cores can also accelerate ray-triangle intersection tests. Indeed, Wald~\etal find that using hardware-accelerated intersection tests {\em in addition} to hardware-accelerated BVH traversal can produce substantial performance gains\cite{wald19}.
+
+In our nearest neighbors algorithm (Algorithm~\ref{alg:rt-neigh}), we expand spheres around the points in the dataset and designate all points that fall within the sphere as neighbors of that point. We performed some experiments to see if we could approximate the spheres using triangles to leverage the hardware acceleration. As the ray-triangle intersection tests were done in hardware, we had to call the {\tt AnyHit} kernel to collect the intersected points. We found that using triangles resulted in 2x to 5x performance degradation due to the overhead cost associated with calls to the {\tt AnyHit} kernel. If there was an extension to the hardware such that the intersected points can be returned without using the costly {\tt AnyHit} kernel, there is massive potential for performance improvement from leveraging hardware-accelerated ray-triangle intersection testing.

@@ -1,0 +1,148 @@
+\section{Method}\label{sec:method}
+
+% subsection name (3.0) implied, dropped
+% \subsection{Method Overview}
+The training of CC3D takes a set of single-view 2D RGB images and a set of top-down semantic layouts.
+We \textit{do not} assume the two image sets to be in 1:1 correspondence;~Fig.~\ref{fig:method} illustrates the overall architecture of our method.
+
+\paragraph{Training}
+We randomly choose 2D semantic layout images and sample style codes.
+The layout images and style codes are passed to the generator network, which outputs 2D features.
+The 2D feature map is then reshaped into a 3D feature volume, which can be rendered via volume rendering with a small MLP network and a 2D upsampling network.
+The realism of the rendered images is scored by the discriminator network against the set of RGB images, and the system is trained with the standard adversarial loss, along with the semantic consistency loss from the top-down views.
+
+\paragraph{Inference}
+We provide a semantic layout image and a style code to the generator to obtain a 3D neural radiance field that can be rendered from an arbitrary camera. Our method allows more control over the generation process compared to the most advanced unconditional GANs \cite{chan2022efficient, or2022stylesdf,gao2022get3d}, as users can specify the layouts with various styles and edit them.
+
+
+% \subsection{2D-Conditioned 3D Neural Fields Generation}
+\subsection{Neural Field Generator}
+\label{sec:gen_main}
+% 
+Our generator network $G(\textbf{L},\textbf{s})$ takes as input a 2D layout image $\textbf{L}$ and a style code $\textbf{s}\in \mathbb{R}^{512}$, sampled from a
+unit Gaussian distribution, and generates a 3D neural feature field $\textbf{F}\in \mathbb{R}^{N\times N \times N\times C}$, where $N$ and $C$ correspond to the spatial resolution and channel size. In our experiments, we set $N=128$ and $C=32$.
+
+\paragraph{Layout Conditioning}
+\label{sec:conditioning}
+The input to our generator is a 2D layout conditioning image $\textbf{L} \in \mathbb{R}^{N\times N\times L}$ that contains information about the scene structure, with $L$ being a dataset-dependent feature dimension.
+In contrast to concurrent work \cite{xu2022discoscene} that uses 3D bounding boxes as conditioning, we choose to guide our generation with 2D semantic layouts images; this allows users to generate layouts via simple 2D editing instead.
+The feature channels of an input layout are composed of the one-hot encoding of semantic classes and additional information such as bounding boxes' local coordinates, which is detailed in the supplementary. 
+% 
+As illustrated in Fig.~\ref{fig:3dfront_2d}, conditioning the generation on a 2D semantic layout can allow us to conveniently control the structure and the style of a scene.
+
+\input{sections/figures/fig_3dfront_2d}
+
+
+
+
+
+\paragraph{Layout-Conditioned 3D Generation}
+\label{sec:generation}
+As detailed in what follows, our conditional generator $G(\textbf{L},\textbf{s})$ is composed of a U-Net \textit{backbone} $U(\cdot)$ that generates a 2D feature image, followed by the \textit{extrusion} operator $E$ that reshapes a 2D feature map into a 3D feature grid as
+% 
+\begin{equation}
+    G(\textbf{L},\textbf{s})=E\circ U(\textbf{L},m(\textbf{s})).
+\end{equation}
+
+\paragraph{Backbone}
+The network $U$ is a ``StyleGAN-like" U-Net architecture composed of encoder and decoder networks, and $m(\cdot)$ is a mapping network that conditions generation via FiLM~\cite{perez2018film}.
+We use skip connections to concatenate the encoder features to the intermediate features of the corresponding decoding layer; please refer to the supplementary for additional details.
+At the last layer, we have a single convolutional layer that increases the number of channels to a multiple of the height dimension of our target 3D feature volume. 
+
+
+
+\paragraph{Extrusion}
+Finally, we convert the U-Net's 2D output in a 3D feature grid with the \textit{extrusion} operator $E$. To achieve this, it suffices  to reshape the channel dimension of the 2D output~($N\times C$) into $N\times C$, giving height dimension to the 2D feature map. In contrast to voxel-based approaches, we compute a 3D feature grid only at the last layer while keeping our intermediate features in 2D, using computationally efficient 2D convolutions only.
+
+
+We rationalize the generator's design choices in Sec.~\ref{sec:representation}.
+
+\subsection{Rendering and Upsampling}
+\label{sec:render}
+Given the generated feature volume $G(\textbf{L},\textbf{s}),$ we can query continuous neural field value at any query 3D point $\textbf{p}$ by passing its tri-linear
+interpolated feature $\lambda(\textbf{p})$ to a small MLP $\phi(\cdot)$, consisting of a single hidden layer of 64 hidden dimension and softplus activation.
+The outputs of the MLP $\phi(\cdot)$ are a scalar density and a 32-dimensional feature, where the first three channels are interpreted as RGB. We do not model view-dependent effects following \cite{chan2022efficient}.
+We integrate radiance by volume rendering $\mathcal{R}(.)$ and generate the image
+% 
+\begin{equation}
+\mathcal{I}^\text{low-res}_\gamma = \mathcal{R}(G(\textbf{L},\textbf{s}), \phi(\lambda(\textbf{p})), \gamma)
+\end{equation}
+% 
+from a camera viewpoint $\gamma$. We use 48 points along the ray sampled with stratified sampling and another 48 points obtained with importance sampling \cite{mildenhall2020nerf}.
+We set the volume rendering resolution to $64^2$ which provides a reasonable trade-off between computational costs and (post-upsampling) multi-view consistency.
+
+\paragraph{Upsampling}
+Volume rendering at our target image resolution of $256^2$ is computationally expensive, so we use the popular 2D super-resolution module (i.e. dual discrimination) of EG3D \cite{chan2022efficient}, which is known to encourage multi-view consistent renderings.
+The upsampled image
+% 
+\begin{equation}
+\mathcal{I}_\gamma=\textit{upsample}(\mathcal{I}^\text{low-res}_\gamma,\textbf{s})
+\end{equation}
+is a function of the volume rendered image $\mathcal{I}^v_\gamma$ and the style code $\textbf{s}$, as we use the StyleGAN2 network for upsampling. 
+
+\input{sections/figures/fig_semantic.tex}
+
+
+\subsection{Discriminator Architecture}\label{sec: discriminator}
+Our generator is trained with an adversarial loss that involves co-training a discriminator $D(\cdot)$, which takes real and fake images and predicts their labels. Our discriminator architecture follows that of StyleGAN2 \cite{karras2020analyzing} and takes input as the concatenation of two $256^2$ images following the dual-discrimination scheme \cite{chan2022efficient}.
+
+\input{sections/figures/fig_representations.tex}
+
+\paragraph{Enforcing Layout Consistency}
+While layout conditioning provides compositional guidance to the generator, we observe that some objects from the input layout are occasionally missing from the final rendering, as shown in Fig.~\ref{fig:semantic}.
+To address this, we introduce a semantic layout consistency loss during training that encourages that the generated scene features rendered from the top-down view are consistent with the input layouts. 
+
+
+Specifically, let us define the $xz$-plane as the floorplan and the $y$-axis the up vector. We want to create a 2D image~$\textbf{S}$ on the $xz$-plane that summarizes the generated feature $\mathbf{F}$ from the top-down view. For each pixel in $\textbf{S}$ we sample $k$ number of equidistant points along the height ($y$) axis. Then, we perturb the sampled points with a small Gaussian noise and extract features from those points with tri-linear interpolation. The resulting image $\textbf{S}$ has dimension $N\times N \times (k\times C)$, which is passed to a segmentation U-Net that predicts a semantic label for each pixel. Here, we reuse the discriminator $D(\cdot)$ and attach a decoder network to convert it to a U-Net structure. Besides the adversarial process, the discriminator additionally takes $\textbf{S}$ and outputs semantic segmentation, which is then compared against the input label map $\textbf{L}$ via $\mathcal{L}_{layout}$, a standard cross entropy loss.
+
+
+\subsection{Training}
+We build on top of recent 3D GAN techniques to train our generator by encouraging the neural field renderings from sampled camera viewpoints via adversarial losses.
+Specifically, we sample style code $\textbf{s}$ and camera pose $\gamma$ from a prior distribution $p(\gamma)$ and render through the generated neural fields to obtain a fake image $\mathcal{I}_{\gamma}(\textbf{L},\textbf{s}).$
+The discriminator takes as input the fake/real images, and outputs the predicted labels.
+The two networks are trained via the standard min-max optimization~\cite{goodfellow2014generative}.
+
+
+
+\paragraph{Training Objectives}
+Our overall training objective comprises the adversarial training loss with R1 regularization loss~\cite{mescheder2018training} and our proposed layout consistency loss of Sec.~\ref{sec: discriminator}, which are weighted equally:
+% 
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{adv} + \mathcal{L}_{R1} + \mathcal{L}_{layout},
+\end{equation}
+% 
+which we minimize by updating the weights of generator~$G(\cdot)$, U-Net backbone~$U(\cdot)$, MLP network~$\phi(\cdot)$, and the extended U-Net discriminator~$D(\cdot)$.
+
+% ---------
+
+
+\subsection{Conceptual Analysis}
+\label{sec:representation}
+% 
+As our architecture applies discriminators on the output of the generator, we ought to design a generator architecture that strikes an appropriate balance between \textit{computational requirements} and \textit{3D geometric inductive bias}, both are generally correlated with the visual quality of generated results; see Fig.~\ref{fig:representations} for an overview.
+
+\paragraph{Computational requirements}
+While neural implicit representations have greatly advanced 3D generative modeling, classical coordinate-based  implicit representations~(Fig.~\ref{fig:representations}a) require the use of large multi-layer perceptrons~(MLPs).
+This incurs in high computational complexity, as every input point evaluates the entire MLP, as well as high memory requirements, as gradients are back-propagated through \textit{all} pixels.
+
+
+As such, several implicit-explicit hybrid representations have been proposed to pre-load the computational overhead to the generation of explicit features by storing them on regular grids~\cite{fastnerf,kilonerf,nglod}.
+Neural field values of query points are obtained by linear feature interpolations, followed by processing with smaller MLPs. Applying these ideas to generative modeling, one can generate 3D features using 3D CNNs as in \cite{xu20223d}; however, 3D convolutions quickly become prohibitively expensive due to the curse of dimensionality.
+
+Recently, GSN~\cite{devries2021unconstrained} suggests adopting planar grids to achieve efficient generation via the use of 2D~\textit{floor-plan} features~(Fig.~\ref{fig:representations}b).
+They define the neural field via an MLP that takes the concatenation of the floor-plan projected features and height coordinates.
+Since the height-wise information needs to be~``generated'' by the MLP based on the projected 2D features, the heavy lifting is still done by the MLP network, which leads to (prohibitively) large MLP size ~\cite{devries2021unconstrained}.
+
+Conversely, we first generate a 2D feature map, using a 2D U-Net architecture and then {\em extrude} them into 3D volumetric features~(Fig.~\ref{fig:representations}d), thereby pre-computing the height-wise features.
+Our 2D-to-3D extrusion strategy enables us to leverage 2D CNNs, and a much smaller MLP to interpret the voxel features.
+
+
+
+\paragraph{Geometric inductive bias}
+Similar to our approach, tri-plane representations \cite{peng2020convolutional, chan2022efficient} (Fig.~\ref{fig:representations}c) encode 3D information of all axes, allowing a dramatic reduction of the MLP size.
+However, these features are jointly generated from a standard 2D CNN and reshaped into three separate planes, leading to the processing of the three planes with very different Euclidean positions via local convolutions.
+Moreover, as the scale of the scenes increases, the 2D plane features become less descriptive since completely different objects in the scene share the same plane-projected features.
+
+In contrast, our 2D-to-3D extrusion strategy leverages efficient 2D operations to output 2D feature images, whose individual pixels encode vertical scene information in the height dimension. 
+Applying local convolutions on the feature image allows associating geometrically neighboring features, resulting in higher quality results, as empirically validated in our experimental evaluation.
+

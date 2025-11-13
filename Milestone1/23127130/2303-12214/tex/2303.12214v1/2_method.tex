@@ -1,0 +1,103 @@
+\section{Method}
+
+Our Prompt-MIL framework consists of three components: a frozen feature model to extract features of tissue patches, a classifier that performs an MIL scheme of feature aggregation and classification of the WSIs, and a trainable prompt. 
+Given a WSI and its label $y$, the image is tiled into $n$ tissue patches/instances $\{x_1, x_2, \dots, x_n\}$ at a predefined magnification.
+As shown in Fig. \ref{fig:framework}, the feature model $F(\cdot)$ computes $n$ feature representations from the corresponding $n$ patches:
+\begin{equation}
+    \begin{aligned}
+    h &= [h_1, h_2, \dots, h_n] \\
+    &= [F(x_1, \mathbb{P}), F(x_2, \mathbb{P}),\dots, F(x_n, \mathbb{P})],
+    \end{aligned}
+\end{equation}
+where $h_i$ denotes the feature of the $i^{th}$ patch, $h$ is the concatenation of all $h_i$, and $\mathbb{P} = \{p_i, i = 1,2,\dots, k\}$ is the trainable prompt consisting of $k$ trainable tokens. 
+The classifier $G(\cdot)$ applies an MIL scheme to predict the label $\hat{y}$ and calculate the loss $\mathcal{L}$ as:
+\begin{align}
+    \mathcal{L} &= \mathcal{L}_{cls}(\hat{y}, y) = \mathcal{L}_{cls}(G(h), y),
+\end{align}
+where the $\mathcal{L}_{cls}$ is a classification loss.
+
+% figure
+\begin{figure}[t]
+\begin{center}
+%\fbox{\rule{0pt}{2in} \rule{.9\linewidth}{0pt}}
+\includegraphics[width=\linewidth]{imgs/figure_refine_final_cropped.pdf}
+\end{center}
+   \caption{Overview of the proposed method.
+   (a) Overall structure of our training pipeline. 
+   Tissue patches tiled from the input WSI are grouped into separate batches, which are fed into a frozen feature model $F(\cdot)$ to compute their respective features. 
+   The features are subsequently concatenated into the feature $h$ and a classifier $G(\cdot)$ applies an MIL scheme on $h$ to predict the label and calculate the loss $\mathcal{L}$. 
+   (b) Structure of the feature model $F(\cdot)$ with the additional prompt. An input image $x_i$ is cropped into $w$ small patches $z_1, \dots, z_w$. $k$ trainable prompt tokens, together with the embedding of small patches and a class token $t_{cls}^0$, are fed into $l$ layers of Transformer encoders. The output feature corresponding to $x_i$ is the last class token $t_{cls}^{l}$. The feature model $F(\cdot)$ is frozen and only the prompt is trainable.
+   }
+\label{fig:framework}
+\end{figure}
+
+
+\subsection{Visual prompt tuning}
+The visual prompt tuning is the key component of our framework.
+As shown in Fig.~\ref{fig:framework}(b), our feature model $F(\cdot)$ is a ViT based architecture.
+It consists of a patch embedding layer $L_0$ and $l$ sequential encoding layers \{$L_1$, $L_2$, \dots, $L_l$\}.
+The ViT first divides an input image $x_i$ into $w$ smaller patches $[z_1, z_2, \dots,z_w]$ and embeds them into $w$ tokens:
+\begin{align}
+    \mathbb{T}_z^0 
+        &= L_0([z_1, z_2, \dots,z_w]) = \{t_1^0, t_2^0, \dots, t_w^0\},
+\end{align}
+where $t_i^0$ is the embedding token of $z_i$ and $\mathbb{T}_z^0$ is the collection of such tokens. 
+% $\mathbb{T}_z^0$ is fed to $l$ layers of the Transformer encoders.
+% The superscript $i$ denotes the output tokens after the $i^{th}$ layer. 
+% The initial input to the $1^{st}$ Transformer encoder is assigned superscript $i=0$.
+These tokens $\mathbb{T}_z^0$ are concatenated with a class token $t_{cls}^0$ and a prompt $\mathbb{P}$:
+The class token is used to aggregate information from all other tokens.
+The prompt consists of $k$ trainable tokens $\mathbb{P} = \{p_i| i = 1,2,\dots, k\}$.
+The concatenation is fed into $l$ layers of the Transformer encoders:
+\begin{align}
+    [\mathbb{T}_z^1, \mathbb{T}_P^1, t_{cls}^1] &= L_1([\mathbb{T}_z^0, \mathbb{P}, t_{cls}^0]) 
+    \\
+    [\mathbb{T}_z^i, \mathbb{T}_P^i, t_{cls}^i] &= L_i([\mathbb{T}_z^{i-1}, \mathbb{T}_P^{i-1}, t_{cls}^{i-1}]), i = 2, 3, \dots, l
+    \\
+    \mathbb{T}_P^i &= \{p_j^i| j = 1,2,\dots, k\},
+\end{align}
+where $p_j^i$ is the $j^{th}$ output prompt token of the $i^{th}$ Transformer encoder and $\mathbb{T}_P^i$ is the collection of all $k$ such output prompt tokens, which are not trainable.
+The output feature of $x_i$ is defined as the last class token: $h_i = t_{cls}^{l}$.
+
+\subsection{Optimization}
+Our overall loss function is defined as
+\begin{equation}
+    \begin{aligned}
+    \mathcal{L} &= \mathcal{L}_{cls}(G(H), y) \\
+    &= \mathcal{L}_{cls}(G([F(x_1, \mathbb{P}), F(x_2, \mathbb{P}),\dots, F(x_n, \mathbb{P})]), y),
+    \end{aligned}
+\end{equation}
+where only the parameters of the $G(\cdot)$ and the prompt $\mathbb{P}$ are optimized, while the feature extractor model $F(\cdot)$ is frozen.
+
+Training the entire pipeline in an end-to-end fashion on gigapixel images is infeasible using the current hardware. 
+To address this issue, we utilize the patch batching and gradient retaining techniques from~\cite{takahama2019multi_retaining}.
+As shown in Fig.\ref{fig:framework}(a), to reduce the GPU memory consumption, the $n$ tissue patches $\{x_1, x_2,\dots, x_n\}$ are grouped into $m$ batches. 
+The first step (step\ding{172} in the figure) of our optimization is to sequentially feed $m$ batches of tissue patches forward to the feature model to compute its respective features which are subsequently concatenated into the $h$ matrix.
+In this step, we just conduct a forward pass like the inference stage, without storing the memory-intensive computational graph for back-propagation.
+
+In the second step (step\ding{173}), we feed $h$ into the classifier $G(\cdot)$ to calculate the loss $\mathcal{L}$ and update the parameters of $G(\cdot)$ by back-propagate the loss. 
+The back-propagated gradients $g=\partial{\mathcal{L}}/\partial{h}$ on $h$ are retained for the next step.
+
+Finally (step\ding{174}), 
+% the gradients $g$ are also divided into batches corresponding to the input. 
+% Each batch of input image patches is fed into the feature model again, and back-propagation is then conducted using gradients $g$ to update the trainable prompt.
+we feed the input batches into the feature model $F(\cdot)$ again and use the output $h$ and the retained gradients $g$ from the last step to update the trainable prompt tokens.
+% In this step, the computational graph is computed for back-propagation.
+In particular, the gradients on the $j^{th}$ prompt token $p_j$ are calculated as:
+\begin{equation}
+    \begin{aligned}
+    \frac{\partial \mathcal{L}}{\partial p_j} 
+    &= \frac{\partial \mathcal{L}}{\partial h} \frac{\partial h}{\partial p_j} \\
+    &= \sum_i \frac{\partial \mathcal{L}}{\partial h_i} \frac{\partial h_i}{\partial p_j}  
+    = \sum_i g_i \frac{\partial h_i}{\partial p_j},
+    \end{aligned}
+\end{equation}
+where $g_i$ is the gradient calculated with respect to $h_i$.
+
+To sum up, in each step, we only update either $F$ or $G$ given the current batch, which avoid storing the gradients of the whole framework for all the input patches. 
+This patch batching and gradient retaining techniques make the end-to-end training feasible.
+
+
+In this study, we use DSMIL~\cite{li2021dual_dsmil} as the classifier and binary cross entropy as the classification loss $\mathcal{L}_{cls}$ when the task is a tumor sub-type classification or cross entropy otherwise. 
+% Our method does not have any limitation on the MIL model and can be applied to most existing MIL methods.
+

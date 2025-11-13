@@ -1,0 +1,91 @@
+\section{Method}\label{sec:method}
+
+\DeclarePairedDelimiter{\norm}{\lVert}{\rVert}
+
+\subsection{OpenSSL Problem Formulation}
+\label{subsec:openssl_problem_formulation}
+
+SSL is a groundbreaking paradigm for learning inherent properties of data, while discarding irrelevant signals by discriminating perturbed samples.
+Recent literature has proposed a contrastive loss function to encourage making representations from the same image similar and representations from different images dissimilar\cite{chen2020simple, he2020momentum, zbontar2021barlow}.
+
+Given an input data $X=\{x_i\}_{i=1}^N$, we generate two copies of random augmented image, $\mathcal{A}(X) = \{\tilde{x}_i\}_{i=1}^{2N}$, where $\tilde{x}_i$ and $\tilde{x}_{N+i}$ are an augmented pair of each other.
+Let $E_{\theta}$ be an encoder network. Then, with the augmented pairs, we generally formulate a contrastive loss as follows:
+\vspace{-2pt}
+\begin{equation}
+    \mathcal{L}(X; E_{\theta}) = \frac{1}{2|X|} \sum_{\tilde{x}_i \in \mathcal{A}(X)} \ell_{\textsf{ssl}}(z_i, z_i^{+}; \{ z_i^{-}\})
+\label{eq:contrastive}
+\vspace{-3pt}
+\end{equation}
+where $z_i = E_{\theta}(\tilde{x}_i)$, $z_i^{+}$ denotes the representation from the augmented pair of $\tilde{x}_i$, and $\{z_i^{-}\}$ is the set of features from all the other samples.
+Eq.\,\ref{eq:contrastive} forces $z_i$ to be closer with $z_i^{+}$ and farther from $\{z_i^{-}\}$.
+Projection heads\cite{chen2020simple} or predictors\cite{grill2020bootstrap} are often used in measuring the similarities of representations.
+In addition, non-contrastive methods \cite{grill2020bootstrap, caron2020unsupervised, caron2021emerging, chen2021exploring} have also been proposed by not utilizing any negative pair set, \ie, $\{ z_i^{-} \} = \emptyset$.
+
+
+
+In the OpenSSL problem, $X$ corresponds to the training set of the fine-grained target dataset. Using Eq.\,\ref{eq:contrastive}, we can pretrain an encoder without any annotation of $X$.
+Furthermore, we have an unlabeled open-set $\mathcal{U}$, which can be jointly used with $X$.
+Rather than pretraining on a simple fusion of $X$ and $\mathcal{U}$, we are motivated to sample a relevant subset $\mathcal{S}$ from the open-set. 
+We then pretrain the encoder with $\mathcal{L}(X \cup \mathcal{S};E_{\theta})$.
+
+
+\subsection{Simple Coreset Sampling from Open-Set}
+\label{subsec:simcore}
+We introduce a simple coreset sampling algorithm, coined as \textbf{SimCore}.
+Motivated by Figure\,\ref{fig:motivation}, selecting an appropriate coreset is a key for the OpenSSL problem. 
+To this end, we build a set with the open-set samples that are the nearest neighbors of the target samples.
+
+
+This is formulated by finding a subset $\mathcal{S}$ that maximizes the following objective function:
+\vspace{-3pt}
+\begin{equation}\label{eq:submodular}
+    f(\mathcal{S}) = \sum_{x \in X} \max_{u \in \mathcal{S}} w(x, u), \text{\,where\,\,} \mathcal{S} \subseteq \mathcal{U},\,\, \mathcal{U} \cap X = \emptyset
+\vspace{-4pt}
+\end{equation}
+while $w(x,u) = z_x^\top z_u$ estimates similarity of two representations, and $z$ is the normalized feature from the encoder $E_\theta$ pretrained on $X$ with small epochs.
+%
+From Eq.\,\ref{eq:submodular}, SimCore finds a subset that shares the most similar semantics with the target set.
+%
+This is reminiscent of the facility location function\cite{mirchandani1990discrete, wei2015submodularity}, $f_{\text{fac}}(\mathcal{S})=\sum_{x \in \mathcal{U}} \max_{u \in \mathcal{S}} w(x, u),\mathcal{S}\subseteq \mathcal{U}$. However, $f(\mathcal{S})$ is different from $f_{\text{fac}}(\mathcal{S})$, since target samples are the elements of $X$, which is disjoint with $\mathcal{S}$.
+
+
+Meanwhile, the direct calculation of pairwise similarities requires the complexity of $\mathcal{O}(|X||\,\mathcal{U}|)$, which might be extremely large. To reduce the computational overhead and make the algorithm scalable, we adapt $k$-means clustering\cite{kmeans} for the target dataset $X$, and replace it with the centroid set $\hat{X}$. Its associated objective function is $\hat{f}(\mathcal{S})$. Even when exploiting only the centroids\,($k=100$ in practice), we show significant performance gains on various benchmarks.
+
+\vspace{-10pt}
+\paragraph{Iterative coreset sampling:}
+$\hat{f}(\mathcal{S})$ is a monotonically increasing submodular function. One remark is that if there is no constrained budget on $\mathcal{S}$, 
+a subset achieving the maximum value of $\hat{f}(\mathcal{S})$ is not unique.
+If we denote $\mathcal{S}^*$ as a minimal set with the maximum value, $\mathcal{S}^*$ is obtained when including only the instances closest to each instance of $\hat{X}$ (\ie, $|\mathcal{S}^*|\leq|\hat{X}|$).
+Since we want to sample sufficiently large subset, we re-define Eq.\,\ref{eq:submodular} with the selection round $t$: $\hat{f}(\mathcal{S}_t)$ where the candidate set is $\mathcal{U}_t$.
+Thus, we iterate the rounds to repeat sampling $\mathcal{S}_t^*$ and excluding them from the candidate set, until we reach the proper budget size (see Algorithm\,\ref{alg:simcore}). We collect all the coreset samples into a set $\mathcal{I}=\mathcal{S}^*_1 \cup \mathcal{S}^*_2 \cup\cdots\cup \mathcal{S}^*_T$ to merge with $X$.
+
+
+\vspace{-10pt}
+\paragraph{Stopping criterion:}
+However, we have no knowledge in practice if every sampled instance within the budget is sufficiently close to the target set. This necessitates stopping criterion that blocks the sampling process from continuing when the samples are no longer close to the target set.
+To this end, we calculate the ratio  $\hat{f}(\mathcal{S}_t^*)/\hat{f}(\mathcal{S}_1^*)$ at each iteration and stop the sampling process if its value is less than the threshold. This implies that we stop at iteration $t$ if the sampled subset is not as similar as the first subset is to the target set. We filtered-out by using the threshold $\tau=0.95$ throughout experiments.
+
+\setlength{\textfloatsep}{10pt}
+\begin{algorithm}[!t]
+\caption{Simple coreset sampling from open-set\!\!\!\!}
+ \label{alg:simcore}
+\SetAlgoLined
+{\bf Require:} $E_{\theta}$: encoder pretrained on $X$\;
+{\bf Require:} $\mathcal{U}_0$: initial candidate set (open-set)\;
+{\bf Require:} $\mathcal{B}$, $\tau$: coreset budget, threshold\;
+initialize $\mathcal{I} \leftarrow \emptyset$, $t\leftarrow 0$\;
+replace $\hat{X} \leftarrow$ cluster centroids of $X$\;
+calculate $z_x, z_u \leftarrow E_{\theta}(x), E_{\theta}(u)$ for $\forall x,u \!\in\! \hat{X}\!\times\mathcal{U}_0$\;
+\While{$|\mathcal{I}|<\mathcal{B}$}{
+    set $\mathcal{S}_t^*$ as the elements in $\mathcal{U}_t$ that are closest to each element in $\hat{X}$ (Eq.\,\ref{eq:submodular})\;
+    $\mathcal{I} \leftarrow \mathcal{I} \cup \mathcal{S}_t^*$,\,\, 
+    $\mathcal{U}_{t+1} \leftarrow \mathcal{U}_t \setminus \mathcal{S}_t^*$ \\
+    $t \leftarrow t+1$ \\
+    \textcolor{gray}{\textit{//\,stopping criterion}}\\
+        \If{${\hat{f}(\mathcal{S}_t^*)} < \tau \cdot {\hat{f}(\mathcal{S}_1^*)}$}
+        {
+            \textit{stop sampling}\;
+        }
+ }
+re-initialize $\theta$ and pretrain $E_{\theta}$ with $X \cup \mathcal{I}$;
+\end{algorithm}
