@@ -1,0 +1,288 @@
+\section{Background}
+\subsection{Neural Radiance Fields (NeRF)}
+\vspace{-0.2cm}
+A neural radiance field~\cite{mildenhall2020nerf}, or NeRF for short, represents a field in 3D space, where each point represents an infinitesimal particle with a certain opacity that emits varying amounts of light along different viewing directions. The opacity at a point is represented as a volume density, and the amount of emitted light is represented as a colour. Mathematically, a NeRF is represented as two parameterized functions,  a volume density $\sigma_{\theta}: \mathbb{R}^3 \to \mathbb{R}_{\geq 0}$ and a colour $\mathbf{c}_{\psi}: \mathbb{R}^3 \times S^2 \to [0,255]^3$. The former maps a 3D coordinate $\mathbf{x} \in \mathbb{R}^3$ to a volume density $\sigma \in \mathbb{R}_{\geq 0}$, and the latter maps a 3D coordinate $\mathbf{x} \in \mathbb{R}^3$ and a viewing direction $\mathbf{d} \in S^2$ to a colour $\mathbf{c} \in [0,255]^3$. 
+
+To render a NeRF from a view, we shoot rays from each pixel on the camera sensor and integrate over the product of colour, volume density and visibility along the ray to arrive at each pixel value. Visibility at a point is represented with transmittance, which accumulates the exponentiated negative volume density multiplicatively up to the point. The higher transmittance at a point, the more visible the point is from the camera. Mathematically, if the camera ray is $\mathbf{r}(t) = \mathbf{o}+t\mathbf{d}$, where $\mathbf{o}$ is the camera centre and $\mathbf{d}$ is the ray direction, the pixel value $\hat{I}_{\theta,\psi}(\mathbf{o}, \mathbf{d})$ we would have is:
+\begin{equation}
+\begin{split}
+    &\hat{I}_{\theta,\psi}(\mathbf{o}, \mathbf{d}) := \int_{t_n}^{t_f} T_{\theta,\mathbf{o},\mathbf{d}}(t)\sigma_\theta(\mathbf{o}+t\mathbf{d})\mathbf{c}_\psi(\mathbf{o}+t\mathbf{d}, \mathbf{d}) \: \mathrm{d}t\\
+    &\text{where } \; T_{\theta,\mathbf{o},\mathbf{d}}(t) = \exp(-\int_{t_n}^t\sigma_\theta(\mathbf{o}+s\mathbf{d}) \: \mathrm{d}s). 
+\end{split}
+\end{equation}
+In the expressions above, $t_n$ and $t_f$ denote the points the ray intersects with the near plane and far plane respectively. 
+
+\subsection{Inverse Rendering with NeRF}
+% \vspace{-0.2cm}
+Given a set of real-world images from known views, inverse rendering aims to find the scene whose rendered images match the real-world images. If we use $I(\mathbf{o}, \mathbf{d})$ to denote the pixel value for the ray $\mathbf{r}(t) = \mathbf{o}+t\mathbf{d}$, this problem can be cast as an optimization problem, namely:
+\begin{equation}
+\begin{split}
+\min_{\theta,\psi} \sum_\mathbf{o} \sum_\mathbf{d} \Vert \hat{I}_{\theta,\psi}(\mathbf{o}, \mathbf{d}) - I(\mathbf{o}, \mathbf{d}) \Vert_2^2
+\end{split}
+\end{equation}
+
+\vspace{-0.2cm}
+If $\hat{I}_{\theta,\psi}(\mathbf{o}, \mathbf{d})$ is differentiable w.r.t. the parameters $\theta,\psi$, this problem can be tackled straightforwardly with gradient-based optimization. To enable this, the volume density function $\sigma_{\theta}$ and the colour function $\mathbf{c}_{\psi}$ are chosen to be neural networks. As a result, inverse rendering amounts to training the NeRF to reconstruct the scene in a way that is consistent with the images that are given. Once the NeRF is trained, novel view synthesis can be achieved by rendering the NeRF from new, unseen views. 
+
+Since this optimization problem is underconstrained, in general many views are needed to reconstruct the scene accurately. Yet, in practical applications, typically only a few views are available, hence priors are needed to provide sufficient constraints. In this paper, we consider priors in the form of monocular depth estimates from each view. The monocular depth estimates are trained on different datasets from the dataset NeRF is trained on to simulate real-world conditions where there is a domain gap between what the prior was trained on and what the NeRF is trained on. 
+\vspace{-0.2cm}
+\subsection{Ray Termination Distance}
+\vspace{-0.2cm}
+In order to leverage depth priors, a natural way is to use them to constrain the ray termination distance. Because NeRF can represent non-opaque surfaces, there is no single ray termination distance. Instead, there is a distribution of ray termination distances. The cumulative distribution function (CDF) of this distribution represents the probability that the ray terminates before reaching a given point. It turns out that the probability density of this distribution $f_{\theta,\mathbf{o},\mathbf{d}}(t)$ is given by~\cite{deng2022depth}:
+\begin{equation}
+\begin{split}
+f_{\theta,\mathbf{o},\mathbf{d}}(t) = T_{\theta,\mathbf{o},\mathbf{d}}(t) \sigma_\theta(\mathbf{o}+t\mathbf{d})
+\label{eq:nerf_pdf}
+\end{split}
+\end{equation}
+
+\vspace{-0.4cm}
+\section{Method}
+\subsection{Supervising Ray Termination Distance}
+\label{section:sup_ray_term}
+\vspace{-0.1cm}
+If all surfaces were opaque and the ground truth depth were given, supervising NeRF with the ground truth depth would be straightforward. All that is needed is to make the NeRFs distribution of ray termination distances as close as possible to a delta distribution centred at the ground truth depth. However, when the ground truth depth is not known, we have to use monocular depth estimates as supervision. The challenge is that unlike ground truth depth, monocular depth estimates may not be stereo-consistent, due to estimation error and inherent ambiguity. As a result, it may not be possible to find a scene that is consistent with the depth estimates from every view. Therefore, in order to reconstruct the scene, we must model the uncertainty and ambiguity in the depth estimates, which can be mathematically characterized by distributions. Such ambiguities cannot be resolved from a single view and can often be resolved from multiple views. So we need an method that can fuse together uncertain depth estimates from different views. 
+
+A natural way of representing uncertainty is through a probability distribution. When there are ambiguities, the distribution of depth estimates are typically \emph{multimodal}, i.e., their probability densities have disjoint peaks, where each mode represents one interpretation of the scene structure. For example, albedo vs shading ambiguity as shown in Figure~\ref{fig:ambiguities} can result in multiple plausible interpretations and make the distribution multimodal. 
+
+An added challenge arises when non-opaque surfaces are present. In this case, there is no single ground truth depth, and so the distribution of ground truth depths is multimodal. So even after training the NeRF, the distribution of ray termination distances induced by NeRF should be multimodal, as illustrated in the glass walls in Figure~\ref{fig:teaser}. 
+
+Prior methods compute moments (i.e., mean and/or variance) of the distribution of depth estimates or ray termination distance induced by NeRF. For example, DS-NeRF~\cite{deng2022depth} predicts the mean depth estimate and uses reprojection error as a proxy for the variance. It then minimizes the KL divergence from the distribution of ray termination distances induced by NeRF to a Gaussian whose moments match those of the depth estimates. DDP~\cite{roessle2022dense} fits a Gaussian to distribution of ray termination distances and maximizes the likelihood of the depth estimate under the Gaussian.
+
+Distilling complex distributions to moments has the drawback of ignoring their possible multimodality. Because both the distribution of depth estimates and ray termination distances are potentially multimodal, it is important to handle the multimodality.
+
+%An inherent modeling drawback of using moment estimation as supervision is it does not account for multimodality of either of the two distributions - from NeRF or from the monocular depth estimate. However both distributions are potentially multimodal.
+% * Moment estimation has an issue because it does not account for the multimodality of either of the two distributions
+
+
+%\red{Q: DS-NeRF says that NeRF ray termination peaks. We are contradicting this -- might need explaining?}
+% * Give an example
+% * When the surfaces in the scene are not opaque - distribution of ray termination distances should be multimodal
+% * When there's ambiguity in the depth predictions, distribution of monocular depth estimates should be multimodal
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/network_leres.png}
+    \vspace{-0.4cm}
+    \caption{{Network Architecture for our Ambiguity-aware Depth Estimates.}}
+    \label{fig:ambiguity-aware-prior}
+    \vspace{-0.6cm}
+\end{figure}
+\vspace{-0.1cm}
+
+\subsection{SCADE}
+We now present our novel method \emph{Space Carving with Ambiguity-aware Depth Estimates} (\textbf{SCADE}). Our contributions addresses the existing problems and drawbacks mentioned in the previous section. First, SCADE accounts for the \emph{multimodality} of both the distributions of monocular depth estimates and ray termination distances that arise due to inherent ambiguities (Sec~\ref{sec:ambiguity-aware}) and non-opaque surfaces. Second, SCADE is also able to resolve these ambiguities by fusing together information from multiple views through our space carving loss (Sec~\ref{sec:space_carving}) that uses the reverse cross entropy loss. Because this a loss on the distribution rather than moments of the distribution (which was the paradigm in prior work~\cite{deng2022depth,roessle2022dense}), it achieves supervision in 3D rather than 2D. Third, our loss formulation is sample-based (Sec~\ref{sec:sampling}) and so is computationally efficient to optimize.
+\vspace{-0.3cm}
+
+\subsubsection{Our Ambiguity-aware Depth Estimates}
+\label{sec:ambiguity-aware}
+\vspace{-0.2cm}
+We handle multimodality of monocular depth distributions by introducing our ambiguity-aware depth estimation module to account for ambiguities in depth estimation from a single view (Figure~\ref{fig:teaser}, \ref{fig:ambiguities}). In contrast to existing monocular depth estimation networks~\cite{Wei2021CVPR} that predict single point estimates for depth, we model the inherent uncertainty in monocular depth estimation by representing the distribution as a \emph{set of samples} generated by a neural network. We propose leveraging conditional Implicit Maximum Likelihood estimation (cIMLE)~\cite{Li2020MultimodalIS} to learn a multimodal distribution of depth estimates. We chose cIMLE rather than conditional GANs~\cite{karras2019style} in order to avoid mode collapse, which can lead to a unimodal distribution. 
+
+%enabling us to capture a variable of discrete depth modes in contrast to unimodal approaches such as GAN's~\cite{karras2019style}, making this a suitable prior for us to constrain NeRF optimization under the few view regime. 
+
+%Given a learned conditional distribution $G$ for a given image $I$, let us denote $G_{\mathbf{o},\mathbf{d}}$ to be the probability distribution along the camera ray $\mathbf{r}(t) = \mathbf{o} + t\mathbf{d}$ for pixel $I({\mathbf{o},\mathbf{d}})$.
+
+%\red{Q please check this notation/terminology. I think it is not supposed to be called the PDF, but nerf was previously defined as the PDF. We need to define the prior distribution.}
+
+Figure~\ref{fig:ambiguity-aware-prior} shows our network architecture. Concretely, we combine cIMLE with a state-of-the-art monocular depth estimation network, LeReS~\cite{Wei2021CVPR}. Our ambiguity-aware depth estimation module ($G$) takes an input image ($I$) and a latent code $z \sim \mathcal{N}(0, \mathbf{I})$ and outputs a conditional depth sample $G(I, z)$ for the input image $I$. To inject randomness into the network, we follow the technique used in~\cite{karras2019style} and incorporate AdaIn layers into the network backbone that predicts a scale and shift to the intermediate network features. Specifically, we added four AdaIn layers to the encoder of the depth estimation backbone.
+
+%\red{Q: Do I have to say something on multimodality in the NeRF distribution? This one only addresses monocular depth.}
+\vspace{-0.3cm}
+
+\subsubsection{Sample-based Losses on Distributions}
+\label{sec:sampling}
+\vspace{-0.2cm}
+
+We desire to achieve an agreement between the distributions from our ambiguity-aware prior and the ray termination distance from NeRF to constrain the NeRF optimization under the sparse view set-up using our learned prior. As distributions are continuous, taking their analytical integral is computationally intractable. Thus, in order to define a differentiable loss function for our optimization problem, we result to a sample-based loss on these two distributions.
+\vspace{-0.3cm}
+\paragraph{Samples from depth prior.} As previously described, we leverage cIMLE to sample from our ambiguity-aware depth prior. Sampling  $z_1, ..., z_M \sim \mathcal{N}(0, \mathbf{I})$, we get depth map samples $G(I, z_1), ..., G(I, z_M)$ for input image $I$. Hence we denote corresponding samples to \emph{estimate} and represent the distribution for ray $\mathbf{r}$ as $y_1, y_2, ..., y_M \sim G_{\mathbf{o},\mathbf{d}}$.
+\vspace{-0.3cm}
+\paragraph{Samples from NeRF.} For the distribution given by the ray termination distances modelled by NeRF, we sample from its probability density function $f_{\theta, \mathbf{o}, \mathbf{d}}$ (Eq.~\ref{eq:nerf_pdf}) with inverse transform sampling. Concretely, we define the probability mass function for ray $\mathbf{r}$ as $f_{\theta, \mathbf{o}, \mathbf{d}}(t_i)$as given in Eq.~\ref{eq:nerf_pdf} with samples $t_1, ..., t_K$, where $t_i \in [t_n, t_f] \forall i$. By inverse transform sampling, we first compute the cumulative distribution function (CDF) of the ray termination distribution at samples $t_i$, which we denote as $F_{\theta, \mathbf{o}, \mathbf{d}}(t_i) = \sum_{j<i}f_{\theta, \mathbf{o}, \mathbf{d}}(t_i)$. Thus our samples $x_1, x_2, ..., x_N$ of ray termination distances from NeRF are then given by:
+\begin{equation}
+    \begin{split}
+       x_i = F^{-1}_{\theta, \mathbf{o}, \mathbf{d}}(u_i), \\
+       \text{where } u_i \sim \mathcal{U}(0, 1)
+    \end{split}
+\end{equation}
+
+%x_1, x_2, ..., x_N \sim f_{\theta, \mathbf{o}, \mathbf{d}}(t)
+%\red{Wrong notation -- it's not the distribution but the PDF.}
+% * Distributions are continuous; cannot just take the integral (cannot integrate analytically)
+% * For distribution of monocular depth estimates: use cIMLE to learn and sample
+% * For distribution of ray termination distances: sample with inverse transform sampling
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/space_carving_illustration.png}
+    \vspace{-0.4cm}
+    \caption{Our space carving loss supervises the ray termination in 3D as opposed to existing approaches that supervise on 2D expected depth. As shown, this clears out clouds of dust in space. Moreover supervising in 3D allows for wide baseline input views and still finds the common mode that correctly snaps the surfaces.}
+    \label{fig:spacecarving}
+    \vspace{-0.5cm}
+\end{figure}
+\vspace{-0.4cm}
+\subsubsection{Our Space Carving Loss}
+\label{sec:space_carving}
+\vspace{-0.2cm}
+We now introduce our novel space carving loss utilizes the samples from both multimodal distributions to constrain the NeRF optimization. The goal is to find a subset of modes captured in the monocular depth distributions from each view that are globally consistent. 
+In doing so, we can fuse together the information from the different views, since the inherent ambiguities are only resolved given information from multiple views. This would allow us to find a common shape that is consistent across all views and ``snap'' objects surfaces together. 
+
+%Moreover, our mode-seeking behavior also allows for the multiple views to find an agreement and 
+We thus desire a loss that has \textbf{mode seeking} behavior, that is the modes of the distribution being trained should be a subset of the modes of the distribution that provides supervision. One such loss is the reverse cross entropy, which is the cross entropy from the NeRF ray termination distance distribution to the distribution of our ambiguity-aware depth estimates:
+\begin{equation}
+    H(f_{\theta, \mathbf{o}, \mathbf{d}}, G_{\mathbf{o},\mathbf{d}}) = -\mathbb{E}_{f_{\theta, \mathbf{o}, \mathbf{d}}}[\log G_{\mathbf{o},\mathbf{d}}].
+    \label{ce_objective}
+\end{equation}
+
+As shown in the IMLE papers~\cite{Li2020MultimodalIS,chimle}, this is equivalent to penalizing the minimum of the L2 norm between the samples from the two distributions, please see~\cite{li2018implicit} for the full proof. Hence, our space carving loss is given by
+\begin{equation}
+    \mathcal{L}_\text{space\_carving}(\mathbf{r}) = \sum_{i\in[N]} \min_{j\in[M]} ||x_i - y_j||^2_2.
+\end{equation}
+
+Because our novel space carving loss operates on distributions rather than moments of distributions, we can have different supervision targets for different points along the ray. In contrast, if the loss were to only to operate on moments, 
+% we would have supervision targets only on the moments. 
+which are integrals along the ray, this only yields the same supervision target for all points along the ray. Therefore, our loss allows us to supervise in 3D, unlike prior methods~\cite{deng2022depth, roessle2022dense} (which use losses on moments) that supervise in 2D. 3D supervision allows us to clear out dust in space, since in order to move a sample from the ray termination distance distribution farther in depth, the loss would have to decrease the probability density of \emph{all} the points in front of it. These advantages are highlighted in Figure~\ref{fig:spacecarving}.
+
+Our total loss to optimize and train our NeRF model is given by
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{photometric}} + \lambda \mathcal{L}_{\text{space\_carving}},
+\end{equation}
+
+\noindent where $\mathcal{L}_\text{photometric}$ is the standard MSE loss on the predicted and ground truth image. See Fig.~\ref{fig:teaser} for our overall pipeline.
+
+%\red{Ke, please fix this. Not sure how to properly tie cIMLE, cross-entropy and L2. HELP :D}
+%\red{Should I put the loss function onto the teaser too? We can use one figure?}
+
+% \subsection{Overview}
+% We propose SCADE, a novel method for constructing NeRFs of complex in-the-wild scenes from few views. The idea is to leverage monocular depth estimates to constrain the volume density in front of the estimated surface, analogously to space carving. The challenge is that monocular depth estimation is ill-posed, due to ambiguities which can only be resolved with multiple views. This results in a chicken-and-egg problem: depth can only be estimated reliably from multiple views, and yet reconstruction from few views requires the depth estimates of each view, and so depth estimation depends on multi-view reconstruction, which depends on depth estimation. To break this circular dependence, the key idea is to generate a multimodal distribution of depth estimates from each view with Conditional Implicit Maximum Likelihood Estimation (cIMLE) and resolve ambiguities by finding a mode common across multiple views.
+
+% \subsection{Our Ambiguity-aware Depth Estimates}
+% In contrast to existing monocular depth estimation networks that predict single point estimates for depth, we model the inherent ambiguity in monocular depth estimation by \textbf{estimating a distribution} of depth maps given a single input view. To achieve this, we use Conditional Implicit Maximum Likelihood Estimation (cIMLE) on top of a state-of-the-art monocular depth estimation network, LeReS~\cite{Wei2021CVPR}. Figure~\ref{fig:ambiguity-aware-prior} shows the netowrk architecture.
+
+% \subsection{Distributions -- Synergy with NeRF}
+% \subsubsection{Definitions}
+% \begin{enumerate}
+%     \item Ray. $r = (r_o, r_d)$, denoting the ray origin and direction, respectively.
+%     \item Samples on the ray. $t_1, t_2, ..., t_K \in [t_n, t_f]$: samples/steps along the ray, where $t_n, t_f$ denote the near and far plane, respectively.
+%     \item 3D query point. $r(t) = r_o + t*r_d$: 3D point corresponding to step $t$ for ray $r$.
+%     \item Opacity. $\sigma(r(t))$: corresponding opacity given the NeRF model for 3D point $r(t)$.
+%     \item Denote $\sigma_1^r, \sigma_2^r, ..., \sigma_K^r$ as the opacities at 3D points $r(t_1), r(t_2), ..., r(t_K)$.
+%     \item Deltas. $\delta_i = t_{i+1} - t_i$
+%     \item Color. $c(r(t), r_d)$ : color at 3D point $r(t)$ viewed from direction $r_d$, and $c_i^r$ corresponds to the color at 3D point $r(t_i)$.
+% \end{enumerate}
+
+% \subsubsection{Volume Rendering Equation}
+
+% \noindent\textbf{Continuous}
+% \begin{equation}
+% \begin{split}
+%     C(r) =   \int_{t_n}^{t_f} T(t)*\sigma(r(t))*c(r(t), r_d) \: dt,\\
+%     \text{where } \; T(t) = exp(-\int_{t_n}^t\sigma(r(s)) \: ds).   
+% \end{split}
+% \end{equation}
+
+% PDF for NeRF:
+% $$P_{\text{vol}}^r (t) = T(t)*\sigma(r(t))$$
+
+% \noindent\textbf{Discrete}
+% \begin{equation}
+% \begin{split}
+%     C(r) =   \sum_{i=1}^{N} T_i^r*(1 - exp(-\sigma_i^r\delta_i))*c_i^r,\\
+%     \text{where } \; T_i^r = exp(-\sum_{j=1}^{i-1}\sigma_j^r\delta_j).   
+% \end{split}
+% \end{equation}
+
+% \begin{figure*}[t]
+%     \centering
+%     \includegraphics[width=0.8\linewidth]{latex/figures/pipeline_draft.png}
+%     \caption{{\bf{SCADE overview}.}}
+%     \label{fig:scade_overview}
+%     \vspace{-1.3em}
+% \end{figure*}
+
+% \subsubsection{P\_vol}
+% We \emph{model} the distribution of depth of each ray given by NeRF, using the predicted opacities. We denote this by $P_{\text{vol}}^r$ for ray $r$. The transmittance term $T_i^r$ links opacities $\sigma^r$ to the depth distribution $P_{\text{vol}}^r$.\\
+
+% Let $f^r(t_i)$ PMF of $P_{\text{vol}}^r$, which we approximate with samples $t_1, ..., t_K$. At samples $t_1, ..., t_K$ for ray $r$, we have opacities $\sigma_1^r, \sigma_2^r, ..., \sigma_K^r$, and hence giving us
+% \begin{equation}
+%     f^r(t_i) = \frac{T_i^r*(1 - exp(-\sigma_i^r\delta_i)}{\sum_{j \in [K]} T_j^r*(1 - exp(-\sigma_j^r\delta_j)}.
+% \end{equation}
+
+
+% \subsubsection{P\_depth}
+% We further \emph{estimate} the distribution of depth for each ray using our multimodal, ambiguity-aware prior network $G$. Our ambiguity-aware prior network $G$ takes in an image $I$ and latent codes $z \sim \mathcal{N}(0, \mathbf{I}) \in \mathbb{R}^D$, the distribution of depth of a given image $I$ estimated by the prior network is given by
+
+% \begin{equation}
+%     G(I, z) \sim P_\text{depth},
+% \end{equation}
+
+% hence we denote the distribution for a given ray $r$ on $I$ as 
+
+% \begin{equation}
+%     G^r(I, z) \sim P_\text{depth}^r.
+% \end{equation}
+
+% and outputs a distribution of depth map hypotheses for the image: $\{d\} = G(I, \{z\})$. 
+% \mika{Notation and representation for $P_\text{depth}^r$ before sampling. Or do we directly write it as the sampled version?}
+
+
+% \subsection{Our Space Carving Loss}
+% We desire to train our NeRF model by leveraging on our learned ambiguity-aware prior. On a high-level, for each ray $r$, we desire to learn the distribution $P_{\text{Vol}}^r$ to match the estimated prior distribution $P_\text{depth}^r$.  
+
+% To disambiguate and fuse the information from the different views, we desire a mode seeking behavior in learning $P_{\text{vol}}^r$ since $P_\text{depth}^r$ is potentially multimodal. Consequently, maximizing the cross entropy from $P_{\text{vol}}^r$ to $P_\text{depth}^r$ exhibits our desired mode seeking behavior:
+% \begin{equation}
+%     H(P_{\text{vol}}^r, P_\text{depth}^r) = -\mathbb{E}_{P_{\text{vol}}^r}[\log P_\text{depth}^r].
+%     \label{ce_objective}
+% \end{equation}
+
+% % \mika{How to mathematically transition between the formulation of reverse KL to using min over L2?}
+% % \mika{What is the proper notation for estimating the distributions with samples?}
+
+% Since the PDF of $P_\text{depth}^r$ is intractable, by the law of large numbers, we can optimize for Eq.~\ref{ce_objective} by approximating the distributions through sampling - from both $P_\text{depth}^r$ and $P_\text{vol}^r$.\\
+% % We compute for the distance between the the distributions through sampling (Monte Carlo).\\
+
+% \noindent\textbf{$P_\text{depth}^r$}. Sampling  $z_1, ..., z_M \sim \mathcal{N}(0, \mathbf{I})$, we get depth map samples $G(I, z_1), ..., G(I, z_M)$ from prior network G. Hence the corresponding samples to approximate the distribution at pixels corresponding to ray $r$ are:
+% % $$y_1, y_2, ..., y_M \sim P_\text{depth}^r $$\\
+
+% \begin{equation}
+%     \begin{split}
+%       y_1, y_2, ..., y_M \sim P_\text{depth}^r, \\
+%       \text{where} \; y_j = G^r(I, z_j). 
+%     \end{split}
+% \end{equation}
+
+% \noindent\textbf{$P_\text{vol}^r$}. Now, we want to generate samples from $P_\text{vol}^r$ given its PMF $\{f^r(t_1), f^r(t_2), ..., f^r(t_K)\}$. We use inverse transform sampling as follows. The CDF of $P_\text{vol}^r$ at samples $t_1, ..., t_K$, denoted by $F_r$ is given by
+
+% $$F_r(t_i) = \sum_{j<i}f^r(t_i).$$
+
+% CDF of $P_\text{vol}^r$ is discretized by $\{F_r(t_1), F_r(t_2), ..., F_r(t_K)\}$. Drawing uniform samples $u_1, ..., u_N \sim \mathcal{U}(0, 1)$, the obtained samples to approximate $P_\text{vol}^r$ is as follows
+% \begin{equation}
+%     \begin{split}
+%       x_1, x_2, ..., x_N \sim P_\text{vol}^r , \\
+%       \text{where} \; x_i = F^{-1}_r(u_i), \\
+%       u_i \sim \mathcal{U}(0, 1).
+%     \end{split}
+% \end{equation}
+
+% Hence, our space carving loss is given by
+
+% \begin{equation}
+%     \mathcal{L}_\text{space\_carving}(r) = \sum_{i\in[N]} \min_{j\in[M]} ||x_i - y_j||^2_2,
+% \end{equation}
+
+% which is equivalent to the objective in Eq.~\ref{ce_objective}. Please refer to the IMLE paper for the full proof.
+
+% Total loss is then
+% $$\mathcal{L} = \mathcal{L}_\text{photometric} + \mathcal{L}_\text{space\_carving}$$.
+
+% See Fig.~\ref{fig:teaser} for our overall method overview.
+
+% \subsection{Backpropagation Formulation -- ongoing work}
+% Since our space carving loss is penalizing on 3D, in contrast to existing works that penalize on expected depth, we are able to compute gradients defined on the continuous 3D coordinates and customize the magnitude of the overall gradient that is mathematically correct. The high level intuition is the derivative of the CDF, which is used in inverse transform sampling, is the PDF, which is defined for all continuous points. In order to achieve the correct gradient magnitude, we needed to rewrite the volumetric rendering equation from piecewise constant to piecewise linear. See Appendix for the current derivation. \mika{This is incomplete yet in terms of solving for the sample given the CDF. We are not planning to include this in the submission but work on it on a future project for applications beyond depth priors on NeRF. Initial experiments did show that the piecewise linear model was working for volumetric rendering.}
+
+% \section{Implementation Details}
+% \subsection{Scale-shift optimization}
+% The distribution estimate from the prior network is agnostic of ground truth scale and shift as this is not directly recoverable from a single image. Hence while optimizing for NeRF, we additionally directly optimize for prior depth distribution scale and shift for each input image.
+
+% \subsection{White balancing inconsistency -- appearance code}
+% The input images have varied white balancing, saturation, illumination and given the sparse view setting, it is difficult for NeRF to learn a consistent representation given different color values for the same locations. As addressed in NeRF-in-the-Wild, we additionally optimize for a low dimensional latent code associated with each image. The issue with this setting is because our input views are sparse, then we do not see enough samples to capture the varied lighting. We thus also utilize cIMLE to learn this appearance code. Figure~\ref{fig:white_balancing} show sample results.

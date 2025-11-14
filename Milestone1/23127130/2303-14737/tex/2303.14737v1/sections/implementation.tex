@@ -1,0 +1,85 @@
+While the above approach is sufficient to generate convex collision-free regions in configuration space, we found several implementation details that accelerated the region generation.
+The new formulation also made it possible to support additional constraints while generating regions.
+In this section we first dive into implementation details that affect the runtime and accuracy of the region. Then we look at how this algorithm can support novel constraints.
+A code implementation that supports all of these features will be made publicly available for the final version.
+
+\subsection{Ordering Collision Pairs}
+\label{sec:ordering}
+As in the original IRIS algorithm, the order in which collision pairs are considered has a significant impact on the runtime and number of hyperplanes added to the polytope.
+Adding hyperplanes to separate close obstacles can also separate more distant obstacles, eliminating the need to add a hyperplane for that obstacle later.
+If the more distant obstacle is considered first, a hyperplane will be added to separate it, and later another hyperplane will be added to separate the closer obstacle, making the first hyperplane redundant.
+
+In the original IRIS paper, obstacles were sorted by distance from the seed point to ensure closer obstacles are considered first.
+What we would like to do is sort the collision pairs in a similar manner, by the distance in configuration space from seed to collision.
+However, calculating this distance is non-trivial and effectively requires solving the optimization for finding counterexamples.
+As a result, we instead sort the collision pairs based on the task-space distance between the two collision bodies when the robot is in the seed configuration.
+Empirically, this serves as a good heuristic for sorting the collision pairs and leads to closer collision pairs being considered first.
+
+\subsection{Probabilistic Certification}
+\label{sec:prob_cert}
+IRIS-NP ensures that the convex region is collision free by searching the current polytope for configurations that cause collision pairs to intersect.
+This search is done by solving a nonlinear optimization, which means in some cases, the solver may report infeasibility when a solution does exist.
+One way to get around this issue is to solve the optimization with different initial guesses.
+Instead of stopping the counterexample search after the first failure to solve, the search continues from different initial conditions until a user defined number of consecutive optimizations fail to find a solution.
+Initial conditions are sampled from the current convex polytope using a Markov chain Monte Carlo strategy describe in \citet{belisle1998convergence} because uniform sampling within an arbitrary polytope is not feasible.
+As the number of consecutive infeasible samples is increased, the probability of missing the local region about a configuration that yields collision diminishes, providing a probabilistic certification of the region.
+In addition, this gives the user a knob to trade off runtime of the algorithm with strength of the collision-free guarantee.
+If we assume that the nonlinear optimization has some non-empty region of attraction for ever optimal counterexample, then the Markov chain Monte Carlo sampler is sufficient to guarantee probabilistic completeness of our counterexample search.
+
+\subsection{Support for Additional Constraints}
+\label{sec:add_constraints}
+Since the process of adding hyperplanes to avoid collision consists of searching for points that violate a nonlinear inequality constraint, this opens the door for IRIS-NP to support general nonlinear inequality constraints.
+Any constraint of the form $g(q) \leq 0$ is supported and counterexamples that violate the constraint are searched for using the optimization
+
+\begin{equation}
+\begin{aligned}
+\min_{q} \quad & (q-d)^T C^T C (q-d) \\
+\text{s.t.} \quad & g(q) \geq 0 \\
+& A q \leq b.
+\end{aligned}
+\end{equation}
+
+\noindent
+This formulation can be used to support constraints on such things as the orientation of a kinematic frame, the position of an end-effector, or the distance between two task-space points.
+So long as each is written as an inequality constraint and the feasible set has a sufficiently large interior, the mechanics presented here work well.
+Equality constraints cannot be supported as they collapses the region to lie on the lower dimensional surface of the constraint, making the region zero volume.
+Just as with the collision avoidance constraints, solving repeatedly from different initial conditions until a set number of consecutive optimizations have failed decreases the chances of missing a counterexample, helping to ensure the constraint is satisfied everywhere within the polytope.
+
+\subsection{Achieving Coverage with Multiple Regions}
+\label{sec:cspace_obstacles}
+Up to this point, we have only considered generating individual collision-free regions.
+Generating multiple regions that provide an approximate cover of C-free can be useful for downstream planning problems \cite{marcucci2022motion}.
+When growing individual regions, the explicit goal is to grow them as large as possible.
+While this is desirable for a singular region, this can result in regions grown from different seeds expanding to fill the same open space, away from tighter crevices that are near to each seed.
+While each region is optimizing for coverage, the result is that the total coverage of all the regions is not much larger than any of the individual regions.
+The goal that we'd like to achieve is maximizing the coverage of all the regions collectively.
+
+The heuristic we use to achieve this goal is to explicitly reduce the overlap between regions.
+After generating one region, that region is treated as a configuration-space obstacle.
+We can then interleave the process for adding separating hyperplane from \citet{deits2015computing} with the process for adding separating hyperplanes for obstacles discussed above.
+As a result, the next polytope is prevented from overlapping with the previously found regions while remaining collision free.
+Adding this to our iterative algorithm encourages the new regions to expand into spaces that have not already been covered by existing regions, increasing total coverage.
+Other heuristics for achieving this goal may perform better as overlapping regions can have better coverage with fewer regions\footnote{Imagine a collision-free space in the shape of a cross. Using overlapping convex regions, the entire space can be covered with two regions. If the convex regions are required not to overlap, three regions are needed to achieve complete coverage.}.
+Searching for better heuristics is an active area of study.
+
+\subsection{Region Refinement for Runtime Obstacles}
+\label{sec:region_refinement}
+While IRIS-NP can efficiently calculate convex collision-free regions, as soon as collision geometry changes in a way not specified by a change in configuration, the region may no longer be collision free.
+While regions could be regenerated from seed points, this may not be the most efficient approach, especially if the change in collision geometry is small.
+An alternate approach is to take the original region and refine it by adding additional hyperplanes to separate the new collisions.
+
+Using the final ellipsoid as the starting metric, a single iteration of adding hyperplanes can be performed, keeping the hyperplanes that defined the original region.
+Using the final ellipsoid as the starting metric ensures the overall shape of the region is leveraged during the refinement.
+Alternatively, if refining the region using the final ellipse results in a configuration of interest (such as the start or goal state for a planning problem) no longer being contained in the refined region, that configuration can be used as an additional seed point to grow a new region inside the original region.
+Only collision pairs involving the changed geometries need to be considered as the remaining collision pairs were already separated during the original region generation.
+This approach is well suited to the case when novel geometry that had not been previously considered is added to the scene.
+If geometry is removed from the scene or moved to be less restrictive of the robot's motion, the new parts of C-free will not be covered by existing regions and the refinement process will not cover that gap.s
+
+This refinement approach was used to generate the region shown in Figure \ref{fig:refined_region}.
+An initial region was generated inside the shelf without any mugs in the scene.
+Then a mug was added to the scene and the region was refined using a seed point with the gripper around the mug prepared to grasp.
+A single iteration with the initial hypersphere about the gripping position seed point as the metric for adding hyperplanes was able to cut down the region and remove the portions that were in collision.
+As is shown in Figure \ref{fig:refined_region}, refining the region to be more restrictive still left the region large enough to contain both grasping and pre-grasp configurations.
+We found this surprising!
+Using IRIS-NP a planner can plan straight to a grasp configuration without having to specify a pre-grasp waypoint to plan to first.
+

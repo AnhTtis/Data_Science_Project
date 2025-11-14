@@ -1,0 +1,85 @@
+% Everything needed to understand the paper. 
+This section first provides a brief background on GNN Training and then discusses the limitations of existing approaches to motivate this work. 
+
+\subsection{Graph Neural Network Training}
+\label{sec:gnn-background}
+
+\mypar{Mini-batch training on GNN models}
+Stochastic Gradient Descent (SGD) trains on a mini-batch of the training data at each iteration.
+In GNNs, a mini-batch consists of a subset of vertices of the graph, which are called \emph{target vertices}, and a \emph{sample} of their k-hop neighborhood (see Figure~\ref{fig:minibatch}).
+In data-parallel training, micro-batches are the partitions of a mini-batch that are trained in parallel, one per GPU, in one iteration.
+They are obtained by sampling the k-hop neighborhood of a partition of the target vertices in the mini-batch.
+
+
+A GNN model is defined as a sequence of \emph{GNN layers}.\footnote{In the following, the term ``layer'' will refer to GNN layers, not to neural network layers, unless otherwise stated.}
+In the forward propagation, each GNN layer $l > 0$ aggregates and transforms the features of the vertices in the layer $l-1$ of the sample and produces the features of the vertices in the layer $l$ (see Figure~\ref{fig:minibatch}).
+The last GNN layer computes the features of the target vertices, which are used to compute the loss.
+In the backward propagation, the layers are executed in an reversed order to compute gradients.  
+
+
+\mypar{GNN layers}
+Each GNN layer $l$ calculates the features of $V^{(l)}$, the vertices in layer $l$, using features of $V^{(l-1)}$ , the vertices in layer $l-1$, and sometimes also features of $E^{(l)}$, the edges between vertices in layer $l-1$ and $l$.
+%In the following, we use the terms \emph{vertex tensor} and \emph{edge tensor} at layer $l$ to describe tensors of size $|V^{(l-1)}|$ and $|E^{(l)}|$ respectively.
+The implementation typically follows a message-passing framework that executes scatter function, message function, gather function, and update function sequentially. 
+
+% applies a message-passing function across edges between vertices in layer $l-1$ and $l$ in the sample, which we denote as the set $E^{(l)}$.
+The \emph{scatter function} $\sigma^{(l)}$ prepares an \emph{edge tensor} of edge-wise vectors to compute messages.
+The edge tensor combines, for each edge $e(u,v) \in E^{(l)}$, vectors for the source and destination vertices, typically the feature vectors $h_u^{(l-1)}$ and $h_v^{(l-1)}$, and optionally an edge feature vector $w^{(l-1)}_e$:
+$$
+  \sigma^{(l)}_e = [h_u^{(l-1)}, h_v^{(l-1)}, w^{(l-1)}_e], \quad e(u,v) \in E^{(l)}
+$$
+This function does not perform any computation: it merely collects and combines sparse data from different vectors based on the structure of the graph.
+
+The \emph{message function} $\phi^{(l)}$ produces a message tensor $M$ containing a message for each edge in $E^{(l)}$.
+It typically takes as input an edge tensor from the scatter operates and applies $\phi^{(l)}$ on each edge $e$ to build a message:
+$$
+  m^{(l)}_e = \phi^{(l)}(\sigma^l_e), \quad e(u,v) \in E^{(l)}.
+$$
+The $\phi$ function is defined by the user and can be, for example, a Multi-Layer Perceptron (MLP). 
+In some simpler GNN models, a message function uses only the source vector of each edge, so it does not require building a full edge tensor using a scatter.
+%, which is an edge tensor of the same size as the input.
+In the example of Figure~\ref{fig:minibatch}, $\phi$ outputs the features of the source vertex for each edge.
+
+The \emph{gather} function $\oplus$ takes a message tensor as input and aggregates all messages to the same destination vertex using a commutative and associative aggregation function such as sum or mean (see the \texttt{Aggr} block in Figure~\ref{fig:minibatch}).
+The entry in the output tensor for a vertex  $v \in V^{(l)}$ is:
+
+$$
+  m_v^{(l)} = \oplus^{(l)}_{e(u,v) \in E^{(l)}} m^{(l)}_e, \quad e(u,v) \in E^{(l)}.
+$$
+%Similar to scatter, the gather function can take as input any tensor having size $|E^{(l)}|$.
+
+Finally, the \emph{update} function $\psi$ computes a new hidden feature for a vertex $v$ based on the aggregated message to $v$.
+This can also be an arbitrary neural network, similar to the message function $\phi$ (see the \texttt{MLP} block in Figure~\ref{fig:minibatch}).
+$$
+  h_v^{(l)} = \psi^{(l)} (h_v^{(l-1)}, m_v^{(l)}), \quad v \in V^{(l)}.
+$$
+
+We call a chain of Scatter, Apply-message, Gather, Apply-update operations a \emph{SAGA}, following the terminology introduced by NeuGraph~\cite{neugraph}.
+
+% The message-passing functions can be combined arbitrarily in a GNN model, but it is very common execute then in a \emph{chain}: scatter to produce edge tensors, run the message function on each edge tensor to produce a message, aggregate the message using the gather function, and finally update the vertex features.
+% A GNN layer may include multiple function chains or partial chains that skip some function in the chain. 
+
+
+% For example, in Figure~\ref{fig:sample} the vertices at layer $l=1$ are ${1,2,3,4}$ and the first bipartite graph consists of ${(1,1),(1,4),(2,2),(2,3)}$
+% We define $N^l$ set of vertices at each layer which are a superset of the preceding.l;
+% The \texttt{k-hop} neighbourhoods of the target vertices are stored as  \texttt{k-1} bipartite graphs $G^l$ where each bipartite graph consists of edges between src nodes from the $N^l$ and $N^{l-1}$
+% This process of extracting mini-batches from the input graph, which is typically much larger, is called \emph{sampling}.
+% A training iteration over a mini-batch computes the hidden features of the target vertices (\textit{forward propagation}).
+% The computation consists of multiple \emph{GNN layers}.
+% Each GNN layer computes the new hidden features of a vertex by \textit{aggregating} and \textit{transforming} the hidden (or input) features of its neighboring vertices at the previous GNN layer, as shown in Figure~\ref{fig:minibatch}.
+% These transformations are of the following format where $\psi$ is a nodewise reduction function and $\phi$ is an edgewise message function.
+% \begin{equation*}
+%     H^{l+1}_v = \psi_{u \in N(v)}\phi(H^l_v,H^l_u)
+% \end{equation*}
+% The transformation can use any number of neural network layers called Multi-Layer Perceptron (MLP), which collectively constitute one GNN layer.
+% The input to each layer is a matrix of feature vectors of dimension $|N^l,in|$ which are transformed to $|N^{l+1}|$
+% For example, in Figure~\ref{fig:minibatch} the model performs the \texttt{Aggr} and \texttt{MLP} operations.
+
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=0.9\columnwidth]{figures/mini-batch.pdf}
+%   \caption{A mini-batch in GNNs consisting of two target vertices and a sample of its 2-hop neighborhood.}
+%   \label{fig:minibatch}
+% \end{figure}
+
+

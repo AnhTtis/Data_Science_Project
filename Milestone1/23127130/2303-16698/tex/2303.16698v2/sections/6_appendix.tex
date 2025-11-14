@@ -1,0 +1,483 @@
+\setcounter{figure}{0}
+\renewcommand{\thefigure}{S\arabic{figure}} 
+
+\section*{Appendix}
+\section{Notation}\label{app:notation}
+
+\begin{table}[h]
+\caption{Notation}\label{tab:notation}
+    \centering
+    \begin{tabular}{@{}ll@{}}
+        \toprule
+        $\state_t \in \mathbb{R}^n$ & state at time $t$ \\
+        $\action_t \in \mathbb{R}^u$ & control at time $t$ \\
+        $\obs_t \in \mathbb{R}^m$ & observation at time $t$ \\
+        $T \in \N$ & number of time steps \\
+        $f: \R^n \times \R^u \times \R^v \to \R^n$ & system dynamics function \\
+        $h: \R^n \times \R^w \to \R^m$ & observation function \\
+        $\statenoise_t \in \mathbb{R}^v$ & standard multivariate normal dynamics noise \\
+        $\obsnoise_t \in \mathbb{R}^w$ & standard multivariate normal observation noise \\
+        $c_t: \R^n \times \R^u \to \R$ & cost function at intermediate time steps \\
+        $c_T: \R^n \to \R$ & cost function at final time step\\
+        $\belief_{t} \in \beliefset$ & summary statistics of agent's belief, $p(\state_t \given \obs_{1:t-1})$ \\
+        $\beliefdynamics_t: \beliefset \times \R^u \times \R^m \to \beliefset$ & belief dynamics \\
+        $\policy_t: \beliefset \times \R^j \to \R^u$ & policy of the agent \\ %\midrule
+        $\params \in \R^p$ & model parameters \\
+        $g: \R^{n} \times \beliefset \times \R^v \times \R^w \times \R^j \to \R^n \times \beliefset$ & joint dynamics of states and beliefs \\
+    \end{tabular}
+\end{table}
+
+\section{MCE IRL Baseline} \label{app:baseline}
+Maximum causal entropy inverse reinforcement learning (MCE IRL) \citep{gleave2022primer} can be formulated as maximizing the likelihood
+\begin{align}
+    p(\state_{1:T} \given \params) = p(\state_0 \given \params) \prod_{t=0}^{T-1} p(\state_{t+1} \given \state_{t}, \action_t, \params) \Pi^{\params}_t(\action_t \given \state_t), \label{eqn:mce_likelihood}
+\end{align}
+with 
+\begin{align*}
+    \Pi^{\params}_t(\action_t \given \state_t) = \exp(Q^{\params}_t(\state_t, \action_t) - V^{\params}_t(\state_t)).
+\end{align*}
+
+Here, $Q^{\params}_t$ is the soft Q-function at time $t$, given by
+\begin{align*}
+    Q^{\params}_t(\state_t, \action_t) = -c_t(\state_t, \action_t) - \E [V^{\params}_{t+1} (\state_{t+1})]
+\end{align*}
+and $V^{\params}_t$ the normalization,
+\begin{align*}
+    V^{\params}_t(\state_t) = \log \int_{\action_t} \exp(Q^{\params}_t(\state_t, \action_t)) \, \td \action_t.
+\end{align*}
+
+For arbitrary systems, computing the soft Q-function exactly is infeasible, therefore common methods apply approximations such as linearization \citep{levine2012continuous}, importance sampling \citep{boularias2011relative}, or deep function approximation \cite{garg2021iq}. For the case of linear dynamics and quadratic reward, the optimal policy is given by a Gaussian distribution $\Pi_t(\action_t \given \state_t) = \Normal(\action_t; L_t \state_t, -H_t^{-1})$, where $L_t$ is the controller gain and $H_t$ a matrix resulting from the computation of the LQG controller \citep{levine2013guided}. 
+As the tasks we consider can be well solved by linearizing the dynamics locally, we choose an approximation by linearization and use the optimal MCE controller for the linearized dynamics to compute the likelihood function for the parameter set $\params$.
+
+To apply this baseline to the setting where control signals are missing, we use the estimates of the controls as we determine in our proposed method for the data-based linearization (\cref{sec:fixed_linearization,app:actions}).
+
+We can compute the approximate likelihood function by performing the following steps:
+\begin{enumerate}
+    \item Estimate the missing control signals using \cref{eq:control_estimates}
+    \item Linearize the system as described in \cref{sec:fixed_linearization}
+    \item Compute the MCE policy for the linearized system, i.e., compute $Q^{\params}_t$ and $V^{\params}_t$
+    \item Compute the likelihood (in log space) using \cref{eqn:mce_likelihood}
+\end{enumerate}
+
+To maximize the (log) likelihood efficiently, one needs to compute the gradient of the likelihood function, which is straightforwardly achieved by backpropagating the gradient using automatic differentiation in step 4.
+
+Note that there is no explicit model of partial observability and we use point estimates for the control signals, therefore the likelihood in \cref{eqn:mce_likelihood} decomposes in independent factors given states and controls. In contrast, in our approach, when incorporating partial observability and missing controls, one has to compute approximate likelihood contributions within a forward pass.
+
+\section{Algorithm to compute an approximate likelihood for IOC}\label{app:algorithm}
+\begin{algorithm}[H]
+\begin{algorithmic}[1]
+\ENSURE Approximate likelihood of parameters $p(\state_{1:T} \given \params)$
+\REQUIRE Parameters $\params$, Data $\state_{1:T}$, Model $f, h$
+    \STATE Determine the policy $\policy$ using iLQG
+    \STATE Determine the belief dynamics $\beliefdynamics$ using the EKF
+    \FOR{$t$ in $\{1, \ldots, T-1 \}$} 
+    \STATE Compute $p(\state_{t+1}, \belief_{t+1} \given \state_{1:t})$ using \cref{eqn:propagation}
+    \STATE Update $p(\belief_{t+1} \given \state_{1:t+1})$ using \cref{eqn:summary}
+    \STATE Obtain $p(\state_{t+1} \given \state_{1:t})$ using \cref{eqn:marginalization}
+    \ENDFOR
+\end{algorithmic}
+
+\caption{Approximate likelihood computation}\label{algo:likelihood}
+\end{algorithm}
+
+\section{Inverse optimal control derivations}
+\label{app:ioc_derivation}
+We start with defining the joint dynamics of states and estimates, which returns the next state and estimate as a function of the previous state and estimate and the noises,
+\begin{align*}
+    \begin{bmatrix} \state_{t+1} \\ \belief_{t+1} \end{bmatrix}
+    = g(\state_t, \belief_t, \statenoise_t, \obsnoise_t, \policynoise_t).
+\end{align*}
+
+To do so, we insert the policy and observation function into the system and belief dynamics, giving
+\begin{align*}
+    \state_{t+1} &= \dynamics(\state_t, \policy_t(\belief_t, \policynoise_t), \statenoise_t),\\
+    \belief_{t+1} &= \beliefdynamics_t(\belief_t, \policy_t(\belief_t, \policynoise_t), h(\state_t, \obsnoise_t)).
+\end{align*}
+
+The individual factors of the likelihood function can be determined as 
+\begin{align*}
+    p(\state_{t+1} \given \state_{1:t}) =  \int p(\state_{t+1}, \belief_{t+1} \given \state_{1:t}) \, \td \belief_{t+1},
+\end{align*}
+where $p(\state_{t+1}, \belief_{t+1} \given \state_{1:t})$ is given by marginalizing over the current belief $\belief_t$ as
+\begin{align*}
+    p(\state_{t+1}, \belief_{t+1} \given \state_{1:t}) &= \int p(\state_{t+1}, \belief_{t+1}, \belief_t \given \state_{1:t}) \, \td \belief_t \\
+    & = \int p(\state_{t+1}, \belief_{t+1} \given \state_{1:t}, \belief_t) \, p(\belief_t \given \state_{1:t}) \, \td \belief_t \\
+    & = \int p(\state_{t+1}, \belief_{t+1} \given \state_t, \belief_t) \, p(\belief_t \given \state_{1:t}) \, \td \belief_t. 
+\end{align*}
+
+\subsection*{Linearization}
+
+To derive a tractable approximation of the distribution $p(\state_{t+1}, \belief_{t+1} \given \state_{1:t})$, we model the initial belief of the agent's state estimate $p(\belief_1)$ as a Gaussian and linearize the joint dynamics function, leading to a Gaussian approximation of the desired quantity, i.e., $p(\state_{t+1}, \belief_{t+1} \given \state_{1:t}) \approx \Normal\left(\mu_t, \Sigma_t  \right)$.
+
+First, we apply a first-order Taylor expansion of the joint dynamics $g$ around the observed state $\state_t$ and the mean of the belief $\mu_t^{(b)}$ and the noises:
+\begin{align*}
+    g(\state_t, \belief_t, \statenoise_t, \obsnoise_t, \policynoise_t) \approx g(\state_t, \mu_t^{(b)}, 0, 0, 0) + J_\belief (\belief_t - \mu_t^{(b)}) + J_{\statenoise} \statenoise_t + J_{\obsnoise} \obsnoise_t + J_{\policynoise} \policynoise_t,
+\end{align*}
+where $J_\bullet$ denotes the Jacobian of $g$ w.r.t. $\bullet$, evaluated at $(\state_t, \mu_t^{(b)}, 0, 0, 0)$.
+
+To derive an explicit representation of the Jacobians, we insert the filtering and control law obtained by the Kalman filter and maximum entropy iLQG controller and find
+\begin{align*}
+    g(\state_t, \belief_t, \statenoise_t, \obsnoise_t, \policynoise_t)
+    &= \begin{bmatrix} \dynamics(\state_t, \policy_t(\belief_t, \policynoise_t), \statenoise_t) \\
+    \beliefdynamics_t(\belief_t, \policy_t(\belief_t, \policynoise_t), h(\state_t, \obsnoise_t))
+    \end{bmatrix} \\
+    &= \begin{bmatrix} \dynamics(\state_t, \action_t, \statenoise_t) \\
+    \beliefdynamics_t(\belief_t, \action_t, \obs_t)
+    \end{bmatrix},
+\end{align*}
+with
+\begin{align*}
+    \obs_t &= h(\state_t, \obsnoise_t), \\
+    \action_t &= \policy_t(\belief_t, \policynoise_t) = \controlmatrix_t (\belief_t - \bar\state_{1:T}) + \controloffset_t + \bar\action_{1:T} - \tilde{\controlmatrix}_t \policynoise_t, \\
+    \beliefdynamics_t(\belief_t, \action_t, \obs_t) &= \dynamics(\belief_t, \action_t, 0) + K_t (\obs_t - h(\belief_t, 0)),
+\end{align*}
+leading to the equations
+\begin{align*}
+    \mathbb{J}_\belief 
+    &= \begin{bmatrix} \nabla_{\action} \dynamics(\state_t, \action_t,0)  \nabla_{\belief} \action_t \\
+    \nabla_{\belief} \beliefdynamics_t(\belief_t, \action_t, \obs_t) + \nabla_{\action} \beliefdynamics_t(\belief_t, \action_t, \obs_t) \nabla_{\belief} \action_t
+    \end{bmatrix} \\
+    &= \begin{bmatrix} \nabla_{\action} \dynamics(\state_t, \action_t, 0)  \controlmatrix_t \\
+    \nabla_{\state} \dynamics(\belief_t, \action_t, 0) - K_t \nabla_{\state} h(\belief_t, 0) + \nabla_{\action} \dynamics(\belief_t, \action_t, 0) \controlmatrix_t
+    \end{bmatrix},\\\\
+    \mathbb{J}_{\statenoise} &= \begin{bmatrix} \nabla_{\statenoise} \dynamics(\state_t, \action_t, 0) \\
+    \nabla_{\statenoise} \dynamics(\belief_t, \action_t, 0)
+    \end{bmatrix},\\\\
+    \mathbb{J}_{\obsnoise} &= \begin{bmatrix} 0 \\
+    \nabla_{h} \beliefdynamics_t(\belief_t, \action_t, \obs_t) \nabla_{\obsnoise} h(\belief_t, 0)
+    \end{bmatrix} %\\
+    = \begin{bmatrix} 0 \\
+    -K_t \nabla_{\obsnoise} h(\belief_t, 0)
+    \end{bmatrix},\\\\
+    \mathbb{J}_{\policynoise} &= 
+    \begin{bmatrix} \nabla_{\action} \dynamics(\state_t, \action_t, 0) \nabla_{\policynoise} \action_t \\
+    \nabla_{\action} \dynamics(\belief_t, \action_t, 0) \nabla_{\policynoise} \action_t
+    \end{bmatrix}
+    = \begin{bmatrix} \nabla_{\action} \dynamics(\state_t, \action_t, 0) \controlmatrix_t \\
+    \nabla_{\action} \dynamics(\belief_t, \action_t, 0) \controlmatrix_t
+    \end{bmatrix}.
+\end{align*}
+
+Propagating the Gaussian belief over the agent's state estimate, $p(\belief_t \given \state_{1:t})$ through the linearized dynamics model (\cref{eqn:propagation}) can be done by applying standard identities for linear transformations of Gaussian random variables \citep{bishop2006pattern} and gives
+\begin{align*}
+    p(\state_{t+1}, \belief_{t+1} \given \state_{1:t}) \approx \Normal\left(\mu_t, \Sigma_t  \right),
+\end{align*}
+with $\mu_t = g(\state_t, \mu_t^{(b)}, 0, 0, 0)$ and $\Sigma_t = \mathbb{J}_\belief \Sigma_t^{(b)} \mathbb{J}_\belief^T + \mathbb{J}_{\statenoise} \mathbb{J}_{\statenoise}^T + \mathbb{J}_{\obsnoise} \mathbb{J}_{\obsnoise}^T + \mathbb{J}_{\policynoise} \mathbb{J}_{\policynoise}^T$. Marginalization over $\belief_{t+1}$ gives the desired likelihood factor, while conditioning on $\state_{t+1}$ gives the belief statistic for the following time step (see \cref{sec:likelihood}).
+
+\newpage
+\section{Special case: full observability}\label{app:fullyobs}
+\begin{wrapfigure}{r}{0.5\textwidth}
+    \centering
+    \begin{adjustbox}{width=0.49\linewidth}
+        \input{tikz/mdp-agent.tikz}
+    \end{adjustbox}
+    \begin{adjustbox}{width=0.49\linewidth}
+        \input{tikz/mdp-experimenter.tikz}
+    \end{adjustbox}
+    \caption{\textbf{Left:} decision network from the agent's perspective \citep[following the notation used in][]{kochenderfer2022algorithms}. The agent directly observes the state $\state_t$. At each time step, they perform a control $\action_t$ and incur a cost $c_t$. \textbf{Right: } probabilistic graphical model from the researcher's perspective, who observes a trajectory $\state_{1:T}$ from an agent. The control signals $\action_t$ are not directly observed.}
+    \label{fig:fullyobs}
+\end{wrapfigure}
+If the state $\state_t$ is fully observable to the agent, the problem is simplified significantly. The control problem from the agent's perspective (\cref{fig:fullyobs}, left) can be solved by applying iLQG \citep{todorov2005generalized} to the observed states directly (\cref{sec:ilqg})
+\begin{align*}
+    \action_t = \policy_t(\state_t, \policynoise_t),
+\end{align*}
+This also simplifies the IOC problem from the researcher's perspective because evaluating the approximate likelihood becomes straightforward as we do not need to marginalize over the agent's belief.
+
+Recall that the likelihood can be decomposed as
+\begin{align*}
+    p(\state_{1:T} \given \theta) = p(\state_0 \given \theta) \prod_{t=0}^{T-1} p(\state_{t+1} \given \state_{1:t}, \theta)
+\end{align*}
+and the dynamics are given as
+\begin{align*}
+    \state_{t+1} = f(\state_t, \action_t, \statenoise_t) = f(\state_t, \policy(\state_t, \policynoise_t), \statenoise_t).
+\end{align*}
+
+We can approximate the likelihood contribution at each time step as
+\begin{align*}
+    p(\state_{t+1} \given \state_{1:t}, \theta) \approx \Normal(\mu_t, \Sigma_t),
+\end{align*}
+with
+\begin{align*}
+    \mu_t &= f(\state_t, \policy(\state_t, 0), 0) \\
+    \Sigma_t &= \mathbb{J}_{\statenoise} \mathbb{J}_{\statenoise}^T + \mathbb{J}_{\policynoise} \mathbb{J}_{\policynoise}^T,
+\end{align*}
+where $\mathbb{J}_\bullet$ denotes the Jacobian of $f$ w.r.t. $\bullet$, evaluated at $(\state_t, \policy(\state_t, 0), 0)$:
+\begin{align*}
+    \mathbb{J}_{\statenoise} &= \nabla_{\statenoise} \dynamics(\state_t, \action_t, 0),\\
+    \mathbb{J}_{\policynoise} &= 
+    \nabla_{\action} \dynamics(\state_t, \action_t, 0) \nabla_{\policynoise} \action_t
+    = \nabla_{\action} \dynamics(\state_t, \action_t, 0) \controlmatrix_t.
+\end{align*}
+
+\section{Implementation}\label{app:implementation}
+We provide a flexible framework for defining non-linear stochastic dynamical systems of the form introduced in \cref{sec:pomdps} by implementing the dynamics, observation function, and cost function. The optimal estimation control methods based on iterative linearization are implemented using the automatic differentiation library \texttt{jax} \citep{frostig2018compiling}, so that Jacobians and Hessians for the linearization of the dynamics and quadratization of the cost do not have to be specified manually. Furthermore, the Jacobians needed for linear-Gaussian approximation in the IOC likelihood (\cref{sec:linearization}) are also computed using automatic differentiation. Gradient-based maximization of the log likelihood was performed using the L-BFGS-B \texttt{scipy} \citep{virtanen2020scipy} from the \texttt{jaxopt} library \citep{blondel2021efficient}.
+The implementation is provided in the supplementary material and
+will be made public upon publication.
+
+For computations, we used an Intel Xeon Platinum 9242 Processor, using 1 core per run. The mean run times for computing maximum likelihood estimates (partially observable setting) were as follows:
+\begin{itemize}
+    \item Reaching: 140 s
+    \item Navigation: 64 s
+    \item Pendulum: 31 s
+    \item CartPole: 115 s
+\end{itemize}
+
+
+\section{Estimating controls for linearization}\label{app:actions}
+For every evaluation of the likelihood function as described in \cref{sec:likelihood}, we would naively need to solve the forward control problem once by running the iLQG algorithm given the current parameter values. This is computationally inefficient due to the iterative procedure of iLQG, which requires multiple forward and backward passes. Instead of performing the iterative procedure, which computes the locally optimal control law $\{\controlmatrix_{1:T-1}, \controloffset_{1:T-1}\}$ around a nominal trajectory $\{\bar \state_{1:T}, \bar \action_{1_T-1}\}$, then computes the new nominal trajectory given the current control law and so on, we realize that in the IOC setting, we already have observed the actual trajectory $\state_{1:T}$ performed by the agent. To make solving the forward control problem more efficient, we only compute the locally optimal control law once around this trajectory. This would require the control signals $\action_{1:T}$ to be given, but they are unobserved in our problem setting. To obtain a proxy for the controls for the purposes of linearization, we solve for the controls given the trajectory $\state_{1:T}$ in the system dynamics equation $\state_{t+1} = f(\state_t, \action_t, 0)$ using the Gauss-Newton method for non-linear least squares as implemented in \texttt{jaxopt}, i.e.,
+\begin{align}
+    \label{eq:control_estimates}
+    \hat{\action}_t = \argmax_{\action} \left(\state_{t+1} - \dynamics\left(\state_t, \action, 0\right) \right)^2.
+\end{align}
+
+\section{Efficient gradient computation}
+\label{app:gradients_computation}
+In the case where the full state is not observable, one cannot linearize around the given trajectory as descibed in \cref{sec:fixed_linearization}. The forward optimal control problem is commonly solved by starting with a randomly initialized nominal trajectory and iterating between computing the locally optimal control law and linearization until convergence.
+To compute gradients, a naive approach would be to differentiate through the loop of the forward procedure. In our experiments, we found, however, that this approach is numerically unstable and does not yield correct gradients (see \cref{fig:estimates_grad_computation}). Here, we provide two approaches to compute gradients in this case.
+
+\subsection{Differentiating through the last iteration}
+In this approach, one first solves the forward problem as usual to determine the linearization. One then executes one additional backward pass for the optimal controller, which one can differentiate using automatic differentiation.
+
+\subsection{Applying the implicit function theorem}
+Determining the optimal linearization and controller is essentially a fixed point problem. To differentiate through the optimal linearization and controller, we apply the implicit function theorem \cite{krantz2002implicit, blondel2022efficient}.
+
+We assume the forward equation to determine the linearization is given by
+\begin{align*}
+    \state_{t+1} &= \hat{f}(\state_t, \action_t, \params), \\
+    \action_t &= \hat{\policy}_t(\state_t, \ids_t, \params)
+\end{align*}
+where $\params$ are the parameters we want to differentiate with respect to and $\ids_t$ is a vector determining the optimal controller, such that it can be determined via a backward pass with
+\begin{align*}
+    \ids_{t-1} = \gamma(\state_t, \action_t, \ids_t, \params).
+\end{align*}
+For the LQG controller, $\ids_t$ would consist of the (vectorized) matrix characterizing the optimal value function.
+
+The fixed point problem of jointly determining the optimal linearization and controller can be formulated as determining $X \defeq [\action_{1}, \state_2, \action_2, \ldots, \action_{T-1}, \state_T, \ids_1, \ldots, \ids_T]$ such that
+\begin{align*}
+    X = \eta(X, \params) \defeq [ &\hat{\policy}_1(\state_1, \ids_1, \params), \hat{f}(\state_1, \action_1, \params), \hat{\policy}_2(\state_2, \ids_2, \params), \ldots, \hat{f}(\state_{T-1}, \action_{T-1}, \params), \\ &\gamma(\state_2, \action_2, \ids_2, \params), \ldots, \gamma(\state_T, \action_T, \ids_T, \params) ].
+\end{align*}
+The optimal solution of the fixed point problem satisfies 
+\begin{align*}
+    \kappa(X^*(\params), \params) \defeq X^*(\params) - \eta(X^*(\params), \params) = 0,
+\end{align*}
+where $X^*(\params)$ is a function yielding the optimal solution depending on $\params$, i.e., $X^*: \R^{p} \to \R^{(n+u+s)t}$, where $s$ is the number of elements of $\ids_t$.
+
+The implicit function theorem \cite{krantz2002implicit} gives, that for $(X_0, \params_0)$ satisfying $\kappa(X_0, \params_0) = 0$ with the requirement that $\kappa$ is continuously differentiable and the Jacobian $\partial_{\params}\kappa(X_0, \params_0)$ is a square invertible matrix, then there exists a function $X^*(\cdot)$ on a neighborhood of $\params_0$ such that $X^*(\params_0) = X_0$. Furthermore, for all $\params$ in this neighborhood, we have that $\kappa(X^*(\params), \params) = 0$ and $\partial X^*(\params)$ exists.
+
+By applying the chain rule, the Jacobian $\partial X^*(\params)$ needs to satisfy
+\begin{align*}
+    0 &= \partial_1 \kappa(X^*(\params), \params) \partial X^*(\params) + \partial_2 \kappa(X^*(\params), \params)\\
+    &= (I - \partial_1 \eta(X^*(\params), \params)) \partial X^*(\params) - \partial_2 \eta(X^*(\params), \params).
+\end{align*}
+
+$\partial_1 \eta(X^*(\params), \params))$ is given by a sparse matrix, as each element of $\eta(X, \params)$ only depends on few elements of $X$. The desired gradient $\partial X^*(\params)$ (or vector-Jacobian products with it) can then be computed using linear system solvers \cite{blondel2022efficient}.
+
+\subsection{Results with different gradient computation methods}
+We ran the MLE for the partially observable reaching task with different gradient computation methods. The results are shown in \cref{fig:estimates_grad_computation}. While unrolling the loop led to numerical problems, so the estimates are far off the true values, all other methods led to quite similar results. The mean run times were as follows:
+\begin{itemize}
+\item Unrolled loop: 141 s
+\item Differentiating through the last iteration: 103 s
+\item Implicit differentiation: 243 s
+\item Data-based linearization: 129 s
+\end{itemize}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/Fig-S2.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the partially observable reaching task with different gradient computation methods}
+    \label{fig:estimates_grad_computation}
+\end{figure}
+
+\section{Hyperparameters}
+\label{app:hyperparams}
+
+Throughout the experiments, we have used the following hyperparameters:
+
+\begin{table}[h]
+\caption{Hyperparameters}\label{tab:hyperparams}
+    \centering
+    \begin{tabular}{@{}ll@{}}
+    \toprule
+    Data set size (number of trajectories) & 50 \\
+    Number of datasets per evaluation & 100 \\
+    Number of time steps ($T$) & 50 (reaching, navigation, pendulum, light-dark), \\ & 200 (cartpole) \\
+    Optimizer & L-BFGS-B (\texttt{scipy} wrapper from \texttt{jaxopt}) \\
+    Maximum entropy temperature & $10^{-6}$ (reaching, navigation), \\ & $10^{-3}$ (pendulum, cartpole), \\ & $10^{-5}$ (light-dark) \\
+    Optimizer restarts & 50 \\
+    \end{tabular}
+    
+\end{table}
+
+\section{Tasks}\label{app:tasks}
+\subsection{Reaching task with biomechanical arm model}\label{app:reaching}
+We implemented the non-linear biomechanical model for arm movements from \citet{todorov2005generalized} and its partially observed version from  \citet{li2007iterative}, which are described in more detail in the PhD thesis of \citet{li2006optimal}. The dynamics describe the movement of a two-link arm, which can be controlled by applying torques to the two joints. 
+The task is to move the hand to a target location, as defined in the cost function
+\begin{align*}
+    J = \norm{\mathbf e_T - \mathbf e^*}^2 + c_v \norm{\dot{\mathbf e}_T}^2 + c_a \sum_{t=1}^{T-1} \norm{\mathbf u_t}^2,
+\end{align*}
+where $\mathbf e_T$ is the position of the hand at the final time step in Cartesian coordinates, $\mathbf e^\star$ is the position of the target, and $\dot{\mathbf e}_T$ is the final velocity of the hand. That is, the task is to bring the hand to the target at the final time step ($T = 50$) and minimize the final velocity while making as little control as possible along the way. The parameters $c_v$ and $c_a$ trade off, how important the velocity and control parts of the cost function are relative to the main goal of reaching the target. Additionally, we parameterize the signal-dependent variability of the motor system with the parameter $\sigma_m$, which defines how strongly the variability is scaled by the control magnitude.
+
+\subsection{Navigation task}\label{app:navigation}
+We implemented a simple navigation task in which an agent walks towards a target. 
+The state $\state_t = \begin{bmatrix}x_t, y_t, \theta_t, \omega_t\end{bmatrix}^T$ consists of the position in the horizontal plane, the heading angle, and the speed in the heading direction. The dynamics are
+\begin{align*}
+    f(\state, \action, \statenoise) = \state + dt \begin{bmatrix}
+    \cos(\theta) \cdot \omega \\ \sin(\theta) \cdot \omega \\ u_1 + \sigma_m u_1 v_1 \\ u_2 + \sigma_m u_2 v_2
+    \end{bmatrix},
+\end{align*}
+which means that the agent controls the velocity of the heading angle and the acceleration in heading direction. There is control-dependent noise, whose strength is determined by the parameter $\sigma_m$. The observation model is
+\begin{align*}
+    h(\state, \obsnoise) = \begin{bmatrix}
+    \sqrt{(x - k_1)^2 + (y - k_2)^2} \\
+    \tan^{-1}(y - k_2, x - k_1) \\
+    \omega
+    \end{bmatrix} + \sigma_o \obsnoise,
+\end{align*}
+where $\mathbf k  = \begin{bmatrix}k_1, k_2\end{bmatrix}^T$ is the position of the target and $\sigma_o$ determines the magnitude of the observation noise. The cost function is
+\begin{align*}
+    J = (x_T - k_1)^2 + (y_T - k_2)^2 + c_v \omega_T + \sum_{t=1}^{T-1} c_a \action_t^T \action_t,
+\end{align*}
+with parameters determining the cost of controls ($c_a$) and the cost of the final velocity ($c_v$). The time horizon was $T = 50$.
+
+\subsection{Classic control tasks}\label{app:classic-control}
+
+We evaluate our method on two classic continuous control tasks. Specifically, we build upon the Pendulum and Cart Pole environments from the \texttt{gym} library \citep{brockman2016openai}.
+Because these environments are not stochastic in their standard implementations and are typically used in an infinite-horizon reinforcement learning setting, we made the following changes to the environments. To account for the finite-horizon setting we are considering in this work, the state-dependent costs associated with the task goal are applied only to the final time step, while control-dependent costs are applied at every time step along the trajectory. To make the problems stochastic, we have added noise on the dynamics and the observation function.
+
+\subsubsection{Pendulum}
+The task is to make a pendulum, which is attached to a fixed point on one side, swing into an upright position, i.e. to reach an angle $\theta = 0$. The pendulum starts at the bottom ($\theta = \pi$) and can be controlled by applying a torque to the free end of the pendulum. We added control-dependent noise to the dynamics, where the parameter $\sigma_m$ controls, how strongly a standard normal noise is scaled by the magnitude of the torque. In addition to this motor noise parameter, the task has two other free parameters: the cost of controls $c_a$ and the cost of the final velocity $c_v$.
+In the partially observable version of the task, the agent receives the observation via the non-linear stochastic observation model $\mathbf \obs_t = \begin{bmatrix} \sin \theta_t, \cos \theta_t, \dot \theta_t \end{bmatrix}^T + 0.1 \obsnoise_t$. The time horizon was $T = 50$.
+
+\subsubsection{Cart pole}
+In the Cart Pole task, a pole is attached to a cart that can be moved left or right by applying a continuous force. In our version of the task, the goal is to move the cart from the horizontal position $x = 0$ to $x = 1$ while balancing the pole in an upright position. Again, we add control-dependent noise to the force, parameterized the strength of the linear control-dependence $\sigma_m$. As above, the other two parameters are the control cost $c_a$ and the cost of the final velocity $c_v$. In the partially observed version of the task, the agent receives a noisy observation with $\mathbf \obs_t = \mathbf \state_t + \obsnoise_t$. The time horizon was $T = 200$.
+
+\subsection{Light-dark domain}\label{app:lightdark}
+We use a slightly modified version of the light-dark domain, which was originally introduced by \citet{platt2010belief}. We adapted the light-dark domain's motion model to include signal-dependent noise on the control
+\begin{align*}
+    \state_{t+1} = \state_t + dt\, \action_t + 0.1\, \action_t \odot \statenoise_t
+\end{align*}
+ 
+The standard deviation of the perceptual uncertainty varies with the horizontal distance to the light source:
+\begin{align*}
+    \obs_t = \state_t + \sigma \lvert x_{t,1} - 5\rvert \; \obsnoise_t.
+\end{align*}
+
+The cost function is composed of three terms. First, the agent should minimize the squared distance to the target $\mathbf p$ at the final time step $T$. Second, the agent should minimize the squared control signals $\action_t$. And finally, the agent should minimize the horizontal distance to the light source:
+\begin{align*}
+    J = \underbrace{(\state_T - \mathbf{p})^2}_\text{final cost} + \underbrace{\textstyle\sum_{t=1}^{T-1} \frac{1}{2}\action_t^2 + c \, (x_{t,1} - 5)^2}_\text{running cost}.
+\end{align*}
+
+The time-horizon was set to $T = 50$.
+
+We simulated the behavior of two agents in the light-dark domain in \cref{fig:lightdark-comparison}. First, the partially observable version of iLQG \citep{li2007iterative} takes the expected belief covariance into account for the computation of the policy. This agent moves towards the light source before approaching the target. Adding another cost term $c$ that expresses a preference to be close to the light source does not change much about this behavior (top row). Second, the fully observable version of iLQG \citep{todorov2005generalized} computes the policy irrespective of the belief. To apply it in the partially observable setting, we simply combine it with an EKF for the state estimation. This agent does not move towards the light source by default and as a result, the belief uncertainty is higher. The agent only moves towards the light source before approaching the target if we add the additional cost term $c > 0$.
+One can also see in \cref{fig:lightdark-comparison} that the agent's belief is more uncertain if it does not move to the light source before approaching the target. This results in a higher variability around the final position (inset plots in \cref{fig:lightdark-comparison}).
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth]{figures/Fig-S3.pdf}
+    \caption{\textbf{Trajectories and beliefs in the light-dark domain.} Partially observable (top) vs.\ fully observable (bottom) iLQG in the light dark domain with different values for the cost parameter $c$, which expresses an inherent desire to be near the light source. The circles indicate the agent's belief covariance (2 standard deviations). One can also see that the variability around the final position is higher for agents that do not move towards the light source before approaching the target (inset plots).}
+    \label{fig:lightdark-comparison}
+\end{figure}
+
+
+\newpage
+\section{Additional results}
+\label{app:add_results}
+The parameter estimates and true values are provided in \cref{fig:estimates_po_pendulum}, \cref{fig:estimates_po_cartpole}, \cref{fig:estimates_po_navigation}.
+
+\subsection{Results for all tasks in the partially observable setting}\label{app:results_partialobs}
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/Fig-S4.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the Pendulum task (partially observable cases).}
+    \label{fig:estimates_po_pendulum}
+\end{figure}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/Fig-S5.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the Cart Pole task (partially observable).}
+    \label{fig:estimates_po_cartpole}
+\end{figure}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/Fig-S6.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the navigation task (partially observable).}
+    \label{fig:estimates_po_navigation}
+\end{figure}
+
+\newpage
+\subsection{Results for all tasks in the fully observable setting}\label{app:results_fullobs}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.7\linewidth]{figures/Fig-S7.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the reaching task (fully observable).}
+    \label{fig:estimates_reaching}
+\end{figure}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.7\linewidth]{figures/Fig-S8.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the pendulum task (fully observable).}
+    \label{fig:estimates_pendulum}
+\end{figure}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.7\linewidth]{figures/Fig-S9.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the cart pole task (fully observable).}
+    \label{fig:estimates_cartpole}
+\end{figure}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.7\linewidth]{figures/Fig-S10.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the navigation task (fully observable).}
+    \label{fig:estimates_navigation}
+\end{figure}
+
+\clearpage
+\subsection{Results for baseline with given control signals}
+\label{app:results_controls}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.7\linewidth]{figures/Fig-S11.pdf}
+    % \vspace{-1cm}
+    \caption{Maximum likelihood parameter estimates for the baseline with given control signals (fully observable)}
+    \label{fig:estimates_baseline_givencontrols}
+\end{figure}
+
+\newpage
+\subsection{Quantitative results for the light-dark domain}
+\label{app:lightdark-results}
+
+As for the other tasks, we generated 100 sets of parameters sampled from uniform distributions in the following ranges
+\begin{itemize}
+    \item horizontal target position $p$: $(-1, 1)$
+    \item state-dependent cost parameter $c$: $(10^{-2}, 1)$
+    \item perceptual uncertainty $\sigma$: $(10^{-2}, 1)$
+\end{itemize}
+
+
+and generated a dataset of 50 trajectories using iLQG \citep{li2007iterative} for each set of parameters. For each set, we then performed inference using our method and the baseline.
+
+While the baseline accurately infers the target position, our method shows more variability in its estimates of the target position. The estimates of the cost term $c$ are comparable for both methods.
+However, the baseline completely fails to estimate the perceptual uncertainty, which our method manages to infer relatively accurately.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.7\linewidth]{figures/Fig-S12.pdf}
+    \caption{Maximum likelihood estimates for our method (top) and the baseline (bottom) in the light-dark domain.}
+    \label{fig:lightdark-quantitative}
+\end{figure}

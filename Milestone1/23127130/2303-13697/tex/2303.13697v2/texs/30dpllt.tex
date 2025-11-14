@@ -1,0 +1,85 @@
+\section{Checking Feasibility}
+\label{sec:dpllt}
+
+\begin{algorithm}[t]
+  \small
+  \begin{algorithmic}[1]
+    \State {\bfseries Input:} linear constraints $\C$, one hot constraints $\O$
+    \State {\bfseries Output:} $\feas/\infeas$
+    \Function{CheckFeas}{$\C, \O$}
+    \State {$\E \mapsto \{\onehot_L(\prop(\binvars))\ |\ \onehot(\binvars)\in \O\}$} \label{line:initE}
+    \State {$r, \cdot \mapsto \recdpllt(\C, \O, \emptyset, \E)$} \label{line:recCall}
+    \State \textbf{return} r
+    \EndFunction
+    \State
+    \State {\bfseries Input:} $\C$, $\O$, decisions $\D$, and propositional constraints $\E$
+    \State {\bfseries Output:} $\feas/\infeas$ and theory lemmas $\L$
+    \Function{RecCheckFeas}{$\C, \O, \D, \E$}
+    \If {$\neg \satProc(\E)$} \textbf{return} $\infeas, \varnothing$ \label{line:checksat}
+    \EndIf
+    \State {$r, \alpha, \L \mapsto \convProc(\C \cup \rlx{\O} \cup \D)$} \label{line:checkconv}
+    \State {$\L \mapsto \L \cap \D$}
+    \If {$r = \infeas$} \textbf{return} $\infeas, \L$  
+    \ElsIf {$\alpha \models (\C \cup \O)$} \textbf{return} $\feas, \varnothing$ \label{line:satfound}
+    \EndIf
+    \For {$\tup{\O_i, \D_i, \E_i} \in \branch(\O, \E)$} \label{line:branch}
+    \State {$r_i, \L_i \mapsto \recdpllt(\C, \O_i, \D_i, \E_i \cup \neg\prop(\L))$} \label{line:solvesub}
+    \If {$r_i = \feas$} \textbf{return} $\feas, \varnothing$  \label{line:satfoundrec}
+    \EndIf
+    \State {$\L \mapsto \L \cup \L_i$} \label{line:augmentlemma}
+    \EndFor 
+    \State \textbf{return} $\infeas, \L$ \label{line:unsatfound}
+    \EndFunction
+  \end{algorithmic}
+  \caption{Complete feasibility search.\label{alg:complete}}
+\end{algorithm}
+
+
+DPLL(T) is a framework for solving SMT problems.\footnote{Here, we touch upon DPLL(T) at a high level;
+a detailed presentation can be found in \cite{barrett2018satisfiability}.}  A DPLL(T)-like procedure for MILP problems with one-hot constraints is shown in Alg.~\ref{alg:complete}. %Since the procedure is fairly standard, we omit a formal presentation and 
+% The goal is to provide intuition for the framework in which the novel stochastic optimization procedure \deepsoi (Sec.~\ref{sec:soi}) operates.
+%
+The procedure takes as inputs the linear constraints $\C$ and the one-hot constraints $\O$ and checks if $\C\cup\O$ is feasible. During the solving process, it accumulates new information about the one-hot constraints at the propositional level, which it stores as a set of propositional constraints, \E, initialized with a propositional encoding of the one-hot constraints as described in \eqref{eq:onehotL} (Line~\ref{line:initE}). The following invariant is preserved throughout the execution:
+\begin{condition}
+If $\C\cup \O$ is feasible, then $\E$ is satisfiable.\footnote{A propositional formula is satisfiable if there exists an assignment to its variables that makes the formula true.}
+\label{cond:consistentE}
+\end{condition}
+
+$\dpllt$ invokes the recursive function \recdpllt with input arguments $\C$ and $\O$, an empty set of decisions, and $\E$. \recdpllt first checks the satisfiability of $\E$ (Line~\ref{line:checksat}). If it is unsatisfiable, then due to Condition~\ref{cond:consistentE}, $\C \cup\O$ must be infeasible. If $\E$ is satisfiable, we check the feasibility of the convex relaxation $\C \cup \rlx{O} \cup \D$ with $\convProc$ (Line~\ref{line:checkconv}).
+
+$\convProc$ calls a convex feasibility checker with the capability of generating \emph{explanations} in the case of infeasibility. An explanation is an (ideally minimal) infeasible subset of the input constraints~\cite{barrett2018satisfiability}.  The first output of the method is either \feas or \infeas, indicating whether the input is feasible. If so, a feasible solution $\alpha$ is returned and $\L$ is empty. If not, $\L$ contains an explanation.  We only care about the part of the explanation coming from the decisions in $\D$, so we restrict $\L$ accordingly.%AW:This rewording makes a ton of sense!
+
+For example, suppose $\D=\{x_i=1, x_j=1, x_k=1\}$, corresponding to a certain combination of modes. In addition to deducing that this mode combination is infeasible, the convex procedure might further deduce that $\C \cup \rlx{\O} \cup \{x_i = 1, x_k = 1\}$ is already infeasible. In this case, we would get $\L = \{x_i = 1, x_k = 1\}$. Efficiently generating explanations for infeasible linear constraints is a well-studied problem (see~\cite{gleeson1990identifying}).  Explanations, also called \emph{theory lemmas}, can be used to prune the search space.
+
+The pruning could be done at the arithmetic level by adding a linear constraint $x_i  + x_k < 2$. However, as we accumulate lemmas during the search, this could lead to a drastic slowdown of the convex procedure. An alternative approach (and the one we take) is to record this information as a propositional constraint $\neg\prop(l):= \neg (\prop(x_i)\land \prop(x_k))$ and rely on $\satProc$ (which in general is much faster than the convex solver) to rule out infeasible mode combinations.
+
+If \convProc finds a feasible solution $\alpha$ that is also a feasible solution to the precise constraints $\C \cup \O$, then the solver returns \feas (Line~\ref{line:satfound}). If $\alpha$ does not satisfy the precise constraints, the analysis is inconclusive, and branching is required to make progress (Line \ref{line:branch}): the \branch method selects one of the one-hot constraints in $\O$ and performs case analysis on it. For example, suppose it chooses $\onehot(\{x_1, x_2\})$. Then, \branch will return: 
+\begin{align*}
+\{\tup{\O \backslash \{\onehot\}, \{x_1 = 1, x_2=0\}, \E \cup \{\prop(x_1) \land \neg\prop(x_2)}, \\
+\tup{\O \backslash \{\onehot\}, \{x_1 = 0, x_2=1\}, \E \cup \{\neg\prop(x_1) \land \prop(x_2)}\}.  
+\end{align*}
+%For soundness and completeness, the following requirement on the generated sub-problems must hold:
+%\begin{condition}
+%$\C \cup \O$ is feasible if and only if one of $\C_i \cup \O_i$ is feasible. \label{cond:completeness}
+%\end{condition}
+
+The procedure iteratively solves each of the sub-problems (Lines~\ref{line:branch}-\ref{line:augmentlemma}), accumulating theory lemmas (Line~\ref{line:augmentlemma}), and using them for later iterations (Line~\ref{line:solvesub}). 
+The procedure returns \feas if one of the sub-problems returns \feas. Otherwise, the procedure returns \infeas along with all the detected theory lemmas.
+
+%The strength of the DPLL(T) procedure is that as theory lemmas are accumulated during the search, more mode combinations can be efficiently refuted by \satProc without invoking \convProc. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

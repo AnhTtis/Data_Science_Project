@@ -1,0 +1,177 @@
+% !TEX root = main.tex
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%                          Enhancement                                 %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{DVL-aided Feature Enhancement}
+\label{sec:enhancement}
+%
+During operation, the vehicle will keep a close distance (1-2 meters) to the ice such that the up-looking camera only has a small coverage, which causes a relatively short feature tracking distance.
+In other words, the relative pose changes between keyframes will be small which may lead to bad feature triangulation.
+To deal with this problem, we designed a DVL-aided feature enhancement strategy that uses the DVL point clouds obtained from 4 beams to constrain the feature depth.
+The detailed approach is discussed in the remaining content in this section. 
+
+\subsection{Data Association}
+%
+Typically, 3D-2D data association between point cloud and image feature require one-by-one matching~\cite{LiDAR-SfM_Zhen_2020}. 
+However, DVL only provides sparse point clouds, making exact point matching challenging.
+%
+Therefore, we attempt to find the nearest DVL point cloud around each feature, then apply bilinear interpolation to obtain the possible depth at the feature's location.
+%
+Our method has three steps, identifying the anchor frame of the feature, identifying relevant DVL point clouds, and finding the DVL point cloud associated with the camera features.
+The anchor frame is selected based on the feature's location in the normalized plane. 
+Among all keyframes, we select the one to be the anchor frame when the feature has a minimum offset from the camera origin because this feature will be highly likely to be bounded by the DVL points nearby in the anchor frame.
+The anchor frame will be treated as the reference frame for feature triangulation. 
+To identify relevant DVL point clouds, we sort the buffered DVL point cloud based on
+the timestamp difference between the DVL point clouds and the anchor frame.
+The $m$ number of DVL point cloud with the smallest time differences will be selected for feature enhancement.
+To match the selected DVL point cloud with the feature, we design the following three-step procedure with pseudo-code displayed in Algorithm ~\ref{alg:cloud_match}.
+
+\begin{algorithm}
+  \caption{Feature and Cloud Match}\label{alg:cloud_match}
+  % \small
+  % \footnotesize
+  \scriptsize
+  % \tiny
+  \Input{
+        {\begin{minipage}[t]{6cm}%
+             \strut   
+             A list of DVL timestamps with clouds \\ 
+             $ \{ \prescript{D_i}{}{t}, \prescript{D_i}{}{\mathcal{P}} \}, i \in (1,m) $ 
+
+             A list of IMU timestamps with clones \\ 
+             $ \{ \prescript{I_j}{}{t}, \prescript{G}{I_j}{T} \in \textit{SE}(3) \}, j \in (1,n) $
+
+             The threshold of standard deviation $\sigma_z$ to filter outlier
+
+             The normalized feature measurement $(u,v)$ and the pose of the anchor frame
+             $\prescript{G}{C}{T}$
+             \strut
+        \end{minipage}}
+        }
+  \Output{cloud at camera frame $\prescript{C_i}{}{\mathcal{P}}$}
+
+  \Let{$\prescript{C_i}{}{\mathcal{P}}$}{\textit{InitializeToEmpty}()}\;
+  \ForEach{$ i \in (1,m), j \in (1,n) $}{
+      \tcc{Step 1: Interpolate DVL Pose}
+      \eIf{$\prescript{I_j}{}{t} \leq 
+            \prescript{D_i}{}{t} \leq 
+            \prescript{I_{j+1}}{}{t}$}{
+          \Let{$\prescript{G}{I}{T}_{D_i}$} 
+              {\textit{Interpolation}(
+                  $\prescript{G}{I}{T}_{I_j}, \prescript{G}{I}{T}_{I_{j+1}},
+                   \prescript{I_j}{}{t}, \prescript{I_{j+1}}{}{t}$)}
+      }{
+          \Continue
+      }
+
+      \tcc{Step 2: Outlier Rejection}
+      \Let{$\prescript{G_i}{}{\mathcal{P}}$}
+          {$\tau(\prescript{D_i}{}{\mathcal{P}}, 
+                 \prescript{G}{I}{T}_{D_i} \prescript{I}{D}{T})$}\\
+      \If{! \textit{Filter}($\prescript{G_i}{}{\mathcal{P}}, \sigma_z$)}{
+          \Continue
+      }
+
+      \tcc{Step 3: Check Coverage}
+      \Let{$\prescript{C_i}{}{\mathcal{P}}$}
+          {$\mathit{\tau}(\prescript{G_i}{}{\mathcal{P}}, \prescript{G}{C}{T})$} \\
+      \If{! \textit{PointInPolygon}($\mathit{\pi}(\prescript{C_i}{}{\mathcal{P}}), (u,v)$)
+           }
+         {\Continue}
+
+  } 
+
+  \Return{$\prescript{C_i}{}{\mathcal{P}}$}
+\end{algorithm}
+% \vspace{-2ex}
+%
+First, we will interpolate the IMU pose at DVL timestamp based on IMU clone poses.
+For this step, We adopt the linear interpolation~\cite{Resource-Constrained-VIO_Li_2014} as described in Eq.~\ref{eq:imu_pose_interpolation},
+where $\exp(\cdot)$ and $\log(\cdot)$ are the \textit{SO}(3) matrix exponential and logarithmic functions~\cite{Lie-Groups_Chirikjian_2011},  $\prescript{D}{}{t}$ is the DVL timestamp, $\prescript{I_a}{}{t}$ and 
+$\prescript{I_b}{}{t}$ are the beginning and end of the IMU clone interval timestamps.
+\begin{subequations}
+\label{eq:imu_pose_interpolation}
+\begin{align}
+	\lambda 
+	  &= (\prescript{D}{}{t} - \prescript{I_a}{}{t}) / (\prescript{I_b}{}{t} - \prescript{I_a}{}{t}) 
+	     \label{eq:interp_lambda} \\
+	\prescript{I}{G}{\mathbf{R}}
+		&= \exp(\lambda \log(\prescript{I_b}{G}{\mathbf{R}} 
+												 \prescript{I_a}{G}{\mathbf{R}}^\top)) 
+			 \prescript{I_a}{G}{\mathbf{R}}
+			 \label{eq:interp_R} \\
+	\prescript{I}{G}{\mathbf{p}}
+	  &=  (1-\lambda) \prescript{G}{}{\mathbf{p}_{I_a}} +
+	  		\lambda \prescript{G}{}{\mathbf{p}_{I_b}}
+	  		\label{eq:interp_p} 
+\end{align}
+\end{subequations}
+%
+
+Second, we remove the outliers in the selected DVL point clouds.
+The DVL point cloud $\prescript{D_i}{}{\mathcal{P}}$ will be transformed to the global frame based on the known transform between IMU and DVL. 
+Since the vehicle will be operated close to the ice (1-2 meters), the 4 points obtained in a single DVL measurement will be close to each other, therefore, the terrain will not change significantly.
+However, during field trials, we may encounter ice-openings (either manually drilled or naturally formed), which causes outliers in the DVL point cloud.
+Therefore, we remove the selected DVL point cloud with depth outside the standard deviation, $\sigma_z$.
+%
+
+Third, we will check each selected DVL point cloud (4 points from each beam) if it bounds the feature. 
+The DVL point cloud will be projected to the normalized plane of the anchor frame. 
+If the feature is located inside the area bounded by 4 DVL points in the normalized plane, we will then use the DVL point cloud for feature enhancement.
+
+\subsection{Feature Enhancement}
+
+%%% depth interpolation
+In~\cite{TerrainAidedNav-Glider_Claus-2015}, bilinear interpolation is applied to obtain the specific terrain depth from a digital elevation model (DEM).
+However, bilinear interpolation requires data located inside a rectilinear grid, which is not our case since the projected DVL point cloud could be an arbitrary quadrilateral. 
+To transform an arbitrary quadrilateral into a unit square, we adopt a bilinear mapping function~\cite{FEM_Hughes_2000}:
+\begin{subequations}
+\label{eq:bilinear_mapping}
+\begin{align}
+  u(\xi,\eta) 
+    &= \alpha_0 + \alpha_1\xi + \alpha_2\eta + \alpha_3\xi\eta
+       \label{eq:mapping_x} \\ 
+  v(\xi,\eta) 
+    &= \beta_0 + \beta_1\xi + \beta_2\eta + \beta_3\xi\eta
+       \label{eq:mapping_y}        
+\end{align}
+\end{subequations} 
+\vspace{-5ex}
+\begin{figure}[ht!]
+    \centering
+    \includegraphics[width=0.9\linewidth]{images/bilinear_interpolation.png}
+    \caption{The mapping process from an arbitrary quadrilateral to unit square}
+    \label{fig:bilinear_interpolation}
+\end{figure}
+
+%\vspace{-1ex}
+
+\begin{figure}[h] \centering
+    \includegraphics[width=0.45\textwidth]{images/orig_enhance.png}
+    \\
+    \includegraphics[width=0.45\textwidth]{images/orig_matched.png}
+    \\
+    \caption{Top: Comparison between triangulation and enhanced feature position,
+         Bottom: Comparison between matched and not matched features. Matched DVL point cloud (only placed on edges) is gray, normal triangulated features are red, and enhanced 
+         features are green.} 
+    \label{fig:depth_enhance}
+\end{figure}
+\vspace{-3ex}
+
+The coefficients $\boldsymbol{\alpha}, \boldsymbol{\beta}$ can be solved after substituting the normalized cloud point coordinates $\{\mathbf{u}_D,\mathbf{v}_D\}$ and square vertex coordinates $\{\boldsymbol{\xi}, \boldsymbol{\eta}\}$ shown in Figure~\ref{fig:bilinear_interpolation}. 
+After that, the normalized feature coordinate can be mapped into the unit square and the bilinear interpolation can be applied to estimate the feature depth. 
+
+%%% position recovery
+%
+Feature position recovery has two steps, normal triangulation and position enhancement.
+First, for each feature, Direct linear transformation (DLT)~\cite{MVG-CV_Hartley_2004} triangulation is applied if more than two observations in the keyframes. 
+After that, inverse-depth parameterization~\cite{MSCKF_Mourikis_2007} based nonlinear optimization is used for refining the feature position. 
+Next, the feature position obtained from the two previous steps is corrected by multiplying the scaling ratio ($z_a/z_b$) where $z_b$ is the feature depth computed from the two previous steps and $z_a$ is the feature depth interpolated from the DVL point cloud.
+This change will then be incorporated into the visual measurement update discussed in Section III.E.
+
+As shown in Figure~\ref{fig:depth_enhance},  the first and second figures visualize the normal triangulation result (red) and enhanced feature position (green). 
+The feature depth is well recovered since they almost align with the DVL point clouds (gray). The third and fourth figures visualize the enhanced (green) and un-enhanced (red) features. 
+Most of the enhanced features are located inside DVL point clouds.
+Because of the keyframe strategy, there is no sufficient measurement update for each image frame. We intend to keep both enhanced and not enhanced features for measurement update.

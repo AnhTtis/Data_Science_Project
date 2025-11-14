@@ -1,0 +1,253 @@
+\section{Evaluation}
+
+We ran all our experiments on publicly-available cloudlab
+infrastructure~\cite{cloudlab}.
+%
+We utilize a Dell Poweredge R6525 server equipped with two AMD EPYC 7543
+32-core processor and 256 GiB RAM.
+%
+The host machine runs a 64-bit Ubuntu 20.04 Linux with v5.19 kernel and
+qemu v6.1.50, whereas the confidential guest VM runs a 64-bit Ubuntu 22.04
+Linux with a v5.17 kernel with open virtual machine firmware (OVMF) version
+\lstinline{edk2-stable202208}, all of which are modified to enable
+\snp{}~\cite{github:amdese}.
+%
+We have also evaluated our software stack on a Lenovo ThinkServer equipped
+with an AMD EPYC 7763 64-core processor and 128 GiB RAM.
+
+\paragraph{Performance overhead} To understand the overheads of commonly
+used TPM functionalities, we study the performance of several TPM commands on
+\svtpm{} and compare that with a vanilla virtual machine that utilizes a
+\vtpm{} hosted by Qemu.
+%
+We rely on Qemu/KVM to launch both the regular and \cvm{}.
+%
+Qemu-\vtpm{} setup uses the native TPM CRB interface as its frontend with
+an \lstinline{swtpm} backend where the backed communicates with the \vtpm{}
+running on the host userspace via a UNIX socket interface.
+%
+The \svtpm{} setup uses a modified TPM CRB interface as its frontend and an
+\svsm{} backend (i.e., calling into \vmpl{0} to utilize the TPM hosted by
+\svsm{}) running under \vmpl{0} inside the \cvm{} environment.
+
+Specifically, we compare the performance of four different TPM commands
+which are essential for remote attestation, i.e., \lstinline{PCRREAD},
+\lstinline{PCREXTEND}, \lstinline{TPM2_QUOTE}, \lstinline{CREATEPRIMARY}.
+%
+Also, we do not compare with a physical TPM as it would be unfair since the
+physical TPMs are an order of magnitude slower than virtual
+TPMs~\cite{fTPM}.
+%
+These TPM commands briefly do the following:
+%
+\begin{itemize}[labelindent=\parindent, leftmargin=*, nosep]
+\item{\textbf{PCR read}} This command reads the platform configuration
+registers of the TPM.
+%
+A TPM may maintain multiple banks of PCR, where each bank is a collection
+of PCRs extended with a specific hashing algorithm~(e.g., sha1, sha256).
+%
+In our benchmark, we read all the PCR values from all the banks~(i.e.,
+sha1, sha256, sha384).
+
+\item{\textbf{PCR extend}} performs an extend operation on a specific PCR from
+a bank, i.e., it computes the hash of the old PCR value concatenated with
+the input data, i.e., 
+%\begin{center}
+$PCR_{new} = hash(PCR_{old} || input\_data)$.
+%\end{center}
+%\vspace*{-\baselineskip}
+We extend a single PCR register from a sha256 bank.
+
+\item {\textbf{Quote}} A TPM quote contains a subset of PCRs from a bank and a
+nonce (to prevent replay attacks) signed by the attestation key~(AIK) of
+the TPM.
+%
+We request a quote of three PCRs~(16-18) from two different banks~(sha1 and
+sha256).
+
+\item{\textbf{Create primary}} The TPM command creates a primary object under
+the chosen hierarchy~(Endorsement, Platform, Owner or NULL) and loads it
+into the TPM.
+%
+The TPM returns only a context with which one can interact with this object
+and the public and private portions of the key are not returned.
+%
+We create an ECC keypair with the default curve~(ecc256).
+\end{itemize}
+
+We perform all the experiments by booting the \cvm{} with the corresponding
+setup~(Qemu or \svsm{}), and invoke the TPM commands from the guest user
+space using the \lstinline{tpm2-tools} package~\cite{gh:tpm2-tools}.
+%
+For each TPM command, we ran the benchmark for 3000 iterations.
+%
+We ran these experiments three times to measure the average
+latency~(~\autoref{fig:tpm_overhead}).
+%
+\svtpm{} incurs 5x lower latency than \qvtpm{} on \lstinline{PCRREAD}s and
+to get a \lstinline{TPM2_QUOTE}.
+%
+We incur 1.8x and 3.5x lower latency on \lstinline{PCREXTEND} and
+\lstinline{CREATEPRIMARY} TPM operations respectively.
+%
+Both qemu-hosted \vtpm{} and \svtpm{} incur an exit into the hypervisor to
+communicate with the TPM.
+%
+However, our \svtpm{} suffers from much less overhead compared to the
+qemu-hosted \vtpm{} as the latter involves communicating with the TPM
+emulator backend (i.e., \lstinline{swtpm}) through the socket interface.
+%
+On the other hand, the physical TPMs are at least X times slower compared
+to the emulated ones as the physical ones are often connected to the mainboard
+via a low-bandwidth bus such as serial peripheral interface (SPI).
+
+\begin{figure}[t] \centering
+  \includegraphics[width=1.0\columnwidth]{plots/tpm_overhead.pdf}
+  \vspace{-8mm}
+  \caption{Performance overhead of \svtpm{} vs Qemu-\vtpm{}}
+  \label{fig:tpm_overhead}
+\end{figure}
+
+\section{Security Analysis}
+
+The gist of our security argument is that we are tying an ephemeral
+\vtpm{} to the AMD-SP hardware's root of trust to perform runtime
+attestation.
+%
+In this section we examine a number of potential security attacks and
+explain how our design prevents them. Our hypothetical attacker's goal
+would be to infiltrate and alter a guest \cvm{} without being detected
+by the remote attestation system (Keylime).
+
+\paragraph{Fake \vtpm{}}
+The guest \cvm{} boots with the \svsm{} firmware containing our \svtpm{} as
+part of the VM launch process.
+%
+The essence of this attack is that after the system is booted and the
+keylime \emph{agent} is registered, an attacker could spawn a new
+software \vtpm{} in the guest userspace to hijack all the \vtpm{}
+commands and redirect to the newly spawned \vtpm{}.
+%
+The new fake software \vtpm{} is no longer running at a higher
+privilege level and can be controlled by the attacker to forge TPM
+quotes in an attempt to authenticate fake boot and IMA logs, and
+therefore hide unauthorized software alterations from keylime.
+
+However, once the registration protocol is complete, the keylime
+registrar has associated the $EK$ of our ephemeral \vtpm{} with the
+$AIK$ that would be used for signing the TPM quote.
+%originating from the verifier.
+%
+With the above redirection of TPM commands to a fake vTPM an attacker
+would not be able to forge the TPM quote, as the fake vTPM has no
+access to the private $AIK$ of the original vTPM, safely hidden by
+\vmpl{0} in \svsm{}.
+
+The attacker could possibly force the registration protocol to restart
+where an attacker could feed the TPM credentials from the newly
+created \vtpm{}.
+%
+Again, keylime would detect this because of the mismatch of the fake TPM's
+$EK_{pub}$ with its digest in the attestation report. A fake attestation
+report cannot be generated because the report contains the \vmpl{} of
+the entity that requested it, and the guest is not running at
+\vmpl{0}.
+
+\paragraph{Fake \snp{} attestation report}
+We save the attestation report requested by \svtpm{} at the same NVIndex as
+the $EK_{cert}$ to make it available to the keylime agent.
+%
+The essence of this attack is that the attacker could overwrite this NVIndex with
+either garbage data or another attestation report after compromising the guest.
+%
+Garbage data would be detected by the keylime \emph{registrar},
+resulting in attestation failure.
+%
+When overwritten with a genuine attestation report, an attacker can
+potentially change the identity of the \vtpm{}, i.e., create another
+\vtpm{}~(similar to Fake \vtpm{} attack) with a new set of keys and record
+the new $EK_{pub}$ as part of the user-data field of the attestation
+report.
+%
+If successful, they can perform all the attacks mentioned under the "Fake
+\vtpm{}" attack~(i.e., spoof PCRs, forge quotes, etc).
+
+Even though one could retrieve an attestation report from a different VM
+privilege level, the platform guarantees that no one could spoof the
+\vmpl{} level in the attestation report as it could be generated only by
+the software running inside \vmpl{0}~(i.e., the keys for
+encrypting the request message is available only at the corresponding
+level).
+%
+Thus, the replaced attestation report, if valid, would contain a \vmpl{}
+level greater than 0.
+%
+To prevent this attack, we check the \vmpl{} level while validating the
+attestation report to ensure the requester \vmpl{} level is set to zero.
+
+An attacker can overwrite the attestation report NVIndex with a genuine
+attestation report off another \cvm{} or from a previous boot of this
+\cvm{}.
+%
+Though the attestation report is signed by the AMD hardware, the user-data
+will not match with the digest of $EK_{pub}$ we have inside the \svtpm{},
+making the attack detectable.
+
+\paragraph{Confidential VMs with no SVSM}
+Though \vmpl{} levels are supported in the \snp{} specification, it cannot
+be enforced by the end-user on a provider-controlled environment.
+%
+A malicious cloud provider could host a regular \sev{} VM and pretend
+that it is running with an \snp{} firmware.
+%
+In this scenario, the \cvm{} would run without the \svsm{} firmware,
+where the entire guest operating system will run under \vmpl{0}.
+%
+This makes it possible for a guest VM to generate its own attestation
+report where the requester \vmpl{} level is set to 0.
+%
+To prevent this attack, we need to verify that our \cvm{} is booted with
+the \svsm{} firmware running at \vmpl{0}.
+%
+The user can compute the measurement of their boot-time binaries that
+includes the \svsm{} firmware running at \vmpl{0} and validate it against
+the measurements reported in the attestation report provided by the cloud
+provider.
+%
+If the measurements do not match, the confidential VM is likely booted
+without the \svsm{} firmware.
+
+\paragraph{Weaknesses in random number generator}
+A weak HWRNG not only poses threat for the \vtpm{} implementation, but also
+for the software running inside the confidential VM.
+%
+Failing to seed the random number generator of a confidential VM correctly
+can result in cryptographic key leakage\cite{kelsey1998cryptanalytic},
+particularly in well documented random input signature algorithms like
+ECDSA\cite{johnson2001elliptic}.
+%
+Furthermore, all \vtpm{}s require a secure random number generator to
+operate correctly because of their reliance on it for the generation of
+ephemeral keys and nonces for secure functions.
+%
+The problem is particularly acute for an ephemeral \vtpm{} because the TPM
+manufacturing stage requires the generation of unguessable seeds which can
+only be achieved if they are based on an entropy source which cannot be
+influenced in any way by the host.
+
+However, AMD hardware has suffered from a buggy HWRNG in the past where
+\lstinline{RDRAND} instruction was always giving out a constant value
+instead of a random number~\cite{amd-hwrand-bug}.
+%
+An attacker could exploit a weak or buggy HWRNG implementation to guess the
+initial seeds of the \vtpm{} and create the same secret keys as the
+\vtpm{}.
+%
+For example, by guessing the attestation key, one could forge TPM quotes
+and break the guarantees of remote attestation.
+%
+To be resilient to such hardware bugs, we can seed the random number
+generator with additional sources of entropy such as the hash of a key
+derived by the AMD-SP upon user's request along with the \lstinline{RDSEED}
+instruction.

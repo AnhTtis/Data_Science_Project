@@ -1,0 +1,95 @@
+\section{Method}
+
+\label{sec:method}
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=\textwidth]{figures/pipeline.pdf}
+    \caption{Overview of TOHO. We formulate the generation of object manipulation motions as a motion-infilling problem that consists of four steps. 1) With the shape parameters of the human and the task type, we estimate the object's final position using our object parameters sampler. 2) The goal net then generates human poses grasping the object at its initial and final positions. 3) Our motion inbetweening model subsequently generates continuous motions to infill the missing frames between the keyframe human poses. 4) Finally, our object motion estimation algorithm outputs a stable and consistent object motion based on the human motion in real-time.}
+    \label{fig:pipeline}
+\end{figure*}
+
+\noindent\textbf{Preliminaries. 1) 3D human representation.} We use the SMPL-X model \cite{pav2019smplx}, which models the human body with hand and face details. SMPL-X takes human shape, $\beta$, pose, $\theta$, and body global translation, $t$, as inputs and generates a mesh with 10,475 vertices. In this work, we predict the 6D continuous pose rotation vector \cite{zhou2019continuity} $\theta \in \mathbb{R}^{55\times 6}$ and the global translation $t \in \mathbb{R}^{3}$. The shape parameter $\beta \in \mathbb{R}^{10}$ is constant for a fixed body shape. \textbf{2) Object shape representation.} We use the Basis Point Set (BPS) \cite{prokudin2019bps} distances to represent the object shapes. Following \cite{GRAB:2020}, we randomly sample 1024 vertices from $[-0.15, 0.15]^3$ as the basis point set to calculate distances.
+
+%------------------------------------------------------------------------
+\subsection{Overview}
+The overview of our method is shown in Fig. \ref{fig:pipeline}. Our goal is to synthesize continuous human-object motions conducting specific tasks with unseen objects. Given three inputs, namely: 1) a task type, 2) an object shape with its starting translation and orientation, and 3) a human pose with its shape at its initial position, our method generates a continuous motion sequence allowing the virtual human to grasp the object and conduct the task with it. The framework generates motions in four steps. We introduce each of the steps in the following sections.
+
+%------------------------------------------------------------------------
+\subsection{Object Parameters Sampler} 
+Previous works \cite{taheri2021goal, wu2022saga} propose to use a pose prediction network to estimate the human pose at the grasping point based on the object's shape and position. However, the object's final position is not conveniently given in object manipulation. Also, with different types of tasks, the object could be taken to very diverse positions. \cite{ghosh2023imos} synthesizes object manipulation motions by predicting frames autoregressively. However, it assumes a grasp is already established and only synthesizes 15-frame motions into the future with known objects. To synthesize long-term human-object motion sequences with high fidelity, we first generate keyframes of a complete manipulation task and infill the in-between frames, which makes the whole sequence bounded by the keyframes and would not deviate. To this end, we formulate the task of generating complete human-object manipulation motions as a motion inbetweening problem. To generate the keyframes, we first propose a task-conditioned object position estimator.
+Our object parameters sampler is a cVAE, and in the  training stage it takes
+\begin{equation}
+X_s=[a_{\rm one}, \beta, t_o^{\rm init}, r_o^{\rm init}, t_o^{\rm off}, t_o^{\rm off} ]
+\end{equation}
+as inputs, where $a_{\rm one}$ is the $a$-th column of an identity matrix, i.e., a one-hot vector, $a \in \mathbb{R}$ is the task label, $\beta \in \mathbb{R}^{10}$ is the human shape, $ t_o^{\rm init} \in \mathbb{R}^3$ and $r_o^{\rm init} \in \mathbb{R}^6$ are the initial translation and orientation of the object, and $t_o^{\rm off} \in \mathbb{R}^3$ and $r_o^{\rm off} \in \mathbb{R}^6$ are the translation and orientation offsets of the object’s ending position from its initial position. The object position estimator encodes the input to a latent space with a dimensionality of 16 and is conditioned on $a_{\rm one}$, $\beta$, $ t_o^{\rm init}$, and $ r_o^{\rm init}$. In inference, the model uses a sampled latent code  $z_s \sim \mathcal{N}(\mu_s, \sigma_s^2)$, where $\mu_s \in \mathbb{R}^{16}$ and $\sigma_s \in \mathbb{R}^{16}$, and the conditioned parameters to decode the ending object translation offset $\hat{t}_o^{\rm off}$ and orientation offset $\hat{r}_o^{\rm off}$. 
+The loss to training the sampler is defined as 
+\begin{equation}
+\mathcal{L}_s=\lambda_t||\hat{t}_o^f-t_o^f||_2 + \lambda_r||\hat{r}_o^f-r_o^f||_2  + \lambda_{KL}\mathcal{L}_{KL} \label{1},
+\end{equation}
+where $\mathcal{L}_{KL}$ is the Kullback-Leibler divergence loss. We set the loss coefficients empirically to balance the different terms.
+
+
+%------------------------------------------------------------------------
+\subsection{Goal Net} 
+Given the object's position at the initial and final positions, we design a goal net that utilizes the object information to synthesize keyframe grasping poses. Our goal net is a cVAE conditioned on the object following \cite{taheri2021goal, wu2022saga }. During training, the goal net inputs the whole-body grasp with the objects’ shape and translation and reconstructs the poses and hand-object distances given the objects’ shape and location. The input to the encoder is:
+\begin{equation}
+X=[\theta, t, \beta, v, d_{b\to o}, h, t_o, b_o, a] \label{goal_net_input},
+\end{equation}
+where $\theta$, $t$, and $\beta$ are the human’s pose, global translation, and shape parameters, respectively, $v \in \mathbb{R}^{400\times 3}$ is the 3D coordinates of 400 sampled vertices on the human’s body surface, $h \in \mathbb{R}^3$ denotes the head orientation, $t_o \in \mathbb{R}$ is the object translation, $b_o \in \mathbb{R}^{1024}$ is the BPS representation of the object shape, $a \in \mathbb{R}$ is the task label, and $d_{b\to o} \in \mathbb{R}^{400\times 3}$ is the offset vectors from the sampled body vertices to the closest object vertices. 
+The decoder predicts the SMPL-X parameters $\hat{\theta}$, $\hat{t}$, the head orientation $\hat{h}$, and a right-hand offset vector $\hat{d}_{r\to o} \in \mathbb{R}^{99\times 3}$ which is a subset of the 400 body vertices to object offsets, given a sampled latent code and conditioned on $\beta$, $b_o$, $t_o$, and $a$. We use the same loss in \cite{taheri2021goal} for training and follow its post-optimization scheme to refine the generated poses.
+
+%------------------------------------------------------------------------
+\subsection{Motion Inbetweening} 
+Existing works of feed-forward motion inbetweening can only generate discrete motion clips. However, the framerate requirements could be diverse for real-world applications in AR/VR and gaming. Previous works need to either re-train the model or apply complex linear interpolations to synthesize a motion sequence of a different length \cite{wu2022saga}, or have to run a per-sequence optimization which prohibits real-time deployment \cite{he2022nemf}. To this end, we propose a motion inbetweening method that generates continuous motions that are parameterized only by the temporal coordinates to infill two given frames. The continuity of the model allows the generated motions to be upsampled to arbitrary frames and sampled non-uniformly to give motions of diverse speeds, all by inputting different temporal coordinates to the same inference model.
+
+Given two frames, our motion inbetweening module aims to predict the human poses and root translations in frames between them. Following \cite{wu2022saga}, we find that first computing an interpolated root trajectory of the first and last frames and then predicting the translation offsets of each frame results in smoother results compared to directly predicting the translations themselves. To infill two frames, we view a motion clip as a motion image with the human pose parameters at frame $i$, $\theta_i \in \mathbb{R}^{55 \times 6}$, $i\in [1,...T]$, flattened and concatenated with its corresponding root translation $t_i \in \mathbb{R}^3$ as a column vector. For training, we define $T=64$, while in inference, $T$ can be any integer value. Thus, one motion clip is represented as a $333 \times 64$ motion image.
+We design our motion inbetweening model as ${\rm F}(\tau;\phi _{\rm INR})=(\theta, t^{\rm off})$, where $\tau \in [0, 1]$ is the temporal coordinate, $\theta$ and $t^{\rm off}$ are the pose and the translation offset from the interpolated trajectory at time $\tau$, respectively. For training, we have each $\tau_i=i/64$ correspond to the $i$-th column of the motion image. The motion inbetweening net is a hypernetwork-based model: firstly, it takes poses of the two endpoint frames, $\theta_1$ and $\theta_T$, and their translation distance, $d_{1\to T}= t_T - t_1$, as input. Then, it generates the weights $\phi_{\rm INR}$ for an INR block ${\rm F}_{\phi_{\rm INR}}$. The INR takes the temporal coordinate vector $\tau_{1:T}$, $\tau_i \in [0, 1]$ as input and generates the complete motion image:
+\begin{equation}
+M=[\hat{\theta}_{1:T}, \hat{t}^{\rm off}_{1:T}], \label{3}
+\end{equation}
+where $\hat{\theta}_{1:T}$ and $\hat{t^{\rm off}}_{1:T}$ are reconstructed SMPL-X pose and translation offset sequences. We apply Factorized Multiplicative Modulation (FMM) \cite{inr_gan} to parameterize the weights of our INR to reduce the number of model parameters.
+
+With the inferenced SMPL-X parameters, we then calculate 99 surface marker locations $\hat{v}^M_{1:T}\in \mathbb{R}^{99\times 3}$ and eight foot-ground contact labels $\hat{C}_{fg} \in \{0, 1\}^8$. This aids the model in utilizing information from the 3D space and assists in circumventing the skating problem. The loss to train the motion inbetweening model is defined as:
+\begin{multline}
+\mathcal{L}_M =\lambda_{\theta}\mathcal{L}_{\theta} + \lambda_{t}\mathcal{L}_{t}
+ + \lambda_{v}\mathcal{L}_{v} + \lambda_{C}\mathcal{L}_{C},    \label{4}
+\end{multline}
+where $\mathcal{L}_{\theta}=\sum_{n=1}^T ||\theta_n - \hat{\theta}_n||_2$, $\mathcal{L}_{t}=\sum_{n=1}^T ||t_n - \hat{t}_n||_1$, $\mathcal{L}_{v}=\sum_{n=1}^T ||v^M _n - \hat{v}^M_n||_1$, $\lambda_{C}\mathcal{L}_{C}=\mathcal{L}_{bce}(C_{fg}, \hat{C}_{fg})$. The hat denotes the reconstructed values.
+% \begin{multline}
+% \mathcal{L}_M =\lambda_{\theta}\sum_{n=1}^T ||\theta_n - \hat{\theta}_n||_2 + \lambda_{t}\sum_{n=1}^T ||t_n - \hat{t}_n||_1 \\
+%  + \lambda_{v}\sum_{n=1}^T ||v^M _n - \hat{v}^M_n||_1 + \lambda_{C}\mathcal{L}_{bce}(C_{fg}, \hat{C}_{fg}),    \label{4}
+% \end{multline}where the hat denotes the predicted results, and the hon-hat denotes the ground truth.
+
+
+In inference, we replace the first and last frames of the sequence with the input two frames. Unlike \cite{wu2022saga}, which requires extensive post-optimization to get smooth motion sequences, we only add a lightweight post-processing step: to get a smoother result at the connection points, we interpolate the first and last five frames with the input frames. The motion inbetweening net is implemented with MLPs with skip connections. More details are given in the supplementary material.
+
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=\linewidth]{figures/results_pipeline.pdf}
+    \caption{We present generated results of TOHO. Each row represents a human with a distinct shape conducting a task with a novel object unseen during training.}
+    \label{fig:full_pipeline}
+\end{figure*}
+\label{sec:experiments}
+%------------------------------------------------------------------------
+\subsection{Object Motion Estimation} 
+Synthesizing human-object interactions without object motions is incomplete. Our method generates whole human-object interaction motions with objects moving consistently with humans. Instead of using a parametric model which is computationally expensive and slow, we propose a compact closed-form object motion estimation algorithm that is stable and yields realistic and natural object motion sequences based on human motions in real-time.
+
+As most hand manipulation tasks only involve the right hand (for right-handed people), we focus on the right-hand-object interactions. When the human achieves a stable grasp, the algorithm computes an object motion based on the grasp to finish the task. 
+We denote the frame of this stable grasp, i.e., the ‘touching’ pose generated by our pose predictor, as frame 1. Denote the locations of the five markers at five right-hand fingertips as $v^{f_i},i\in\{1, 2, 3, 4, 5\}$ and the marker at the right palm as $v^{f_0}$, $v^{f_i} \in \mathbb{R}^3$. 
+At each timestamp $n\in \{2,...,T\}$, we compute the offset vectors of the fingertip markers from the palm as $o_n^{f_i}= v_n^{f_i}- v_n^{f_0}, i\in \{1, 2, 3, 4, 5\}$, and find the rotation $R_n$ that optimally aligns the set of vectors $o_n^{f_{1:5}}$ to $o_1^{f_{1:5}}$ with the Kabsch algorithm, i.e., find $R_n$ s.t.,
+\begin{equation}
+R_n=\underset{R}{\mathrm{argmin}} \frac{1}{2} \sum^5_{i=1}||o_1^{f_i}-R o_n^{f_i}||_2 \label{rotation}
+\end{equation}
+Thus, the object orientation at time $n$ is given by:
+\begin{equation}
+rot_n= R_n^T rot_1, \label{5}
+\end{equation}
+where $rot_i$ is the rotation matrix of the object orientation at frame $n$. The 6D orientation $r_n$ can be computed from $rot_n$. Then the object translation at frame $n$ is given by:
+\begin{equation}
+t_n^o=\frac{1}{6}\sum_{i=0}^5 v_n^{f_i}+R^T_n(t_1^o-\frac{1}{6}\sum_{i=0}^5 v_1^{f_i}) \label{6}
+\end{equation}
+The object motion parameters $(r_{1:T}, t_{1:T}^o)$ are then used to construct the object motion consistent with the right hand.
+
+

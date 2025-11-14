@@ -1,0 +1,151 @@
+
+\section{Learning Rewards via Behavioral Cloning Inverse Reinforcement Learning (\genmethod)}
+\label{sec:main_method} 
+
+We now present our algorithm for learning reward functions via behavioral cloning inverse reinforcement learning.
+We start by contrasting the maximum entropy and imitation loss objectives for inverse reinforcement learning in \Cref{sec:method:irl-objectives}. 
+We then introduce a general formulation for \genmethod in \Cref{sec:method:meta-irl}, and present an algorithmic instantiation that optimizes a BC objective to update the \emph{reward} parameters via gradient-based bi-level optimization with a model-free RL algorithm in the inner loop in \Cref{sec:method:ppo_mirl}. 
+
+\subsection{Outer Objectives: Max-Ent vs Behavior Cloning }\label{sec:method:irl-objectives}
+In this work, we study an alternative IRL objective from the maximum entropy objective. 
+While this maximum entropy IRL objective has led to impressive results, it is unclear how well this objective is suited for learning reward functions that generalize to new task settings, such as new start and goal distributions.
+Intuitively, assigning a high reward to demonstrated states (without task-specific hand-designed feature engineering) makes sense when you want to learn a reward function that can recover exactly the expert behavior, but it leads to reward landscapes that do not necessarily capture the essence of the task (e.g. to reach a goal, see \Cref{fig:teaser:me}). 
+
+Instead of specifying an IRL objective that is directly a function of reward parameters (like maximum entropy), we aim to measure the reward function's performance through the policy that results from optimizing the reward.  
+With such an objective, we can  optimize reward parameters for what we care about: for the resulting policy to match the behavior of the expert.
+The behavioral cloning (BC) loss measures how well the policy and expert actions match, defined for continuous actions as $\mathbb{E}_{(s_t, a_t) \sim \extraj} \left( \pi_\theta(s_t) - a_t \right)^2 $ where $\extraj$ is an expert demonstration trajectory. 
+Policy parameters $\theta$ are a result of using the current reward parameters $\psi$, which we can make explicit by making $\theta$ a function of $\psi$ in the objective: $\bcirl = \mathbb{E}_{(s_t, a_t) \sim \extraj}  (\pi_{\theta(\psi)}(s_t)  - a_t)^2 $. 
+The IRL objective is now formulated in terms of the policy rollout ``matching" the expert demonstration through the BC loss. 
+
+We use the chain-rule to decompose the gradient of $\bcirl$ with respect to reward parameters $\psi$. We also expand how the policy parameters $\theta(\psi)$ are updated via a REINFORCE update with learning rate $ \alpha$ to optimize the current reward $R_\psi$ (but any differentiable policy update applies).
+\begin{align}
+  \label{eq:bi_level_opt} 
+   \frac{\partial}{\partial \psi} \bcirl
+   &= \frac{\partial}{\partial \psi} \left[ 
+     \E_{(s_t, a_t) \sim \extraj}
+     \left[\left( \pi_{\theta(\psi)}(s_t) - a_{t} \right)^{2} \right]
+   \right] 
+   = \E_{(s_t, a_t) \sim \extraj} \left[ 2 \left( \pi_{\theta(\psi)}(s_t) - a_{t} \right)\right] \frac{\partial}{\partial \psi}   \pi_{\theta(\psi)} \nonumber \\
+   &\text{where   } \theta(\psi) = \theta_{\text{old}} + \alpha \E_{(s_t, a_t) \sim \pi_{\theta_{\text{old}}}} \left[ 
+     \left( \sum_{k=t+1}^{T} \gamma^{k-t-1} R_\psi(s_k) \right) \nabla \ln \pi_{\theta_{\text{old}}} (a_t | s_t)
+   \right] 
+\end{align} 
+Computing the gradient for the reward update in \Cref{eq:bi_level_opt} includes samples from $ \pi$ collected in the reinforcement learning (RL) inner loop.
+This means the reward is trained on diverse states beyond the expert demonstrations through data collected via exploration in RL.
+As the agent explores during training, \genmethod must provide a meaningful reward signal throughout the state-space to guide the policy to better match the expert.
+Note that this is a fundamentally different reward update rule as compared to current state-of-the-art methods that maximize a maximum entropy objective.
+We show in our experiments that this results in twice as high success rates compared to state-of-the-art MaxEnt IRL baselines in challenging generalization settings, demonstrating that \genmethod learns more generalizable rewards that provide meaningful rewards beyond the expert demonstrations.
+
+
+The BC loss updates only the reward, as opposed to updating the policy as typical BC for imitation learning does \cite{bain1995framework}.
+\genmethod is a IRL method that produces a reward, unlike regular BC that learns only a policy.
+Since \genmethod uses RL, not BC, to update the policy, it avoids the pitfalls of BC for policy optimization such as compounding errors.
+Our experiments show that policies trained with rewards from \genmethod generalize over twice as well to new settings as those trained with BC.
+In the following section, we show how to optimize this objective via bi-level optimization.
+
+\vspace{-5pt}
+\subsection{BC-IRL}\label{sec:method:meta-irl} 
+\vspace{-5pt}
+
+We formulate the IRL problem as a gradient-based bi-level optimization problem, where the outer objective is optimized by differentiating through the optimization of the inner objective. 
+We first describe how the policy is updated with a fixed reward, then how the reward is updated for the policy to better match the expert.
+
+\begin{wrapfigure}{R}{0.55\textwidth}
+\vspace{-20pt}
+\begin{minipage}{0.55\textwidth}
+  \begin{algorithm}[H]
+  \begin{algorithmic}[1]
+  \footnotesize{
+    \STATE{Initial reward $R_\psi$, policy $\pi_\theta$}
+    \STATE{Policy updater $\popt(R, \pi)$}
+    \STATE{Expert demonstrations $ \exdata$}
+    \FOR{each epoch}
+      \STATE{Policy Update:}
+      \STATE{$ \theta' \gets \popt(R_\psi, \pi_\theta) $}
+      \STATE{Sample demo batch $\extraj \sim \exdata$}
+      \STATE{Compute IRL loss}
+      \STATE{$ \bcirl = \mathbb{E}_{(s_t, a_t) \sim \extraj} \left( \pi_{\theta'}(s_t) - a_t \right)^2 $}
+      \STATE{Compute gradient of IRL loss wrt reward}
+      \STATE{$\nabla_\psi \bcirl = \frac{\partial \bcirl}{\partial \theta'} \frac{\partial \popt(R_\psi, \pi_\theta)}{\partial \psi}$}
+      \STATE{$\psi \gets \psi - \nabla_{\psi} \bcirl$}
+    \ENDFOR
+  }
+  \end{algorithmic}
+  \caption{\genmethod (general framework)}
+  \label{algo:method:mirl}
+  \end{algorithm}
+\end{minipage}
+  \vspace{-10pt}
+\end{wrapfigure}
+
+\textbf{Inner loop (policy optimization):} The inner loop optimizes policy parameters $\theta$ given current reward function $R_\psi$. 
+The inner loop takes $K$ gradient steps to optimize the policy given the current reward.
+Since the reward update will differentiate through this policy update, we require the policy update to be differentiable with respect to the reward function parameters.
+Thus, any reinforcement learning algorithm which is differentiable with respect to the reward function parameters can be plugged in here, which is the case for many policy gradient and model-based methods. 
+However, this does not include value-based methods such as DDPG \cite{lillicrap2015continuous} or SAC \cite{haarnoja2018soft} that directly optimize value estimates since the reward function is not directly used in the policy update. 
+
+\textbf{Outer loop (reward optimization)}: The outer loop optimization updates the reward parameters $\psi$ via gradient descent. 
+More concretely: after the inner loop, we compute the gradient of the outer loop objective $\nabla_\psi \higherobj$ wrt to reward parameters $\psi$ by propagating through the inner loop. 
+Intuitively, the new policy is a function of reward parameters since the old policy was updated to better maximize the reward.
+The gradient update on $\psi$ tries to adjust reward function parameters such that the policy trained with this reward produces trajectories that match the demonstrations more closely. 
+We use \citet{higher} for this higher-order optimization. 
+
+\genmethod is summarized in \Cref{algo:method:mirl}.
+Line 5 describes the inner loop update, where we update the policy $\pi_\theta$ to  maximize the current reward $R_\psi$. 
+Lines 6-7 compute the BC loss between the updated policy $\pi_{\theta'}$ and expert actions sampled from expert dataset $\exdata$.
+The BC loss is then used in the outer loop to perform a gradient step on reward parameters in lines 8-9, where the gradient computation requires differentiating through the policy update in line 5.
+
+
+\vspace{-15pt}
+\subsection{\ppomethod}
+\vspace{-5pt}
+\label{sec:method:ppo_mirl}
+
+We now instantiate a specific version of the \genmethod framework that uses proximal policy optimization (PPO) \cite{schulman2017proximal} to optimize the policy in the inner loop. 
+This specific version, called \ppomethod, is summarized in \Cref{algo:method:ppo_mirl}.
+
+\begin{wrapfigure}{R}{0.55\textwidth}
+\vspace{-20pt}
+\begin{minipage}{0.53\textwidth}
+  \begin{algorithm}[H]
+  \begin{algorithmic}[1]
+  \footnotesize{
+    \STATE{Initial reward $R_\psi$, policy $\pi_\theta$, value function $V_\nu$}
+    \STATE{Expert demonstrations $ \exdata$}
+    \FOR{each epoch}
+      \FOR{$k=1 \to K$} 
+        \STATE{Run policy $\pi_{\theta}$ in environment for $T$ timesteps}
+        \STATE{Compute rewards $\hat{r}_t^{\psi}$ for rollout with current $R_\psi$}
+        \STATE{Compute advantages $\hat{A}^{\psi}$ using $\hat{r}^{\psi}$ and $V_\nu$}
+        \STATE{Compute $ \mathcal{L}_{\text{PPO}}$ using $\hat{A}^{\psi}$}
+        \STATE{Update $\pi_\theta$ with $\nabla_\theta \mathcal{L}_{\text{PPO}}$}
+      \ENDFOR
+      \STATE{Sample demo batch $\extraj \sim \exdata$}
+      \STATE{Compute $ \bcirl = \mathbb{E}_{(s_t, a_t) \sim \extraj} \left( \pi_\theta(s_t) - a_t \right)^2 $}
+      \STATE{Update reward $R_\psi$ with $ \nabla_{\psi} \bcirl$}
+    \ENDFOR
+  }
+  \end{algorithmic}
+  \caption{\ppomethod}
+  \label{algo:method:ppo_mirl}
+  \end{algorithm}
+  \end{minipage}
+\vspace{-10pt}
+\end{wrapfigure}
+
+
+
+\ppomethod learns a state-only parameterized reward function $R_{\psi}(s)$, which assigns a state $s \in \mathcal{S}$ a scalar reward. 
+The state-only reward has been shown to lead to rewards that generalize better \cite{fu2017learning}. 
+\ppomethod begins by collecting a batch of rollouts in the environment from the current policy (line 5 of \Cref{algo:method:ppo_mirl}). 
+For each state $s$ in this batch we evaluate the learned reward function $R_\psi(s)$ (line 6). 
+From this sequence of rewards, we compute the advantage estimates $\hat{A}_t$ for each state (line 7).  
+As is typical in PPO, we also utilize a learned value function $V_\nu(s_t)$ to predict the value of the starting and ending state for partial episodes in the rollouts. 
+This learned value function $V_\nu$ is trained to predict the sum of future discounted rewards for the current reward function $R_\psi$ and policy $\pi_\theta$ (part of $ \mathcal{L}_{\text{PPO}}$ in line 8). 
+Using the advantages, we then compute the PPO update (line 9 of \Cref{algo:method:ppo_mirl}) using the standard PPO loss in equation 8 of \citet{schulman2017proximal}.
+Note the advantages are a function of the reward function parameters used to compute the rewards, so PPO is differentiable with respect to the reward function. 
+Next, in the outer loop update, we update the reward parameters, by sampling a batch of demonstration transitions (line 11), computing the behavior cloning IRL objective $\mathcal{L}_\text{BC-IRL}$ (line 12), and updating the reward parameters $\psi$ via gradient descent on $\mathcal{L}_\text{BC-IRL}$ (line 13).
+Finally, in this work, we perform one policy optimization step ($K=1$)  per reward function update. 
+Furthermore, rather than re-train a policy from scratch for every reward function iteration, we initialize each inner loop from the previous $\pi_{\theta}$. 
+This initialization is important in more complex domains where $K$ would otherwise have to be large to acquire a good policy from scratch. 
+

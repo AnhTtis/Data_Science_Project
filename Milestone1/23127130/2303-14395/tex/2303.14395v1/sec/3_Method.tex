@@ -1,0 +1,134 @@
+\section{Methodology}\label{sec:method}
+We outline the proposed MDQE from the perspective of query-based mask prediction in \cref{sec:overview}, then introduce the two major parts of MDQE: object query initialization in \cref{sec:query-init} and the inter-instance mask repulsion loss in \cref{sec:inter-inst}. Finally, we present the training loss and near-online inference process in \cref{sec:entire_arch}.
+
+\subsection{Framework Overview}\label{sec:overview}
+An input video is partitioned into a few video clips, each with $T$ frames.
+As illustrated in the left of \cref{fig:overview}, during training, a video clip first passes through the backbone and encoder to obtain its multi-scale features $F$, where the one at the largest scale is represented as $F^0$.
+% , where $d, H^0 $ and $ W^0$ indicate the channels, height and width of the feature, respectively. 
+The feature $F^0$ is then used as the input to our proposed query initialization module in \cref{sec:query-init} to produce temporally-aligned frame-level queries $\{q_t\}_{t=1}^T$ (denoted by circles), which will be fed into the decoder to obtain discriminative clip-level queries $q$ (denoted by squares). 
+On the other hand, the multi-scale features $F$ are input into the Mask Net to generate mask features $D$, which are then combined with the clip-level queries $q$ to produce clip-level instance masks $\hat{M}$ using linear combination \cite{bolya2019yolact, tian2020conditional}. Finally, the predicted masks $\hat{M}$ are supervised by our proposed inter-instance mask repulsion loss in \cref{sec:inter-inst} to distance each instance from its nearby non-target instances, implementing contrastive learning of instance masks.
+
+\subsection{Frame-level Query Initialization}\label{sec:query-init} 
+In this subsection, we initialize frame-level queries with instance-specific information and improve the decoder architecture to mine discriminative instance embeddings.
+
+\input{fig/dec_arch.tex}
+
+Existing query-based VIS methods typically adopt zero or random input as the initial positional embeddings and content features of object queries, following DETR \cite{carion2020end} and deformable DETR \cite{zhu2020deformable}. 
+However, a recent method \cite{pei2022osformer} called \textit{grid-guided query selection} was proposed to endow object queries with positional and contextual information of the input image, as shown in the top of \cref{fig:overview}(b). This method inputs the features $F^0$ into a semantic segmentation head ($\phi_s$ with three linear layers) to predict the class-aware activation map: $S=\phi_s(F^0) \in R^{c\times T\times H^0\times W^0}$, where $c$ is the number of categories and $H^0, W^0$ are the height and width of features. The activation map is evenly divided into several patches through a grid, and the peak point with the highest response (the white dots) in each patch is selected. The coordinates $p \in R^2$ and features $F^0_p \in R^d$ of the peak point are then assigned as the initial positions and content features of the query, where $d$ is the dimension of features.
+
+However, the grid-guided query selection may not be able to cover an object with the same grid across multiple frames because object motion or camera jitters will cause position shifts over time. To improve temporal consistency, we extend the grid-guided query selection by incorporating the \textit{inter-frame query association}, as illustrated in the bottom of \cref{fig:overview}(b). 
+For a video clip, we first perform the above grid-guided query selection frame by frame to obtain the initial frame-level queries, and then input the content features of these queries into an embedding head ( $\phi_e$ with three linear layers) and output their embeddings: $e_p=\phi_e(F^0_p)\in R^{d_e}$, where $p$ represents the query position and $d_e$ is the dimension of embeddings. 
+To obtain temporally-aligned queries, we calculate the embedding similarity between each query in the central frame and neighboring queries within a large window in the non-central frame. The query in the non-central frame with the highest similarity is assigned as the matched query. Note that the size of the window increases if two frames are far apart. After applying the above inter-frame query association, frame-level queries within the same grid are roughly aligned across multiple frames.
+
+In training, we employ the commonly used focal loss \cite{lin2017focal} to supervise the class-aware activation map, denoted as $\mathcal{L}_\textbf{init-sem}$.
+Besides, we employ contrastive learning \cite{pang2021quasi,IDOL} to pull the query embeddings with the same instance ID over multiple frames closer, and push them away from each other otherwise. For an object query at position $p$, its contrastive loss of embeddings is defined as:
+\begin{align}
+    \mathcal{L}_\textbf{init-reid} &= -\log \frac{\exp(e_p \cdot e^{r+}_{p'})}{\exp(e_p \cdot e^{r+}_{p'}) + \sum_{r-}\exp(e_{p} \cdot e^{r-}_{p'})}, \nonumber
+\end{align}
+where $e_p$ represents its query embeddings, $e^{r+}_{p'} $ and $e^{r-}_{p'}$ denote the embeddings vectors of its neighbouring queries at position $p'$ with the same instance ID and with different instance IDs, respectively. 
+% $\Omega = [-w,w]$ denotes the neighbouring window and $w$ controls the window size.
+
+Since our query initialization can provide instance-specific spatial-temporal information for frame-level queries, we further adjust the decoder architecture to take full advantage of it. We compare the architectures of the first decoder layer of SeqFormer\cite{seqformer} and our MDQE in \cref{fig:dec_arch}. As shown in \cref{fig:dec_arch}(a), SeqFormer employs random input as clip-level queries, calculates cross-attention between clip-level queries and per-frame encoded features to specify frame-level queries in each frame, and finally updates clip-level queries as the weighted combination of frame-level queries. We refer to this architecture of coping embeddings from clip-level instance queries to frame-level object queries as `I2O'.
+
+Our MDQE utilizes a different decoder architecture, as shown in \cref{fig:dec_arch}(b). it first computes cross-attention and then self-attention, and integrates frame-level object queries into clip-level instance queries (`O2I' for short). 
+The clip-level queries $q \in R^{N\times d} $ are calculated similarly to SeqFormer \cite{seqformer}:
+$q  = \sum\nolimits_{t=1}^{T} w_t \cdot q_t, $
+where $q_t \in R^{N\times d}$ indicates frame-level queries, and $w_t = \text{FFN}(q_t) \in R^{N\times 1}$ is the time weight of each frame in the clip. 
+Additionally, we add an extra temporal cross-attention (TCA) layer to mine and integrate discriminative features of instances in a larger spatio-temporal receptive field. The attention module in TCA extracts deformable points from multi-frame single-scale feature maps \cite{zhu2020deformable}.
+Our proposed query initialization can early associate instances across frames, providing a good warm-up to the decoder with the `O2I' architecture. This helps to reduce confusing masks among crowded instances.
+
+
+\subsection{Inter-instance Mask Repulsion Loss }\label{sec:inter-inst}
+\input{fig/inter_mask}
+The clip-level instance masks $\hat{M} \in R ^{N\times T\times H\times W}$ can be produced by the linear combination of mask features $D\in R^{d \times T\times H\times W}$ and clip-level queries $q \in R^{N\times d}$:
+% \begin{align}\label{eq:mask}
+    $\hat{M} = q D,$
+% \end{align}
+% where mask features $D$ are generated by feeding the multi-scale features $F$ into a small mask net. 
+as shown in \cref{fig:overview}(a).
+During training, the predicted instance masks $\hat{M}$ are supervised by the ground-truth instance masks $M$ via the binary cross-entropy (BCE) loss and the Dice loss \cite{dice1945dice,milletari2016dice_vnet}.
+The typical instance mask prediction loss thus can be formulated as: 
+\begin{equation}
+    \mathcal{L}_{\textbf{mask}} = \mathcal{L}_\textbf{BCE}(\hat{M},\ M) + \mathcal{L}_\textbf{Dice}(\hat{M},\ M),
+    \label{eq:intra-inst}
+\end{equation}
+where $M \in R^{K\times T\times H\times W}$ is the ground-truth (GT) instance mask, and $K$ is the number of matched GT instances. The formula of Dice loss is as follows:
+\begin{equation}\label{eq:dice}
+    \mathcal{L}_\textbf{Dice}(\hat{M},\ M) = \frac{1}{K} \sum\nolimits_{i=1}^K 1-\frac{2|\hat{M_i} \odot M_i|}{|\hat{M_i}|+|M_i|}
+\end{equation}
+where $\odot$ denotes the point-wise matrix multiplication and $|\cdot|$ sums the values in the matrix.
+
+However, the mask prediction supervision gives priority to match the pixels of its target instance, and then mismatch the pixels of other instances and the background. This may make the query-based segmenter converge to a shortcut of object spatial locations, resulting in imprecise segmentation prediction and confusing masks on occluded instances.
+
+% 1. Dice loss 优先将正样本像素点的mask预测为1，然后再将负样本点的mask预测为0。极端情况下，当网络预测mask接近0或1时，对应点梯度值极小，dice loss 存在梯度饱和现象。此时预测失败(FN，FP)的情况很难扭转回来。尤其负样本梯度 = 2｜M*M_gt｜ / (|M|+|M_gt|)^2
+% 2. Inter-Dice loss 优先将正样本像素点的mask预测为1，且其邻近为正样本点的mask预测为0。 此过程实现了相似物体间的pixel-level contrastive learning。相比背景的负样本点，inter-instance的梯度 （M_o）下降更快
+In fact, the relative relationship between each instance and its surrounding instances can provide contrastive features to the query-based segmenter. Inspired by the success of contrastive learning \cite{wang2021densectt,chen2020simplectt,ke2021occlusion-aware}, we design an inter-instance mask repulsion loss to suppress the pixels belonging to the nearby non-target instances. 
+For the $i$-th instance, we define its nearby non-target instances via the intersection of union of bounding boxes (BIoU):
+\begin{equation}\label{eq:biou-inter}
+    o_i = \{ j\ | \max_{t\in [1, T]} \text{IoU}(B_{ti}, B_{tj})\! >\! \epsilon,\forall j\! \in\! [1, K], j \!\neq\! i\}, 
+\end{equation}
+where $\epsilon $ is a threshold to control the number of nearby non-target samples, which is set to 0.1 by default. Let the union of nearby GT instance masks be the complementary GT inter-instance mask, \ie, $M_{o_i} = \cup_{j\in o_i} M_j$,
+which contains all pixels of its nearby non-target instances, as illustrated in \cref{fig:inter_mask}. Since most annotations used in instance segmentation are not mutually exclusive, we further set $M_{o_i} = M_{o_i} \cap (1-M_i)$ to remove pixels contained in the GT mask and the GT inter-instance mask at the same time.
+
+Typically, the supervision for predicting instance masks includes the BCE and Dice losses in \cref{eq:intra-inst}. In order to train the segmenter to perceive the relative relationships between each instance and its surroundings, we enhance the original BCE and Dice losses by incorporating inter-instance repulsion supervision, named inter-instance BCE loss and inter-instance Dice loss, respectively.
+Specifically, we adopt a weighted BCE loss to assign a larger weight for the pixels belonging to the target instance and its nearby instances. The formula of the inter-instance BCE loss is:
+\begin{align}
+    \mathcal{L}_\textbf{BCE-inter}  = \frac{1}{|W_i|} \sum\nolimits_{p=1}^N  W_{ip}\ \text{BCE}(\hat{M}_{ip}, M_{ip}), 
+    % [M_{i,p}\log(\hat{M}_{i,p}) + (1-M_{i,p}) \log(1-\hat{M}_{i,p})] \nonumber \\
+     % & + M_{i, p} \log(\hat{M}_{i,p}),
+    \label{eq:inter-inst}
+\end{align}
+where $p$ and $N$ indicate the pixel position index and the total number of points in the mask, respectively. The corresponding inter-instance weight $W_{ip}$ is set to $\alpha$ (2 by default), if $M_{ip} = 1$ or $M_{{o_i}p} = 1$, otherwise 1.
+
+On the other hand, we introduce an inter-instance mask repulsion loss, which involves $M_{o_i}$ into the Dice loss to explicitly suppress the pixels of nearby non-target instances. The formula of inter-instance Dice loss is:
+% \begin{align}
+    % \mathcal{L}_\textbf{Dice-inter}
+     % = 1 - \frac{2|\hat{M}_i \odot M_i|}{|\hat{M}_i|\ +\ |M_i|} \ + \frac{|(1-\hat{M}_i) \odot M_{o_i}|}{
+     % |M_{o_i}|}. \label{eq:dice-inter} \nonumber
+% \end{align}
+\begin{align}
+    \mathcal{L}_\textbf{Dice-inter}
+     = 1 - \frac{2|\hat{M}_i \odot M_i| \ + \ |(1-\hat{M}_i) \odot M_{o_i}|}{|\hat{M}_i|\ +\ |M_i| \ + \ |M_{o_i}|}. \label{eq:dice-inter}
+\end{align}
+% \mathcal{L}_\textbf{Dice-inter} requires to consider the balanced numbers between M and M_o, 防止被吸走！ matching stability 
+If an instance is isolated to other instances, \ie, $|M_{o_i}|=0$, the inter-instance Dice loss degrades to the original Dice loss in \cref{eq:dice}. In terms of gradient back-propagation, the pixels that belong to the target instance and its nearby instances will have a larger gradient value compared to other pixels in the image. 
+% Please refer to the \textbf{supplementary materials} for detailed derivation process and analysis.
+
+Finally, our inter-instance mask repulsion loss is
+\begin{align}
+    % (\hat{M}_i, M_i, M_{o_i})
+    \mathcal{L}_{\textbf{inter-mask}} = \frac{1}{K} \sum\nolimits_{i=1}^K &\quad \mathcal{L}_\textbf{BCE-inter}(\hat{M}_i, M_i, M_{o_i}) \nonumber \\
+    & + \mathcal{L}_\textbf{Dice-inter}(\hat{M}_i, M_i, M_{o_i}).
+\end{align}
+The above loss considers both the matching of pixels belonging to the target instance and the mismatching of pixels belonging to the nearby non-target instances, therefore providing instance discriminative information to the segmenter for producing more accurate instance masks.
+% During the label assignment process, we introduce the proposed inter-instance mask repulsion loss into the cost matrix as well. 
+
+%For instance, compared to those isolated instances, the instances that are occluded by other instances in a crowded scene may have a higher weight, because the number of $n_{O_i}$ is larger. 
+% This results in that the mask of occluded instance only has a few pixels (\ie $|M_i|$ is small), while the mask of occluder instance remains more pixels (\ie $|M_j|$ is large).  the instance with ID $i$ is heavily occluded by the instance with ID $j$. Supposing that two instances with IDs $i$ and $j$ are occluded each other, Then the GT inter-instance mask of instance with ID $i$ is the instance mask with ID $j$: $M_{o_i}=M_j$. 
+% This can ultimately lead to better instance segmentation results in crowded scenes with occluded objects.
+% Consequentially, the inter-instance mask repulsion loss helps to improve the accuracy of instance segmentation on challenging videos by considering the occlusion relationship between instances and incorporating information about nearby non-target instances.
+
+\subsection{Training and Inference Details} \label{sec:entire_arch}
+We employ Deformable DETR \cite{zhu2020deformable} as the transformer framework, and SeqFormer \cite{seqformer} as the clip-level VIS baseline. The training losses of our proposed MDQE is:
+\begin{equation}
+\begin{aligned}
+    \mathcal{L}_{total}\ = \ & \lambda_1\ \mathcal{L}_{\textbf{cls}} + \lambda_2\ \mathcal{L}_{\textbf{box}} + \lambda_3\ \mathcal{L}_{\textbf{inter-mask}} \\
+    & + \lambda_4\ \mathcal{L}_{\textbf{init-sem}} + \lambda_5\ \mathcal{L}_{\textbf{init-reid}}, \nonumber
+\end{aligned}
+\vspace{-1mm}
+\end{equation}
+where we adopt the focal loss for classification, and the smooth $L_1$ loss and the generalized IoU loss \cite{giou} for bounding box regression. During training, we empirically set $\lambda_1 = 2$, $\lambda_2 = 2$, $\lambda_3 = 4$, $\lambda_4=2$, and $\lambda_5=0.5$.
+
+\input{fig/inference.tex}
+
+During inference, MDQE processes the testing video clip by clip in a near-online fashion. 
+Multiple frames (more than $T$ frames) are loaded into the backbone and encoder to obtain encoded features, which are then extracted clip by clip to the decoder to output clip-level queries. Overlapping frames between clips are only used in the decoder, making MDQE fast. 
+In each clip, instances with classification confidence below a threshold are removed, and their masks and embeddings are added to the memory pool to remember objects from previous clips. 
+For a new clip, denoted as the $l$-th video clip for clarity, MDQE generates instance masks $\hat{M}$ and clip-level embeddings $q$ with high classification confidence, and extracts memory-based instance masks $\hat{M}^m$ and embeddings $q^{m}$ from the previous $T_\text{mem}$ clips. 
+The Hungarian matching algorithm is applied on the score matrix $S$ to associate instances across clips: 
+\begin{equation}\label{eq:tracking}
+    S = \beta_1\ \text{mIoU}(\hat{M}^m, \hat{M}) + \beta_2\ \text{sim}(q^{m},\ q),
+\end{equation}
+where `mIoU' and 'sim' measure the mask IoU of instance masks and embedding similarity of instance queries between the memory pool and the current clip, respectively. $\beta_1$ and $\beta_2$ balance the proportions of the two losses, which are set to 1 by default. This process is illustrated in \cref{fig:inference}.
+
+

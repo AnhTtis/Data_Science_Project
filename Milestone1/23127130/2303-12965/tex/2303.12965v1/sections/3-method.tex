@@ -1,0 +1,124 @@
+\section{Method}
+
+We formulate the problem as inverse rendering and extend~\cite{munkbergExtractingTriangular3D2022} to model dynamic actors that are driven solely by skeletons.
+The canonical shapes, materials, lights, and actor motions are learned jointly in an end-to-end manner.
+The rendering happens with an efficient rasterization-based differentiable renderer~\cite{laineModularPrimitivesHighPerformance2020}. 
+
+
+\textbf{Optimization Task}: Let $\Phi$ denote all the trainable parameters (\textit{i.e.,} SDF values and corresponding vertices offset parameters for canonical geometry, spatial-varying and pose-dependent materials and light probe parameters for shading, and forward skinning weights and non-rigid vertices offset parameters for motion).
+For a given camera pose $\mathbf{c}$ and a tracked skeleton pose $\mathbf{P}$, 
+we render the image $I_{\Phi}(\mathbf{c}, \mathbf{P})$ with a differentiable renderer, and compute loss with a loss function $L$, against the reference image $I_\mathit{ref}(\mathbf{c}, \mathbf{P})$.
+The optimization goal is to minimize the empirical risk:
+\begin{equation}
+    \underset{\phi}{\mathrm{argmin}}\ \mathbb{E}_{\mathbf{c}, \mathbf{P}} \big[L\big( I_{\Phi}(\mathbf{c}, \mathbf{P}), I_\mathit{ref}(\mathbf{c}, \mathbf{P}) \big)\big].
+\end{equation}
+
+\noindent The parameters $\Phi$ are optimized with Adam~\cite{kingmaAdamMethodStochastic2017} optimizer.
+Following~\cite{munkbergExtractingTriangular3D2022}, our loss function $L = L_\mathrm{img} + L_\mathrm{mask} + L_\mathrm{reg}$ consists of three parts: an image loss $L_\mathit{img}$ using $\ell_1$ norm on tone mapped color, and mask loss $L_\mathrm{mask}$ using squared $\ell_2$, and regularization losses $L_\mathrm{reg}$ to improve the quality of canonical geometry, materials, lights, and motion.
+At each optimization step, our method holistically learns both shape and materials from the whole image, while the volume rendering-based implicit counterparts only learn from limited pixels. Powered by an efficient rasterization-based renderer, our method enjoys both faster convergence and real-time rendering speed.
+For optimization losses and implementation details, please refer to our supplementary.
+
+\subsection{Canonical Geometry}
+\label{method:geometry}
+
+Rasterization-based differentiable renderers take triangular meshes as input, which means the whole optimization process happens over the mesh representation.
+Previous works~\cite{alldieckVideoBasedReconstruction2018,alldieckDetailedHumanAvatars2018} require a mesh template to assist optimization as either a good initialization or a shape regularization.
+The templates have fixed topology under limited resolutions which harm the geometry quality.
+Besides, to make the learned geometry generalize to novel poses, the underlying geometry representations should lie in a canonical space.
+
+We utilize the differentiable marching tetrahedra~\cite{shenDeepMarchingTetrahedra2021,gaoLearningDeformableTetrahedral2020} algorithm, which converts SDF fields into triangular meshes to model the actors in canonical space.
+This method enjoys the merit of both template and topology-free from implicit SDF representations and outputs triangle meshes that are directly applicable to rasterization-based renderers.
+
+Let $\mathbf{V}_\mathrm{tet}$, $\mathbf{F}_\mathrm{tet}$, $\mathbf{T}_\mathrm{tet}$ and be the pre-defined vertices, faces, and UV coordinates of the tetrahedra grid.
+We parameterize both per-tet vertice SDF value $\mathbf{S}$ and vertices offsets $\Delta \mathbf{V}_\mathrm{tet}$ with a coordiante-based nerual net:
+\begin{equation}
+    F_{\Phi_\mathit{geom}}: (\mathbf{V}_\mathrm{tet}) \to (\mathbf{S}, \Delta \mathbf{V}_\mathrm{tet}),
+\end{equation}
+
+\noindent The canonical mesh $\mathbf{M}_\mathrm{c} = (\mathbf{V}_\mathrm{c} ,\mathbf{F}_\mathrm{c} ,\mathbf{T}_\mathrm{c})$ (\textit{i.e,} canonical mesh vertices, faces, and UV map coordinates) is derived by marching tetrahedra operator $\Pi$:
+\begin{equation}
+    \Pi: (\mathbf{V}_\mathrm{tet}, \mathbf{F}_\mathrm{tet}, \mathbf{T}_\mathrm{tet}, \mathbf{S}, \Delta \mathbf{V}_\mathrm{tet}) \to \\
+    (\mathbf{V}_\mathrm{c} ,\mathbf{F}_\mathrm{c} ,\mathbf{T}_\mathrm{c} ).
+\end{equation}
+
+\noindent Specifically, the vertices of the canonical mesh are computed by $\mathbf{v}_c^{ij} = \frac{\mathbf{v}_\mathit{tet}^{\prime i} s_j - \mathbf{v}_\mathit{tet}^{\prime j} s_i}{s_j - s_i}$,
+where $\mathbf{v}_\mathit{tet}^{\prime i} = \mathbf{v}^i + \Delta \mathbf{v}^i$ and $\mathrm{sign}(s_i) \neq \mathrm{sign}(s_j)$.
+In other words, only the edges that cross the surface of canonical mesh participate the marching tetrahedra operator, which makes the mesh extraction both computation and memory-efficient.
+
+After training, we can discard the SDF and deformation neural nets $F_{\Phi_\mathit{geom}}$ and store the derived meshes. That leads to zero computation overhead in inference time.
+
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=1\linewidth]{figs/performance.v5.png}
+\vspace{-1em}
+\caption{\textbf{Qualitative results of novel view synthesis on the H36M and ZJU-MoCap datasets}. \cite{pengNeuralBodyImplicit2021, pengAnimatableNeuralRadiance2021} generates blurry textures compared with our method. The mesh representations and forward skinning modeling help to improve generalization. Left: Hn36M dataset. Right: ZJU-MoCap dataset. Up: Training pose. Down: Novel pose. \textbf{Zoom in for a better view}.}
+\vspace{-1em}
+\label{fig:h36m}
+\end{figure*}
+
+
+\subsection{Shading Model}
+\label{method:shading}
+
+\textbf{Materials}: we use a physically-based material model~\cite{mcauleyPracticalPhysicallybasedShading2012}, which is directly applicable to our differentiable renderer.
+It consists of a diffuse term with an isotopic GGX lobe representing specularity.
+Concretely, it consists of three parts: 1) diffuse lobe $\mathbf{k}_d$ has four components, \textit{i.e.} RGB color channels and an additional alpha channel; 
+2) specular lobe comprises a roughness value $r$ for GGX normal distribution function 
+and a metalness factor $m$ which interpolates the sense of reality from plastic to pure metallic appearance.
+The specular highlight color is given by $\mathbf{k}_s = (1-m) \cdot 0.04 + m \cdot \mathbf{k}_d$.
+We store the specular lobe into texture $\mathbf{k}_\mathrm{orm} = (o, r, m)$ following the convention, where the channel $o$ is unused.
+To compensate for the global illumination, we alternatively store the ambient occlusion value into $o$.
+3) normal maps $\mathbf{n}$ represents the fine-grained geometry details.
+The diffues color $\mathbf{k}_d$, texture $\mathbf{k}_\mathrm{orm}$, and normal maps $\mathbf{n}$ are parametrized by an neural net:
+\begin{equation}
+    F_{\Phi_\mathrm{mat}}: (\mathbf{v}_c, \mathbf{P}) \to (\mathbf{k}_d, \mathbf{k}_\mathrm{orm}, \mathbf{n}).
+\end{equation}
+
+We query the vertices after rasterization and barycentric interpolation.
+The PBR material is further conditioned on poses to model the pose-dependent shading effect.
+ 
+\textbf{Lights}: Our method learns a fixed environment light directly from the reference images. The lights are represented as a cube light.
+Given direction $\omega_o$, We follow the render equation~\cite{kajiyaRENDERINGEQUATION1986} to compute the outgoing radiance $L\left(\omega_o\right) $:
+\begin{equation}
+L\left(\omega_o\right)=\int_{\Omega} L_i\left(\omega_i\right) f\left(\omega_i, \omega_o\right)\left(\omega_i \cdot \mathbf{n}\right) d \omega_i,
+\end{equation}
+
+\noindent The outgoing radiance is the integral of the incident radiance $L_i\left(\omega_i\right)$ and the BRDF $f\left(\omega_i, \omega_o\right)$. We do not use spherical Gaussians~\cite{chenLearningPredict3D2019} or spherical harmonics~\cite{bossNeRDNeuralReflectance2021a,zhangPhySGInverseRendering2021} to approximate the image-based lighting.
+Instead, we follow~\cite{munkbergExtractingTriangular3D2022} using the split sum approximation that capable of modeling all-frequency image-based lighting:
+\begin{equation}
+\begin{split}
+L\left(\omega_o\right) & \approx \int_{\Omega} f\left(\omega_i, \omega_o\right)\left(\omega_i \cdot \mathbf{n}\right) d \omega_i \\
+&\quad \int_{\Omega} L_i\left(\omega_i\right) D\left(\omega_i, \omega_o\right)\left(\omega_i \cdot \mathbf{n}\right) d \omega_i.
+\end{split}
+\end{equation}
+
+The materials and lights are optimized jointly with geometry and motion modules in an end-to-end manner.
+The decomposed design of geometry and shading, along with compatibility with the triangle renderer enables editing and content creation instantly after training. For details about light modeling, please refer to the supplementary.
+ 
+\subsection{Motion Model}
+\label{method:motion}
+
+Since we derived mesh-based actors in canonical space with materials and lights, it is intuitive and natural to choose forward linear skinning as our motion model.
+Given a skeleton with $B$ bones, the skeleton poses $\mathbf{P} = \{\mathbf{T}_1, \mathbf{T}_2, \ldots, \mathbf{T}_B\}$, where each $\mathbf{T}_i$ represents the transformation on bone $i$, and the blend skinning weights $\mathbf{W} = \{w_1, w_2, \ldots, w_B  \}$, we deform each mesh vertice $\mathbf{v}_c$ in canonical space to the posed vertice $\mathbf{v}_w$ in world space by:
+\begin{equation}
+    \mathbf{v}_w = \mathrm{LBS}(\mathbf{v}_c, \mathbf{P}, \mathbf{W}) = (\sum\limits_{i=1}^{B} w_i \mathbf{T}_i ) \mathbf{v}_c,
+\end{equation}
+
+To compensate for non-rigid cloth dynamics, we further add a layer of pose-dependent non-rigid offsets $\Delta \mathbf{v}_c$ for canonical meshes:
+\begin{equation}
+    \mathbf{v}_w = \mathrm{LBS}(\mathbf{v}_c  + \Delta \mathbf{v}_c, \mathbf{P}, \mathbf{W}),
+\end{equation}
+
+\noindent Where the blend skinning weights and the pose-dependent non-rigid offsets are, respectively, parameterized by neural nets whose inputs are canonical mesh vertices:
+\begin{equation}
+    F_{\Phi_\mathrm{LBS}}: (\mathbf{v}_c) \to \mathbf{W},
+\end{equation}
+\begin{equation}
+    \quad\; F_{\Phi_\mathrm{nr}}: (\mathbf{v}_c, \mathbf{P}) \to \Delta \mathbf{v}_c.
+\end{equation}
+
+
+Modeling forward skinning is efficient for training as it only forward once in each optimization step, while the volume-based methods~\cite{liTAVATemplatefreeAnimatable2022,wangARAHAnimatableVolume,chenSNARFDifferentiableForward2021} solve the root-finding problem for canonical points in every iteration.
+After training, we can export the skinning weight from neural nets which removes the extra computation burden for inference.
+

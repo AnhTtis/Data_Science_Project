@@ -1,0 +1,184 @@
+\section{\name's API} \label{sec:api}
+\name offers a \emph{layer-centric} programming API that simplifies the development of GNN sampling and training code and kernels by hiding cross-GPU coordination.
+Besides simplicity, this approach supports the reuse of optimized single-GPU kernels for GNN sampling and training, including the ones proposed by recent research~\citep{adaptgear, fastkernel, wu2021seastar, nextdoor, gsampler, fu2022tlpgnn, ye2023sparsetir}. 
+% 
+% The API introduces two new operators, \textit{split} and \textit{shuffle}, that give each GPU the abstraction of operating only on its local frontiers.
+% These two functions reduce the cost of communication by building a shuffle index data structure and reusing it for every shuffle of the same iteration.
+% We now describe how to implement split-parallel sampling and training with \name's API and how to use the split and shuffle operators. 
+
+\mypar{Motivation for a layer-centric API}
+% Its \emph{scatter} function produces messages for each edge separately based on the features of the source and destination vertices.
+% The \emph{gather} function aggregates these messages incrementally using a commutative and associative function, and the \emph{transform} function computes the partial activations that are accumulated using a \emph{sync} function and then given to the \emph{apply} function to compute the hidden features of the destination vertex.
+Single-GPU kernels used by data-parallel systems are layer-centric: they assume that at each GNN layer, the source vertex, destination vertex, and edge features for all incoming edges incident to the same destination vertex are locally available.
+\name's API supports this property even after it splits destination vertices of the same mini-batch among different GPUs.
+The alternative hybrid mini-batch parallelism approach, which is $P^3$, breaks this assumption to offer an \emph{edge-centric} API to enable pushing part of the computation of each micro-batch to multiple hosts and GPUs in a fine-grained manner.
+For example, implementing state-of-the-art attention-based models such as Graph Attention Networks (GAT) requires a custom implementation to ensure correctness~\citep{gandhi2021p3}.
+% \name's split/shuffle API uses a layer-centric approach and ensures that all incoming edges for the same destination vertex in a layer are available locally at each GPU before starting the layer computation.
+% This supports existing single-GPU kernels and modern attention-based GNN models such as GAT.
+
+\mypar{Sampling} \label{sec:sampling}
+% In split-parallel sampling, all GPUs sample the same mini-batch.
+% Each GPU is responsible for sampling a split of the mini-batch and two splits do not have overlapping vertices.
+Algorithm~\ref{algo:sp-sample} shows the pseudocode of sampling using \name's API. 
+The \texttt{sp\_sample} function executed by each GPU takes as input the subset of target vertices in the mini-batch that are local to the GPU  according to the splitting algorithm (\texttt{local\_targets}) and produces as output a \emph{split}, which consists of the set of \texttt{edges} at each layer that are used by the local training kernels to aggregate features.
+%In the example of Figure~\ref{fig:overview}, for GPU 1, the sampler starts with the local target vertices $\{a, b\}$ and outputs the split consisting of the edges colored in blue.
+The function also outputs a \textit{shuffle index} (\texttt{shuffle\_idx}), which consists of gather and scatter indexes to efficiently send and receive sparse vertex data in the frontiers during the all-to-all shuffle rounds at each layer.
+%The index will be described more in detail in Section~\ref{sec:implementation}.
+% 
+% Split-parallel sampling works from top to bottom and layer by layer. 
+% It starts from target vertices at layer $L$ and samples the neighbors of these vertices as layer $L-1$. 
+% At each layer, $l$, sampling starts from a local frontier of vertices in the GPU's local partition and produces a mixed frontier, which could include remote vertices.
+% In order to continue sampling vertices for Layer $l-1$, GPUs must shuffle data to send locally-sampled \emph{remote} vertices and receive remotely-sampled \emph{local} vertices.
+% 
+In the pseudocode, we abstract away the single-GPU kernels that sample one layer by using the \texttt{sample\_layer} function, which takes the local frontier from the previous layer as input (Line~\ref{ln:sample}).
+The function outputs a new mixed frontier (\texttt{mixed\_front}) and the edges from the input local frontier to the output mixed frontier (\texttt{edges[l]}).
+The mixed frontier includes both local and remote vertices.
+The sampling code must invoke the \texttt{split} function to perform a shuffle and obtain a local frontier (Line~\ref{ln:split}).
+The function also produces the shuffle index for the layer (\texttt{shuffle\_idx}).
+
+% In Figure~\ref{fig:overview}, at layer 1, GPU 1 runs \texttt{sample\_layer} on the local frontier $\{a,b\}$ to sample the mixed frontier $\{e,h,f\}$, which includes the remote vertex $h$. 
+% GPU 1 then calls the \texttt{split} function to obtain the local frontier for layer 1, which is $\{e,f,g\}$.
+
+% Sampling algorithms can be categorized into individual and collective ones~\citep{nextdoor}.
+% The previous discussion considers the case of individual sampling algorithms, which sample the neighbors of a vertex based only on the adjacency list of that vertex. 
+% To run collective sampling algorithms such as LADIES~\citep{ladies}, GPUs must broadcast all the vertices they sampled locally so that each GPU gets the entire global frontier.
+%Each GPU can then sample a fixed number of neighbors by accessing the adjacency lists stored on the host memory in pinned memory.
+% \ms{check} \juelin{Ladies is too lightweight to use GPU, original paper only uses CPU for sampling. So it doesn't make too much sense here to compare it.}
+
+%\mypar{Comparison with data-parallel sampling}
+The pseudocode of Algorithm~\ref{algo:sp-sample} is almost exactly the same as the one that would be used in data parallelism.
+%In data parallelism, each GPU samples micro-batches independent from each other using single-GPU code.
+The most common sampling implementations in DGL~\citep{dgl}, research prototypes, and single-GPU sampling APIs~\citep{nextdoor,c-saw,wang2021skywalker,gsampler}, operate layer-by-layer.
+Their behavior can be encapsulated by the same \texttt{sample\_layer} function used in Algorithm~\ref{algo:sp-sample}.
+The main difference in data-parallel training is that the function now directly returns the \texttt{local\_front} for the next layer at Line~\ref{ln:sample}.
+There is no notion of mixed frontier and no need to invoke the \texttt{split} function in Line~\ref{ln:split}.
+\input{algorithms/sp-sample}
+\input{algorithms/sp-forward}
+
+\begin{comment}
+ ==== LADIES discussion
+
+The main goal of \name is to speed up loading, which only requires training to be \tadj as discussed in Section~\ref{sec:overview}.
+This gives the \name runtime some flexibility on how to run sampling code written with its API.
+Our current implementation based on \tadj sampling supports \emph{individual} sampling algorithms, such as the common neighborhood sampling~\citep{graphsage}, where the neighbors of each vertex in the frontier are sampled independently.
+The \name runtime can also run the sampling code of Algorithm~\ref{algo:sp-sample} in a centralized fashion, where each GPU samples a different mini-batch independently and produces splits and shuffle indexes for all GPUs.
+The split function does not perform a shuffle.
+A centralized implementation supports running \emph{collective} sampling algorithms such as LADIES~\citep{ladies}, which require accessing the entire frontier to sample the next layer.
+We leave this extension for future work.
+    
+\end{comment}
+
+
+
+\mypar{Training}
+\label{sec:training}
+We now explain how to implement cooperative split-parallel training.
+Algorithm~\ref{algo:sp-forward} shows the pseudocode for the forward propagation. 
+The backward propagation works similarly except that the computation happens from the top layer to the bottom layer. 
+
+The \texttt{sp\_forward} function takes as input the GNN model (\texttt{model}) the input features of the vertices in the local split (\texttt{feat}), the structure of the split (\texttt{edges}), and the shuffle index (\texttt{shuffle\_idx}).
+The latter two inputs are produced by the sampling code of Algorithm~\ref{algo:sp-sample}.
+It produces as output the hidden features of the target vertices.
+% The pseudocode iterates over all GNN layers.
+% The GNN layer $l$ at one GPU computes the hidden features for layer $l+1$ locally by using single-GPU code, which we abstract away with the \texttt{gnn\_layer} function.
+% Split-parallel training interleaves feature shuffling with the computation of a GNN layer. 
+At each layer $l$, each GPU starts by shuffling the features/activations of its local vertices to other GPUs using the \texttt{shuffle} function provided by \name
+(Line~\ref{ln:shuffle}). 
+% At layer $0$, these features are the input features of the local vertices (Line~\ref{ln:input}).
+The output of this function is the \texttt{mixed\_hidden} tensor, which contains all the features required to compute the hidden features at layer $l+1$.
+These could include the features of remote vertices.
+The GNN layer then computes the next-layer hidden features for the vertices in the local partition of the GPU (Line~\ref{ln:layer}).
+
+% We use the example in Figure~\ref{fig:overview} to illustrate the forward pass. 
+% To compute layer 1's features for the vertices in their partitions, GPUs 1 and 2 require layer 0's features as input. 
+% GPU 1 requires the input features of the local vertices $\{j, k, l\}$ and the remote vertex $\{m\}$. 
+% Similarly, GPU 2 requires the local vertices $\{m, p\}$ and the remote vertices $\{j, k\}$. 
+% The \texttt{shuffle} function exchanges the input features of the remote vertices, $\{m\}$ and $\{j, k\}$, between the two GPUs so that the GPUs can compute the hidden features of layer 1's vertices. 
+% These features are added to the local features to form the \texttt{mixed\_hidden} tensor.
+%%%After layer 1's computation finishes, GPU 1 and GPU 2 move to the next layer and again shuffle the features of remote vertices, $\{f, g\}$ and $\{h\}$ from layer 1, and then proceed to compute layer 2's features for the target vertices. 
+
+%\mypar{Comparison with data-parallel training}
+Data-parallel training code is similar to the pseudocode in Algorithm~\ref{algo:sp-forward}.
+%The implementation of the \texttt{model} is the same as the \tadj implementation.
+The main difference is that there is only a local frontier, so there is no need to use the \texttt{shuffle} function to get a mixed frontier and we can skip Line~\ref{ln:shuffle}.
+Each GNN layer directly takes as input the local frontier (\texttt{local\_hidden}) from the previous layer at Line~\ref{ln:layer} and produces the local frontier for the next layer.
+Optimized single-GPU training kernels can be directly used as \texttt{gnn\_layer} implementations since they operate on one layer at a time~\citep{adaptgear, fastkernel, wu2021seastar, fu2022tlpgnn, ye2023sparsetir}.
+
+
+\begin{comment}
+==== Implementation section 
+\begin{figure}[tp]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/index2.drawio.pdf}
+     \caption{Execution of the \texttt{split} function at GPU 1 for layer 1 in the example of Figure~\ref{fig:overview}. Vertices assigned to GPU 1 (resp. GPU 2) are colored in blue (resp. red).}
+    \label{fig:shuffle-index}
+\end{figure}
+
+\section{\name Implementation}
+\label{sec:implementation}
+\name is implemented based on the DGL and consists of approximately 5600 lines of C++ and CUDA code and 200 lines of Python code.
+% The \name API gives each GPU the abstraction of operating on a local split.
+% To make each split fit into a single GPU and reduce memory and computation costs in the presence of arbitrarily large graphs, \name uses a compact representation of the split subgraph that considers only local vertices and edges by remapping each vertex ID to a local vertex ID.
+% The \texttt{split} and \texttt{shuffle} functions must map between different local representations when serializing and deserializing messages.
+We now discuss how the split and shuffle functions construct the shuffle index and use it to perform the mapping.
+
+\mypar{Split function}
+Figure~\ref{fig:shuffle-index} illustrates the execution of the \texttt{split} function at GPU 1 for layer 1 in the example of Figure~\ref{fig:overview}.
+The function (Alg.~\ref{algo:sp-sample}, Line~\ref{ln:split}) takes a \ds as input and outputs the next layer of the split,
+% (\texttt{edges[l]} in Line 5 of Algorithm~\ref{algo:sp-sample}), 
+% the shuffle index, (\texttt{shuffle\_idx}), 
+which is depicted in Figure~\ref{fig:shuffle-index}, and the next local frontier,
+% (\texttt{local\_front[l]}), 
+which is not depicted.
+The shuffle index built by the \texttt{split} function contains four data structures: the mixed index, the mixed offsets, the layer index, and the layer offsets.
+
+To shuffle messages using the NCCL all-to-all primitive, a sender GPU must gather vertex IDs from a sparse tensor (the \ds) into a dense tensor (the message). 
+NCCL requires a message tensor as input, so all vertices in the \ds that belong to the same partition must be placed in contiguous memory locations.
+The mixed index is used as a gather index that indicates the corresponding position in the \ds for each position in the message array. 
+NCCL also requires the offsets of the boundaries of each message, which are contained in the mixed offsets array.
+
+After the all-to-all shuffle, each GPU receives messages containing only the vertices that are local to its partition. 
+The \texttt{split} function adds these vertices to the local layer using a scatter operation.
+This is done by creating the layer index as a scatter index, which is an array that maps each position in the message to the local ID assumed by the vertex stored at that position in the message.
+
+\mypar{Shuffle function}
+The \texttt{shuffle} function reuses the shuffle index to make the hidden representation and the gradients flow between different splits.
+The index can be reused because the shuffle at a layer always exchanges information about the same vertices across the sampling, forward pass, and backward pass phases.
+For example, consider the shuffle for layer 1 in Figure~\ref{fig:overview}.
+During the sampling phase, GPU 2 sends the IDs of vertices $\{f, g\}$ to GPU 1.
+During the forward pass for the same layer, GPU 1 sends the features of $\{f, g\}$ back to GPU 2.
+
+During the forward pass, data flows bottom-up from lower to higher layers.
+Consider the execution of layer 1 at GPU 1.
+GPU 1 must send the features of vertices $\{f, g\}$ to GPU 2.
+Vertex features flow bottom-up through the data structures depicted in Figure~\ref{fig:shuffle-index}.
+The \texttt{shuffle} function gets as input the hidden features of the vertices in layer 1 (\texttt{local\_hidden}), which were computed locally (Alg.~\ref{algo:sp-forward}, Line~\ref{ln:shuffle}).
+It then uses the layer index as a gather index, rather than a scatter index, to create output messages from these features.
+The forward pass sends hidden feature vectors instead of vertex IDs, so all offsets need to be multiplied accordingly.
+After the all-to-all operation, the \texttt{shuffle} function at the receivers uses the mixed index as a scatter index to scatter the feature vectors of the input message into the \texttt{mixed\_hidden} tensor.
+
+In the backward pass, information flows top-down like during sampling.
+The mixed index is again used as a gather index to build messages and the lower index is used as a scatter index to build arrays of gradients.
+If a GPU receives gradients for the same vertex in multiple messages, as in the case of vertex $f$ in Figure~\ref{fig:shuffle-index}, the scatter operation uses an atomic operation to aggregate the values of the gradients.
+
+\begin{figure}[tp]
+    \centering
+    \includegraphics[width=0.65\columnwidth]{figures/kernel.drawio.pdf}
+     \caption{Building the mixed index and offsets at GPU 1 for layer 1 in the example of Figure~\ref{fig:shuffle-index}.}
+    \label{fig:kernel}
+\end{figure}
+
+\mypar{Dedicated kernels}
+\name uses dedicated kernels to build the shuffle index efficiently. 
+We now discuss how the mixed index and offset arrays are constructed during sampling. 
+The \texttt{split} function builds the mixed index based on an arbitrary partition function that assigns vertices to GPUs. 
+\name constructs the mixed index for all messages in a single pass using a fused dedicated kernel.
+Figure~\ref{fig:kernel} shows how the kernel builds the mixed index for GPU 1 and layer 1 shown in Figure~\ref{fig:shuffle-index}. 
+
+The fused kernel initially creates a binary \emph{partition array} of size $s \cdot p$, where $s$ is the size of the \ds and $p$ is the number of partitions/GPUs. 
+Then, the kernel sets the binary array element at position $p \cdot i$ to 1 if and only if the $i^{th}$ element of the \ds belongs to partition $p$ according to the partitioning function. 
+Subsequently, the kernel performs a prefix sum on the binary array and decrements all elements by one. 
+If the bit at position $p \cdot i$ is set to 1 in the binary array, the corresponding element in the prefix sum array contains the position of the $i^{th}$ element of the \ds in the upper index. 
+The prefix sum array also includes the boundary offset of the $k^{th}$ message at position $s \cdot k - 1$, which is stored in the mixed offset.
+
+\end{comment}

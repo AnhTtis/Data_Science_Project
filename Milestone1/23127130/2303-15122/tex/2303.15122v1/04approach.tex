@@ -1,0 +1,70 @@
+\section{Methodology}
+\label{sec:method}
+\begin{figure}
+\begin{center}
+  \includegraphics[width=0.9\linewidth]{images/oldnewresblock.png}
+\end{center}
+\caption{ResBlock Modification: Comparison of the residual block design in EDSR with our modification. We add an Instance normalization after each convolution in the residual block.} 
+\label{fig:resblock}
+\end{figure}
+The human face has a regular and locally consistent structure because the various features on the human face, like eyes, nose, mouth, .etc, would maintain their relative position. We use this uniformity to design a lightweight model for face parsing. We adopt the LIIF \cite{liif} framework to learn a continuous representation for segmentation for locally consistent structures of human faces.
+\subsection{Segmentation as Local Implicit Image Function}
+An image $I$ in LIIF is represented by a 2D grid of features $Z \in \mathbb{R}^{H\times W \times D}$ such that a function $f_{\theta}$ can map each $z\in \mathbb{R}^{D}$ in $Z$ to another domain. Here, $f$ is an MLP, and $\theta$ are its parameters. This can be represented by eq \ref{eq:liif-convert}:
+\begin{equation}
+\label{eq:liif-convert}
+s = f_{\theta}(z, x)
+\end{equation}
+where, $x \in \mathcal{X}$ is a 2D coordinate, and $s$ is the signal in the domain we want to convert our image $I$ into. The coordinates are normalized in the $[-1, 1]$ range for each spatial dimension. In this paper, $s$ is the probability distribution among a set of labels, i.e., $P(y|I,x)$, where $y$ denotes the class label. So for a given image $I$, with latent codes $z$ and query coordinate $x_q$, the output can be defined as $P(y|x_q) = f_{\theta}(z,x_q)$. So using the LIIF approach, we can write
+\begin{equation}
+P(y|x_q) = f_{\theta}(z^*, x_q - v^*)
+\label{eq:mlp}
+\end{equation}
+where $z^*$ is the nearest $z$ to the query coordinate $x_q$ and $v^*$ is the nearest latent vector coordinate. 
+% In practise when there is a mismatch between the spatial dimensions of $Z$ (i.e. $H\times W$) and $x_q$ (i.e. $H_o\times W_o$) then $Z$ is sampled into the a grid of size $H_o\times W_o$ and used in eq. \ref{eq:mlp}.  
+
+Other methods mentioned in LIIF\cite{liif}, such as Feature Unfolding and Local Ensemble, are also used. Feature Unfolding is a common practice of gathering local information or context by concatenating the local $z$ in the $3\times 3$ neighborhood for each $z$ in $Z$. To illustrate, the feature unfolding of a $Z$ of dimension $(H\times W \times D)$ would end up as $(H \times W \times 9D)$. Local Ensemble is a way to address the discontinuity in $f_{\theta}$ along sharp boundaries. An average of $f_{\theta}$ is calculated for each pixel according to the four nearest neighbors of $z^*$. This also bakes in a voting mechanism in the model at a per-pixel level. 
+
+\begin{figure*}
+\begin{center}
+  \includegraphics[width=0.93\linewidth]{images/decoder.png}
+\end{center}
+\caption{Decoder Architecture: Our decoder takes in the feature grid $Z$ from the encoder and performs unfolding and global avg-pooling as shown in the figure. A two-layer fully connected MLP is used to reduce the number of channels in the unfolded volume. This is upsampled and concatenated with the global pool feature $g$ and positional encoding. Finally, a four-layer MLP is applied per spatial location to generate the classwise probability distribution.} 
+\label{fig:decoder}
+\end{figure*}
+
+\subsection{Image Encoder}
+We now describe our image encoder that takes as input an RGB image of size $256 \times 256$ and generates an output volume of latent vectors of size $64 \times 64$. Our encoder is a modified version of EDSR \cite{edsr} as shown in Figure \ref{fig:encoder}. We modify all the resblocks by appending an instance normalization block \cite{instnorm} after every convolution layer, Figure \ref{fig:resblock}. We create 24 resblocks Figure \ref{fig:encoder}, and all convs have a size of $3\times 3$ and filter depth of 64 channels unless otherwise stated. The input is first passed through a conv before passing it into resblock-groups. 
+
+We have three resblock-groups. We added the first two to extract and preserve the fine-grained information from the image while the activation volume undergoes a reduction in the spatial dimensions because of the strides conv. The third group of resblock is used to generate the image representation $Z$. Each of the resblock-groups are a series of resblocks followed by a residual connection from the input, Figure \ref{fig:encoder}. The output of the first resblock-group that contains two resblocks is passed to a $3 \times 3$ conv with a stride of 2. This is passed to the second resblock-group which has six resblocks. This is again followed by a conv of stride 2. The output of this second downsampling is passed through the third resblock-group containing 16 resblocks. This generates a feature volume of size $64\times64\times64$, which is then passed to the LIIF decoder.
+
+\begin{figure}
+\begin{center}
+  \includegraphics[width=0.8\linewidth]{images/EdgeDetect.png}
+\end{center}
+\caption{Binary edge generation} 
+\label{fig:edge}
+\end{figure}
+\subsection{LIIF decoder}
+The task of the decoder is to predict the segmentation labels at each pixel, which depends on the local context and the global context. Therefore, to provide global context during per-pixel prediction, we first extract the global context by doing an average pool of the latent volume along the spatial dimensions, as shown in Figure \ref{fig:decoder}. Additional local context is added by passing the latent volume through a $3 \times 3$ unfolding operation, which increases the channel size to $64\times9$. The unfolded volume is then sent through a two-layer reduce channel MLP (RCMLP) with depths of 256 and 64. This makes the next upsampling operations computationally cheaper. 
+The resulting volume $\hat{Z}$ of size $64\times64\times64$ is bilinearly upsampled to the output size  and concatenated with the previously extracted global feature and two channels of positional encoding. The positional encodings are x,y coordinates ranging from $-1$ to $1$ along the spatial dimension of the feature volume. This volume of latent vectors is flattened and passed through a 4-layer MLP of 256 channels each to predict logits for the segmentation labels.  
+Next, we perform a LIIF-like ensemble of these predictions using multiple grid sampling over $\hat{Z}$. Note that the regular conv can't be used to directly replace the unfolding operation because grid sampling result would differ for a $\hat{Z}$ derived from a $w \times h \times 9D$ volume compared to a $w\times h\times D$ volume because of the different neighbors of the $D$ and $9D$ channels.
+
+
+% LIIF performs an ensemble using the unfolded volume by doing a grid sampling over the $w\times h\times9D$ volume. This grid sampling result would differ for a $w \times h \times 9D$ volume and a $w\times h\times D$ volume due to differences in the neighbors of $D$ channels and unfolded $9D$ channels.
+
+\subsection{Loss}
+The logits are passed through a softmax and then guided with a cross-entropy loss $L_{cce}$ and edge-aware cross-entropy loss $L_{e\_cce}$. The edge-aware loss is calculated by extracting the edges of the ground truth label map with an edge detection kernel (Fig. \ref{fig:edge}) and calculating cross-entropy only on these edges.
+The final loss can be defined as:
+\begin{equation}
+    L= L_{cce} + \lambda.L_{e\_cce}
+\end{equation}
+where $\lambda$ is the additional weight for the edge-cross-entropy.
+
+
+% \begin{figure}
+% \begin{center}
+%   \includegraphics[width=\linewidth]{images/EdgeDetect.png}
+% \end{center}
+% \caption{Binary edge generation} 
+% \label{fig:edge}
+% \end{figure}

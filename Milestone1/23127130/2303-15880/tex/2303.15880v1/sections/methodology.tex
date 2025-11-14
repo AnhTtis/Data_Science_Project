@@ -1,0 +1,227 @@
+\section{Methodology}
+\label{sec:Methodology}
+
+We jointly learn pose estimation as part of the view synthesis process, using our Gaussian-based renderer, as shown in \cref{fig:Methodology:BlockDiagram}.
+From the input image $I_{1}^{*}$, our model encodes two modalities, the three-dimensional pose $P_{1}$ relative to input camera, and the appearance $a_{1}$ of the subject.
+The pose $P_{1}$ is transferred to a new viewpoint using camera extrinsic parameters $(R_{1 \rightarrow 2}, t_{1 \rightarrow 2})$.
+From the pose $P_{2}$, seen from a novel orientation, we derive the location $\mu_{2}$ and shape $\Sigma_{2}$ of the primitives, which are used, along with their appearance $a_{1}$ and the intrinsic parameters and distortion coefficients of the second camera $(K_{2}, D_{2})$, for the rendering of the subject in a high-dimensional image $J_{2}$.
+This feature image $J_{2}$ is enhanced in an image translation module to form the output image $I_{2}$, which closely resembles the target image $I_{2}^{*}$.
+
+\subsection{Extracting Human Pose and Appearance from Images}
+\label{sec:Methodology:FeatureExtraction}
+
+We model the human skeleton as a graph $G = (P, E)$ with $N$ vertices and $M$ edges, where $P \in \mathbb{R}^{N \times 3}$ denotes the joint locations and $E = \{(i, j) | i, j \in [1..N]\}$.
+
+\subsubsection{Inferring the Pose}
+\label{sec:Methodology:FeatureExtraction:ImageToPose}
+
+We use OpenPose~\cite{cao2017realtime}, an off-the-shelf detector, to infer the 2D pose from the input image $I_{1}^{*} \in \mathbb{R}^{H_{I} \times W_{I} \times 3}$,
+\begin{align}
+    \label{eq:Methodology:FeatureExtraction:ImageToPose2D}
+    I_{1}^{*}
+    \rightarrow
+    p_{1}, c_{1},
+\end{align}
+where $p_{1} \in \mathbb{R}^{N \times 2}$ refers to the 2D joints locations and $c_{1} \in \mathbb{R}^{N}$ to their respective confidence values. \\
+We use a simple fully-connected network~\cite{martinez2017simple} to infer the 3D pose from the 2D pose,
+\begin{align}
+    \label{eq:Methodology:FeatureExtraction:Pose2DToPose3D}
+    p_{1}, c_{1} \rightarrow \bar{P}_{1},
+\end{align}
+where $\bar{P}_{1} \in \mathbb{R}^{(N - 1) \times 3}$ refers to the 3D pose relative to the root joint. \\
+We compute the root joint location $P_{1, \text{root}}$ in camera coordinates by finding the optimal depth which minimize the error between the re-projected 3D pose $\bar{P}_{1}$ and the 2D pose $p_{1}$ (see \cref{appendix:Depth}).
+We obtain the pose in camera coordinates $P_{1} \in \mathbb{R}^{N \times 3}$,
+\begin{align}
+    P_{1} = [P_{1, \text{root}} | P_{1, \text{root}} + \bar{P}_{1}].
+\end{align}
+
+\subsubsection{Estimating the Appearance}
+\label{sec:Methodology:FeatureExtraction:ImageToAppearance}
+
+From the input image $I_{1}^{*}$, we use a ResNet-50~\cite{he2016deep} to infer high-dimensional appearance vectors $a_{1}$ used to produce the primitives for rendering,
+\begin{align}
+    \label{eq:Methodology:FeatureExtraction:ImageToAppearance}
+    I_{1}^{*}
+    \rightarrow
+    a_{1},
+\end{align}
+where $a_{1} \in \mathbb{R}^{M \times A}$ describe the appearances of each of the edges in the human skeleton as seen from the input view.
+These high-dimensional vectors allow the transfer of the subject's appearance from one view to the other without considering pose configuration of the subject, and disentangling pose and appearance.
+
+\input{figures/visualisation}
+
+\subsubsection{Changing the Viewpoint}
+\label{sec:Methodology:FeatureExtraction:ViewChange}
+
+To create an image of the world as seen from another viewpoint, we transfer the pose using the extrinsic parameters $(R_{1 \rightarrow 2}, t_{1 \rightarrow 2})$,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:ViewChange}
+    P_{2} = R_{1 \rightarrow 2} \times P_{1} + t_{1 \rightarrow 2}.
+\end{align}
+
+\subsection{Differentiable Rendering of Diffuse Gaussian Primitives}
+\label{sec:Methodology:Rendering}
+We render a simplified skeletal structure of diffuse primitives, directly obtained from the 3D pose.
+The intuition underlying our new renderer is straightforward.
+Each primitive can be understood as an anisotropic Gaussian defined by its location $\mu$ and shape $\Sigma$, and the rendering operation is the process of integrating along each ray.
+Occlusions are handled by a smooth aggregation step.
+Our renderer is differentiable with respect to each input parameter, as the rendering function is itself a composition of differentiable functions.
+
+\subsubsection{From Pose to Primitives}
+\label{sec:Methodology:FeatureExtraction:PoseToPrimitives}
+From the subject's pose, we compute the location and shape of the primitives,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:PoseToPrimitives}
+    P_{2}\rightarrow \mu_{2}, \Sigma_{2},
+\end{align}
+where $\mu_{2} \in \mathbb{R}^{M \times 3}$ refers to the locations, while $\Sigma_{2} \in \mathbb{R}^{M \times 3 \times 3}$ refers to the shapes.
+For clarity, we drop the subscripts indicating the viewpoint.
+
+For each edge $(i, j)$, we create a primitive at the midpoint between two joints, with an anisotropic shape aligned with the vector between the two joints,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:Primitives}
+    \mu_{i j} &= \frac{P_{i} + P_{j}}{2}, \\
+    \Sigma_{i j} &= R_{i j} \times \Lambda_{i j} \times R_{i j}^{\intercal},
+\end{align}
+where,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:DetailedPrimitives}
+    R_{i j} &= f_{R}(P_{j} - P_{i}, e), \\
+    \Lambda_{i j} &= 
+    % \begin{pmatrix}
+    %     {||P_{j} - P_{i}||}_2 & 0 & 0 \\
+    %     0 & w_{i j} & 0 \\
+    %     0 & 0 & w_{i j}
+    % \end{pmatrix}.
+    \text{diag}({||P_{j} - P_{i}||}_2, w_{i j}, w_{i j}).
+\end{align}
+Here, $f_{R}$ calculates the rotation between two non-zero vectors (see \cref{appendix:Rotation}) and $w_{i j}$ loosely represents the width of the limb.
+
+\subsubsection{Rendering the Primitives}
+\label{sec:Methodology:FeatureExtraction:RenderingPrimitives}
+
+Modelling the scene as a collection of diffuse primitives, we render a high-dimensional latent image $J_{2}$,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:RenderingPrimitives}
+    J_{2} &= \mathcal{R}_{\alpha, \beta}(\mu_{2}, \Sigma_{2}, a_{1}, b, K_{2}, D_{2}) \in \mathbb{R}^{H_{R} \times W_{R} \times A},
+\end{align}
+where,
+$\mathcal{R}$ is the rendering function;
+$\alpha > 0$ is a coefficient scaling the magnitude of the shapes of the primitives;
+$\beta > 1$ is a background blending coefficient;
+$b \in \mathbb{R}^{A}$ describes the appearance of the background;
+and $K_{2} \in \mathbb{R}^{3 \times 3}$ and $D_{2} \in \mathbb{R}^{K}$ refers to the intrinsic parameters and distortion coefficients.
+
+To simplify notation, we drop the subscripts indicating the viewpoint, and retain the following letters for subscripts: $i \in [1..H_{R}]$ refers to the height of the image, $j \in [1..W_{R}]$ refers to the width of the image, and $k \in [1..M]$ refers to each of the $M$ primitives.
+
+We define the rays $r_{i j}$ as unit vectors originating from the pinhole, distorted by the lens, and passing through every pixel of the image,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:Rays}
+    r_{i j} &= \frac{d^{-1}(K^{-1} \times p_{i j}, D)}{{||d^{-1}(K^{-1} \times p_{i j}, D)||}_{2}},
+\end{align}
+where $d^{-1}$ is a fast fixed-point iterative method~\cite{opencv_library} finding an approximate solution to undistorting the rays, and $p_{i j} = \begin{pmatrix} j & i & 1 \end{pmatrix}^{\intercal}$ is a pixel on the image plane.
+
+We calculate the integral $F_{i j k}$ of the diffusion of a single primitive $(\mu_{k}, \Sigma_{k})$ along a ray $r_{i j}$,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:DiffusionIntegral}
+    F_{i j k} &= \int_{0}^{+\infty}{e^{-\Delta^{2}(z \cdot r_{i j}, \mu_{k}, \alpha \cdot \Sigma_{k})} dz}.
+\end{align}
+See \cref{appendix:Rendering_Integral} for the analytical solution.
+
+Objects closer to the camera should occlude those farther from it.
+We define a smooth rasterisation coefficient $\lambda_{i j k}$ for each primitive $(\mu_{k}, \Sigma_{k})$, which smoothly favours one primitive, and discounts the others, based on their proximity to the ray $r_{i j}$,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:SmoothRasterisation}
+    \lambda_{i j k} &=  \frac{1}{1 + {(z_{i j k}^{*})}^{4}},
+\end{align}
+where,
+\begin{align}
+    z_{i j k}^{*} &= \argmax_{z} {e^{-\Delta^{2}(z \cdot r_{i j}, \mu_{k}, \alpha \cdot \Sigma_{k})}}.
+\end{align}
+The optimal depth $z_{i j k}^{*}$, is attained when the squared Mahalanobis distance $\Delta^{2}$ between the point on the ray $z \cdot r_{i j}$ and the primitive $(\mu_{k}, \Sigma_{k})$ is minimal, which in turns maximises the Gaussian density function.
+See \cref{appendix:Smooth_Rasterization} for details.
+
+The background is treated as the $(M + 1)^{\text{th}}$ primitive, with unique properties: it is colinear with every ray and located after the furthest primitive, its shape is a constant matrix, and its appearance is also a constant.
+Its density $F_{i j M + 1}$ and smooth rasterisation coefficient $\lambda_{i j M + 1}$ are detailed in \cref{appendix:Background_Primitive}.
+
+We derive the weights $\omega_{i j k}$ quantifying the influence of each primitive $(\mu_{k}, \Sigma_{k})$ (including the background) onto each ray $r_{i j}$, such that $\forall k \in [1..{M + 1}]$,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:Weights}
+    \omega_{i j k} &= \frac{\lambda_{i j k} \cdot F_{i j k}}{\sum\limits_{l=1}^{M + 1}{\lambda_{i j l} \cdot F_{i j l}}}.
+\end{align}
+Finally, we render the image by combining the weights with their respective appearance,
+\begin{align}
+\label{eq:Methodology:FeatureExtraction:Render}
+    J_{i j} &= \sum\limits_{k=1}^{M + 1}{\omega_{i j k} \cdot a_{k}}.
+\end{align}
+
+\subsection{Synthesizing the Output Image}
+\label{sec:Methodology:ImageSynthesis}
+
+As shown on the left side of \cref{fig:Methodology:Visualisation}, the intermediate rendered image is feature-based and not photorealistic due to a small number of primitives.
+While we could render any image with a sufficient number of primitives, increasing the number not only increases realism, but also the computational cost and the difficulty in optimising the overall problem.
+Instead, we render a simplified skeletal structure $(\mu_{2}, \Sigma_{2})$ with a high-dimensional appearance $a_{1}$.
+
+We synthesize the output image of the subject $I_{2} \in \mathbb{R}^{H_{O} \times W_{O} \times 3}$ using the primitive image $J_{2} \in \mathbb{R}^{H_{R} \times W_{R} \times A}$, which is fed to an encoder-decoder network.
+Following StyleGAN2~\cite{karras2020analyzing} style mixing and design principles, we use a U-Net encoder-decoder~\cite{ronneberger2015u}.
+Where the output resolution is higher than the rendered resolution, the input is upsampled.
+To recover high-frequency details, we incorporate the appearance $a_{1}$ as styles at each stage,
+\begin{align}
+\label{eq:Methodology:ImageSynthesis}
+    J_{2}, a_{1} \rightarrow I_{2}.
+\end{align}
+From the input image $I_{1}^{*}$, we only estimate information about the foreground subject, as seen on the right side of \cref{fig:Methodology:Visualisation}.
+As it is impossible to accurately infer a novel view of a static background captured by a static camera, we infer a constant background around the subject, and use a segmentation mask to discard the background information from the groundtruth image $I_{2}^{*}$, as seen on \cref{fig:Experiments:KnownViewpoints}.
+
+\input{figures/infer_real}
+
+\subsection{Losses}
+\label{sec:Methodology:Losses}
+
+\subsubsection{Image Reconstruction}
+\label{sec:Methodology:Losses:Reconstruction}
+
+We assess the performance of novel view synthesis by measuring the average pixel-to-pixel distance between the image generated by the model $I_{2}$ and the target image $I_{2}^{*}$ in the pixel space,
+\begin{align}
+\label{eq:Methodology:Losses:Pixel}
+    \mathcal{L}_{I} = \mathbb{E}_{I_{1}^{*}, I_{2}^{*}}\left[{||I_{2}^{*} - I_{2}||}_{1}^{1}\right],
+\end{align}
+which we complement with either the standard perceptual loss~\cite{johnson2016perceptual}, $\mathcal{L}_{\phi_{\text{VGG}}}$ with a pretrained VGG network~\cite{simonyan2014very}, or the fine-tuned LPIPS loss~\cite{zhang2018unreasonable}, $\mathcal{L}_{\phi_{\text{LPIPS}}}$, to enable the model to synthesize images containing high-frequency detail.
+
+\subsubsection{Adversarial Framework}
+\label{sec:Methodology:Losses:Adversarial}
+
+To further enhance the realism of the synthesized images, we fine-tune our novel synthesis model in an adversarial framework,
+\begin{align}
+\label{eq:Methodology:Losses:Adversarial}
+    \mathcal{L}_{A} = \mathbb{E}_{I_{2}^{*}}\left[\log(D(I_{2}^{*}))\right] + \mathbb{E}_{I_{1}^{*}}\left[\log(1 - D(I_{2}))\right].
+\end{align}
+
+\subsubsection{Pose Estimation}
+\label{sec:Methodology:Losses:Pose}
+
+We require supervision to ensure that the locations of body parts correspond to prespecified keypoints and convey the same semantic meaning,
+\begin{align}
+\label{eq:Methodology:Losses:Pose}
+    \mathcal{L}_{P} = \mathbb{E}_{p_{1}, \bar{P}_{1}^{*}}\left[{c^{*} \cdot ||\bar{P}_{1}^{*} - \bar{P}_{1}||}_{2}^{2}\right],
+\end{align}
+where $c^{*} \in \mathbb{R}^{N}$ denotes the confidence values of the points.
+
+\subsubsection{Appearance Regularization}
+\label{sec:Methodology:Losses:Appearance}
+
+Appearance vectors are an unsupervised intermediate representation. We regularize the squared norm of the appearance vectors,
+\begin{align}
+\label{eq:Methodology:Losses:Appearance}
+    R_{a} = {||a_{1}||}_{2}^{2}.
+\end{align}
+
+\subsubsection{Final Objective}
+\label{sec:Methodology:Losses:Final}
+
+We obtain our final objective,
+\begin{align}
+\label{eq:Methodology:Losses:Total}
+    \min_{M} \max_{D} \lambda_{I} \mathcal{L}_{I} + \lambda_{\phi} \mathcal{L}_{\phi} + \lambda_{A} \mathcal{L}_{A} + \lambda_{P} \mathcal{L}_{P} + \lambda_{a} R_{a},
+\end{align}
+with, $\lambda_{I} = \lambda_{\phi} = 10$, $\lambda_{A} = \lambda_{P} = 1$, and $\lambda_{a} = 10^{-3}$.

@@ -1,0 +1,57 @@
+\section{The \name{} Training Pipeline}
+\label{sec:overview}
+
+We now present a running example to describe one training iteration in \name (see Figure~\ref{fig:overview}). 
+The example shows how \name uses the splitting algorithm to obtain splits on-the-fly, as described in detail in Section~\ref{sec:workload}, and introduces the abstractions used by \name's API, such as the local and mixed frontier and the split index, which are further described in Section~\ref{sec:api}.
+Note that although \name can be combined with distributed GPU caching, the example assumes no caching to simplify the illustration and ease the description.
+%\ms{Say that same communication pattern during sampling and training, so we can build index}
+% \ms{Discuss that sampling does not need to be split-parallel in order to get the benefits of reduced loading. We could sample centrally, but we use this implementation for convenience.}
+
+\mypar{Sampling}
+The sampling step prepares the splits for the training phase, with each split corresponding to one GPU. 
+\name pushes sampling to the GPU for performance reasons, in line with recent work~\citep{nextdoor,c-saw,wang2021skywalker,gsampler}.
+It uses a \tadj implementation of sampling, where all GPUs sample and split the same mini-batch cooperatively.
+% However, it is not necessary to make sampling \tadj or to push it to the GPU to achieve our goal of eliminating redundant loads, since using \tadj training is sufficient.
+%For example, our preliminary implementation of \name used CPU-based sampling~\citep{gsplit-arxiv}.
+
+\Tadj sampling proceeds top-down and layer-by-layer.
+At each layer, a GPU has a set of vertices whose neighbors should be sampled.
+This set is called the \emph{frontier}.
+% This frontier-based approach is followed by the sampling algorithms included in DGL and by existing APIs for GNN sampling such as NextDoor~\citep{nextdoor} and gSampler~\citep{gsampler}.
+%\Tadj sampling follows the same approach, but now 
+\name uses an embarrassingly parallel splitting algorithm to separate local and remote vertices by mapping each vertex to its split in constant time, as discussed in Section~\ref{sec:workload}.
+
+Each GPU samples its local split of the same mini-batch, rather than a separate micro-batch.
+At each layer, a GPU starts from a frontier, samples its neighbors, and obtains what we call the \emph{\ds}.
+Unlike the regular frontier, a \ds can include remote vertices.
+For example, in Figure~\ref{fig:overview}, GPU 1 starts from its layer-2 frontier $\{a,b\}$ and samples the \ds $\{e,h,f\}$, which includes the remote vertex $h$. 
+Similarly, GPU 2 starts from the frontier $\{c,d\}$ and samples the \ds $\{f,g,h,i\}$, which includes the two remote vertices $h$ and $i$.
+To continue sampling in a \tadj manner, it is necessary to shuffle them to their partitions.
+GPUs then build the \emph{local frontier} for the next layer based on the vertices they receive in the messages.
+For example, the new local frontier of GPU 2 at layer-1 is $\{h,i\}$, where $h$ was received from GPU 1.
+Analogously, the local frontier of GPU 1 is $\{e,f,g\}$, where $\{g\}$ was sampled by GPU 2.
+The sampling of the next layer starts from the new local frontier.
+The next \emph{layer} is the union of mixed and local frontier: $\{e, f, g, h\}$ for GPU 1 and $\{h, i, f, g\}$ for GPU 2.
+The splitting step creates an auxiliary data structure, called the \emph{shuffle index}, that consists of gather and scatter indexes to efficiently send and receive sparse vertex data during the shuffle rounds at each layer.
+% We describe the splitting process and the shuffle index in detail in Section~\ref{sec:api}.
+%The shuffle index is reused to perform \tadj training over the same layer in the same iteration, as we now discuss.
+
+\mypar{Loading}
+% Sampling and splitting iterate until they sample all required layers.
+After sampling finishes, the loading step loads the input vertex features from the host memory into the GPUs.
+When \tname is combined with caching, a GPU can skip loading an input feature if it is already cached locally.
+% Unlike data-parallel systems using caching, \tname does not require loading \sand{cache-missed} input features among GPUs in the load phase.
+Unlike data-parallel systems that could load redundant input features, \tname eliminates the redundant CPU-GPU data loading as splits do not have overlapping vertices. 
+In the example of Figure~\ref{fig:overview}, we consider no caching, so GPU 1 loads the input features of the vertices $\{j,k,l\}$ from the host memory and GPU 2 of the vertices $\{m,p\}$.
+
+\mypar{Training}
+The training phase begins after loading and proceeds bottom-up.
+At each layer, a GPU is responsible for computing the hidden features of the vertices in its local frontier by aggregating the features of the neighbors in the layer below.
+These vertices are the same vertices that were in the \ds for that layer during sampling, so we can reuse the shuffle index generated at that step.
+In the example, GPU 1 must compute the layer-2 hidden features of vertices $a$ and $b$.
+To do that, it needs the layer-1 hidden features of vertices $\{e,f,g,h\}$, which constituted the \ds during sampling and include the remote vertex $h$.
+
+GPUs receive the features of remote neighbors by performing an all-to-all shuffle.
+The shuffle rebuilds the \ds, which now holds hidden features.
+The backward pass then proceeds top-down, layer-by-layer, in the reverse direction.
+Data flows along the same edges as in the sampling step, allowing us to reuse the shuffle index.

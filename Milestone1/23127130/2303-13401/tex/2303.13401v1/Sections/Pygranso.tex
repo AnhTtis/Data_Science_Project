@@ -1,0 +1,140 @@
+\section{A generic solver for max-loss form and min-radius form: \pygranso~With Constraint-Folding (PWCF)}
+\label{Sec:pygranso}
+Although~\pygranso~can handle max-loss form and min-radius form, naive deployment of \pygranso~can suffer from slow convergence and low-quality solutions. To address this, we introduce \pygranso~\textbf{w}ith \textbf{C}onstraint-\textbf{F}olding (PWCF) to substantially speed up the optimization process and improve the solution quality. 
+% We remark that these techniques are general guidelines to improve \pygranso's performance in constrainted deep learning problems, which are not limited to the RE problems, and should be applied whenever the conditions described are encountered in similar situations. We first describe these techniques in \cref{subsec: reformulate Linf constraint} to \cref{subsec: loss clip}, and show their effects in \cref{subsec: PWCF techniques demo}
+
+\subsection{General techniques}
+\label{pygranso general tricks}
+\input{Sections/section_elements/Fig-Sec3-Ablation-w-wo-folding.tex}
+The following techniques are developed for solving max-loss form and min-raidus form, but can also be applied to other NLOPT problems in similar situations.
+\subsubsection{Reducing the number of constraints: constraint-folding}
+\label{subsec: folding}
+The natural image constraint $\mb x' \in [0, 1]^n$ is a set of $n$ box constraints. The reformulations described in \cref{subsec: reformulate Linf constraint} and \cref{subsec: reformulate l1 and linf obj} will introduce another $\Theta(n)$ box constraints. Although all of these are simple linear constraints, the $\Theta(n)$-growth is daunting: for natural images, $n$ is the number of pixels that can easily go into hundreds of thousands. Typical NLOPT problems become much more difficult when the number of constraints becomes large, which can, e.g., lead to slow convergence for numerical algorithms. 
+
+\change{To address this, we introduce constraint-folding to reduce the number of constratins by allowing multiple constraints to be turned into a single one. We note that folding or aggregating constraints is not a new idea, which has been popular in engineering design. For example, \cite{martins2005structural} uses $\ell_\infty$ folding and its log-sum-exponential approximation to deal with numerous design constraints; see~\cite{ZhangEtAl2018Constraint,DomesNeumaier2014Constraint,ErmolievEtAl1997Constraint,TrappProkopyev2015note}. However, applying folding to NLOPT problems in machine learning and computer vision seems rare, potentially because producing non-smooth constraint(s) due to folding seems counterproductive. However, \pygranso~is able to handle non-smooth functions reliably. Thus, constraint folding can enjoy benefiting from reducing the difficulty and expense of solving the two types of quadratic programming (QP) subproblems ((\ref{penalty_sqp_dual}) and (\ref{QP_termination}) in \cref{Sec:granso_summary}) in each iteration of \pygranso, which are harder to solve as the number of constraints increases. Although turning multiple constraints into fewer but non-smooth ones can possibly increase the per-iteration cost, we show in this paper that there indeed can be a beneficial trade-off between non-smoothness and large number of constraints, in terms of speeding up the entire optimization process.}
+
+\change{As for the implementation of the constraint-folding, first note that any equality constraint $h_j(\mb x) = 0$ or inequality constraint $c_i(\mb x) \le 0$ can be reformulated as 
+\begin{align} \label{eq:simple_constr_form}
+    \begin{split}
+            & h_j (\mb x) = 0 \Longleftrightarrow \abs{h_j(\mb x)} \le 0 ~ \text{,}\\ 
+            & c_i(\mb x) \le 0 \Longleftrightarrow \max\{c_i(\mb x), 0\} \le 0 ~ \text{,}
+    \end{split}
+\end{align} 
+Then we can further fold them together into 
+\begin{equation} 
+    \label{eq:folded_constraint} 
+    \begin{split}
+        \mc F(& \abs{h_1(\mb x)}, \cdots, \abs{h_i(\mb x)}, \max\{c_1(\mb x), 0\}, \\
+        & \cdots, \max\{c_j(\mb x), 0\}) \le 0,
+    \end{split}
+\end{equation}
+where $\mc F: \RJU^{i+j}_{+} \mapsto \RJU_+$ ($\RJU_+ = \{\alpha: \alpha \ge 0\}$) can be any function satisfying $\mc F(\mb z) = 0 \Longrightarrow \mb z = \mb 0$, e.g., any $\ell_p$ ($p \ge 1$) norm, and (\ref{eq:folded_constraint}) and (\ref{eq:simple_constr_form}) still shares the same feasible set.}
+
+The constraint folding technique can be used for a subset of constraints (e.g., constraints grouped and folded by physical meanings) or all of them. 
+%We note that folding or aggregating constraints is not a new idea and has been popular in engineering design. For example, \cite{martins2005structural} uses $\ell_\infty$ folding and its log-sum-exponential approximation to deal with numerous design constraints; see ~\cite{ZhangEtAl2018Constraint,DomesNeumaier2014Constraint,ErmolievEtAl1997Constraint,TrappProkopyev2015note}. \emph{However, applying folding into NLOPT problems in machine learning and computer vision seems rare, potentially because producing non-differentiable constraint(s) due to the folding seems counterproductive.} But \pygranso~is able to handle these constraints reliably.
+\change{Throughout this paper, we use $\mc F = \norm{\cdot}_2$ for constraint-folding, and the constraints are folded by group (they are: $\mb x' \in [0, 1]^n$, distance metric $d$ and decision boundary constraint, respectively.)} \cref{Fig: Ablation on constraint folding} shows the benefit of constraint folding with an example of max-loss form, where the time efficiency is greatly improved while the solution quality remains.
+
+\subsubsection{Two-stage optimization}
+\label{subsec: pygranso early stop}
+Numerical methods may converge to poor local minima for NLOPT problems. Running the optimization multiple times with different random initializations is an effective and practical way to overcome this problem. For example, each method in \texttt{AutoAttack} by default runs five times and ends with the preset MaxIter. Here, we apply a similar practice to PWCF, but in a two-stage fashion:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Stage 1 (selecting the best initialization):} Optimize the problems by PWCF with $R$ different random initialization $\mb x^{(r, 0)}$ for $k$ iterations, where $r=1, \ldots, R$, and collect the final first-stage solution $\mb x^{(r, k)}$ for each run. Determine the best intermediate result $\mb x^{(*, k)}$ and the corresponding initialization $x^{(*, 0)}$ following \cref{alg:2-stage screening}.
+    \item{\textbf{Stage 2 (optimization):} Restart the optimization process with $x^{(*, 0)}$ until the stopping criterion is met\footnote{This is equivalent to warm start (continue optimization) with the intermediate result $\mb x^{*, k}$ with the corresponding Hessian approximation stored. To make the warm start follow the exact same optimization trajectory, the configuration parameter "scaleH0" for \pygranso\, must be turned off, which is different from the default value.} (reaching the tolerance level of stationarity and total constraint violation, or reaching the MaxIter $K$).
+    }
+\end{enumerate}
+
+\change{The purpose of the two-stage optimization is simply to avoid PWCF spending too much time searching on unpromising optimization trajectories---after a reasonable number of iterations, PWCF tends to only refine the solutions; see (b) and (d) in \cref{Fig: Abaltion-OPT-Traj} later for an example, where PWCF has reached solutions with reasonable quality in very early stages and only improves the solution quality marginally afterward. Picking reasonably good values of $R$, $k$ and $K$ can be simple, e.g., using a small subset of samples and tuning them empirically. We present our result in \cref{Sec:pygranso} using $k=20$ and $K=400$ for max-loss form, $k=50$ and $K=4000$ for min-radius form and $R=10$ for both formulations, as PWCF can produce solutions with sufficient quality in the experiments in \cref{Sec:pygranso}.}
+% \emph{We remark that our choice of $k$, $K$ and $R$ in this paper is purely empirical. Although choosing these parameters adaptively (e.g., for different DNN models with different capacities, or for different samples) may further improve the optimization speed and the solution quality, we will leave it for future work.}
+
+\begin{algorithm}[!tb]
+\caption{Selection of $x^{(*, k)}$ and $x^{(*, 0)}$ in the two-stage process}
+\label{alg:2-stage screening}
+\begin{algorithmic}[1]
+\Require Initialization $x^{(r, 0)}$ and the corresponding intermediate optimization results $x^{(r, k)}$.
+
+\If{Any $x^{(r, k)}$ is feasible for \formulation (\ref{eq:NO_form})}
+\State Set $x^{(*, k)}$ to be the feasible $x^{(r, k)}$'s with the least objective value.
+\Else
+\State Set $x^{(*, k)}$ to be the $x^{(r, k)}$ with the least constraint violation.
+\EndIf 
+\State Set $x^{(*, 0)}$ corresponds to $x^{(*, k)}$ found.
+\State \Return{$x^{(*, k)}$ and $x^{(*, 0)}$.}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Techniques specific to max-loss form and min-radius form}
+\label{pygranso specific techniques}
+In addition to the general techniques above, the following techniques can also help improve the performance of PWCF in solving (\ref{eq:robust_loss}) and (\ref{eq:min_distort}).
+
+\input{Sections/section_elements/Fig-Sec3-Ablation-Linf-Reform.tex}
+
+\subsubsection{Avoiding sparse subgradients: reformulating $\ell_\infty$ constraints}
+\label{subsec: reformulate Linf constraint}
+\change{The BFGS-SQP algorithm inside \pygranso~uses the subgradients of the objective and the constraint functions to approximate the (inverse) Hessian of the penalty function, which is used to compute search directions. For the $\ell_\infty$ distance, the subdifferential (the set of subgradients) is:
+\begin{align} 
+\label{eq:subgrad_linf}
+\nonumber
+    \partial_{\mb z}  \norm{\mb z}_\infty = \conv \{\mb e_k \sign(z_k): z_k =  \norm{\mb z}_\infty \; \forall\, k\}
+\end{align} 
+where $\mb e_k$'s are the standard basis vectors, $\conv$ denotes the convex hull, and $\sign(z_k) = z_k/\abs{z_k}$ if $z_k \ne 0$, otherwise $[-1, 1]$.
+Any subgradient within the subdifferential set contains no more than $n_k = \abs{\{k: z_k = \norm{\mb z}_\infty\}}$ nonzeros, and is sparse when $n_k$ is small. When all subgradients are sparse, only a handful of optimization variables may be updated on each iteration, which can result in slow convergence. To speed up the overall optimization process, we propose the reformulation:
+\begin{equation}
+    \label{eq: Linf to box}
+    \norm{\mb x - \mb x'}_\infty \le \eps \Longleftrightarrow -\eps \mb 1 \le \mb x - \mb x' \le \eps \mb 1,
+\end{equation}
+where $\mb 1 \in \RJU^n$ is the all-ones vector. Then, the resulting $n$ box constraints can be folded into a single constraint as introduced in \cref{subsec: folding} to improve efficiency; see \cref{Fig: Ablation on Linf Reform} for an example of such benefits.}
+
+\begin{figure}[!tb]
+\centering
+\includegraphics[width=0.4\textwidth]{Figures/Sec3-Ablations/L1-Reform/L1-Reform.png}
+\caption{Robustness radii found by solving min-radius from with $\ell_1$ distance in the original formulation (\ref{eq:min_distort}) (\textcolor{blue}{blue}) and in the reformulated version (\ref{eq: l1 min form reformualtion}) (\textcolor{orange}{orange}) on $18$ CIFAR-10 images. The x-axis denotes the sample index and the y-axis denotes the radius. As all results have reached the feasibility tolerance, the lower the radius found, the more effective the solver is at handling the optimization problem.} 
+\label{fig:L1 Reform Ablation} 
+% \vspace{-1em}
+\end{figure}
+
+\subsubsection{Decoupling the update direction and the radius: reformulating $\ell_1$ and $\ell_\infty$ objectives}
+\label{subsec: reformulate l1 and linf obj}
+It is not surprising that for min-radius form with $\ell_\infty$ distance, it is more effective to solve the reformulated version (\ref{eq: min reform}) than the original one (\ref{eq:min_distort})---(\ref{eq: min reform}) moves the $\ell_\infty$ distance into the constraint, thus allowing us to apply constraint folding technique described in \cref{subsec: reformulate Linf constraint}. In practice, we also find that solving the reformulated version below is more effective when $d$ is the $\ell_1$ distance in min-radius form:
+\begin{align} 
+\label{eq: l1 min form reformualtion}
+   \begin{split}
+       & \min_{\mb x'\, , \mb t} \; \mb{1}^{\TJU}\mb t\\
+    \st \; & \max_{i \ne y} f_{\mb \theta}^i (\mb x') \ge f_{\mb \theta}^y (\mb x') \\
+    & \abs{\mb x_i - \mb x'_i} \leq t_i\, , \quad i = 1, 2, \cdots, n \\
+    & \mb x' \in [0, 1]^n.
+   \end{split}
+\end{align}
+where $t_i$ is the $i^{th}$ element of $\mb t$. The newly introduced box constraint $\abs{\mb x_i - \mb x'_i} \leq t_i$ is then folded as described in \cref{subsec: folding}. \cref{fig:L1 Reform Ablation} compares the robustness radius found by solving (\ref{eq:min_distort}) and (\ref{eq: l1 min form reformualtion}) on the same DNN model with $\ell_1$ distance on $18$ CIFAR-10 images, respectively. The radius found by solving (\ref{eq: l1 min form reformualtion}) are much smaller in all but one sample than by solving (\ref{eq:min_distort}), showing that solving (\ref{eq: l1 min form reformualtion}) with constraint-folding is more effective than solving the original form (\ref{eq:min_distort}).
+
+\input{Sections/section_elements/Fig-Sec3-Ablation-MinLinf-Rescale.tex}
+
+\subsubsection{Numerical re-scaling to balance objective and constraints}
+\label{subsec: granso resscale}
+The steering procedure for determining search directions in \pygranso~(see line 5 in \cref{{alg:steering}}, \cref{Sec:granso_summary}) can only successively decrease the influence of the objective function in order to push towards feasible solutions. Therefore, if the scale of the objective value is too small compared to the initial constraint violation value, numerical problems can arise---\pygranso~will try hard to push down the violation amount, while the objective hardly decreases. This can occur when solving min-radius form with the $\ell_\infty$ distance, using the reformulated version (\ref{eq: min reform}). The objective $t$ is expected to have the order of magnitude $10^{-2}$ while the folded constraints are the $\ell_2$ norm of a $n$-dimensional vector (e.g., $n = 3 \times 32 \times 32 = 3072$ for a CIFAR-10 image). To address this, we simply rebalance the objective by a constant scalar---we minimize $t\cdot\sqrt{n}$ instead of $t$, which can help PWCF perform as effectively as in other cases; see an example in \cref{Fig: Ablation on Min Linf Rescale}.
+
+\input{Sections/section_elements/Fig-Loss-Clipping.tex}
+
+\subsubsection{Loss clipping in solving max-loss form with PWCF}
+\label{subsec: loss clip}
+When solving  max-loss form using the popular cross-entropy (CE) and margin losses as $\ell$ (both are unbounded in maximization problems, see \cref{fig:loss_clipping}), the objective value and its gradient can easily dominate over making progress towards pushing down the constraint violations. \change{While \pygranso~tries to make the best joint progress of these two components, PWCF can still persistently prioritize maximizing the objective over constraint satisfaction, which can lead to bad scaling problems in the early stages and result in slow progress towards feasibility. To address this, we propose using the margin and CE losses with clipping at critical maximum values. For margin loss, the maximum value is clipped at $0.01$, since $\ell_{\mathrm{ML}} > 0$ indicates a successful attack. Similarly, CE loss can be clipped as follows: the attack success must occur when the true logit output is less than $1/N_c$ (after softmax normalization is applied), where $N_c$ is the number of classes. The corresponding critical value is thus $\ln N_c$---approximately $2.3$ when $N_c=10$ (the number of total classes for the CIFAR-10 dataset) and $4.6$ when $N_c=100$ (for ImageNet-100\footnote{ImageNet-100~\cite{laidlaw2021perceptual} is a subset of ImageNet, where samples with label index in $\{0, 10, 20, \cdots, 990\}$ are selected. ImageNet-100 validation set thus contains in total $5000$ images with $100$ classes.} dataset). Loss clipping significantly speeds up the optimization process of PWCF to solve max-loss form; see \cref{Fig: ablation loss clipping} for an example.}
+
+\input{Sections/section_elements/Fig-Sec3-Ablation-LossClip.tex}
+\input{Sections/section_elements/Table-PWCF-Alg.tex}
+\input{Sections/section_elements/Fig-Sec3-Ablation-TerminateIter-OPT-Traj.tex}
+
+\subsection{Summary of PWCF to solve the max-loss form and min-radius form}
+\label{subsec: PWCF techniques demo}
+We now summarize PWCF for solving max-loss form and min-radius form in \cref{alg:pwcf}. We also provide information on PWCF's reliability and running time analysis on these two problems. \change{We will present the ability of PWCF to handle general distance metrics in \cref{Sec: experiments and results}.}
+
+% \input{Sections/section_elements/Table-Sec3-Ablation-PWCF-Time.tex}
+\subsubsection{Reliability}
+\label{subsec: reliability}
+As mentioned in \cref{Sec:introduction}, popular numerical methods only relying on preset MaxIter are subject to premature termination (see \cref{Fig:APGD-FAB-Terminate-Iter} to review). In contrast, PWCF terminates either when the stopping criterion is met (solution quality meet the preset tolerance level), or by MaxIter with stationarity estimate and total violation to assess whether further optimization is necessary (see \cref{Fig: PWC-Max-Terminate-Iter} to review). \cref{Fig: Abaltion-OPT-Traj} provide extra examples of the optimization trajectories of APGD, FAB and PWCF, which again shows why PWCF's termination mechanism is more reliable.
+
+\input{Sections/section_elements/Fig-Sec3-Ablation-PWCF-Time-Max.tex}
+\input{Sections/section_elements/Fig-Sec3-Ablation-PWCF-Time.tex}
+\input{Sections/section_elements/Table-Granso_attack_acc_l1.tex}
+
+\subsubsection{Running cost}
+\label{subsec: running cost}
+We now consider run-time comparisons of APGD and FAB v.s. PWCF in solving max-loss form and min-radius form on CIFAR-10 and ImageNet images, as in \cref{Fig: PWC-Terminate-Time-Max} and \cref{Fig: PWC-Terminate-Time}. Our computing environment uses an AMD Milan 7763 64-core processor and a NVIDIA A100 GPU (40G version). We use $10^{-2}$ as PWCF's stationarity and violation tolerances to benchmark PWCF's running cost. The results show that PWCF can be faster than FAB (except for the $\ell_\infty$ case on CIFAR-10 images) when solving min-radius form (\cref{Fig: PWC-Terminate-Time}), but can be about $10$ times slower than APGD when solving max-loss form (\cref{Fig: PWC-Terminate-Time-Max}).  Again, we remark that solution reliability should come with a higher priority than speed for RE; we leave improving the speed of PWCF as future work. The run-time result of PWCF implies that PWCF may be favorable for RE where reliability and accuracy are crucial but may be non-ideal to be used in training pipelines.

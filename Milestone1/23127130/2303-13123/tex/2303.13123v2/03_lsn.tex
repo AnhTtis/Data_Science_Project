@@ -1,0 +1,88 @@
+To model the posterior distribution in Eq.~\eqref{pred_dist} we apply Laplace's method which approximates the weight posterior with a Gaussian distribution $q(\theta)$ around a local mode $\theta_{\MAP}$ using the Hessian matrix $\mathbf{H}$ \cite{mackay1992bayesian}
+\begin{equation}
+   q(\theta)= \mathcal{N}(\theta \vert \theta_{\MAP}, \mathbf{H}^{-1}). 
+\end{equation}
+Evaluating $\mathbf{H}$ is computationally infeasible because of the quadratic complexity in network parameters and the large output dimensions for segmentation. We improve upon Hessian approximation techniques \cite{daxberger2021laplaceredux,botev2020} by extending recent progress in scaling LA for images \cite{miani_2022_neurips} to segmentation networks with skip connections.
+\subsection{Laplace Approximation of the Mean Network}
+We can reformulate the integral for the predictive distribution over the binary predictions $y$ in Eq.~\eqref{pred_dist} by integrating over logits $\eta$ to obtain 
+\begin{equation}
+    \label{pred_dist_with_logits}
+ p(y \vert x, D) = \iint p(y \vert \eta) p(\eta \vert x,\theta) p(\theta \vert D) \diff \eta \diff \theta.
+\end{equation}
+Following \cite{kendall2017} and \cite{monteiro2020}, we model the conditional distribution over logits $p(\eta \vert x,\theta)$ as a normal distribution parametrized by neural networks $\mu$ and $\Sigma$ :
+\begin{equation}
+    \label{logit_dist}
+    \eta \vert x \sim \mathcal{N}(\mu(x, \theta_1),\Sigma(x,\theta_2)),
+\end{equation}
+and assume pixel-wise independence for the predicted labels given the logits. Thus, we can model $p(y \vert \eta)$ for each pixel $s$ as a Bernoulli distribution parametrized by the sigmoid of the respective logit. 
+Since the size of the covariance matrix $\Sigma$ scales quadratically with the number of pixels $S$ in the image, we use the low-rank parameterisation of \cite{monteiro2020}:
+\begin{equation}
+    \Sigma(x) = D(x) + P(x)^T P(x),
+\end{equation}
+i.e.~the variance network $\Sigma(x)$ is implemented with two networks $D(x)$ and $P(x)$. 
+
+The vectors $\theta_1 \in \Theta_1 = \mathbb{R}^T$ and $\theta_2 \in \Theta_2 = \mathbb{R}^T$ parameterize the mean and variance networks (c.f.\@ Eq.~\ref{logit_dist}) and share the first $t$ entries, i.e.we define the shared weight vector $\theta_t$ of the network by 
+\begin{equation}
+    \theta_{t} \coloneqq (\theta_{1_1}, \ldots ,\theta_{1_t} ) = (\theta_{2_1}, \ldots ,\theta_{2_t} ) \in \Theta_t =\mathbb{R}^t.
+\end{equation}
+Then $\theta \in \Theta = \mathbb{R}^{(t+2\cdot(T-t))}$ contains all model parameters
+\begin{equation}
+    \theta \coloneqq (\theta_t, \theta_{1_{t+1}}, \ldots, \theta_{1_{T}}, \theta_{2_{t+1}}, \ldots, \theta_{2_{T}}).
+\end{equation}
+The post-hoc Laplace approximation first finds a mode $\theta_{\MAP}$ by minimizing 
+\begin{multline}
+    \mathcal{L}(\theta) = - \log \mathbb{E}_{p(\eta \vert x, \theta)} [p(y \vert \eta)] - \log p(\theta) \approx  \\-\text{logsumexp}_{m=1}^M \left(\sum_{s=1}^S \log p(y_s \vert \eta_s^{(m)})\right) + \log(M) ,
+\end{multline}
+where $M$ logits $\eta$ are sampled from the distribution in Eq.~\eqref{logit_dist} and where the term $\log p(\theta)$ vanishes assuming a flat prior $\nabla_{\theta} p(\theta) = 0$. 
+Since current algorithms for fast Hessian computations have no implementation for this loss function, we instead make use of the shared weights in the parameter vectors to estimate the mean and variance of the logit distribution based on the feature maps of a deep deterministic segmentation model. Using only one convolutional layer each for mean and variance estimation, we omit the entries of the variance heads on the parameter vector $\theta_{\MAP}$, i.e.\@ we set 
+\begin{equation}
+   \theta_{\MAP}^* \coloneqq \restr{\theta_{\MAP}}{(\theta_t, \theta_{1_{t+1}}, ..., \theta_{1_{T}})} \in \Theta_{\textrm{mean}} =\mathbb{R}^{T}.
+\end{equation}
+We can make use of the fact that the SSN loss function reduces to the binary cross entropy loss under zero variance, which allows us to fall back on the fast Hessian computation frameworks available. The posterior is then found by Laplace's method resulting in a Gaussian approximation in the parameter space $\Theta_{\textrm{mean}}$
+\begin{equation}
+    q(\theta^{*})= \mathcal{N}\left(\theta^{*} \vert \theta_{\MAP}^{*}, \mathbf{H^{*}}^{-1}\right), 
+\end{equation}
+with $\mathbf{H^*}$ defined as 
+$
+    \mathbf{H^*} = - \nabla_{\theta^{*}} \nabla_{\theta^{*}} \log \restr{p(\theta^{*} \vert D)} {\theta^{*} = \theta_{\MAP}^{*}}.
+$
+During inference we can now sample segmentation networks from the posterior distribution in form of the Laplace approximation. Each sampled segmentation network predicts one logit distribution.  Figure~\ref{fig:model_overview} gives an schematic overview of the proposed Laplacian Segmentation Network (LSN) and derived uncertainty measures. 
+\begin{figure*}[t]
+\begin{center}
+\includegraphics[width=0.8\linewidth]{model_overview_grey.png}
+%\vspace*{-\baselineskip}
+\end{center}
+   \caption{Model overview - uncertainty measures are calculated by approximating expectations by Monte Carlo-sampling mean networks from the Laplace approximation $q(\theta^*)$ and predicting the respective logit distributions $p(\eta \vert x, \theta)$ for $x$. }
+\label{fig:model_overview}
+%\vspace*{-\baselineskip}
+\end{figure*}
+\subsection{Fast Hessian Approximations for Segmentation Networks with Skip Connections}\label{sec:fastH}
+Computation of second order derivatives for Segmentation Networks is expensive due to the vast amount of parameters and pixels in the output. Standard methods approximate the Hessian with the diagonal of the Generalized Gauss Newton (\textsc{ggn}) matrix \cite{foresee1997ggn,botev2020}. This approximation, besides enforcing positive definiteness, also allows for an efficient backpropagation-like algorithm. The required compute scales linearly in the number of parameters and quadratic in the number pixels. The quadratic dependency is prohibitive already with images of size $64 \times 64$. We therefore make use of the diagonal backpropagation ($\textsc{db}$) proposed by \cite{miani_2022_neurips}, which returns a trace-preserving approximation of the diagonal of the \textsc{ggn}. The complexity of this approximation scales linearly with the number of pixels, allowing the computation of the Hessian also for larger images. The idea is to add a diagonal operator $\mathcal{D}$ in-between each backpropagation step. For each layer $l$
+\begin{align}
+    [\nabla_{\theta} & \nabla_{\theta} \log p(\theta \vert D)]_l
+    \! \overset{\textsc{ggn}}{\approx} \!
+    [J_\theta f_\theta (x)^\top \textbf{H}^{(L)} J_\theta f_\theta(x)]_l = \\ \nonumber
+    & =
+    J_\theta {f^{(l)}}^\top
+        \left(
+        \prod_{i=l+1}^L J_x {f^{(i)}}^\top
+        \textbf{H}^{(L)}
+        \prod_{i=L}^{l+1} J_x f^{(i)}
+        \right)
+    J_\theta f^{(l)} \\ \nonumber
+    & \overset{\textsc{db}}{\approx}
+    J_\theta {f^{(l)}}^\top
+        \mathcal{D}
+        \left(
+        J_x {f^{(l+1)}}^\top
+        \mathcal{D}
+            \left(
+            \dots
+            \right)
+        J_x f^{(l+1)}
+        \right)
+    J_\theta f^{(l)}
+\end{align}
+where $J_\theta$ denotes the Jacobian and $\textbf{H}^{(L)}$ the Hessian of the binary cross entropy loss with respect to the logits. The Hessian matrix can be expressed in closed form as a diagonal matrix plus an outer product matrix.
+
+Moreover, we extend the \texttt{StochMan} library \cite{software:stochman} with support for skip-connection layers. For a given submodule $f_\theta$, a skip-connection layer $\textsc{sc}_f$ concatenates the function with the identity, such that $\textsc{sc}_f(x) = (f_\theta(x), x)$. The Jacobian is then defined as $J_x \textsc{sc}_f(x) := (J_x f_\theta(x), \mathbb{I}_x) $. We utilize the block structure of the Jacobian matrix and efficiently backpropagate its diagonal only. With a recursive call on the submodule $f$, the backpropagation supports nested skip-connections, i.e.\@ when some submodules of $f$ are skip-connections as well. This unlocks the use of various curvature-based methods for segmentation architectures with skip connection in future research. For a technical description of the used Hessian approximation we refer to the supplementary material.

@@ -1,0 +1,182 @@
+\section{Design}\label{design}
+\subsection{LearnedFTL Overview}
+
+The main idea of LearnedFTL is combining the learned index with demand-based FTL, where the demand-based mapping scheme handles locality-based access patterns and learned indexes handle random access patterns. This design allows LearnedFTL to serve all types of workloads efficiently. Figure~\ref{three_schemes}(c) illustrates the system overview of LearnedFTL. 
+
+
+In LearnedFTL, each request first checks the CMT. If the CMT fails, LearnedFTL queries the corresponding GTD entry and uses the learned index model to predict the PPN. If the prediction is correct, LearnedFTL accesses the predicted PPN directly, thus eliminating the flash double-read operation. If the prediction is inaccurate, LearnedFTL accesses the data by using the original flash double-read method in TPFTL.
+
+Each model in the GTD is called an \textbf{in-place-update linear model}. Each in-place-update model is a piece-wise linear model, and each linear model has adjustable parameters. To guarantee the accuracy of the model predictions (\textbf{Challenge \#1}), each in-place-update linear model is equipped with a bitmap filter, which indicates whether the prediction of a certain LPN is accurate, thus reducing the cost of inaccurate predictions. To obtain contiguous PPNs for sorted LPNs (\textbf{Challenge \#2}), LearnedFTL proposes the virtual PPN (VPPN) representation to convert PPNs from different parallel units into sequential ones. To reduce the space overhead and performance overhead of model training under random writes (\textbf{Challenge \#3}), LearnedFTL proposes a group-based allocation to bring LPNs belonging to the same GTD entry together and proposes two model training strategies, including a computation-free sequential initialization and a model training via GC/rewrite strategy.
+
+
+\begin{figure}[t]
+    \centering
+    % \setlength{\abovecaptionskip}{5pt}
+    \includegraphics[scale=0.62]{photos/design/inplace_model1.pdf}
+    \caption{The structure of an in-place-update model in GTD.}
+    \label{fig-model-layer}
+    % \vspace{-10pt}
+\end{figure}
+
+\subsection{In-Place-Update Linear Model}
+\label{in-place-model}
+
+The model layer in GTD is the most critical component in LearnedFTL, as it determines the efficiency of the entire address mapping process. Figure~\ref{fig-model-layer} illustrates the structure of the \textbf{in-place-update linear model} used in LearnedFTL. Since each model is attached to a GTD entry, each model is only used to predict the mappings of the LPN range represented by its attached GTD entry. An in-place update linear model is a piece-wise linear regression model (PLR model), and it consists of two parts: a \textbf{parameter array} $<$k,b, off$>$[N] and a \textbf{bitmap filter}.
+
+In the parameter array, 
+Each $<$k,b,off$>$ represents a linear model, including intercept (\textbf{$\mathrm{b}$}), slope (\textbf{$\mathrm{k}$}), and the offset (\textbf{$\mathrm{off}$}) from this PLR model's starting LPN. Given a certain LPN, the offset (\textbf{$\mathrm{off_x}$}) from the starting LPN is calculated first, and then LearnedFTL queries the corresponding linear model \textbf{$\mathrm{<k_n, b_n, off_n>}$} based on the \textbf{$\mathrm{off_x}$}. The PPN can be predicted using the $y=k_n\times(LPN-LPN_{start}) + b_n$.
+
+A bitmap filter is a bitmap, and each bit in the bitmap is associated with an LPN, representing whether an LPN can be accurately predicted (\emph{1} means accurate, \emph{0} means inaccurate). The bitmap is updated during model training (detailed in Section~\ref{three-three}).
+With the bitmap filter, the in-place-update linear model offers two significant benefits over the traditional learned indexes: 
+
+(1) \textbf{Accurate predictions}. The bitmap filter can mark which LPNs can make accurate predictions, assisting models to make only accurate predictions.
+Figure~\ref{fig-model-predict} illustrates the two different instances of the bitmap filter. For a request with an $LPN_{req1}$ that needs to use the model to predict the PPN, LearnedFTL first checks the corresponding bit in the bitmap and finds the bit is \emph{1}. Then LearnedFTL will perform model prediction to generate the true $PPN_{req1}$. Since this prediction is marked as accurate, LearnedFTL directly uses this $PPN_{req1}$ to access data. For another request with $LPN_{req2}$ whose corresponding bit is \emph{0}, LearnedFTL will perform a double read for this LPN and not use the model to make predictions. With the bitmap filter, LearnedFTL can make only the correct model predictions and avoid miss penalty caused by wrong model predictions. 
+
+\begin{figure}[t]
+    \centering
+    % \setlength{\abovecaptionskip}{5pt}
+    \includegraphics[scale=0.85]{photos/design/predictor.pdf}
+    \caption{The workflow of bitmap filter.}
+    \label{fig-model-predict}
+    % \vspace{-10pt}
+\end{figure}
+
+% In addition to filtering wrong predictions, the bitmap filter can assist LearnedFTL to in-place update learned indexes, maintaining the timeliness of learned indexes without incurring additional overhead.
+
+%Figure~\ref{fig-inplace-model} shows the workflow of model in-place update.
+
+\begin{figure}
+   \centering
+   \setlength{\abovecaptionskip}{5pt}
+   \includegraphics[scale=0.65]{photos/design/inplace_update_process.pdf}
+   \caption{The workflow of model in-place update.}
+   \label{fig-inplace-model}\vspace{-10pt}
+\end{figure}
+
+(2) \textbf{The model parameters can be updated as needed}. The bitmap filter offers the ability to control each LPN, making in-place update of the model possible. Figure~\ref{fig-inplace-model} shows the workflow of model in-place update, when we retrain the LPN-PPN mapping for $model_1$ (with $k_1$ and $b_1$), we can directly update the original model in-place. The model in-place update first modifies the slope $k_1$ and then intercepts $b_1$ to the newly calculated value $k_1'$ and $b_1'$. Since the range of new $model_1'$ and the range of $model_2$ have conflict, the $off_2$ of $model_2$ should be increased until it does not conflict with the new $model_1'$. Finally, the bitmap is updated based on the accuracy of the newly generated model. With the in-place-update ability, an in-place update linear model can always maintain a fixed space overhead, avoiding the need for space compaction like the LSMT in LeaFTL.
+
+The data consistency of the in-place-update linear model is guaranteed upon each update. Specifically, for each write request with an LPN, LearnedFTL first checks if the corresponding bit of this LPN in the bitmap is \emph{\textbf{1}}. If so, LearnedFTL will set this bit to \emph{\textbf{0}} to prevent the model from making wrong predictions. 
+
+
+Since persisting the models to flash upon each update will bring additional writing overhead,
+the models are saved to flash follows the GTD saving procedure as the TPFTL and DFTL handle. During a normal power-off, the models are saved in a flash area alongside GTD. This allows us to easily retrieve and use the stored models when the device reboots.
+In the event of a power failure, GTD is rebuilt by scanning all translation pages. Models can also be reconstructed from the mapping information within these translation pages, similar to TPFTL and DFTL. The reconstruction won't take much time since the time overhead for model training is minimal, as shown in Figure~\ref{fig-compute-simulation}.
+
+
+\subsection{Virtual PPN Representation}
+
+We propose virtual PPN representation to address the problem of non-contiguous PPNs caused by SSD internal parallelism. During model training of learned indexes, it is important to allocate contiguous PPNs for contiguous LPNs. However, the pages with consecutive LPNs may be written back to different flash chips, leading to non-contiguous PPNs.
+To tackle this problem, LearnedFTL uses a VPPN representation to transform the non-contiguous PPNs scattered across different chips into contiguous ones. Figure~\ref{fig-virtual} shows the translation principle from PPN to virtual PPN. Since the total number of physical flash pages is fixed in an SSD, the PPN is formed in such a way that it represents the hierarchical tree structure of an SSD by the concatenation of address fields representing different levels of the hierarchy from the highest (channel) to the lowest (page) granularity. Because of the commutative law of multiplication, the order of these address fields in PPN can be changed to obey the allocation order. Thus, each physical page retains its unique number, and the new page number will become contiguous according to the allocation order.
+\begin{figure}[t]
+    \centering
+    % \setlength{\abovecaptionskip}{5pt}
+    \includegraphics[scale=0.85]{photos/design/virtual_address_principle.pdf}
+    \caption{The principle of virtual PPN translation.}
+    \label{fig-virtual}
+    % \vspace{-10pt}
+\end{figure}
+
+
+Figure~\ref{fig-virtual-example} gives an example of the PPN-to-VPPN translation. In LearnedFTL, the allocation order is \emph{channel, chip, plane, page, and block}, which is the fastest allocation order based on the previous study~\cite{hu2011performance}. For requests with LPNs \emph{1001, 1002, 1003} that are already written to flash-based SSD, their PPNs are \emph{5013631, 6062207, 7110783}, which are not contiguous. However, after the PPN-to-VPPN translation by changing the order of the fields in the address appropriately, LearnedFTL obtains contiguous VPPNs \emph{2105388, 2015389, 2105390} for these LPNs.
+
+
+
+The virtual PPN representation allows LearnedFTL to generate contiguous VPPNs for model training when valid pages are written to the flash-based SSDs concurrently. Since the training model is built based on LPN-VPPN mappings, the predicted VPPN needs to be translated back to PPN to obtain the physical flash page.
+
+
+\begin{figure}
+    \centering
+    % \setlength{\abovecaptionskip}{5pt}
+    \includegraphics[scale=0.85]{photos/design/virtual_address_sample.pdf}
+    \caption{An example of PPN-to-VPPN translation.}
+    \label{fig-virtual-example}
+    % \vspace{-10pt}
+\end{figure}
+
+
+
+
+\subsection{Group-based Allocation Strategy}
+
+Since random writes generate requests of non-contiguous LPNs, it's non-trivial to group them together and create a learned index during writes. Fortunately, garbage collection provides the opportunity to rearrange PPNs. Specifically, during GC, LearnedFTL can rearrange one GTD entry's PPNs to consecutive PPNs and then train models over these newly arranged PPNs.
+
+
+However, the current dynamic allocation strategy used by LeaFTL and TPFTL makes PPN rearrangement difficult. This is because when allocating a flash page for a PPN, dynamic allocation will select the least busy flash chip to allocate pages for optimal parallelism and write efficiency. As a result, the PPNs of a GTD entry will be scattered across various locations. When building a learned model over this GTD entry via GC, LearnedFTL needs to collect the valid pages across multiple flash blocks, and these blocks also may contain PPNs belonging to other GTD entries. As a result, the GC process generates frequent data movement, which significantly increases the complexity and overhead of the model training process. 
+
+
+To address this PPN rearrangement issue, we propose a \textbf{group-based allocation strategy}. The basic idea is to divide GTD into groups of consecutive entries, referred to as \emph{GTD entry group}. Each group is allocated an exact number of contiguous flash blocks to accommodate all the LPNs of the group. When the flash blocks allocated to a GTD entry group are full, these used flash blocks are replaced by the same number of contiguous empty flash blocks. When there are no empty flash blocks or the cumulative number of flash blocks allocated to this GTD entry group reaches a threshold, GC is performed on the GTD entry group with the most invalid data pages. During GC, LearnedFTL reclaims data blocks by relocating the valid data pages and retrains the learned models for all GTD entries in this group. 
+
+
+Figure~\ref{fig-group-allocation} illustrates an example of group-based allocation. In this instance, for the convenience of presentation, each GTD entry group contains two entries and needs two contiguous flash blocks to accommodate all its LPNs. Therefore, LPNs \emph{0-1023} belong to group 0 and LPNs \emph{4096-5119} belong to group 4. When a request for data with LPN belonging to group 0 arrives, two contiguous blocks, \emph{blk1} and \emph{blk2}, are allocated to group 0. When a request for data with LPN belonging to group 4 arrives, another two contiguous blocks, \emph{blk110} and \emph{blk111}, are allocated to group 4 to accommodate the required data pages. When group 0 has no free physical pages, another two contiguous blocks, \emph{blk3} and \emph{blk4}, are allocated to this group. If group 0 is selected for garbage collection, all four blocks are collected directly.
+ 
+\begin{figure}[t]
+    \centering
+    % \setlength{\abovecaptionskip}{0pt}
+    \includegraphics[scale=0.85]{photos/design/group_allocation.pdf}
+    \caption{An example of group-based allocation.}
+    \label{fig-group-allocation}
+    % \vspace{-20pt}
+\end{figure}
+
+A serious write-amplification concern arises with this group-based allocation strategy: when all GTD entry groups have been written at least once, a few hot GTD entry groups have been written frequently, which causes huge write amplification. To solve the problem, a global counter is associated with each GTD entry group to identify the hot groups by counting available free pages in the group. 
+
+
+To address the situation where hot GTD entry groups have limited or no free pages, LearnedFTL employs an \emph{opportunistic cross-group allocation} strategy. This approach allows these hot groups to utilize the available free-page spaces within flash blocks belonging to "cold" GTD entry groups that have an abundance of free pages and untrained models. By encroaching into the free-page spaces of the cold groups, LearnedFTL effectively avoids or delays the need for GC operations. Once the amount of encroachment reaches a specific threshold, GC is triggered for both the encroaching (hot) group and the encroached (cold) group. Subsequently, their respective models undergo retraining and training processes. Consequently, this opportunistic cross-group allocation approach not only reduces the frequency of GC and the write amplification caused by GC operations in hot groups but also ensures the early training of models in cold groups.
+
+
+
+\subsection{Model Training}
+\label{three-three}
+
+To ensure the timeliness of the in-place-update model, LearnedFTL uses two model training strategies. One is sequential initialization, which is used to initialize the model through sequential write requests during data writing. The other is model training via GC, which is used to train the model during garbage collection to achieve higher accuracy.
+
+
+\subsubsection{Sequential Initialization}
+\label{sequential_init}
+
+The main idea of sequential initialization is to update the learned index model in place based on sequential write requests. In many workloads, the I/O size of each request may range from several to tens of flash pages. When assigning contiguous PPNs for each I/O request, these LPN-PPN mappings can be seen as a \textbf{\emph{y=x}} model. Therefore, we can use these y=x models to update the corresponding in-place-update linear model. For each write request, there are four steps in sequential initialization:
+
+\ding{172} \textbf{Obtaining contiguous PPNs.} LearnedFTL first writes the data of this request to the flash memory and obtains contiguous PPNs. After obtaining contiguous PPN, each LPN must check whether the corresponding bit in the bitmap is `1'. If it is, LearnedFTL updates it to `0'. 
+
+\ding{173} \textbf{Generate the linear model.} LearnedFTL builds a \emph{\textbf{y=x}} model on these LPN-PPN mappings. Then LearnedFTL obtains the model's starting LPN ($\mathrm{LPN_{start}}$), ending LPN ($\mathrm{LPN_{end}}$), and length ($\mathrm{L}$). 
+
+\ding{174} \textbf{Check corresponding model.} LearnedFTL locates the corresponding model with $\mathrm{<k, b, off>}$ in GTD by $\mathrm{LPN_{start}}$ and $\mathrm{LPN_{end}}$. After that, LearnedFTL calculates the length $\mathrm{L_{old}}$ of the existing model through the corresponding bitmap. 
+
+\ding{175} \textbf{Update the model.} If $\mathrm{L_{old}}$ is smaller than $\mathrm{L}$, LearnedFTL performs in-place-update to replace the existing linear model with the newly generated linear model.
+
+
+\subsubsection{Model Training via GC}
+\label{model-training}
+
+Since only long write requests will perform sequential initialization, LearnedFTL also proposes model training via GC to obtain a more comprehensive and accurate model.
+With the help of group-based allocation, when LearnedFTL performs garbage collection, all valid pages of one GTD entry group can be collected and trained. 
+When a GTD entry group needs to perform GC, the whole model training process via GC is divided into four steps:
+
+\textbf{\ding {172} Regulate valid mappings.} First, LearnedFTL reads all the translation pages of this GTD entry group and only keeps the valid translations in memory. Then LearnedFTL sorts the valid translations by their LPNs to make them ordered. 
+
+\textbf{\ding {173} Write valid pages back and obtain PPNs.} After regulating the valid LPNs, LearnedFTL allocates another group of flash blocks to this GTD entry group, then writes the valid pages back to the newly allocated flash blocks to get contiguous PPNs. 
+
+\textbf{\ding {174} Train the learned model.} In this step, each GTD entry in this group will train its in-place-update linear model. For each GTD entry, calculate the offset of PPNs/LPNs from this GTD entry’s starting PPN/LPN. Then, perform greedy linear regression to fit to get the $<$k, b, off$>$ parameters array. 
+
+\textbf{\ding {175} Evaluate the model.} After training the models, Learned FTL will evaluate the model and update the bitmap filter. During this process, each LPN will be inputted into the model. If the predicted PPN is accurate, the corresponding bit will be set to `1'.
+
+
+\subsubsection{Model Training via Rewrite}
+
+For some scenarios where GC rarely happens, the model training can be integrated into the SSD rewrite process~\cite{cai2015data,maneas2022operational}. The rewrite is a widely used reliability mechanism to reduce retention errors in modern SSDs by periodically reading, correcting, and reprogramming the flash memory. Rewrite happens frequently and is the most significant factor for write amplification~\cite{maneas2022operational}. During SSD rewrite, LPNs of flash pages can be sorted in order so that these pages are written back in contiguous PPNs, which then enables a model to be built and trained on them by LearnedFTL.
+
+
+
+\subsection{Cost Analysis}
+
+\label{three-cost}
+Though LearnedFTL introduces multiple new components to apply the learned index in the FTL, it only introduces minor computational overhead, illustrated as follows.
+
+\textbf{(1) Write}: For each write request, LearnedFTL incurs two additional operations, one is the \textbf{bitmap check} operation (Section~\ref{in-place-model}) to maintain the consistency of the model, the other is the sequential initialization (Section~\ref{sequential_init}). Both operations are performed in memory, and there are no calculation operations. Thus, the overhead can be ignored.
+
+\textbf{(2) Read}: For each read request with an LPN, LearnedFTL incurs two additional operations when this LPN cannot hit in the CMT. The first operation is a \textbf{bitmap check} to check if this LPN can predict a real PPN. The second operation is a \textbf{model prediction} when the bitmap check is true. For these LPNs, LearnedFTL will use the model to predict the real PPN instead of an extra flash read. The model prediction includes calculating the VPPN with the \emph{y=kx+b} model and translating the predicted VPPN to PPN. 
+
+\textbf{(3) GC}: The model training incurs two computational overheads during the GC period. The first one is \textbf{sorting} all the LPNs within each GTD entry (Step \ding {172} in Section~\ref{model-training}). The second one is \textbf{training} each GTD entry's model (Step \ding{174} in Section~\ref{model-training}).
+
+Our experiments in Section~\ref{overhead-analysis} have detailed evaluations to quantitatively analyze these overheads.
+

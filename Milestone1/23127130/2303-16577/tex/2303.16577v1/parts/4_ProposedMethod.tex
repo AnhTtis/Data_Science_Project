@@ -1,0 +1,233 @@
+\begin{figure*}[t]
+  \begin{center}
+    \includegraphics[scale = 0.48,bb = 0 0 1092 420.96]{figs/method_overview.pdf}
+    \caption{An overview of proposed method.\todo{simplify figure}}
+    \label{SystemOverview}
+  \end{center}
+\end{figure*}
+The optimization problem for time-series schema described in Section~\ref{Sec:Optimization} does not scale due to the large size of decision variables ($\delta_{jt}$ and $\delta^{E}_{goht}$).
+% ($\delta_{jt}$, where $j$ is a column family and $t$ is a time step and $\delta^{E}_{goht}$ where $g, h$ are column family, $o$ is migration query, $t$ is a time step)
+For example, the size of $\delta_{jt}$ is the product of the number of column families and the number of time steps.
+This is caused by the fact that the number of schema candidates blows up depending on the number of time steps, and the number of migration plan candidates also blows up depending on the number of queries and schema candidates.
+To overcome these obstacles, we propose a system for optimizing time-series schema by effectively reducing the number of schema (column family) candidates as well as the number of migration plan candidates.
+
+%\memo{Proposal: 1st novelty}
+First, we propose a novel column family pruning technique for time-dependent workload by introducing workload summary tree.
+The workload summary tree approximates the ILP for the original workload using multi-level of workload summaries and the pruning technique effectively identifies uninteresting column families by leveraging the workload summary tree.
+The novel idea is that we identify uninteresting column families that are never chosen as ILP answers at any nodes in the tree.
+This approach is scalable because each summarized sub-workload at each node consists only of three time steps so we can largely reduce the size of decision variables for the ILP of each summarized sub-workload.
+
+%\memo{Proposal: 2nd novelty}
+Second, we propose an effective technique that reduces the number of migration plan candidates.
+Notice that workload changes cause optimized query plan changes, which necessitate database migration. 
+Our idea is that we can effectively reduce the number of migration plan candidates by restricting them according to how optimized query plans are changed instead of enumerating all possible candidates.
+
+\subsection{System Overview}
+Figure~\ref{SystemOverview} depicts an overview of our system.
+Our system identifies an optimized time-series schema and outputs optimized query plans and migration plans using the following procedures: 
+column family pruning (Section \ref{Section:PreOptimizationPruning}), 
+column family and query plan enumeration (Section \ref{Section:EnumerateCFQueryPlan}), 
+migration plan enumeration (Section \ref{Section:EnumerateMirgatePlan}), 
+cost estimation (Section \ref{Section:Cost}), and 
+optimization (Section \ref{sec:WholeOptimization}).
+
+\subsection{Column family pruning using workload summary tree}
+\label{Section:PreOptimizationPruning}
+The objective function described in Section~\ref{Sec:Optimization} indicates that the decision variable size increases linearly to the time step size used in a time-dependent workload.
+So, the optimization problem by ILP does not scale to a large number of time steps.
+To tackle this issue, we propose a novel column family pruning technique for time-dependent workload by introducing novel hierarchical data structure, workload summary tree.
+The workload summary tree approximates ILP of the original workload in multi-level of workload summaries and the pruning technique effectively identifies uninteresting column families by leveraging the multi-level of workload summaries.
+
+\subsubsection{Workload summary tree}
+We introduce workload summary tree in order to approximate ILP of the original workload.
+We design the workload summary tree to have the following features, 1) every child node represents a sub-workload split in time-scale from the workload of its parent node, and 2) every parent node's workload is summarized from its children's sub-workload.
+Therefore, the root node represents a highly summarized whole workload with small time steps and each leaf node represents an unsummarized sub-workload split. 
+Each intermediate node represents a summarized sub-workload split.
+In detail, we design the workload summary tree as a binary tree\footnote{To make the discussion simple, we assume the time step size in the workload is $2^n$. If not, we can add additional leaf nodes for the remainder time steps.}. 
+Each node manages sub-workload with three time steps (minimum, median, maximum).
+The workload managed at each parent node represents the summary of the workloads of its child nodes: the left child manages the left half of the parent workload (between the minimum and median time steps) and the right child manages the right half (between median and maximum time steps). 
+
+\subsubsection{Column Family Pruning Algorithm}
+By leveraging the novel workload summary tree, 
+our pruning technique effectively identifies uninteresting column families using the multi-level of workload summaries: the upper level captures global aspects and the lower level captures more local aspect of the workload. 
+Moreover, 
+in order to take the global aspect from the upper level into account at the lower level, 
+we propose a novel algorithm that recursively constructs an ILP for the summarized workload assigned to each node starting from the root and translates its answer as the ILP constraint of its child sub-workload.
+In detail, the constraint enforces the ILP of child workloads to inherit optimized column families found at the parent workload: a child node solves local ILP so that the optimized column families at min/max time steps should be identical with the ones found at the same time steps (e.g. min and median for the left child node) at the parent workload. 
+After computing the portion of the ILP for each node throughout the tree, we can identify uninteresting column families that are never chosen as ILP answers at any nodes in the tree.
+This approach is efficient, because the time step size of the (sub-)workload at every node is limited to only three (minimum/median/maximum), which is significantly smaller than that of the original workload.
+
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetAlgoLined
+\SetCommentSty{algocommfont}
+\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+\SetKwProg{Fn}{Function}{ is}{end}
+\Input{w (workload), const (ILP constraint)}
+\Output{column families chosen at least by one node of workload summary tree}
+\BlankLine
+\Fn{get\_subtree\_cfs(w, const)}{
+    \If{min\_ts + 1 is max\_ts}{
+        \Return $\emptyset$\;
+    }
+    
+    \tcp{get solution of current workload}
+%    \State S \gets solve\_ILP(w, const)\; 
+    $S \gets solve\_ILP(w, const)\;$
+    
+    \tcp{get used CFs in the solution}
+%    \State C \gets S.cfs
+   $C \gets S.cfs$
+
+    \tcc{get middle time step of current workload}
+%    \State mid\_ts \gets (w.min\_ts + w.max\_ts) / 2\;
+    $mid\_ts \gets (w.min\_ts + w.max\_ts) / 2\;$
+
+    \tcc{translate solution to the constraint}
+%    \State const \gets const \bigcup translate\_to\_const(S)\;
+    $const \gets const \bigcup translate\_to\_const(S)\;$
+        
+%    \State l\_child\_w \gets get\_child\_workload(w, w.min\_ts, mid\_ts)\;
+    $l\_child\_w \gets get\_child\_workload(w, w.min\_ts, mid\_ts)\;$
+    
+    $C \gets C \bigcup get\_subtree\_cfs(l\_child\_w, const)\;$
+
+%    \State r\_child\_w \gets get\_child\_workload(w, mid\_ts, w.max\_ts)\;
+    $r\_child\_w \gets get\_child\_workload(w, mid\_ts, w.max\_ts)\;$
+    
+    $C \gets C \bigcup get\_subtree\_cfs(r\_child\_w, const)\;$
+    
+    \Return $C\;$
+}
+\caption{Obtaining interesting column families from subtree of workload summary tree}
+\label{Algo:Presolve}
+\end{algorithm}
+The detailed algorithm is given in \ref{Algo:Presolve}.
+$\mathit{solve\_ILP}()$ function (line 5) optimizes ILP for each node in the workload summary tree.
+$\mathit{translate\_to\_const}()$ function (line 8) translates the ILP answer of a current node into the constraint for its child node in order to share the optimized column families found at $\mathit{min\_ts}$, $\mathit{mid\_ts}$, $\mathit{max\_ts}$ time steps. 
+$\mathit{get\_child\_workload}()$ function (line 9, 11) constructs workload for a child node for given min/max time steps.
+We recursively invoke $\mathit{get\_subtree\_cfs}()$ function (line 10, 12) by splitting the current workload into two child sub-workloads. 
+After the recursion (line 3, 13), the identified interesting column families are returned. 
+We remove column families that are not contained in these interesting column families from candidates of the optimization.
+
+\subsection{Column Family And Query Plan Enumeration}\label{Section:EnumerateCFQueryPlan}
+
+\subsubsection{Column Family Enumeration}\label{ssec:EnumerateCF}
+The purpose of this step is to enumerate column family candidates used for the optimization problem of time-series schema (Section~\ref{Sec:Optimization}). 
+Since arbitrary query plans can be chosen as optimized plans at any time step, we enumerate all possible column family candidates.
+To this end, we take the same approach used in existing systems~\cite{Mior2017} for column family enumeration; We decompose each query and materialize the whole query or its sub-queries as column families. Thus, we can answer a query with a single column family (query efficient MV plan) or multiple column families by joining them (update efficient join plan). 
+In detail, we employ a query graph, which is a sub-graph of the entity graph in a conceptual schema and expresses a partial schema referred from a given query.
+We enumerate column family candidates by recursively decomposing query graphs; a query graph is decomposed at every node into two sub-queries that are materialized as column families.
+In addition, in order to increase the utilization of column families for answering queries, we employ {\emph{relaxed queries}}~\cite{Mior2017} that are transformed from original queries by moving arbitrary attributes used in \texttt{WHERE}/\texttt{ORDER BY} clauses to \texttt{SELECT} clause\footnote{We keep at least a single equality predicate in \texttt{WHERE} clause in the same way as NoSE in order to construct a valid \texttt{Get} request for the column family.}.
+The column families materialized from relaxed queries can be used to answer more queries, because they can answer queries with fewer conditions in \texttt{WHERE}/\texttt{ORDER BY} clauses.
+However, the number of such column families increases exponentially with the number of query graph edges, because column families are materialized from sub-queries recursively decomposed at every edge.
+Moreover, it increases relative to the factorial of the number of attributes used in \texttt{WHERE}/\texttt{ORDER BY} clauses, because column family variants are sensitive to attribute order. 
+\par
+To overcome such significant growth in the number of enumerated column families, we propose two pruning techniques.
+First, we restrict the number of recursive decompositions of query graphs only to a single time for enumerating column families.
+Thus, we only need to enumerate MV plans and two-CF join plans for all queries.
+The enumerated query plans require at most a single join between column families.
+The number of the original queries and decomposed sub-queries becomes $N_k = 1 + 2k$, which is linear to the number of edges ($k$) in a query graph.
+Second, we reduce the variants of clustering keys in column families by following the features of extensible record stores: the prefix of clustering keys should contain attributes used in \texttt{GROUP BY}/\texttt{ORDER BY} clauses so that \texttt{GROUP BY}/\texttt{ORDER BY} operations can be executed on the server side.
+Notice that we ignore the order of the remaining part of clustering keys if they do not appear in \texttt{WHERE}/\texttt{GROUP BY}/\texttt{ORDER BY} clauses.
+Thus, we can reduce the number of column families by treating the remaining part of clustering keys to be order-insensitive.
+
+\subsubsection{Query Plan Enumeration}
+
+This step transforms each SQL query in the workload to query plans. % that are used in Section~\ref{ssec:QueryPlanAndMigrationPlan}.
+We take the same approach proposed by Mior and Salem~\cite{Mior2017} as follows.
+We enumerate query plans that join column family candidates enumerated in the column family enumeration step (Section~\ref{ssec:EnumerateCF}) from all queries. Here, each query plan corresponds to reconstructing the original query graph from its decomposed subqueries.
+The enumerated query plans consist of three types of operations, 1) \texttt{Get}/\texttt{Put} operations for column families, 2) \texttt{ORDER BY}/\texttt{GROUP BY} at the server side, and 3) join/selection/\texttt{ORDER BY}/\texttt{GROUP BY} at the application side.
+
+\subsection{Migration Plan Enumeration}\label{Section:EnumerateMirgatePlan}
+
+The purpose of this step is to enumerate migration plan candidates used for the optimization problem of time-series schema (Section~\ref{Sec:Optimization}). 
+That is, we enumerate all possible migration plans that migrate schema from $S_{t}$ to $S_{t+1}$ at any time step $t$. 
+However, column families in $S_{t}$ are not decided before the schema optimization, so we enumerate migration plan candidates that generate each target column family enumerated in the column family enumeration (Section~\ref{Section:EnumerateCFQueryPlan}). 
+We introduce two techniques for migration plan enumeration. 
+The first one utilizes query plans as migration plans based on the fact that workload changes cause optimized query plan changes, which necessitate database migration. 
+The second one enumerates additional migration plans to complement the first one.
+
+\subsubsection{Migration plan enumeration by reusing query plans}
+Optimized query plan changes require generating the target column families in $S_{t + 1}$ that are used by the optimized query plans at time step $t + 1$. 
+We observe that if the optimized query plans at time step $t$ and $t+1$ are produced from the same query, 
+they use column families (physical schema elements) produced from the same tables (conceptual schema elements), so the former plan outputs similar target column families in $S_{t + 1}$ as those of the latter plan.
+Based on this observation, we can utilize query plans at time step $t$ as migration plans from $S_{t}$ to $S_{t + 1}$.
+However, since optimized query plans are not decided before the schema optimization, we treat all enumerated query plans at time step $t$ as migration plan candidates in order to permit those query plans to become optimized query plans.
+
+In detail, we identify source queries from workload queries $Q$ for each target column family in the enumerated column families (Section~\ref{Section:EnumerateCFQueryPlan}). 
+A source query is a query whose query plans use the target column family. 
+Then, we modify the source queries to migration queries by making the following modifications: 1) we simplify query plans by removing aggregation/\texttt{ORDER BY} operations that are not necessary for migration plans, and 2) we adjust the projections of the query plans to include the required columns of the target column family.
+Finally, we enumerate query plans for the migration queries and treat them as migration plans.
+
+Figure~\ref{Fig:MigrationPlanExample} depicts migration plan examples generated using $\mathit{CF}4$ in Figure~\ref{SchemaDesignExample} as the target column family.
+Since $\mathit{CF}4$ is used in $q_2$ query plan group, we choose this as the source query for $\mathit{CF}4$. 
+Then, we modify $q_2$ to migration query $q^{\prime}_2$ as follows:
+\begin{verbatim}
+SELECT item.id, user.id, user.name, user.email
+FROM user.item WHERE item.quantity = ?
+\end{verbatim}
+$q^{\prime}_2$ shares the same \texttt{FROM}/\texttt{WHERE} clauses as $q_2$'s but with a different \texttt{SELECT} clause which contains the necessary columns of $\mathit{CF}4$.
+Finally, we generate migration plans using $q^{\prime}_2$ and $\mathit{CF}3$ and $\mathit{CF}5$ (excluding the target column family, $\mathit{CF}4$).
+We obtain $p_{2,2}$ as a migration plan which uses $\mathit{CF}3$ and $\mathit{CF}5$.
+
+\subsubsection{Complementary migration plan enumeration}
+The above enumeration technique may not enumerate appropriate migration plans when the number of query plans in each query is small. 
+To complement this, the second technique enumerates additional migration plans using a simple migration query, which specifies the partition key and columns of the target column family in WHERE clause and SELECT clause, respectively. 
+In Fig.~\ref{Fig:MigrationPlanExample}, $q^{\prime}_a$ is simple migration query of $\mathit{CF}4$ and the second technique enumerates its migration plan uses $\mathit{CF}6$.
+
+\subsection{Cost Estimation} \label{Section:Cost}
+In order to optimize the objective of Equation~\ref{baseObjective:Objective}, we need to estimate the coefficients used in the workload execution cost (Equation~\ref{WorkloadCost}) and migration cost (Equation~\ref{migrateCost}).
+\par
+Remember that $C_{ij}$ in Equation~\ref{WorkloadCost} is defined as the coefficient that represents the cost of query $i$ processing using column family $cf_j$. We estimate it using linear regression with the function $T(n, w, s)$\footnote{We choose the simplest approach of using linear regression. We can utilize more recent techniques using deep learning for achieving higher accuracy.} where $n$ is the number of \texttt{Get} operations, $w$ is the query-cardinality (the expected number of records in the result), and $s$ is the record size of column family $j$. 
+$n$ is computed as the sum of \texttt{Get} operations in the query plan tree: a single \texttt{Get} operation is required for the first step in the tree, and we use the query-cardinality of this node as the required number of \texttt{Get} operations for later steps, because we need to invoke a \texttt{Get} operation for each record returned from this node.
+$w$ is computed using the cardinality of attributes in equality conditions and using the number of records of each entity in the conceptual schema.
+When query $i$ uses a \texttt{GROUP BY} clause, $w$ is computed using the number of expected groups by pushing down the \texttt{GROUP BY} clause at the server side.
+Since linear regression function $T(n, w, s)$ depends on the instance of extensible record stores and its computing environment, we train $T(n, w, s)$ using performance profiles as the training datasets collected by changing queries (attributes used in \texttt{SELECT}/\texttt{WHERE} clauses) and the number of records in column families.
+Next, $C^{\prime}_{un}$ in Equation~\ref{WorkloadCost} is defined as the coefficient that represents the cost of update operation $u$ for column family $cf_n$.
+We estimate it using linear regression function $T^{\prime}(w)$ where $w$ is the number of expected updated records. 
+Similar to the above $C_{ij}$ estimation, we train $T^{\prime}(w)$ using performance profiles.
+
+As for the migration cost, we need to estimate the coefficients $C^{E}, C^{L}, C^{U}$ used in Equation~\ref{migrateCost}.
+First, $C^{E}_{h}$ is the coefficient that represents the cost of data collection from each column family $cf_h$, which depends on the size of $cf_h$.
+%マイグレーションプランの実行時には，プラン内で使用する column family の全レコードをそれぞれ収集するため\footnote{マイグレーションプランがジョインプランである場合にはクライアントにおいてジョイン処理を行う．このジョイン処理はデータベースの処理を圧迫しないため，ジョイン処理のコストは考慮しない．}，$C^{E}_{gh}$ はレコードを収集する対象の column family $h$ のサイズに依存する．
+So, we estimate $C^{E}_{h}$ using linear regression with the function $T^{\prime\prime}(s_h)$ where $s_h$ is the size of $cf_h$.
+Second, $C^{L}_{g}$ is the coefficient that represents the cost of inserting the collected records into new column family $cf_g$, which depends on the size of $s_g$.
+So, we estimate $C^{L}_{g}$ using linear regression with the function $T^{\prime\prime\prime}(s_g)$ where $s_g$ is the size of $cf_g$.
+Finally, $C^{U}_{ug}$ is the coefficient that represents the cost of the update operation $u\in U$ for new column family $cf_g$ during the migration process. 
+We estimate it using Equation~\eqref{Eq:UpdateConstructingCF}:
+\begin{equation}\label{Eq:UpdateConstructingCF}
+  C^{U}_{ug} = f_{u(t - 1)} C^{\prime}_{ug} \frac{C^{L}_{g}}{(interval)}
+\end{equation}
+where $C^{L}_{g} / (interval)$ is the time ratio of column family $g$ generation to the interval between time steps, and 
+$f_{u}(t-1)$ is the frequency of update operation $u$ at time step $t-1$.
+
+Similar to the coefficient estimation for workload cost, we train the above regression models using performance profiles from collecting and inserting records as the training datasets: the profiles are collected by changing the number of records in column families.
+
+\subsection{Optimization}\label{sec:WholeOptimization}
+Finally, we obtain the optimal design for the time-series schema by minimizing the total cost of the time-dependent workload execution and database migrations for enumerated column families, query plans, and migration plans. 
+In addition, we additionally minimize the number of column families and their storage size with three steps as follows.
+
+First, we identify the optimal design for the time-series schema using Equation~\eqref{baseObjective:Objective} and keep its minimum cost. 
+Second, we additionally minimize the number of column families using \eqref{eq:minCFNum} while keeping the cost of Equation~\eqref{baseObjective:Objective} as the minimum cost.
+\begin{equation}\label{eq:minCFNum}
+    \min \sum_{t = 1}^{T} \sum_{j} \delta_{jt} 
+\end{equation}
+Finally, we also minimize the size of column families using \eqref{eq:minStorage} while keeping the number of column families as the minimum.
+\begin{equation}\label{eq:minStorage}
+    \min \sum_{t = 1}^{T} \sum_{j} s_{j}\delta_{jt} 
+\end{equation}
+This approach is especially effective when the workload does not have update operations, because the approach ensures the minimality of the number of column families and their size.
+
+\begin{comment}
+\subsection{Limitation}\label{Section:limitation}
+Our system does not fully support the specification of SQL languages.
+First, our system does not handle queries without equal conditions.
+Second, it does not support several predicates, such as LIKE and BETWEEN.
+Third, it does not support nested queries.
+We have detours for the second and third limitations; rewriting some predicates to equal and range conditions, and decomposing a nested query into multiple flat queries. 
+We use these detours in our experiments when workloads face these limitations.
+We note that NoSE also has the same limitations. Furthermore, NoSE cannot support aggregation functions such as SUM and AVERAGE.
+Thus, our system supports richer queries than NoSE.
+\end{comment}

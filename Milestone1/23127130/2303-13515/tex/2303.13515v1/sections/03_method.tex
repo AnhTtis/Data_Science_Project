@@ -1,0 +1,123 @@
+\section{Method}\label{sec:method}
+
+
+Our scene representation for unbounded landscapes consists of two components, a \emph{scene layout grid} and a \emph{skydome}. 
+The scene layout grid models the landscape terrain, and is a 2D grid of features defined on a ``ground plane.'' 
+These 2D features are intended to describe both the height and appearance content of the terrain, representing the full 3D scene --- in fact, we decode these features to a 3D radiance field, which can then be rendered to an image (\S\ref{sec:scene-layout}). 
+To enable camera motion beyond the training volume, 
+we spatially extend the 2D feature grid to arbitrary sizes (\S\ref{sec:extension}). Because it is computationally expensive to generate and volume render highly detailed 3D content at the scale we aim for, we use an image-space refinement network that adds additional texture detail to rendered images (\S\ref{sec:refinement}).
+
+The second scene component is a \emph{skydome} (\S\ref{sec:skydome}), which is a spherical (panoramic) image intended to model very remote content, such as the sun and sky, as well as distant mountains. The skydome is generated to harmonize with the terrain content described by the scene layout grid.
+
+All the stages of our approach are trained with GAN losses (\S\ref{sec:training}). In what follows, we use the 3D coordinate convention that the ground plane is the $\textit{xz}$-plane, and the $y$-axis represents height above or below this plane. Generally, the camera used to view the scene will be positioned some height above the ground.
+
+
+\subsection{Scene layout generation and rendering}\label{sec:scene-layout}
+
+To represent a distribution over landscapes, we take a generative approach following the layout representation of GSN~\cite{devries2021unconstrained}. First, a 2D scene layout grid is 
+synthesized from a sampled random noise code $\LatentCode$ passed to a StyleGAN2~\cite{karras2020analyzing} generator $\GeneratorLand$. This creates a 2D feature grid $\FeatureLand$, which we bilinearly interpolate to obtain a 2D function over spatial coordinates $\X$ and $\Z$:
+\begin{equation}
+\FeatureLand(\X, \Z) = \mathrm{Interpolate}(\GeneratorLand(\LatentCode), (\X, \Z))
+\end{equation}
+To define a full 3D scene, we need a way to compute the content at any 3D location $(\X, \Y, \Z)$. We define a multi-layer perceptron $\MLP$ that takes a scene grid feature, as well as the height $\Y$ of the point at which we want to evaluate the scene content. 
+The outputs of $\MLP$ are the 2D-to-3D lifted feature $\FeatureColor$ and the density $\sigma$ at point $(\X, \Y, \Z)$:
+\begin{equation}
+\FeatureColor, \sigma = \MLP(\FeatureLand(\X, \Z), \Y).
+\end{equation}
+In this way, the 2D scene layout grid determines a radiance field over all 3D points within the bounds of the grid\cite{yu2021pixelnerf,devries2021unconstrained,sharma2022seeing}. That is, feature vectors in the grid encode not just appearance information, but also the height (or possibly multiple heights) of the terrain at their ground location.
+
+To render an image from a desired camera pose, we cast rays $\Ray$ from the camera origin through 3D space, sample points $(\X, \Y, \Z)$ along them, and compute $\FeatureColor$ and $\sigma$ at each point. We then use volume rendering to composite $\FeatureColor$ along each ray into projected 2D image features $\FeatureImage$, a disparity image $\DepthLR$, and a sky segmentation mask $\MaskLR$. We form an initial RGB image of the terrain, $\ImageLR$, via a learned linear projection $\Projection$ of these image features. %
+This process is depicted in the left half of Fig.~\ref{fig:schematic}, and is defined as:
+\begin{equation}
+\begin{split}
+\FeatureImage(\Ray) &= \sum_{i=1}^N\Weight_{i}\FeatureColorSample, \quad
+\DepthLR(\Ray) = \sum_{i=1}^N\Weight_{i}\Depth_i, \\
+\MaskLR(\Ray) &= \sum_{i=1}^N\Weight_{i},
+\hspace{14mm} \ImageLR = \Projection \FeatureImage, \\
+\end{split}
+\end{equation}
+where $i\in\{1..N\}$ refers to the index of each sampled point along ray $\Ray$ in order of increasing distance from the camera, $\Depth_i$ is the inverse-depth (disparity) of point $i$, and weights $\Weight_{i}$ are determined
+from the volume rendering equations used in NeRF~\cite{mildenhall2020nerf} (see supplemental). 
+
+
+We intend the mask $\MaskLR$ to distinguish sky regions (which will be empty and filled later using the skydome) from non-sky regions, and achieve this by training using segmented real images in which color and disparity for sky pixels are replaced with zero. Since to achieve zero disparity all weights along a ray must be zero (which also results in a zero-valued color feature), this approach encourages the generator to omit sky content.
+However, 
+while we find that the model indeed learns to generate transparent sky regions, land geometry can also become partially transparent. To counter this, we penalize visible decreases in opacity along viewing rays using finite differences of opacity $\alpha$:
+\begin{equation}\label{eqn:geometry}
+    \mathcal{L}_{\text{transparent}}(\Ray) = \sum_{i=2}^N \Weight_i \frac{\max(\alpha_{i-1}-\alpha_{i}, 0)}{\delta_i}.
+\end{equation}
+
+\subsection{Layout Extension}\label{sec:extension}
+
+\input{figures/01_stitching}
+
+
+While $\GeneratorLand$ creates a fixed-size feature grid, our objective is to generate geometry of arbitrary size, enabling long-distance camera motion at inference time. 
+Hence, we devise a way to \textit{extend} the feature grid in the $\X$ and $\Z$ dimensions. We illustrate this process in Fig.~\ref{fig:stitching}, where we first sample noise codes $\LatentCode$ in a grid arrangement, where each $\LatentCode$ generates a 2D layout feature grid of size $H \times W$. To obtain a smooth transition between these independently sampled layout features, we generalize the image interpolation 
+approach from SOAT (StyleGAN of all Trades)~\cite{chong2021stylegan} to two dimensions. We operate on $2\times2$ sub-grids and blend intermediate features from each layer of the generator as follows:
+\begin{equation}\label{eqn:soat}
+\begin{split}
+\Feature_{k, l+1} & = \Generator_l(\Feature_l, \LatentCode_k);\quad k=\{00,~01,~10,~11\} \\
+\Feature_{l+1} & = \sum_{k=\{00, 01, 10, 11\}}\Bilinear_k(\X, \Z)\Feature_{k, l+1}.
+\end{split}
+\end{equation}
+For each of the four corner anchors $k$, we construct the modulated feature $\Feature_{k, l+1}$ by applying $\Generator_l$ (the $l$-th layer of $\GeneratorLand$) in a fully convolutional manner over the entire sub-grid. We then interpolate between the four feature grids using bilinear interpolation weights $\Bilinear_k(\X, \Z)$. By stitching these $2\times2$ sub-grids in an overlapping manner, we can obtain a scene layout feature grid of arbitrary size to use as $\FeatureLand$. Additional details are provided in the supplemental. 
+
+\subsection{Image refinement}\label{sec:refinement}
+Due to the computational cost of volume rendering, training the layout generator at higher resolutions becomes impractical. We therefore use a refinement network $\GeneratorUpsample$ to upsample the initial generated image $\ImageLR$ to a higher-resolution result $\ImageHR$, while adding  textural details (Fig.~\ref{fig:schematic}-right). We use a StyleGAN2 backbone for $\GeneratorUpsample$, replacing the earlier feature layers with feature output $\FeatureImage$ and the RGB residual layers with a concatenation of $\ImageLR$, $\DepthLR$, and $\MaskLR$.
+To encourage the refined terrain image $\ImageHR$ to be consistent with the sky mask, the network also predicts a refined disparity map and sky mask 
+for compositing with the skydome (see \S\ref{sec:skydome}): 
+\begin{equation}\label{eqn:upsampler}
+    \ImageHR, \DepthHR, \MaskHR = \GeneratorUpsample(\FeatureImage,\ImageLR, \DepthLR, \MaskLR).
+\end{equation}
+We compute a reconstruction loss between the initial and refined disparity and mask outputs, and  penalize $\GeneratorUpsample$ for producing gray sky pixels in $\ImageHR$ outside the predicted mask $\MaskHR$. Please see the  supplemental for more details. 
+
+For fine texture details, StyleGAN2 also uses layer-wise spatial noise in intermediate generator layers (in addition to the global latent $\LatentCode$).
+Using a fixed 2D noise pattern results in texture `sticking' as we move the camera~\cite{karras2021aliasfree}, but resampling it every frame reduces spatial coherence and removing it entirely results in convolutional gridding artifacts. To avoid these issues and improve spatial consistency, we replace the 2D image-space noise with projected 3D world-space noise, where the noise input to $\GeneratorUpsample$ is the projection of samples from a grid of noise, $\Noise$. This noise pattern is drawn from a standard Gaussian distribution defined on the ground plane at the same resolution of the layout features, which is then lifted into 3D and volume rendered along each ray $\Ray$:
+\begin{equation} \label{eqn:noise}
+\Noise(\Ray) = \sum_{i=1}^N\Weight_{i}\Noise(\X, \Z).
+\vspace{-0.2cm}
+\end{equation}
+
+\input{figures/01_skydome}
+
+\subsection{Skydome}\label{sec:skydome}
+We model remote content (sky and distant mountains) separately with a skydome generator $\GeneratorBackground$ (Fig.\ref{fig:skydome}). This generator follows the StyleGAN3 architecture~\cite{karras2021aliasfree}, with a mapping network and synthesis network conditioned on cylindrical coordinates~\cite{chai2022anyresolution}. We adapt it by conditioning on the terrain output: we encode terrain images $\ImageHR$ using the pretrained CLIP image encoder $\EncoderBackground$~\cite{radford2021learning}, and concatenate this to the style-code output of the mapping network as input into $\GeneratorBackground$:
+\begin{equation}
+\begin{split}
+    \ImageSky &= \GeneratorBackground(\mathrm{concat}(\EncoderBackground(\ImageHR), \mathrm{mapping}(\LatentCode))).
+\end{split}
+\end{equation}
+Conditioning on the foreground terrain image encourages the skydome generator to generate a sky that is consistent with the terrain content. This model trains on single-view landscape images but can produce a full panorama at inference-time by passing in coordinates that correspond to a 360$^{\circ}$ cylinder.
+The skydome is rendered to an individual camera viewpoint using camera ray directions, giving the skydome image $\ImageSkyPano$ which is then composited with the terrain image using the sky mask:
+\begin{equation}
+    \ImageFull = \ImageHR \odot \MaskHR + \ImageSkyPano \odot (1-\MaskHR).
+\end{equation}
+
+
+
+
+
+
+\input{figures/02_qualitative}
+
+
+\subsection{Training}\label{sec:training}
+We train the layout generator (rendering at 32x32), refinement network (upsampling to 256x256), and skydome generator separately. To train the refinement network, we operate on outputs of the layout generator, freezing the weights of that model. For the skydome generator, we train using real landscape images, and apply it only to the outputs of the refinement network at inference time. We follow the StyleGAN2 objective~\cite{karras2020analyzing}, with additional losses for each training stage, architecture, and hyperparameters provided in the supplemental.
+
+
+\myparagraph{Dataset and camera poses.} We train on LHQ~\cite{skorokhodov2021aligning}, a dataset of of 90K unposed, single-view images of natural landscapes. A number of LHQ images contain geometry that is not amenable to ``flying'', such as a landscape pictured through a window, or a closeup of trees. Therefore, we perform a filtering process on LHQ prior to training (see supplemental). We also obtain auxiliary outputs -- disparity and sky segmentation -- using the pretrained 
+DPT~\cite{ranftl2021vision} model. 
+Disparity and sky segmentation are used to construct the real image distribution in the GAN training phases.
+
+After filtering, we use 56,982 images for training, and augment with horizontal flipping. During training we also need to sample camera poses. Prior 3D generators\cite{devries2021unconstrained,chan2021pi,chan2022eg3D,schwarz2020graf,orel2022styleSDF,gu2021stylenerf} either use ground-truth poses from a simulator, or assume an object-centric camera distribution in which the camera looks at a fixed origin from some radius. 
+Because our dataset lacks ground truth poses, we first sample a bank of training poses uniformly across the layout feature grid with random small height offsets, and rotate such that the near half of the camera view frustum falls entirely within the layout grid. 
+Since the aerial layout should not be specific to any given camera pose, we generate $\FeatureLand$ without any camera pose information, and then adopt the sampling scheme from GSN\cite{devries2021unconstrained} which samples a camera pose from the initial training pose bank proportional to the inverse terrain density at each camera position, to avoid placing the camera within occluding geometry.
+
+
+
+
+
+
+
+

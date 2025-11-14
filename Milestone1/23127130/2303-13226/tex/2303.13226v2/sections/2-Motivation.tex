@@ -1,0 +1,166 @@
+
+\section{Background and Motivation}
+\label{background}
+
+
+\subsection{Demand-based Page-Level FTLs}
+\label{two-one}
+
+
+Address translation is a vital function in FTL, which searches the physical addresses of flash memory for incoming requests. There exist several mapping schemes such as page-level mapping, block-level mapping, and hybrid mapping~\cite{lee2008last,lee2006fast,bez2003introduction}.
+% Address Translation is a vital function in FTL since all requests accessing the flash memory need to undergo address translation.
+Since the flash page is the basic unit for read/write operations, page-level mapping can handle requests flexibly and performs well. However, this fine-grained mapping scheme requires a huge DRAM memory to accommodate its mapping table. For example, suppose an SSD has a 10TB capacity with a 4KB page size, and each entry of the LPN-PPN mapping is 8B, the SSD requires 20GB of DRAM memory to store the LPN-PPN mapping of 2.5 billion entries. This huge DRAM memory consumption, unfortunately, is impractical for enterprise SSDs.
+
+Block-level mapping~\cite{kang2006superblock} and hybrid mapping~\cite{lee2006fast,lee2008last} addressed the space issue by compressing the mapping table. In these schemes, the address mappings are organized at the granularity of a flash block, leading to a significantly lower mapping space overhead. However, block-level mapping has a limitation, that is, data stored in a block must have contiguous LPNs. Flash pages can only be written to a fixed location in the flash block. Consequently, these mapping schemes exhibit poor writing performance. 
+
+
+To strike a good balance between write performance and DRAM memory, demand-based page-level FTLs (DFTL)~\cite{gupta2009dftl} is proposed. Specifically, DFTL uses a selective cache solution to only buffer frequently accessed mappings into SSD memory to exploit workloads' temporal locality, thus reducing memory usage without compromising performance. Figure~\ref{three_schemes}(a) illustrates the general structure of DFTL. It stores the whole mapping table in multiple flash pages, called \textbf{translation pages}. DFTL contains two data structures in SSD memory. \textbf{Cached Mapping Table (CMT)} stores mapping information for frequently accessed flash pages while \textbf{Global Translation Directory (GTD)} records the physical location of translation pages in flash memory. For requests that miss from CMT, DFTL imposes a high miss penalty. In particular, the SSD controller needs an additional flash read to fetch the missing mapping from the translation page. A read request may generate two flash reads for data and metadata, which is called \textbf{double reads}.
+
+Several demand-based page-level FTLs have been proposed to address double reads by exploiting workload locality characteristics. Examples include TPFTL~\cite{zhou2015efficient}, HCFTL~\cite{chen2019hcftl}, and ZFTL~\cite{wang2012zftl}. Among them, TPFTL is a well-known FTL that utilizes both temporal and spatial locality. It proposes a workload-adaptive loading policy to prefetch mappings to CMT based on the request length. This approach improves the hit ratio of CMT and significantly alleviates double reads in workloads with a strong locality. 
+
+
+\subsection{Performance Impact of Double Reads}
+Despite the effectiveness of demand-based page-level FTLs in reducing memory usage, their efficiency is limited to workloads with high locality. This becomes problematic in some modern applications with random accesses. Therefore, the ability of FTL to solve double reads under random workloads is of great importance. 
+
+\begin{figure}[t]
+    % \setlength{\abovecaptionskip}{0pt}
+    \subfigure[Read throughput]{
+        \begin{minipage}[t]{0.46\linewidth}
+            \centering
+            \includegraphics[scale=0.82]{photos/seq_rand.pdf}
+            \label{seqrand}
+        \end{minipage}%
+    }
+    \subfigure[CMT hit ratio]{
+        \begin{minipage}[t]{0.46\linewidth}
+            \centering
+            \includegraphics[scale=0.80]{photos/motivation/hit_ratio.pdf}
+            \label{breakdown}
+        \end{minipage}
+    }
+    \caption{The performance of a FEMU-emulated SSD under sequential reads and random reads.} 
+    \label{first-test}
+    % \vspace{-15pt}
+\end{figure}
+
+To investigate whether demand-based FTLs can handle random workloads, we evaluate the sequential and random read performance of TPFTL driven by FIO~\cite{FIOmisc} stress testing tool. As shown in Figure~\ref{seqrand}, regardless of the variation in the number of threads, the performance of random reads consistently falls short compared to sequential reads (i.e., up to 60\% degradation). Figure~\ref{breakdown} shows the CMT hit ratio under different threads. Under random reads, although TPFTL adopts a prefetching strategy, it can only predictively prefetch PPNs near one PPN. However, the two following requests in random reads may be far apart. As a result, the prefetching strategy becomes ineffective, incurring a very low CMT hit ratio.
+
+
+Increasing the size of the CMT is a straightforward solution to improve the random read performance. However, this approach remains ineffective due to cache contention. Figure~\ref{diff_cmt_space} illustrates the changes in the CMT hit ratio of TPFTL when increasing CMT space. Even when the CMT space expands to 50\% of the total page mappings, the hit ratio only improves slightly to 25.9\%. It is clear that contention for the CMT will exist unless the CMT can accommodate the majority of the mappings. Consequently, regardless of the practical capacity of the CMT, the prefetched mappings will be frequently replaced, leading to a low CMT hit ratio. 
+
+\begin{figure}[t]
+    \centering
+    % \setlength{\abovecaptionskip}{0em}
+    \includegraphics[scale=0.84]{photos/motivation/different_ratio.pdf}  
+    \caption{The hit ratio of TPFTL under different CMT space.}
+    \label{diff_cmt_space}
+    % \vspace{-10pt}
+\end{figure}
+
+The above experiments and analysis demonstrate that the selective cache solution of demand-based FTL cannot handle random reads. Since a random read request may access any LPN in the entire address space, an efficient solution is to place as many mappings as possible in the small capacity of SSD memory. The mapping table compression scheme mentioned earlier is the only approach that meets these criteria. However, this approach adversely impacts SSD write performance. Thus, to improve the random read performance, we need a new solution to compress the mapping table without degrading SSD write performance. 
+
+
+\subsection{Learned Index and LeaFTL}
+\label{two-four}
+\noindent \textbf{Learned Index.}
+Recent studies on \emph{learned index}~\cite{kraska2018case,ALEX,ferragina2020pgm,li2021finedex,Tsunami,ROLEX} have demonstrated its potential for compressing the mapping table since it has a high compression rate and low write limit. The learned index only requires the LPN-PPN mappings to be ordered and builds lightweight models for key-position mappings. A model with several parameters can calculate hundreds of data locations, thus reducing memory consumption.
+Figure~\ref{fig-principle} illustrates the workflow of the learned index. Building a learned index model only requires two steps: training an approximate model (usually linear models) over the key-position mappings and identifying the maximum error between the fitted model and the actual values. With the simple model and maximum error, the needed value can be found in the error interval [$y-error$, $y+error$], where $y$ is the predicted position by the approximate model. 
+
+\begin{figure}[t]
+    \centering
+    % \setlength{\abovecaptionskip}{0pt}
+    \includegraphics[scale=0.9]{photos/motivation/WorkFlow.pdf}
+    \caption{The workflow of the learned index.}
+    \label{fig-principle}
+    % \vspace{-20pt}
+\end{figure}
+
+\noindent \textbf{LeaFTL~\cite{sun2023leaftl}.}
+Ideally, if the learned index could completely replace the existing mapping table structure and index all mappings in memory, the double-read problem could be solved. Recently, LeaFTL has taken this approach. The primary motivation behind LeaFTL is to utilize the learned indexes to replace the current mapping table, thereby reducing the DRAM memory overhead to store the mapping table.
+
+Figure~\ref{three_schemes}(b) illustrates the structure of LeaFTL. LeaFTL uses a learned segment design for learned indexes, and each learned segment has four parameters \emph{\textbf{[S, K, L, I]}}, expressed as a model $PPN = LPN * K + I, LPN\in[S, S+L]$. In LeaFTL's configuration, one learned segment can index up to 256 mappings. For learned segments that are not 100\% accurate (denoted as approximate segments), LeaFTL conceals the error interval in the Out Of Band (OOB) area of each flash page. When the model predicts a wrong PPN, LeaFTL reads the error interval from the OOB of the mispredicted flash page and finds the correct PPN, then LeaFTL can read the correct PPN to access data. With this approach, each misprediction requires 2 flash reads.
+
+Since the learned index cannot be updated unless retrained, LeaFTL adopts the idea of a Log-Structured Merge-tree to ensure the timeliness of the learned segments. LeaFTL allocates a small area in SSD internal memory, called \textbf{data buffer}, to buffer newly written data (up to 2048 pages). When the data buffer is full, LeaFTL sorts all data by their LPNs and then writes them to flash pages of continuous PPNs. After that, LeaFTL groups these mappings according to the translation pages they belong, and each group trains a newly learned segment. Then all the learned segments are flushed to the corresponding translation pages. In each translation page, the learned segments are organized in a log-structured mapping table (LSMT). The newly created segment is inserted into the top layer. If one layer has overlapped segment, LeaFTL will migrate the old segment to the next layer. 
+Since the log-structured design brings space amplification (In our evaluations, LSMT can only reduce the space to 10\%-15\% of the original mapping table, which is still too large to be fully stored in memory), LeaFTL continues to use the idea of CMT and only caches the most frequently used learned segments into memory. 
+
+\subsection{Challenges in Learned Indexes/LeaFTL}
+While LeaFTL can reduce the size of the mapping table by several times, it, unfortunately, fails in improving the read performance. We take an in-depth analysis and observe multiple key challenges in Learned Index/LeaFTL.
+
+\begin{figure}[t]
+    \centering
+    % \setlength{\abovecaptionskip}{0pt}
+    % \setlength{\abovecaptionskip}{5pt}
+    \includegraphics[scale=0.9]{photos/motivation/triple_read.pdf}
+    \caption{The workflow of triple reads in LeaFTL~\cite{sun2023leaftl}.}
+    \label{fig-ptriple}
+    % \vspace{-15pt}
+\end{figure}
+
+\noindent \textbf{Challenge \#1: Accuracy of learned indexes.} The accuracy of learned indexes directly determines the efficiency of address translation. LeaFTL is a purely learned index based address translation scheme and replaces the mapping cache of DFTL/TPFTL with a model cache. Thus, mispredictions of learned indexes will bring \textbf{double reads} (one for error interval in OOB and one for data) in LeaFTL. LeaFTL uses a linear regression model~\cite{kraska2018case,li2021finedex,APEX} that can only express \emph{PPN=LPN*K+B}. As a result, if the LPN-PPNs in the model buffer are not linear, part of the requests may experience double reads.
+
+Moreover, LeaFTL even causes \textbf{triple reads} owing to its model cache design. Figure~\ref{fig-ptriple} illustrates the workflow of triple reads in LeaFTL. When an LPN fails to hit any model in the model cache, it initiates a translation read to find the corresponding model from NAND flash. However, as the model in LeaFTL is an approximate one, the predicted PPN may be wrong. After sending a second flash read to access the wrong flash page, this request has to find the correct PPN via the error interval stored in OOB. Finally, this request reads the correct PPN to access data with a third flash read. The workflow of triple reads indicates that the miss penalty in LeaFTL is much higher than double reads in DFTL.
+
+Considering the fact that the accuracy of learned indexes cannot reach 100\%, the problems of double reads and triple reads will have a significant impact on the performance of LeaFTL. Figure~\ref{leaf_rand} illustrates the normalized throughput of TPFTL and LeaFTL under FIO~\cite{FIOmisc} random reads. LeaFTL exhibits a 29\% lower throughput compared to TPFTL. Figure~\ref{stat} shows the fraction of double reads and triple reads during random reads. Triple reads and double reads account for 43\% and 52\%, respectively. These results demonstrate that the double reads and triple reads make LeaFTL completely unable to handle random reads.
+
+
+\begin{figure}[t]
+    % \setlength{\abovecaptionskip}{0pt}
+    \subfigure[Random read]{
+        \begin{minipage}[t]{0.46\linewidth}
+            \centering
+            \includegraphics[scale=0.75]{photos/motivation/rand_leaf.pdf}
+            \label{leaf_rand}
+        \end{minipage}%
+    }
+    \subfigure[Multi-read count statistics]{
+        \begin{minipage}[t]{0.46\linewidth}
+            \centering
+            \includegraphics[scale=0.7]{photos/motivation/rand_stat.pdf}
+            \label{stat}
+        \end{minipage}
+    }    
+    \caption{The performance results under random reads.}    
+    \label{second-test}
+    % \vspace{-15pt}
+\end{figure}
+
+
+Besides affecting random workload, double and triple reads also have a negative effect on workloads with high locality. Figure~\ref{leaf_filebench} shows the performance comparison between TPFTL and LeaFTL under three Filebench~\cite{Filebench} workloads. The performance of LeaFTL is equal to or even worse than that of TPFTL. Figure~\ref{hit_ratio_filebench} shows the cache and model hit ratio under \textbf{webserver} workload (read-intensive). In this context, the cache hit ratio of LeaFTL simply indicates that the model cache contains the corresponding model for the queried LPN, and it does not mean that the correct PPN has been calculated. Due to the space efficiency of learned indexes, the corresponding model of an LPN can be easily found in the model cache, making the model cache hit ratio high. However, there are instances where models experience mispredictions, leading to a significant number of requests requiring double reads. Consequently, the proportion of LPNs that are successfully hit in the model cache and accurately predicted by the model is significantly lower than the LPNs hit in the CMT of TPFTL.
+%the number of double reads induced by mispredictions is greater than the number of double reads induced by CMT misses in TPFTL. 
+Therefore, TPFTL performs much better than LeaFTL under workloads with high locality. This experiment indicates that when dealing with locality-based workloads, using direct mapping in the cache is more reliable and efficient than using models.
+
+
+The above analysis and experiments all indicate that handling mispredictions caused by incompletely accurate learned index models directly affects SSD performance.
+
+ 
+\noindent \textbf{Challenge \#2: Conflict between the linear model and access parallelism.} 
+A key requirement for training the linear model in learned indexes is sorted LPN-PPN mappings. In LeaFTL, after the model buffer is sorted with LPNs, LeaFTL needs to allocate contiguous PPNs for these LPNs. However, modern SSDs are highly dependent on internal parallelism so that multiple flash blocks can be accessed simultaneously across separate flash chips~\cite{hu2011performance,ParaFS}. To be specific, when a set of LPNs needs to be written to an SSD, these LPNs are written to different parallel units (channels, chips, dies, and planes). Since the parallel units belong to a high hierarchical structure, the PPNs in different parallel units may be far apart. Therefore, assigning contiguous PPNs for sorted LPNs is hard in the parallel writing strategy. 
+
+
+\begin{figure}[t]
+    % \setlength{\abovecaptionskip}{0pt}
+    \subfigure[Throughput]{
+        \begin{minipage}[t]{0.55\linewidth}
+            \centering
+            \includegraphics[scale=0.8]{photos/motivation/filebench_leaf_tp.pdf}
+            \label{leaf_filebench}
+        \end{minipage}%
+    }
+    \subfigure[Hit ratio in webserver]{
+        \begin{minipage}[t]{0.38\linewidth}
+            \centering
+            \includegraphics[scale=0.8]{photos/motivation/file_hit.pdf}
+            \label{hit_ratio_filebench}
+        \end{minipage}
+    }    
+    \caption{The performance of TPFTL and LeaFTL under workloads with high locality.}    
+    \label{first-filebench-test}
+    % \vspace{-10pt}
+\end{figure}
+
+
+\noindent \textbf{Challenge \#3: High training overhead.} 
+In LeaFTL, model training is performed on the critical write path. It brings two overheads: (1) Performance overhead: The model training includes sorting, parameters fitting, and compaction, which is time-consuming. These operations performed on the critical write path will directly affect write performance. (2) Space overhead: The space overhead happens in random writes. The LPNs of adjacent write requests are dramatically separated. It is difficult for the model buffer to gather these LPNs in LeaFTL. In the worst case, each LPN-PPN mapping in the model buffer becomes an individual learned segment, leading to a huge space overhead.
+
+
+To sum up, recent advances in the learned index have shown that it can achieve significantly faster lookup speed and index space savings. Motivated by the urgent need to resolve the double-read problem caused by random reads in flash-based SSDs, along with the challenges learned from learned indexes/LeaFTL, we propose LearnedFTL, which utilizes lightweight learned index models in the existing on-demand page-level FTL (TPFTL) to enhance the random-read performance of flash-based SSDs. 

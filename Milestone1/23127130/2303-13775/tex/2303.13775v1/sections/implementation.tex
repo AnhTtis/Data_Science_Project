@@ -1,0 +1,65 @@
+We implemented \tadj training in \name, a multi-GPU GNN training system supporting synchronous training.
+\name is implemented on top of DGL 0.8.2 and Torch 1.8.0 with CUDA 11.1. The implementation consists of about 10k lines of code.
+The sampling and splitting code is in C++, the remaining code in Python.
+
+\mypar{Sampling and scheduling}
+\name runs sampling and splitting on the CPU to easily scale to large graphs that do not fit in GPU memory. 
+It uses one thread to randomly shuffle the set of training nodes and create a set of target vertices for each mini-batch.
+Sampling and scheduling are performed using multiple \emph{sampler} processes, each working independently in parallel on one mini-batch to sample it and split vertices and edges as they are sampled. 
+It also uses one \emph{trainer} process per GPU, each responsible for invoking kernels on that GPU.
+
+In \tadj training, all GPUs must work on splits of the same mini-batch at the same time.
+\name uses one trainer as a leader, which selects which mini-batch to process next among the ones currently complete.
+To avoid making the leader a bottleneck, \name separates the data and control paths.
+Workers write mini-batches into shared memory and send a handle to the leader.
+The leader picks one handle and instructs all other trainers to operate on that mini-batch.
+
+\mypar{Partitioning and caching policy}
+\name can use any offline partitioning and caching policy.
+By default, it uses Metis for offline graph partitioning~\cite{karypis1997metis}.
+After partitioning the graph offline, \name caches the highest degree vertices of each partition in the corresponding GPU, unless the user specifies a different policy. 
+It allows the user to decide how much GPU memory should be dedicated to caching.
+%If the total available space for caching across GPUs is larger than the entire input features, \name replicates the features of the highest degree vertices in the entire graph at all GPUs. 
+
+
+\mypar{Cooperative training}
+The cooperative training we discussed requires a split-aware version of the scatter operator.
+% Their behavior (which data is sent and received) is based on the splits.
+% Each scatter and gather operation is executed in parallel by all GPUs, since all GPUs hold a replica of the GNN model parameters, using a shuffle.
+% If a GPU has no information to send or receive during these operations, it directly proceeds to the next operation.
+% 
+% The operator use direct GPU-GPU coordination across the entire iteration without  materializing intermediate data on the CPU host memory.
+It uses fast direct GPU-GPU buses such as NVLink if available in the system or the PCIe bus otherwise.
+Shuffles use data coalescing to have a GPU send at most one message to each other GPU.
+Vertices in the same local split have contiguous ids, so that the online scheduling algorithm and our split-aware operators can find the local split of a vertex using a simple range check.
+
+\mypar{Integration with DGL and Torch}
+\name implements sampling, split-parallel online scheduling, feature extraction, feature loading, and feature caching from scratch.
+It runs all GPU-local GNN operators by invoking unmodified DGL.
+The message and update operators are fully local, whereas the split-aware scatter and gather functions interleave local steps, executed by invoking DGL, and shuffle steps, which are implemented by \name.
+\name uses NCCL to implement inter-GPU peer-to-peer communication and exploits NVLink if available.
+It invokes NCCL through Torch.
+\name uses Torch also for gradient aggregation and model update.
+
+
+% \TODO{Co-ordination}
+% Unlike traditional approaches where we have each trainer process working on an independent set of training nodes. 
+% We need each gpu to have a consistent view of the training nodes.
+% We have one worker thread generating the work or a set of training nodes which is put into a work queue. 
+% We have 16 workers which pop work from this queue and generate gpu local data structures (i.e split partitions). 
+% While current architecture partition target nodes amongst sample workers.
+
+% \TODO{Shared Memory}
+% To efficiently move data between processes, we use shared memory.
+% The workers pop from a shared memory file from a shared queue and write all data into it. 
+% They then push this shared file name to process 1 running on gpu 0. 
+% This process acts as a leader. 
+% Writing the popped meta data to other processes. 
+% This is done as so that all the trained process have the same consistent view of the minibatch and split graphs.
+
+% Questions to answe
+% How do we extend DistDGL here.
+% How to create a tensor-cache.
+% How does pytorch model paralleism work.
+% This is literally the same thing, where data must be merged in the back pass.
+% https://pytorch.org/tutorials/intermediate/model_parallel_tutorial.html

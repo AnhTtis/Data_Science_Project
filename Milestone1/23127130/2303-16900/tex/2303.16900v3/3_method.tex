@@ -1,0 +1,184 @@
+\vspace{-2mm}
+\section{Formulation and Method}
+\begin{algorithm}[t]
+\vspace{-1mm}
+\caption{Inception Depthwise Convolution (PyTorch-like Code)}
+\label{alg:code}
+\definecolor{codeblue}{rgb}{0.25,0.5,0.5}
+\definecolor{codekw}{rgb}{0.85, 0.18, 0.50}
+\lstset{
+  backgroundcolor=\color{white},
+  basicstyle=\fontsize{7.5pt}{7.5pt}\ttfamily\selectfont,
+  columns=fullflexible,
+  breaklines=true,
+  captionpos=b,
+  commentstyle=\fontsize{7.5pt}{7.5pt}\color{codeblue},
+  keywordstyle=\fontsize{7.5pt}{7.5pt}\color{codekw},
+}
+\begin{lstlisting}[language=python]
+import torch.nn as nn
+
+class InceptionDWConv2d(nn.Module):
+    def __init__(self, in_channels, square_kernel_size=3, band_kernel_size=11, branch_ratio=1/8):
+        super().__init__()
+        
+        gc = int(in_channels * branch_ratio) # channel number of a convolution branch
+        
+        self.dwconv_hw = nn.Conv2d(gc, gc, square_kernel_size, padding=square_kernel_size//2, groups=gc)
+        
+        self.dwconv_w = nn.Conv2d(gc, gc, kernel_size=(1, band_kernel_size), padding=(0, band_kernel_size//2), groups=gc)
+        
+        self.dwconv_h = nn.Conv2d(gc, gc, kernel_size=(band_kernel_size, 1), padding=(band_kernel_size//2, 0), groups=gc)
+        
+        self.split_indexes = (gc, gc, gc, in_channels - 3 * gc)
+        
+    def forward(self, x):
+        # B, C, H, W = x.shape
+        x_hw, x_w, x_h, x_id = torch.split(x, self.split_indexes, dim=1)
+        
+        return torch.cat(
+            (self.dwconv_hw(x_hw), 
+            self.dwconv_w(x_w), 
+            self.dwconv_h(x_h), 
+            x_id), 
+            dim=1)
+\end{lstlisting}
+\vspace{-2mm}
+\end{algorithm}
+
+\vspace{-3mm}
+\subsection{MetaNeXt}
+\vspace{-1mm}
+\myPara{Formulation of MetaNeXt Block}
+In ConvNeXt \cite{convnext}, for its each ConvNeXt block, the input $X$ is first processed by a depthwise convolutioin to propagate information along spatial dimensions. 
+We follow MetaFormer \cite{metaformer} to abstract the depthwise convolution as a \textit{token mixer} which is responsible for spatial information interaction. Accordingly, as shown in the second subfigure in Figure \ref{fig:block}, the ConvNeXt  is abstracted as \textit{MetaNeXt} block. Formally, in a MetaNeXt block, its  input $X$ is firstly processed as
+\begin{equation}
+    X' = \mathrm{TokenMixer}(X),
+\end{equation}
+where $X, X' \in \mathbb{R}^{B \times C \times H \times W}$ with $B$, $C$, $H$ and $W$ respectively denoting batch size, channel number, height and width. 
+Then the output from the token mixer is normalized
+\begin{equation}
+    Y = \mathrm{Norm}(X').
+\end{equation}
+After normalization \cite{batch_norm, layer_norm}, the features are then fed into an MLP module which consists of two fully-connected layers with an activation function between them, the same as feed-forward network in Transformer \cite{transformer}. The two fully-connected layers can also be implemented by $1 \times 1$ convolutions. Also, shortcut connection \cite{resnet, highway} is adopted. This process can be expressed by
+\begin{equation}
+     Y = \mathrm{Conv}_{1 \times 1}^{rC\rightarrow C}\{\sigma[\mathrm{Conv}_{1 \times 1}^{C \rightarrow rC}(Y)]\} + X,
+\end{equation}
+where $\mathrm{Conv}_{k \times k}^{C_i \rightarrow C_o}$ means convolution with kernel size of $k \times k$, input channels of $C_i$ and output channels of $C_o$; $r$ is the expansion ratio and $\sigma$ denotes activation function.
+
+\myPara{Comparison to MetaFormer block} As shown in Figure \ref{fig:block}, it can be found that MetaNeXt block shares similar modules with MetaFormer block \cite{metaformer}, \eg,~token mixer and MLP. Nevertheless, a critical difference between the two models lies in the number of shortcut connections \cite{resnet, highway}. MetaNeXt block implements a single shortcut connection, whereas the MetaFormer block incorporates two, one for the token mixer and the other for the MLP.
+From this aspect, MetaNeXt block can be regarded as a result of merging two residual sub-blocks from MetaFormer, thereby simplifying the overall architecture.
+As a result, the MetaNeXt architecture exhibits a higher speed compared to MetaFormer. 
+However, this simpler design comes with a limitation: the token mixer component in MetaNeXt cannot be complicated (\eg, Attention) as shown in our experiments (Table \ref{tab:iso}).
+
+\myPara{Instantiation to ConvNeXt} As shown in Figure \ref{fig:block}, in ConvNeXt, the token mixer is simply implemented by a depthwise convolution
+\begin{equation}
+    X' = \mathrm{TokenMixer}(X) = \mathrm{DWConv}_{k \times k}^{C\rightarrow C}(X),
+\end{equation}
+where $\mathrm{DWConv}_{k \times k}^{C \rightarrow C}$ denotes depthwise convolution with kernel size of $k \times k$. In ConvNeXt, $k$ is set as 7 by default.
+
+
+\subsection{Inception depthwise convolution}
+\begin{table}[h]
+\vspace{-2mm}
+\setlength{\tabcolsep}{3pt}
+\footnotesize
+\centering
+\input{tables/pre_exp}
+\caption{\textbf{Preliminary experiments based on ConvNeXt-T. } Convolution ratio means the ratio of channels to be processed by depthwise convolution while the other channels keep unchanged. Throughputs are measured on an A100 GPU with batch size of 128 and TF32. * The result is reported in ConvNeXt paper \cite{convnext}.
+\label{tab:pre_exp}
+}
+\vspace{-5mm}
+\end{table}
+\myPara{Preliminary experiments on ConvNeXt-T}
+We first conducted preliminary experiments based on ConvNeXt-T and report the results in Table \ref{tab:pre_exp}. Firstly, the kernel size of depthwise convolution is reduced from $7 \times 7$ to $3 \times 3$. Compared to the model with kernel size of $7 \times 7$, the one with kernel size of $3 \times 3$ enjoys $1.4 \times$ higher training throughput, but suffers a significant performance drop from 82.1\% to 81.5\%. Next, inspired by ShuffleNet V2 \cite{shufflenet_v2}, we only feed partial input channels into depthwise convolution while the remaining ones keep unchanged. The number of processed input channels is controlled by a ratio. It is found that when the ratio is reduced from 1 to $1/4$, the training throughput can be further improved while the performance almost maintains. In summary, these preliminary experiments convey two findings on ConvNeXt. \underline{Finding 1}: Large-kernel depthwise convolution is the speed bottleneck. \underline{Finding 2}: Processing partial channels is good enough in single depthwise convolution layer \cite{shufflenet_v2}. 
+
+\begin{table}
+\vspace{-3mm}
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{10pt}
+\begin{tabular}{l|c|c}
+\whline
+Conv. type &  Params & FLOPs \\
+\whline
+Conventional conv. & $k^2C^2$ & $2k^2C^2HW$\\
+Depthwise conv. & $k^2C$ & $2k^2CHW$\\
+Inception dep. conv. & $(2k+9)C/8$ & $(2k+9)CHW/4$ \\
+\whline
+\end{tabular}
+\end{center}
+\vspace{-2mm}
+\caption{\textbf{Complexity of different types of convolution.} For simplicity, assume input and output channels are the same, and the bias term is omitted. $k$, $C$, $H$ and $W$ denote kernel size, channel number, height and width, respectively. The parameters and FLOPs of vanilla convolution and depthwise convolution are quadratic to kernel size $k$. In contrast, Inception depthwise convolution is linear to $k$.}
+\label{tab:complexity}
+\vspace{-3mm}
+\end{table}
+
+
+\begin{figure}[t]
+\vspace{-2mm}
+\begin{center}
+   \includegraphics[width=0.8\linewidth]{figures/two_types_of_conv.pdf}
+\end{center}
+\vspace{-8mm}
+\caption{\textbf{Comparison of FLOPs between depthwise convolution and Inception depthwise convolution.} Inception depthwise convolution is much more efficient than depthwise convolution as kernel size increases.}
+\label{fig:two_types}
+\vspace{-2mm}
+\end{figure}
+
+\begin{table}[t]
+\footnotesize
+\centering
+\setlength{\tabcolsep}{1pt}
+\input{tables/models}
+\caption{\textbf{ Configurations of \modelname{} models} which have similar model configurations to ConvNeXt \cite{convnext}. ``A'', ``T'', ``S'' and ``B'' represent ``Atto'', ``Tiny'', ``Small'' and ``Base'', respectively.
+}
+\label{tab:model}
+\vspace{-9mm}
+\end{table}
+
+
+
+
+
+\myPara{Formulation}
+Based on the above findings, we propose a new type of convolution to keep both accuracy and efficiency. According to \underline{Fingding 2}, we leave partial channels unchanged and denote them as a branch of identity mapping. Motivated by \underline{Fingding 1}, for the processing channels, we propose to decompose the depthwise operations in Inception style \cite{inception_v1, inception_v3, inception_v4}. 
+Inception \cite{inception_v1} utilizes several branches of small kernels (\eg,~$3 \times 3$) and large kernels (\eg,~$5 \times 5$). Similarly, we adopt $3 \times 3$ as one of our branches but get rid of the usage of the large square kernels because of their slow practical speed.  Instead, large kernel $k_h \times k_w$ is decomposed as $1 \times k_w$ and $k_h \times 1$ inspired by Inception v3 \cite{inception_v3}. 
+
+Specifically, for input $X$, we split it into four groups along the channel dimension,
+\begin{equation}
+\begin{split}
+X_\mathrm{hw}, X_\mathrm{w}, X_\mathrm{h}, X_\mathrm{id} &= \mathrm{Split}(X) \\
+&= X_{:, :g}, X_{:, g:2g}, X_{:, 2g:3g}, X_{:, 3g:} ,
+\end{split}
+\end{equation}
+where $g$ is the channel numbers of convolution branches. We can set a ratio $r_g$ to determine the branch channel numbers by $g = r_g C$. Next, the splitting inputs are fed into different parallel branches,
+\begin{equation}
+\begin{split}
+X'_\mathrm{hw} &= \mathrm{DWConv}_{k_s \times k_s}^{g\rightarrow g}(X_\mathrm{hw}), \\
+X'_\mathrm{w} &= \mathrm{DWConv}_{1\times k_b}^{g\rightarrow g}(X_\mathrm{w}), \\
+X'_\mathrm{h} &= \mathrm{DWConv}_{k_b\times 1}^{g\rightarrow g}(X_\mathrm{h}), \\
+X'_\mathrm{id} &= X_\mathrm{id}, \\
+\end{split}
+\end{equation}
+where $k_s$ denotes  the small square kernel size set as 3 by default;   $k_b$ represents the band kernel size set as 11 by default. Finally, the outputs from each branch are concatenated,
+\begin{equation} \label{eq1}
+X' = \mathrm{Concat}(X'_\mathrm{hw}, X'_\mathrm{w}, X'_\mathrm{h}, X'_\mathrm{id}).
+\end{equation}
+The illustration of \modelname{} block is shown in Figure \ref{fig:block}. Moreover,  its  PyTorch \cite{pytorch} code is summarized  in Algorithm \ref{alg:code}.
+
+
+
+
+\myPara{Complexity} The complexity of three types of convolution, \ie, conventional, depthwise, and Inception depthwise convolution is shown in Table \ref{tab:complexity}. As can be seen, Inception depthwise convolution is much more efficient than the other two types of convolution in terms of parameter numbers of FLOPs. Inception depthwise convolution consumes parameters and FLOPs linear to both channel and kernel size. The comparison of depthwise and Inception depthwise convolutions regarding FLOPs is also clearly shown in Figure \ref{fig:two_types}. 
+
+
+
+
+\vspace{-1mm}
+\subsection{\modelname{}}
+\vspace{-1mm}
+Based on InceptionNeXt block, we can build a series of models named InceptionNeXt. Since ConvNeXt \cite{convnext} is the our main comparing baseline, we mainly follow it to build models with several sizes \cite{rw2019timm}. Specifically, similar to ResNet \cite{resnet} and ConvNeXt, \modelname{} also adopts 4-stage framework.  The same as ConvNeXt, the numbers of 4 stages are [2, 2, 6, 2] for atto size,  [3, 3, 9, 3] for small size and [3, 3, 27, 3] for base size. 
+We adopt Batch Normalization since this paper emphasizes speed.  Another difference with ConvNeXt is that \modelname{} uses an MLP ratio of 3 in stage 4 and moves the saved parameters to the classifier, which can help reduce a few FLOPs (\eg,~3\% for base size). The detailed model configurations are reported in Table \ref{tab:model}.
+
+

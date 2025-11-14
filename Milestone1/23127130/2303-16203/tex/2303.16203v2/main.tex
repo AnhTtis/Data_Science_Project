@@ -1,0 +1,751 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage{iccv}
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{pifont}
+
+\usepackage{colortbl}
+\usepackage{booktabs, adjustbox}
+\usepackage{xcolor} %
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\RequirePackage{algorithmic}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+
+\input{macros}
+\newcommand{\xmark}{\textcolor{red}{\ding{55}}}
+\newcommand{\greencheck}{\textcolor{green}{$\checkmark$}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+\definecolor{first}{rgb}{1.0, 0.93, 0.7}
+\newcommand{\rowstyle}[1]{\gdef\currentrowstyle{#1}#1\ignorespaces}
+
+\definecolor{dt}{gray}{0.7}  
+\def \first {\cellcolor{green!15}}
+
+\makeatletter
+\def\blfootnote{\gdef\@thefnmark{}\@footnotetext}
+\makeatother
+
+
+\ifx \cvprsubmission \undefined
+    \newcommand{\todo}[1]{\textcolor{red}{todo: #1}}
+    \newcommand{\sduggal}[1]{\textcolor{red}{Shivam: #1}}
+    \newcommand{\deepak}[1]{\textcolor{red}{Deepak: #1}}
+\else
+	\newcommand{\todo}[1]{}
+	\newcommand{\sduggal}[1]{{#1}}
+        \newcommand{\deepak}[1]{{#1}}
+\fi
+
+
+\usepackage[pagebackref=true,breaklinks=true,colorlinks=true,bookmarks=false]{hyperref}
+
+\iccvfinalcopy %
+
+\def\iccvPaperID{11420} %
+\def\httilde{\mbox{\tt\raisebox{-.5ex}{\symbol{126}}}}
+
+
+\begin{document}
+
+\title{Your Diffusion Model is Secretly a Zero-Shot Classifier}
+
+
+
+
+\author{Alexander C. Li$\quad$
+Mihir Prabhudesai$\quad$
+Shivam Duggal$\quad$
+Ellis Brown$\quad$
+Deepak Pathak
+\vspace{2.5mm} \\
+Carnegie Mellon University
+}
+\maketitle
+\blfootnote{Correspondence to: Alexander Li $<$\href{mailto:alexanderli@cmu.edu}{alexanderli@cmu.edu}$>$} 
+\ificcvfinal\thispagestyle{empty}\fi
+
+\begin{abstract}
+The recent wave of large-scale text-to-image diffusion models has dramatically increased our text-based image generation abilities.
+These models can generate realistic images for a staggering variety of prompts and exhibit impressive compositional generalization abilities. 
+Almost all use cases thus far have solely focused on sampling; however, diffusion models can also provide conditional density estimates, which are useful for tasks beyond image generation.
+In this paper, we show that the density estimates from large-scale text-to-image diffusion models like Stable Diffusion can be leveraged to perform zero-shot classification \textbf{without any additional training}.
+Our generative approach to classification, which we call \textbf{Diffusion Classifier},
+attains strong results on a variety of benchmarks and outperforms alternative methods of extracting knowledge from diffusion models. 
+Although a gap remains between generative and discriminative approaches on zero-shot recognition tasks, we find that our diffusion-based approach has stronger multimodal relational reasoning abilities than competing discriminative approaches. 
+Finally, we use Diffusion Classifier to extract standard classifiers from class-conditional diffusion models trained on ImageNet. Even though these models are trained with weak augmentations and no regularization, they approach the performance of SOTA discriminative classifiers. Overall, our results are a step toward using generative over discriminative models for downstream tasks.
+Results and visualizations on our website: \href{https://diffusion-classifier.github.io/}{\url{diffusion-classifier.github.io/}}
+\end{abstract}
+
+\vspace{-0.1in}
+\section{Introduction}
+\textit{To Recognize Shapes, First Learn to Generate Images}~\cite{Hinton2007ToRS}---in this seminal paper, Geoffrey Hinton emphasizes generative modeling as a crucial strategy for training artificial neural networks for discriminative tasks like image recognition.  Although generative models tackle the more challenging task of accurately modeling the underlying data distribution, they can create a more complete representation of the world that can be utilized for various downstream tasks. As a result, a plethora of implicit and explicit generative modeling approaches \cite{goodfellow2014generative,KingmaWelling,ebm_lecun,realNVP,PixelRNN, sohl2015deep, VincetScoreMatching} have been proposed over the last decade. However, the primary focus of these works has been content creation \cite{devlin2018bert, brown2020language, pix2pix2017, StyleGAN, wavenet, imagen_video} rather than their ability to perform discriminative tasks.
+In this paper, we revisit this classic generative vs.\ discriminative debate in the context of diffusion models, the current state-of-the-art generative model family.
+In particular, we examine \textit{how diffusion models compare against the state-of-the-art discriminative models on the task of image classification.}
+
+
+
+
+
+
+
+
+
+Diffusion models are a recent class of likelihood-based generative models that model the distribution of the data via an iterative noising and denoising procedure~\cite{sohl2015deep, ho2020denoising}.
+They have recently achieved state-of-the-art performance \cite{dhariwal2021diffusion} on several text-based content creation and editing tasks \cite{ramesh2022, saharia2022photorealistic,imagen_video, ruiz2022dreambooth, poole2022dreamfusion}.  Diffusion models operate by performing two iterative processes---the fixed \textit{forward process}, which destroys structure in the data by iteratively adding a small amount of noise, and the learned \textit{backward process}, which attempts to recover the structure in the noised data. These models are trained via a variational objective, which maximizes an evidence lower bound (ELBO)~\cite{variational_inference} of the data log-likelihood. 
+For most diffusion models, computing the ELBO simply consists of repeatedly adding noise $\epsilon$ to a sample, using the neural network to predict the added noise, and measuring the prediction error.
+
+
+
+
+
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/arch_figure6.pdf}
+    \vspace{-4.5mm}
+    \caption{\textbf{Overview of our Diffusion Classifier approach:} Given an input image $\mathbf{x}$ and a set of possible conditioning inputs (e.g., text for Stable Diffusion or class index for DiT), we use a diffusion model to choose the one that best fits this image. \model is theoretically motivated through the variational view of diffusion models and uses the ELBO to approximate $\log p_\theta(\mathbf{x}\mid \mathbf{c})$. \model chooses the conditioning $\mathbf{c}$ that best predicts the noise added to the input image. \textit{\model can be used to extract a zero-shot classifier from Stable Diffusion and a standard classifier from DiT without any additional training.}}
+    \label{fig:method}
+    \vspace{-3.5mm}
+\end{figure*}
+
+Conditional generative models like diffusion models can be easily converted into classifiers~\cite{NgJordon}. Given an input $\mathbf{x}$ and a finite set of classes $\mathbf{c}$ that we want to choose from, we can use the model to compute class-conditional likelihoods $p_\theta(\mathbf{x} \mid \mathbf{c})$. Then, by selecting an appropriate prior distribution $p(\mathbf{c})$ and applying Bayes' theorem, we can get predicted class probabilities $p(\mathbf{c} \mid \mathbf{x})$. 
+For conditional diffusion models that use an auxiliary input, like a class index for class-conditioned models or prompt for text-to-image models, we can do this by leveraging the ELBO as an approximate class-conditional log-likelihood $\log p(\mathbf{x} \mid \mathbf{c})$. 
+In practice, obtaining a diffusion model classifier through Bayes' theorem consists of repeatedly adding noise and computing a Monte Carlo estimate of the expected noise reconstruction losses (also called $\epsilon$-prediction loss) for every class.  
+We call this approach \textbf{Diffusion Classifier}. 
+Diffusion Classifier can extract zero-shot classifiers from text-to-image diffusion models and standard classifiers from class-conditional diffusion models, \textit{without any additional training}.
+We develop techniques for appropriately choosing diffusion timesteps to compute errors at, reducing variance in the estimated probabilities, and speeding up classification inference.
+
+
+We highlight the surprising effectiveness of our proposed Diffusion Classifier on zero-shot and supervised classification tasks by comparing against multiple baselines on ten different datasets, including the challenging ObjectNet \cite{Barbu2019ObjectNetAL}, ImageNetV2 \cite{Recht2019DoIC}, and ImageNet-A \cite{hendrycks2021nae} datasets. To the best of our knowledge, \textit{our approach is among the first generative modeling approaches to achieve competitive zero-shot classification accuracy with state-of-the-art methods such as CLIP (Table~\ref{tab:zero_shot_cls}).} Finally, our supervised classification experiments (Figure~\ref{fig:id_vs_ood}) highlight that \textit{our generative approach is catching up to SOTA discriminative classifiers on ImageNet, both in-distribution and out-of-distribution}.
+
+
+
+
+
+
+
+
+
+
+\section{Related Work}
+\vspace{-0.05in}
+\paragraph{Generative Models for Discriminative Tasks:} Machine learning algorithms designed to solve common classification or regression tasks generally operate under two paradigms: \textit{discriminative} approaches directly learn to model the decision boundary of the underlying task, while \textit{generative approaches} learn to model the distribution of the data and then address the underlying task as a maximum likelihood estimation problem. Algorithms like naive Bayes \cite{NgJordon}, VAEs \cite{KingmaWelling}, GANs \cite{goodfellow2014generative}, EBMs \cite{Du2019ImplicitGA, ebm_lecun}, and diffusion models \cite{sohl2015deep, ho2020denoising} fall under the category of generative models. The idea of modeling the data distribution to better learn the discriminative feature has been highlighted by several seminal works \cite{Hinton2007ToRS, NgJordon, RanzatoHinton}. These works train deep belief networks \cite{deep_belief_networks} to model the underlying image data as latents, which are later used for image recognition tasks. Recent works on generative modeling have also learned efficient representations for both global and dense prediction tasks like classification \cite{MaskedAutoencoders2021, hjelm2018learning, croce-etal-2020-gan, brown2020language, Devlin2019BERTPO} and segmentation \cite{semanticGAN, zhang21, InfoGAN, baranchuk2022labelefficient,burgert2022peekaboo}. Moreover, such models \cite{grathwohl2020your, Liu2020HybridDT, NEURIPS2020_0660895c} have been shown to \textit{generalize better, be more robust, and be better calibrated}. However, most of the aforementioned works either train jointly for discriminative and generative modeling or fine-tune generative representations for downstream tasks. Directly utilizing generative models for discriminative tasks is a relatively less-studied problem, and in this work, we  particularly highlight the \textit{efficacy of directly using recent diffusion models as zero-shot image classifiers.}
+
+\vspace{-0.1in}
+\paragraph{Diffusion Models:}
+
+Diffusion models \cite{ho2020denoising, sohl2015deep} have recently gained significant attention from the research community due to their ability to generate high-fidelity and diverse content like images \cite{saharia2022photorealistic, glide, ramesh2022}, videos \cite{singer2023makeavideo, imagen_video, Villegas2022PhenakiVL}, 3D \cite{poole2022dreamfusion, lin2022magic3d}, and audio \cite{kong2021diffwave, liu2023audioldm} from various input modalities like text.
+Diffusion models are also closely tied to EBMs \cite{ebm_lecun, Du2019ImplicitGA}, denoising score matching \cite{SongErmon, vincent2008extracting}, and stochastic differential equations \cite{song2020score,zimmermann2021score}.
+In this work, we investigate to what extent the impressive high-fidelity generative abilities of these diffusion models can be utilized for discriminative tasks (namely classification). We take advantage of the variational view of diffusion models for efficient and parallelizable density estimates. 
+The prior work of Dhariwal \& Nichol \cite{dhariwal2021diffusion} proposed using a classifier network to modify the output of an unconditional generative model to obtain class-conditional samples. Our goal is the reverse: using diffusion models as classifiers.  %
+
+\vspace{-0.1in}
+\paragraph{Zero-Shot Image Classification:}
+Classifiers thus far have usually been trained in a supervised setting where the train and test sets are fixed and limited.  CLIP \cite{radford2019language} showed that exploiting large-scale image-text data can result in zero-shot generalization to various new tasks. 
+Since then there has been a surge towards building a new category of classifiers, known as zero-shot or open-vocabulary classifiers, that are capable of detecting a wide range of class categories \cite{gadre2022clip,li2022blip,li2022grounded,alayrac2022flamingo}. These methods have been shown to learn robust representations that generalize to various distribution shifts \cite{ilharco_gabriel_2021_5143773,dehghani2023scaling,taori2020measuring}.
+Note that in spite of them being called ``zero-shot,''  it is still unclear whether evaluation samples lie in their training data distribution. 
+In contrast to the discriminative approaches above, we propose extracting a zero-shot classifier from a large-scale \textit{generative} model.
+
+
+\section{Method: Classification via Diffusion Models}
+\label{sec:method}
+
+We describe our approach for calculating class conditional density estimates in a practical and efficient manner using diffusion models. We first provide an overview of diffusion models (Sec.~\ref{subsec:diffusion_background}), discuss the motivation and derivation of our \model method (Sec.~\ref{subsec:derivation}), and finally propose techniques to improve its accuracy (Sec.~\ref{subsec:paired_diff}). 
+
+
+\subsection{Diffusion Model Preliminaries}
+\label{subsec:diffusion_background}
+Diffusion probabilistic models (``diffusion models'' for short) \cite{sohl2015deep,ho2020denoising} are generative models with a specific Markov chain structure. Starting at a clean sample $\mathbf{x}_0$, the fixed forward process $q(\mathbf{x}_t \mid \mathbf{x}_{t-1})$  adds Gaussian noise, whereas the learned reverse process $p_\theta(\mathbf{x}_{t-1} \mid \mathbf{x}_t, \mathbf{c})$ tries to denoise its input, optionally conditioning on a variable $\mathbf{c}$. In our setting, $\mathbf{x}$ is an image and $\mathbf{c}$ represents a low-dimensional text embedding (for text-to-image synthesis) or class index (for class-conditional generation). Diffusion models define the conditional probability of $\mathbf{x}_0$ as:
+\begin{align}
+p_\theta(\mathbf{x}_0 \mid \mathbf{c}) = \int_{\mathbf{x}_{1:T}} p(\mathbf{x}_T) \prod_{t=1}^T p_\theta(\mathbf{x}_{t-1} \mid \mathbf{x}_t, \mathbf{c})\  \mathrm{d}\mathbf{x}_{1:T}
+\end{align}
+where $p(\mathbf{x}_T)$ is typically fixed to $\mathcal{N}(0, I)$. Directly maximizing $p_\theta(\mathbf{x}_0)$ is intractable due to the integral, so diffusion models are instead trained to minimize the variational lower bound (ELBO) of the log-likelihood:
+\begin{align}
+   \log p_\theta (\mathbf{x}_0 \mid \mathbf{c}) & \geq \mathbb{E}_{q}\left[\log \frac{p_\theta(\mathbf{x}_{0:T}, \mathbf{c})}{q(\mathbf{x}_{1:T} \mid \mathbf{x}_0)}\right]
+\end{align}
+Diffusion models parameterize $p_\theta(\mathbf{x}_{t-1}\mid \mathbf{x}_t, \mathbf{c})$ as a Gaussian and train a neural network to map a noisy input $\mathbf{x}_t$ to a value used to compute the mean of $p_\theta(\mathbf{x}_{t-1}\mid \mathbf{x}_t, \mathbf{c})$. Using the fact that 
+each noised sample
+$\mathbf{x}_t =\sqrt{\bar \alpha_{t_i}}\mathbf{x} + \sqrt{1-\bar\alpha_{t_i}} \epsilon_i$ can be written as a weighted combination of a clean input $\mathbf{x}$ and Gaussian noise $\epsilon \sim \mathcal{N}(0, I)$, diffusion models typically learn a network $\epsilon_\theta(\mathbf{x}_t, \mathbf{c})$ that estimates the added noise. Using this parameterization, the ELBO can be written as:
+\begin{align}
+   - \mathbb{E}_\epsilon \left[\sum_{t = 2}^T w_t \|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c})\|^2 - \log p_\theta(\mathbf{x}_0 \mid \mathbf{x}_1, \mathbf{c}) \right] + C
+\end{align}
+where $C$ is a constant term that does not depend on $\mathbf{c}$. Since $T = 1000$ is large and $\log p_\theta(\mathbf{x}_0 \mid \mathbf{x}_1, \mathbf{c})$ is typically small, we choose to drop this term. Finally, \cite{ho2020denoising} find that removing $w_t$ improves sample quality metrics, and many follow-up works also choose to do so. We found that deviating from the uniform weighting used at training time hurts accuracy, so we set $w_t = 1$.
+Thus, this gives us our final expression for the ELBO: 
+\begin{align}
+    - \mathbb{E}_{t, \epsilon} \left[\|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c})\|^2 \right] + C
+\label{eq:elbo}
+\end{align}
+
+
+
+\renewcommand{\algorithmiccomment}[1]{// #1}
+
+\begin{algorithm}[t]
+   \caption{$\texttt{Diffusion Classifier}$}
+   \label{alg:diffusion_classifier}
+\begin{algorithmic}[1]
+    \STATE {\bfseries Input:} test image $\mathbf{x}$, conditioning inputs $\{\mathbf{c}_i\}_{i=1}^n$ (e.g., text embeddings or class indices), number of stages $N_{\text{stages}}$, list $\texttt{KeepList}$ of number of $\mathbf{c}_i$ to keep after each stage, list $\texttt{TrialList}$ of number of trials done by each stage 
+    \STATE Initialize $\texttt{Errors}[\mathbf{c}_i] = \text{list}()$ for each $\mathbf{c}_i$ 
+    \STATE $\displaystyle \mathcal{C} = \{\mathbf{c}_i\}_{i=1}^n$
+    \STATE $\texttt{PrevTrials}$ = 0
+    \FOR{stage i $=1, \dots, N_{\text{stages}}$}
+        \FOR{trial $j = 1, \dots, \texttt{TrialList}[i] - \texttt{PrevTrials} $}
+            \STATE Sample $t \sim [1, 1000]$
+            \STATE Sample $\epsilon \sim \mathcal{N}(0, I)$
+            \STATE $\mathbf{x}_t = \sqrt{\bar \alpha_{t}}\mathbf{x} + \sqrt{1-\bar\alpha_{t}} \epsilon$
+            \FOR{conditioning $\mathbf{c}_k \in \mathcal{C}$}
+                \STATE $\texttt{Errors}[\mathbf{c}_k].\texttt{append}(\|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c}_k)\|^2)$
+            \ENDFOR
+        \ENDFOR
+        \STATE \COMMENT{Keep best $\texttt{KeepList}[i]$ $\mathbf{c}_k$ with the lowest errors} 
+        \STATE $\displaystyle \mathcal{C} \leftarrow \argmin_{\substack{\mathcal S \subset C; \\ |\mathcal S| = \texttt{KeepList}[i]}} \sum_{c_k \in \mathcal S} \texttt{mean}(\texttt{Errors}[\mathbf{c}_k])$
+        \STATE $\texttt{PrevTrials}$ = \texttt{TrialList}[i]
+    \ENDFOR
+    \RETURN $\displaystyle \argmin_{\mathbf{c}_i \in \mathcal C} \texttt{mean}(\texttt{Errors}[\mathbf{c}_i])$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{figure}[t]
+\vspace{-0.1in}
+    \centering
+    \includegraphics[width=\linewidth]{figures/error_variance.pdf}
+    \caption{We show the $\epsilon$-prediction error for a fixed image of a Great Pyrenees dog and two prompts. Each subplot corresponds to a single $\epsilon$, with the error evaluated for every $1 \leq t \leq 1000$. Errors are normalized to be zero-mean at each timestep across the 4 plots, and lower is better. Variance in $\epsilon$-prediction error is high across different $\epsilon$, but the variance in relative error between prompts at each $t$ is much smaller for the same $\epsilon$.}
+    \label{fig:correlated_errors}
+    \vspace{-0.1in}
+\end{figure}
+
+\subsection{Classification with diffusion models}
+\label{subsec:derivation}
+In general, classification using a conditional generative model can be done by using Bayes' theorem on the model predictions and the prior $p(\mathbf{c})$ over labels $\{\mathbf{c}_i\}$: 
+\begin{align}
+    p_\theta(\mathbf{c}_i \mid \mathbf{x}) = \frac{p(\mathbf{c}_i)\ p_\theta(\mathbf{x} \mid \mathbf{c}_i)}{\sum_j p(\mathbf{c}_j)\ p_\theta(\mathbf{x} \mid \mathbf{c}_j)}
+\label{eq:bayes}
+\end{align}
+A uniform prior over $\{\mathbf{c}_i\}$ (i.e., $p(\mathbf{c}_i) = \frac{1}{N}$) is natural and leads to all of the $p(\mathbf{c})$ terms cancelling. For diffusion models, computing $p_\theta(\mathbf{x}\mid \mathbf{c})$ is intractable, so we use the ELBO in place of $\log p_\theta(\mathbf{x} \mid \mathbf{c})$ and use Eq.~\ref{eq:elbo} and Eq.~\ref{eq:bayes} to obtain a posterior distribution over $\{\mathbf{c}_i\}_{i=1}^N$:
+\begin{align}
+    p_\theta(\mathbf{c}_i \mid  \mathbf{x}) 
+    &\approx \frac{\exp\{- \mathbb{E}_{t, \epsilon}[\|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c}_i)\|^2] + C \}}{\sum_j \exp\{- \mathbb{E}_{t, \epsilon}[\|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c}_j)\|^2] + C\}} \\
+    &= \frac{\exp\{- \mathbb{E}_{t, \epsilon}[\|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c}_i)\|^2]\}}{\sum_j \exp\{- \mathbb{E}_{t, \epsilon}[\|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c}_j)\|^2]\}} 
+\label{eq:posterior}
+\end{align}
+We compute an unbiased Monte Carlo estimate of each expectation by sampling $N$ $(t_i, \epsilon_i)$ pairs, with $t_i \sim [1, 1000]$ and $\epsilon \sim \mathcal{N}(0, I)$, and computing
+\begin{align}
+    \frac{1}{N}\sum_{i=1}^N \left\|\epsilon_i - \epsilon_\theta(\sqrt{\bar \alpha_{t_i}}\mathbf{x} + \sqrt{1-\bar\alpha_{t_i}} \epsilon_i, \mathbf{c}_j)\right\|^2
+\label{eq:monte_carlo}
+\end{align}
+By plugging Eq.~\ref{eq:monte_carlo} into Eq.~\ref{eq:posterior}, we can extract a classifier from any conditional diffusion model. We call this method \textbf{\model}.
+\textit{\model is a powerful, hyperparameter-free approach to extracting classifiers from pretrained diffusion models without any additional training.} 
+\model can be used to extract a zero-shot classifier from a text-to-image model like Stable Diffusion \cite{rombach2022high}, to extract a standard classifier from a class-conditional diffusion model like DiT \cite{Peebles2022DiT}, and so on. We show an overview of our method in Figure~\ref{fig:method}.
+
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figures/pets_per_t_accs.pdf}
+    \caption{\textbf{Pets accuracy, evaluating only a single timestep per class}. Small $t$ corresponds to less noise added, and large $t$ corresponds to significant noise. Accuracy is highest when an intermediate amount of noise is added ($t=500$).}
+    \label{fig:single_t}
+\end{figure}
+
+
+
+\subsection{Variance Reduction via Difference Testing}
+\label{subsec:paired_diff}
+At first glance, it seems that accurately estimating $\mathbb{E}_{t, \epsilon}\left[\|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c})\|^2 \right]$ for each class $\mathbf{c}$ requires prohibitively many samples. Indeed, a Monte Carlo estimate even using thousands of samples is not precise enough to distinguish classes reliably. However, a key observation is that classification only requires the \textit{relative} differences between the prediction errors, not their \textit{absolute} magnitudes. We can rewrite the approximate $p_\theta(\mathbf{c}_i \mid \mathbf{x})$ from Eq.~\ref{eq:posterior} as:
+\begin{align}
+    \frac{1}{\sum_j \exp\left\{\mathbb{E}_{t, \epsilon}[\|\epsilon -\epsilon_\theta(\mathbf{x}_t, \mathbf{c}_i)\|^2 -\|\epsilon -\epsilon_\theta(\mathbf{x}_t, \mathbf{c}_j)\|^2] \right\}}
+    \label{eq:paired}
+\end{align}
+Eq.~\ref{eq:paired} makes apparent that we only need to estimate the \emph{difference} in prediction errors across each conditioning value. Practically, instead of using different random samples of  $(t_i, \epsilon_i)$ to estimate the ELBO for each conditioning input $\mathbf{c}$, we simply sample a fixed set $S = \{(t_i, \epsilon_i)\}$ and use the same samples to estimate the $\epsilon$-prediction error for every $\mathbf{c}$. This is reminiscent of paired difference tests in statistics, which increase their statistical power by matching conditions across groups and computing differences.
+
+In Figure~\ref{fig:correlated_errors}, we sample 4 fixed $\epsilon_i$'s and evaluate $\|\epsilon_i - \epsilon_\theta(\sqrt{\bar \alpha_{t}}\mathbf{x} + \sqrt{1-\bar\alpha_{t}} \epsilon_i, \mathbf{c}) \|^2$ for every $t \in {1, \dots, 1000}$, two prompts (``Samoyed dog'' and ``Great Pyrenees dog''), and a fixed input image of a Great Pyrenees. Even for a fixed prompt, the $\epsilon$-prediction error varies wildly across the specific $\epsilon$ used. However, the error difference between each prompt is much more consistent. \textit{Thus, by using the same $(t_i, \epsilon_i)$ for each conditioning input, our estimate of $p_\theta(\mathbf{c}_i\mid \mathbf{x})$ is much more accurate. }
+
+
+
+
+\section{Practical Considerations}
+\label{sec:practical}
+Our \model method requires repeated error prediction evaluations for every class in order to classify an input image. These evaluations naively require significant inference time, even with the technique presented in Sec~\ref{subsec:paired_diff}. In this section, we present further insights and optimizations that reduce our method's runtime.
+
+\subsection{Effect of timestep}
+
+Diffusion Classifier, which is a theoretically principled method for estimating $p(\mathbf{c}_i \mid  \mathbf{x})$, uses a uniform distribution over the timestep $t$ for estimating the $\epsilon$-prediction error. Here, we check if alternate distributions over $t$ yield more accurate results. Figure~\ref{fig:single_t} shows the Pets accuracy when using only a single timestep evaluation per class. Perhaps intuitively, accuracy is highest when using intermediate timesteps ($t \approx 500)$. This begs the question: can we improve accuracy by oversampling intermediate timesteps and undersampling low or high timesteps?
+
+
+We try a variety of timestep sampling strategies, including repeatedly trying $t=500$ with many random $\epsilon$, trying $N$ evenly spaced timesteps, and trying the middle ${t - N/2, \dots, t + N/2}$ timesteps. The tradeoff between different strategies is whether to try a few $t_i$ repeatedly with many $\epsilon$ or to try many $t_i$ once. Figure~\ref{fig:scaling} shows that all strategies improve when taking using average error of more samples, but simply using evenly spaced timesteps is best. 
+We hypothesize that repeatedly trying a small set of $t_i$ scales poorly since this biases the ELBO estimate. 
+
+
+
+
+\subsection{Efficient Classification}
+A naive implementation of our method requires $C \times N$ trials to classify a given image, where $C$ is the number of classes and $N$ is the number of $(t, \epsilon)$ samples to evaluate for each conditional ELBO. However, we can do better. Since we only care about $\argmax_{\mathbf{c}} p(\mathbf{c}\mid \mathbf{x})$, we can stop computing the ELBO for classes we can confidently reject. Thus, one option to classify an image is to use an upper confidence bound algorithm~\cite{auer2002using} to allocate most of the compute to the top candidates. However, this would require making the assumption that the distribution of $\|\epsilon -\epsilon_\theta(\mathbf{x}_t, \mathbf{c}_j)\|^2$ is the same across timesteps $t$. We found that a simpler method works just as well. We split our evaluation into a series of stages, where in each stage we try each remaining $c_i$ some number of times and then remove the ones that have the highest average error. This allows us to efficiently eliminate classes that are almost certainly not the final output and allocate more compute to reasonable classes. As an example, on the Pets dataset, we have $N_{\text{stages}}$ = 2 stages. We try each class 25 times in the first stage, then prune to the 5 classes with the smallest average error. Finally, in the second stage we try each of the 5 remaining classes 225 additional times. In Algorithm~\ref{alg:diffusion_classifier}, we write this as $\texttt{KeepList} = (5, 1)$ and $\texttt{TrialList} = (25, 250)$. With this evaluation strategy, classifying one Pets image requires 15 seconds on a single 3090 GPU. As our work focuses on understanding diffusion model capabilities, and does not propose a practical inference algorithm, we do not significantly tune the evaluation strategies. 
+Future work could focus on further speeding up inference time. Further details are in Appendix~\ref{sec:zero_shot_details}.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/scaling1.pdf}
+    \caption{\small \textbf{Zero-shot scaling curves for different timestep sampling strategies}. We evaluate a variety of strategies for choosing the timesteps at which we evaluate the $\epsilon$-prediction error. Each strategy name indicates which timesteps it uses---
+    e.g., ``$0$'' only uses the first timestep, ``$0,500,1000$'' uses only the first, middle and last, ``Even 10'' uses 10 evenly spaced timesteps.
+    We allocate more $\epsilon$ evaluations at the chosen timesteps as the number of trials increases. Strategies that repeatedly sample from a restricted set of timesteps, like ``475, 500, 525'', scale poorly with trials. Using timesteps uniformly from the full range [1, 1000] scales best.
+    }
+    \label{fig:scaling}
+    \vspace{-2mm}
+\end{figure}
+
+\section{Experimental Details}
+We provide setup details, baselines \& datasets for zero-shot and supervised classification.
+
+
+\begin{table*}[t]
+    \centering
+        \begin{adjustbox}{width=\textwidth}
+    \begin{tabular}{lcccccccccccccccccccc}
+       & Zero-shot? & \rotatebox{0}{Food101} & \rotatebox{0}{CIFAR10} & \rotatebox{0}{FGVC} & \rotatebox{0}{Oxford Pets} & \rotatebox{0}{Flowers102} & \rotatebox{0}{STL10} & \rotatebox{0}{ImageNet} & \rotatebox{0}{ObjectNet} \\
+    \midrule
+    Synthetic SD Data             & \greencheck & 12.6 & 35.3 & 9.4 & 31.3 & 22.1 & 38.0 & 18.9 & 5.2 \\
+    \color{dt}{SD Features}        &     \xmark       & \color{dt}{73.0} & \color{dt}{\textbf{84.0}} & \color{dt}{\textbf{35.2}} & \color{dt}{75.9} & \color{dt}{\textbf{70.0}} & \color{dt}{87.2} & \color{dt}{56.6} & \color{dt}{10.2} \\
+    Diffusion Classifier (ours)                 & \greencheck & \textbf{77.9} & 76.3 & 24.3 & \textbf{85.7} & 56.8 & \textbf{94.2} & \textbf{58.4} & \textbf{38.3} \\
+    \midrule
+    CLIP ResNet-50                              & \greencheck & 81.1 & 75.6 & 19.3 & 85.4 & 65.9 & 94.3 & 58.2 & 40.0 \\
+    OpenCLIP ViT-H/14                           & \greencheck & 92.7 & 97.3 & 42.3 & 94.6 & 79.9 & 98.3 & 76.8 & 69.2 \\
+    
+
+    \bottomrule
+    \vspace{-1mm}
+    \end{tabular}
+    \end{adjustbox}
+    \caption{\textbf{Zero-shot classification performance}. Our zero-shot \model method (which utilizes Stable Diffusion) significantly outperforms the zero-shot diffusion model baseline that trains a classifier on synthetic SD data. Diffusion Classifier also generally outperforms the baseline trained on Stable Diffusion features, especially on complex datasets like ImageNet, in spite of the fact that ``SD Features'' uses the entire training set to train a classifier. Finally, although it is difficult to make an apples-to-apples comparison due to architecture, our generative approach surprisingly matches CLIP ResNet-50 performance and is competitive with OpenCLIP ViT-H.
+    }
+    \label{tab:zero_shot_cls}
+\end{table*}
+
+
+
+
+
+
+\subsection{Zero-shot Classification}
+
+\paragraph{Diffusion Classifier Setup:} We build \model on top of Stable Diffusion~\cite{rombach2022high}, a text-to-image latent diffusion model trained on a filtered subset of LAION-5B~\cite{schuhmann2022laion}. 
+For more details on Stable Diffusion model, refer to \cite{rombach2022high}.
+
+\vspace{-0.15in}
+\paragraph{Baselines:} We provide results using two strong discriminative zero-shot models: (a) CLIP ResNet-50 \cite{radford2021learning} 
+and (b) OpenCLIP ViT-H/14 \cite{cherti2022reproducible}. 
+We provide these for reference only, as these models have very different architectures from ours and cannot be compared apples-to-apples.
+We further compare our approach against two alternative ways to extract class labels from diffusion models: (c) \textbf{Synthetic-Labeled-SD}: We train a ResNet-50 classifier on synthetic data generated using Stable Diffusion (with class-names as prompts), (d) \textbf{Real-Labeled-SD}: This baseline is not a zero-shot classifier, as it requires a \textbf{labeled dataset} of real-world images and class-names. Inspired by Label-DDPM \cite{baranchuk2022labelefficient}, we extract Stable Diffusion features (mid-layer U-Net features at a resolution [$8 \times 8 \times 1024$] at timestep $t=100$), and then fit a ResNet-50 classifier on the extracted features and corresponding ground-truth labels. Details are in Appendix~\ref{sec:baseline_details}.
+
+
+\vspace{-0.15in}
+\paragraph{Datasets:} We evaluate the zero-shot classification performance across eight datasets: Food-101 \cite{bossard14}, CIFAR-10 \cite{CIFAR-10},  FGVC-Aircraft \cite{maji13fine-grained}, Oxford-IIIT Pets \cite{parkhi12a}, Flowers102 \cite{Nilsback08}, 
+STL-10 \cite{pmlr-v15-coates11a}, ImageNet \cite{deng2009imagenet} and ObjectNet \cite{Barbu2019ObjectNetAL}. 
+We also evaluate zero-shot compositional reasoning ability on the Winoground benchmark~\cite{thrush2022winoground} .
+
+
+
+
+
+\subsection{Supervised Classification}
+\paragraph{\model Setup:} We build \model on top of Diffusion Transformer (DiT)~\cite{Peebles2022DiT}, a class-conditional latent diffusion model trained on ImageNet. 
+Other details are the same as those in the zero-shot setting.
+
+\vspace{-0.15in}
+\paragraph{Baselines:} We compare against these discriminative models trained with cross-entropy on ImageNet: ResNet-18, ResNet-34, ResNet-50, and ResNet-101~\cite{he2016deep}, as well as ViT-L/32, ViT-L/16, and ViT-B/16~\cite{dosovitskiy2020image}.
+
+
+
+
+
+\vspace{-0.15in}
+\paragraph{Datasets:} We evaluate the in-distribution (ImageNet) and out-of-distribution (remaining datasets) generalization of \model and the discriminative baselines on four different datasets: ImageNet \cite{deng2009imagenet}, ImagenNet-A \cite{hendrycks2021nae}, ImageNetV2 \cite{Recht2019DoIC}, and ObjectNet \cite{Barbu2019ObjectNetAL}. We evaluate on 125 shared classes (with 5 data samples per class) between the ImageNet, ImageNetV2, and ObjectNet datasets and 27 common classes of the ImageNet-A dataset.
+
+
+
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/figure_1.pdf}
+    \caption{\textbf{Analyzing \model for Zero-Shot Classification:} We analyze the role of different text/captions (BLIP, Human-modified BLIP, correct class-name, incorrect class-name) for zero-shot classification using text-based diffusion models. To do so, we invert the input image using the corresponding caption and then reconstruct it using deterministic DDIM sampling. The image inverted and reconstructed using a human-modified BLIP caption aligns the most with the input image since this caption is the most descriptive. The images reconstructed using \colorbox{green!15}{correct class names as prompts (column 4)} align much better with the input image in terms of class-descriptive features of the underlying object than the images reconstructed using \colorbox{red!15}{incorrect class names as prompts (columns 5 and 6)}. Row 3 (columns 4 and 5) demonstrates an example where the base Stable Diffusion does not distinguish the two cat breeds, Birman and Ragdoll, and hence cannot invert/sample them differently. As a result, our classifier also fails.}
+    \label{fig:zero_shot_analysis}
+\end{figure*}
+
+
+\section{Experimental Results}
+In this section, we conduct detailed experiments aimed at addressing the following questions:
+\begin{enumerate}[noitemsep,topsep=0pt]
+    \item How does our model compare against zero-shot state-of-the-art classifiers such as CLIP?
+    \item How does our method compare against alternative approaches for classification with diffusion models?
+    \item How well does our method compare to discriminative models trained on the same dataset?
+    \item How robust is our model compared to state-of-art classifiers over various distribution shifts?
+\end{enumerate}
+
+\subsection{Zero-shot Classification Results}
+Table \ref{tab:zero_shot_cls} shows that \model significantly outperforms Synthetic-SD-Data baseline, an alternate zero-shot approach of extracting information from diffusion models. Our method also achieves comparable performance to SD-Features, which is a classifier trained \textit{supervised} using the entire \textit{labeled training set} for each dataset. In contrast, our method requires no additional training or labels. Furthermore, while it is difficult to make a fair comparison due to architectural differences, our method matches CLIP ResNet-50 performance and is competitive with OpenCLIP ViT-H. This is a major advancement in the performance of generative approaches, and there are clear avenues for improvement. First, we perform no manual prompt tuning and simply use the prompts used by the CLIP authors. Tuning the prompts to the Stable Diffusion training distribution should improve its recognition abilities. 
+
+Second, we suspect that Stable Diffusion classifier accuracy could improve with a wider training distribution. 
+Stable Diffusion was trained on a subset of LAION-5B \cite{schuhmann2022laion} filtered aggressively to remove low-resolution, potentially NSFW, or unaesthetic images. This decreases the likelihood that it has seen relevant data for many of our datasets. CIFAR10 and STL10, the datasets where \model has the largest relative gap with CLIP, use images that are too small to pass the $256\times 256$ size requirement. 
+
+Finally, another factor that affects performance is the fact that the diffusion model optimization objective is chosen for sample quality over good log-likelihoods. Ho \etal \cite{ho2020denoising} found that uniform weighting of the $\epsilon$-prediction error over timesteps improves Inception score and FID at the cost of lower log-likelihoods. Stable Diffusion \cite{rombach2022high}, having been trained on this uniformly weighted objective, thus have worse log-likelihood estimation capabilities (and hence potentially worse at classification) than if they had been trained on the weighted variational objective.
+
+
+
+
+
+\subsection{Analyzing \model for Zero-Shot Classification}
+We now analyze why our proposed diffusion-based density estimator, Diffusion Classifier, works well.
+
+\vspace{0.01in}
+\textbf{Experiment Setup:} Given an input image, we first perform DDIM inversion \cite{DDIM, Kim_2022_CVPR} (with 50 timesteps) using Stable Diffusion 2.1 and different captions as prompts: BLIP \cite{li2022blip} generated caption, human-refined BLIP generated caption, ``a photo of \textit{\{correct-class-name\}}, a type of pet'' and ``a photo of \textit{\{incorrect-class-name\}}, a type of pet.''.  Next, we leverage the inverted DDIM latent and the corresponding prompt to attempt to reconstruct the original image (using a deterministic diffusion scheduler \cite{DDIM}). 
+The underlying intuition behind this experiment is that the inverted image should look more similar to the original image when a correct and appropriate/descriptive prompt is used for DDIM inversion and sampling.
+
+\textbf{Experimental Evaluation:} Figure~\ref{fig:zero_shot_analysis} shows the results of this experiment for the Oxford-IIIT Pets dataset. The image inverted using a human-modified BLIP caption (column 3) is the most similar to the original image (column 1). This aligns with our intuition as this caption is most descriptive of the input image. The human-modified caption (column 2 in Figure~\ref{fig:zero_shot_analysis}) only adds the class name (Bengal Cat, American Bull Dog, Birman Cat) ahead of the BLIP predicted ``cat or dog'' token for the foreground object and slightly enhances the description for the background. \textit{Comparing the BLIP-caption results (column 2) with the human-modified BLIP-caption results (column 3)}, we can see that by just using the class-name as the extra token, the diffusion model can inherit class-descriptive features (Bengal cat has stripes, American Bulldog has a wider chin, Birman cat has a black patch on the face) into the reconstructed image. \textit{This backs our proposal of diffusion-based generative models as strong zero-shot classifiers.}
+
+
+Compared to the image generated using the oracle (human-generated) caption as a prompt, the images reconstructed using only class names as prompts (columns 4,5,6) align less with the input image (column 1). \textit{This is expected as class names by themselves are not dense descriptions of the input images.} Comparing the results of column 4 (correct class names as prompt) with those of column 5,6 (incorrect class names as prompt), we can see that the foreground object has similar class-descriptive features (brown and black stripes in row 1, white, and black face patches in row 3) to the input image for the correct-prompt reconstructions. This strongly highlights the fact that although using class names as approximate prompts will not lead to absolute perfect denoising or density estimation (Eq.~\ref{eq:monte_carlo}), \textit{for the global prediction task of classification, the correct class names should provide enough descriptive features for denoising, relative to the incorrect class names.} 
+
+Row 3 of Figure~\ref{fig:zero_shot_analysis} further highlights an example where the base Stable Diffusion model generates very similar-looking inverted images for correct Birman and incorrect Ragdoll text prompts. As a result, our model also incorrectly classifies Birman cat with Ragdoll, although getting the perfect zero-shot top-2 classification metric. This happens because Ragdolls and Birmans look extremely similar (even to humans). Finally, we fine-tuned the Stable Diffusion diffusion model on a dataset of Ragdoll/Birman cats (175 images in total). Diffusion Classifier using this finetuned model achieves a classification accuracy of 85\%, significantly higher than the initial zero-shot accuracy of 45\%.
+
+
+\subsection{Improved Relational Reasoning Abilities}
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/figure_3.pdf}
+    \caption{\textbf{Example visualizations of Winoground swap types.} Each category corresponds to a different type of linguistic swap in the caption. Object swaps noun phrases, Relation swaps verbs, adjectives, or adverbs, and Both can swap entities of both kinds.}
+    \label{fig:winoground_explanation}
+\end{figure}
+
+Large text-to-image diffusion models are capable of generating samples with impressive compositional generalization. 
+In this section, we test whether this generative ability translates to improved compositional \textit{reasoning}. 
+
+
+\begin{table}%
+    \centering
+    \scalebox{0.85}{
+    \begin{tabular}{lcccc}
+        \toprule
+        Model & Object & Relation & Both & Average \\
+        \midrule
+        Random Chance & 25.0 & 25.0 & 25.0 & 25.0 \\
+        CLIP ViT-L/14 & 27.0 &  25.8 & 57.7 & 28.2 \\
+        OpenCLIP ViT-H/14 & 39.0 & \textbf{26.6} & 57.7 & 33.0 \\ 
+        Diffusion Classifier (ours) & \textbf{41.8} & 25.3 & \textbf{69.2} & \textbf{34.0} \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{1mm}
+    \caption{\textbf{Zero-shot reasoning results on Winoground Object, Relation and Both benchmarks.} Diffusion Classifier improves text score (Eq~\ref{eq:text_score}) whenever object swaps are involved (Both also swaps the object). However, performance on Relation still remains roughly at random chance for all three methods. }
+    \label{tab:winoground}
+    \vspace{-3mm}
+\end{table}
+
+
+\paragraph{Winoground Benchmark:}
+We compare Diffusion Classifier to contrastive models like CLIP~\cite{radford2021learning} on Winoground~\cite{thrush2022winoground}, 
+a popular benchmark for evaluating the visuo-linguistic compositional reasoning abilities of vision-language models. 
+Each example in Winoground consists of 2 (image, caption) pairs. %
+Notably, both captions within an example contain the exact same set of words, just in a different order. 
+Vision-language multimodal models are scored on Winoground by their ability to match captions $C_i$ to their corresponding images $I_i$. 
+Given a model that computes a score for each possible pair $score(C_i, I_j)$, the \textit{text score} of a particular 
+example $((C_0, I_0), (C_1, I_1))$ is 1 if and only if it independently prefers caption $C_0$ over caption $C_1$ for
+ image $I_0$ and vice-versa for image $I_1$. Precisely, the model's text score on an example is: 
+\begin{align}
+\label{eq:text_score}
+\begin{split}
+\mathbb{I}[&score(C_0, I_0) > score(C_1, I_0)  \text{ AND } \\
+&score(C_1, I_1) > score(C_0, I_1)]
+\end{split}
+\end{align}
+Achieving a high text score is extremely challenging. Humans (via Mechanical Turk) achieve 89.5\% accuracy on this benchmark, 
+but even the best models do barely above chance. 
+Models can only do well if they understand compositional structure within each modality. 
+CLIP has been found to do poorly on this benchmark since its embeddings tend to be more like a ``bag of concepts'' that fail to bind subjects to attributes or verbs~\cite{yamada2022lemons}. 
+
+Each example is tagged by the type of linguistic swap (object, relation and both) between the two captions: 
+\begin{enumerate}[noitemsep,topsep=0pt]
+    \item Object: reorder elements like noun phrases that typically refer to real-world objects/subjects.
+    \item Relation: reorder elements like verbs,  adjectives,  prepositions,  and/or adverbs that modify objects. 
+    \item Both: a combination of the previous two types.
+\end{enumerate}
+We show examples of each swap type in Figure~\ref{fig:winoground_explanation}.
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/figure_4.pdf}
+    \caption{Results on selected Winoground examples.}
+    \label{fig:wino}
+    \vspace{-1em}
+\end{figure}
+
+
+
+
+\paragraph{Results} 
+Table~\ref{tab:winoground} compares Diffusion Classifier to OpenCLIP ViT-H/14 (whose text embeddings Stable Diffusion conditions on) and CLIP ViT-L/14. 
+For the ``Relation'' swaps, all three models do about the same as a purely random baseline. However, \textit{Diffusion Classifier clearly does better than both discriminative approaches when object swaps are involved (Object and Both).} This indicates that Diffusion Classifier exhibits better compositional generalization than these contrastive methods. Since Stable Diffusion uses the same text encoder as OpenCLIP ViT-H/14, this improvement must come from better cross-modal binding of concepts to images. 
+Overall, we find it surprising that Stable Diffusion, trained with only sampling in mind, can be repurposed into such a good classifier and reasoner.
+
+In Figure \ref{fig:wino}, we show examples of some successes and failures. As can be seen from Figure \ref{fig:wino} (row 2, column 2), Diffusion Classifier is better able to reason about the spatial and the compositional understanding of the underlying images and hence performs better on the Winoground benchmark. Figure \ref{fig:wino} (row 2, column 1) shows a challenging example where all the baselines and our approach fail.
+
+\subsection{Supervised Classification Results}
+\label{sec:supervised}
+In this section, we compare the robustness of our \model with a variety of strong discriminative models. We compare \model, leveraging the Imagenet-trained DiT model~\cite{Peebles2022DiT}, to variants of ViTs~\cite{dosovitskiy2020image} and ResNets~\cite{he2016deep} trained on ImageNet. In Figure \ref{fig:id_vs_ood} and Table~\ref{tab:id_vs_ood} we show that \model is strongly competitive with state-of-the-art discriminative classifiers on various natural distribution shifts. \model matches the in-distribution accuracy of a ViT-L/32 model and consistently does better OOD than half of the discriminative methods. Notably, to the best of our knowledge, we are the first to show that a generative model can achieve ImageNet classification accuracy comparable with highly competitive discriminative methods like ViTs~\cite{dosovitskiy2020image}. This is especially impressive since DiT was trained with \textit{only random horizontal flips}, unlike typical classifiers that use RandomResizedCrop, Mixup~\cite{zhang2017mixup}, RandAugment~\cite{cubuk2020randaugment}, and other tricks. Furthermore, \cite{Peebles2022DiT} reports stable training with fixed learning rate (no warmup or decay) and no regularization other than weight decay. These results indicate that it may be time to revisit a generative approach to classification. Explicitly training diffusion models to maximize their classification accuracy is an exciting avenue for future work. 
+
+
+\begin{table}
+    \centering
+    \begin{adjustbox}{width=0.9\linewidth}
+    \begin{tabular}{@{\extracolsep{4pt}}lcccc@{}}
+    \toprule
+    \multirow{2}{*}{\textbf{Method}}
+    &\multicolumn{1}{c}{\textbf{ID}} 
+    &\multicolumn{3}{c}{\textbf{OOD}} \\
+    \cmidrule{2-2} \cmidrule{3-5}
+                 & IN & IN-v2 & IN-A & ObjectNet \\
+    \midrule
+    ResNet-18  & \first 74.1 & \first 57.3 & \first 15.0 & \first 26.6 \\
+    ResNet-34  & \first 78.1 & \first 59.8 & \first 10.5 & \first 31.6 \\ 
+    ResNet-50  & 79.7        & \first 61.6 & \first 9.8  & 35.6 \\
+    ResNet-101 & 82.2        & 63.2        & \first 19.5 & 38.2 \\
+    ViT-L/32   & 79.0        & \first 61.6 & 26.3        & \first 29.9 \\
+    ViT-L/16   & 81.0        & 66.6        & 25.6        & 36.7 \\
+    ViT-B/16   & 83.4        & 66.6        & 30.1        & 37.8 \\
+    \midrule
+    Diffusion Classifier & 78.9 & 62.1 & 22.6 & 32.3\\
+    \bottomrule
+    \end{tabular}
+    \end{adjustbox}
+    \vspace{2mm}
+    \caption{\textbf{Diffusion Classifier performs well ID and OOD.}\\
+    We compare our generative \model approach to discriminative models trained on ImageNet. We highlight cells where \model does better. }
+    \label{tab:id_vs_ood}
+    \vspace{-2mm}
+\end{table}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/id_vs_ood_accs.pdf}
+    \caption{\textbf{ImageNet ID vs OOD accuracy} Even with weak augmentations, \model generalizes OOD better than ResNets and the same as ViTs. }
+    \label{fig:id_vs_ood}
+\end{figure}
+
+
+ 
+
+\section{Conclusion and Discussion}
+We investigated diffusion models for zero-shot and supervised classification by leveraging diffusion models as conditional density estimators. By performing a simple unbiased Monte Carlo estimate of the $\epsilon$-predictions at various timesteps of diffusion sampling, we extract \textbf{\model}---a \textit{powerful, zero-shot, and hyper-parameter-free classifier without any additional training.}
+We find that this classifier narrows the gap with SOTA discriminative approaches on zero-shot and standard classification and outperforms them on multimodal reasoning.
+
+\vspace{-0.15in}
+\paragraph{Role of Diffusion Model Design Decisions}
+Since we don't change the base diffusion model of our \model, we believe the exact choices made during diffusion training affect the classifier. For instance, Stable Diffusion \cite{rombach2022high} conditions the image generation on the text embeddings from 
+OpenCLIP~\cite{ilharco_gabriel_2021_5143773}. 
+However, the language model in OpenCLIP is much weaker than open-ended large-language models like T5-XXL \cite{T5Model} because it is only trained on text data available from image-caption pairs, a minuscule subset of total text data on the Internet. Hence, we believe that diffusion models trained on top of T5-XXL embeddings, such as Imagen~\cite{saharia2022photorealistic}, 
+should display better zero-shot classification results, but these are not open-source to empirically validate. Other design choices, such as whether to perform diffusion in latent space (e.g. Stable Diffusion) or in pixel space (e.g. DALLE 2), can also affect the adversarial robustness of the classifier and present interesting avenues for future work.
+
+In conclusion, while generative models have previously fallen short of discriminative ones for classification, today's pace of advances in generative modeling means that they may catch up in the near future. Our strong classification, multimodal reasoning, and generalization and results represent an encouraging step in this direction.
+
+
+
+
+
+
+
+
+
+
+\vspace{2mm}
+\noindent \textbf{Acknowledgements} We thank Patrick Chao for helpful discussions and Christina Baek, Rishi Veerapaneni for paper feedback. Stability.AI contributed compute to run some of our experiments. AL is supported by the NSF GRFP DGE1745016 and DGE2140739. This work is supported by NSF IIS-2024594 and ONR MURI N00014-22-1-2773.
+
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{main}
+}
+\newpage
+\appendix
+\onecolumn
+\section*{Appendix}
+
+
+
+
+
+ 
+
+
+
+
+
+
+\section{Techniques that did not help}
+\model requires many samples to accurately estimate the ELBO. In addition to using the techniques in Section~\ref{sec:method} and \ref{sec:practical}, we tried several other options for variance reduction. None of the following methods worked, however. We list negative results here for completeness, so others do not have to retry them. 
+
+\paragraph{Classifier-free guidance}
+Classifier-free guidance~\cite{ho2022classifier} improves the match between a prompt and generated image, at the cost of mode coverage. This is done by training a conditional $\epsilon_\theta(\mathbf{x}_t, \mathbf{c})$ and unconditional $\epsilon_\theta(\mathbf{x}_t)$ denoising network and combining their predictions at sampling time: 
+\begin{align}
+    \Tilde{\epsilon}(\mathbf{x}_t, \mathbf{c}) = (1 + w) \epsilon_\theta(\mathbf{x}_t, \mathbf{c}) - w \epsilon_\theta(\mathbf{x}_t)
+\end{align}
+where $w$ is a guidance weight that is typically in the range $[0, 10]$. 
+Most diffusion models are trained to enable this trick by occasionally replacing the conditioning $\mathbf{c}$ with an empty token. Intuitively, classifier-free guidance ``sharpens'' $\log p_\theta(x \mid  \mathbf{c})$ by encouraging the model to move away from regions that unconditionally have high probability. 
+We test \model to see if using the $\Tilde{\epsilon}$ from classifier-free guidance can improve confidence and classification accuracy. Our new $\epsilon$-prediction metric is now 
+    $\left\|\epsilon - (1 + w) \epsilon_\theta(\mathbf{x}_t, \mathbf{c}) - w \epsilon_\theta(\mathbf{x}_t) \right\|^2$.
+However, Figure~\ref{fig:classifier_free} shows that $w=0$ (i.e., no classifier-free guidance) performs best. We hypothesize that this is because \model fails on uncertain examples, which classifier-free guidance affects unpredictably. 
+
+
+
+
+\paragraph{Error map cropping}
+
+The ELBO $\mathbb{E}_{t, \epsilon}[\|\epsilon - \epsilon_\theta(\mathbf{x}_t, \mathbf{c})\|^2]$ depends on accurately estimating the added noise at every location of the $64 \times 64 \times 4$ image latent. We try to reduce the impact of edge pixels (which are less likely to contain the subject) by computing $\mathbf{x}_t$ as normal, but only measuring the ELBO on a center crop of $\epsilon$ and $\epsilon_\theta(\mathbf{x}_t, \mathbf{c})$. We compute: 
+\begin{align}
+    \|\epsilon_{[i:-i, i:-i]} - \epsilon_\theta(\mathbf{x}_t, \mathbf{c})_{[i:-i, i:-i]}\|^2
+\end{align}
+where $i$ is the number of latent ``pixels'' to remove from each edge. However, Figure~\ref{fig:error_cropping} shows that any amount of cropping reduces accuracy. 
+
+\begin{figure}[h!]
+\centering
+\begin{minipage}{0.49\textwidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/classifier_guidance.pdf}
+  \caption{Accuracy plot of classifier-free guidance on Pets.}
+  \label{fig:classifier_free}
+\end{minipage}\hfill
+\begin{minipage}{0.49\textwidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/cropping.pdf}
+  \caption{Cropping $\epsilon$ and $\epsilon_\theta(\mathbf{x}_t, \mathbf{c})$ reduces accuracy on Pets. }
+  \label{fig:error_cropping}
+\end{minipage}
+\end{figure}
+
+\paragraph{Importance sampling}
+Importance sampling is a common method for reducing the variance of a Monte Carlo estimate. Instead of sampling $\epsilon \sim \mathcal{N}(0, I)$, we sample $\epsilon$ from a narrower distribution. We first tried fixing $\epsilon = 0$, which is the mode of $\mathcal{N}(0, I)$, and only varying the timestep $t$. We also tried the truncation trick~\cite{brock2018large}
+which samples $\epsilon \sim \mathcal{N}(0, I)$ but continually resamples elements that fall outside the interval $[a, b]$. Finally, we tried sampling $\epsilon \sim \mathcal{N}(0, I)$ and rescaling them to the expected norm ($\epsilon \rightarrow \frac{\epsilon}{\|\epsilon\|_2}\mathbb{E}_{\epsilon'}[\|\epsilon'\|_2])$) so that there are no outliers. 
+Table~\ref{tab:importance_sampling} shows that none of these importance sampling strategies improve accuracy. This is likely because the noise $\epsilon$ sampled with these strategies 
+are completely out-of-distribution for the noise prediction model. For computational reasons, we performed this experiment on a 10\% subset of Pets.
+\begin{table}[h!]
+    \centering
+    \begin{tabular}{lc}
+        \toprule
+        Sampling distribution for $\epsilon$ & Pets accuracy \\
+        \midrule
+        $\epsilon = 0$ & 41.3 \\
+        TruncatedNormal, $[-1, 1]$ & 49.9 \\
+        TruncatedNormal, $[-2.5, 2.5]$ & 81.5\\
+        Expected norm & 86.9 \\
+        $\epsilon \sim \mathcal{N}(0, I)$ & 87.5 \\
+        \bottomrule
+    \end{tabular}
+    \vspace{2mm}
+    \caption{Every importance sampling strategy underperforms sampling the noise $\epsilon$ from a standard normal distribution. }
+    \label{tab:importance_sampling}
+\end{table}
+
+
+\section{Additional Implementation Details}
+\subsection{Zero-shot classification using Diffusion Classifier}
+\label{sec:zero_shot_details}
+\paragraph{Training Data}
+For our zero-shot Diffusion Classifier, we utilize Stable Diffusion 2.1~\cite{rombach2022high}. 
+This model was trained on a subset of the LAION-5B dataset, filtered so that the training data is aesthetic and appropriately safe-for-work. 
+LAION classifiers were used to remove samples that are too small (less than $256 \times 256$), potentially pornographic (punsafe $\geq 0.1$), or unaesthetic (aesthetic score $< 4.5$). 
+These thresholds are relatively conservative, since false negatives (leaving NSFW or undesirable images in the training set) 
+is worse than removing extra images from a large starting dataset. 
+As discussed in Section 6.1, these filtering criteria bias the distribution of Stable Diffusion training data 
+and likely negatively affect Diffusion Classifier's performance on datasets whose images do not satisfy these criteria. 
+The checkpoint we use was trained for 550k steps at resolution $256 \times 256$ on this subset, 
+followed by an additional 850k steps at resolution $512 \times 512$ on images that are at least that large. 
+This checkpoint can be downloaded online through the diffusers repository at 
+\verb|stabilityai/stable-diffusion-2-1-base|.
+
+\paragraph{Inference Details}
+We use FP16 and Flash Attention~\cite{dao2022flashattention} to improve inference speed. 
+This enables efficient inference with a batch size of 32, which works across a variety of GPUs, from RTX 2080Ti to A6000. 
+We found that adding these two tricks did not affect test accuracy compared to using FP32 without Flash Attention. 
+Given a test image, we resize the shortest edge to 512 pixels using bicubic interpolation, 
+take a $512 \times 512$ center crop, and normalize the pixel values to $[-1, 1]$. 
+We then use the Stable Diffusion autoencoder to encode the $512 \times 512 \times 3$ RGB image into a $64 \times 64 \times 4$ latent.
+We finally classify the test image by applying the method described in Sections 3 and 4 to estimate $\epsilon$-prediction error in this latent space. 
+
+\paragraph{Sampling Strategy}
+Table~\ref{tab:eval_strategy} shows the evaluation strategy used for each zero-shot dataset. We hand-picked the strategies based on the number of classes in each dataset. Further gains in accuracy may be possible with more evaluations. 
+\begin{table}[]
+    \centering
+    \begin{tabular}{lllcc}
+    \toprule
+        Dataset & Prompts kept per stage & Evaluations per stage &  Avg. evaluations per class & Total evaluations \\
+    \midrule
+        Food101 & 20 10 5 1 & 20 50 100 500 & 50.7 & 5120 \\
+        CIFAR10 & 5 1 & 100 500 & 300 & 3000 \\
+        FGVC Aircraft & 20 10 5 1 & 20 50 100 500 & 51 & 5100 \\
+        Pets & 5 1 & 25 250 & 51 & 1890\\
+        Flowers102 & 20 10 5 1 & 20 50 100 500 & 50.4 & 5140 \\
+        STL10 & 5 1 & 100 500 & 300 & 3000 \\
+        ImageNet & 500 50 10 1 & 50 100 500 1000 & 100 & 100000\\
+        ObjectNet & 25 10 5 1 & 50 100 500 1000 & 118.6 & 13400 \\
+        \bottomrule
+    \end{tabular}
+    \vspace{2mm}
+    \caption{Evaluation strategy for each zero-shot dataset.}
+    \label{tab:eval_strategy}
+\end{table}
+
+\subsection{ImageNet classification using Diffusion Classifier}
+For this task, we use the recent Diffusion Transformer (DiT)~\cite{Peebles2022DiT} as the backbone of our Diffusion Classifier. DiT~\cite{Peebles2022DiT} was trained on ImageNet-1k, which contains about 1.28 million images from 1,000 unique classes. 
+While it was originally trained to produce high-quality samples with strong FID scores, we repurpose the model and compare it 
+against discriminative models with the same ImageNet-1k training data. Notably, DiT achieves strong performance while using
+much weaker data augmentations than what discriminative models are usually trained with. During training time for our $256 \times 256$ checkpoint, the smaller edge of the input image is resized to 256 pixels. 
+Then, a $256 \times 256$ center crop is taken, followed by a random horizontal flip, followed by embedding with the Stable Diffusion autoencoder. 
+At test time, we follow the same preprocessing pipeline, but omit the random horizontal flip. Diffusion Classifier performance in this setting may improve if stronger augmentations, like RandomResizedCrop or color jitter, are used during the diffusion model training process.
+
+
+
+
+
+
+
+
+\subsection{Baselines for Zero-Shot Classification}
+\label{sec:baseline_details}
+
+\textbf{Synthetic-SD:} We provide the implementation details of the ``Synthetic-SD'' baseline (row 1 of Table~\ref{tab:zero_shot_cls}) for the task of zero-shot image classification.
+Our Diffusion Classifier approach builds on the intuition that a model capable of generating examples of desired classes should be able to directly discriminate between them.
+In contrast, this baseline takes the simple approach of using our generative model, Stable Diffusion, as intended to generate \emph{synthetic training data} for a discriminative model.
+For a given dataset, we use pre-trained Stable Diffusion 2.1 with default settings to generate $10{,}000$ synthetic $512 \times 512$ pixel images per class as follows:
+we use the English class name and randomly sample a template from those provided by the CLIP~\cite{radford2021learning} authors to form the prompt for each generation.
+We then train a supervised ResNet-50 classifier using the synthetic data and the labels corresponding to the class name that was used to generate each image.
+We use batch size $= 256$, weight decay $= 1e-4$, learning rate $= 0.1$ with a cosine schedule, the AdamW optimizer, and use random resized crop \& horizontal flip transforms.
+We create a validation set using the synthetic data by randomly selecting 10\% of the images for each class; we use this for early stopping to prevent over-fitting. Finally, we report the accuracy on the target dataset's proper test set.
+\\
+
+\textbf{Real-Labeled-SD:}
+We provide the implementation details of the ``Real-Labeled-SD'' baseline (row 2 of Table~\ref{tab:zero_shot_cls}) for the task of image classification. This baseline is inspired by Label-DDPM \cite{baranchuk2022labelefficient}, a recent work on diffusion-based semantic segmentation. Unlike Label-DDPM, which leverages a category-specific diffusion model, we directly build on top of the open-sourced Stable Diffusion model (trained on the LAION dataset). We then approach the task of classification as follows: given the pre-trained Stable Diffusion model, we extract the intermediate U-Net features corresponding to the input image. These features are then passed through a ResNet-based classifier to predict the corresponding class name.
+To extract the intermediate U-Net features, we add a noise equivalent to the $100th$ timestep noise to the input image and evaluate the corresponding noisy latent using the forward diffusion process. We then pass the noisy latent through the U-Net model, conditioned on timestep $t = 100$ and text conditioning ($y$) as an empty string, and extract out the features from the mid-layer of the U-Net at a resolution of [8 × 8 × 1024]. Next, we train a supervised classifier on top of these features. \textit{Thus, this baseline is not zero-shot.} The architecture of our classifier is similar to ResNet-18, with small modifications to make it compatible with an input size of  $[8 \times 8 \times 1024]$. Table \ref{table:resnet18sd} defines these modifications. We set batch size $= 16$, learning rate $= 1e-4$, and use AdamW optimizer. During training, we do augmentations similar to the original ResNet (Random Crop and Flip). We do early stopping using the validation set to prevent over-fitting. We use the official train-test splits for each dataset, except ImageNet and ObjectNet. For these two datasets, we perform class sub-sampling and use the same train-test split as our model. We do this to achieve fair comparisons with the other baselines.
+
+
+
+
+\begin{table}
+\centering
+\begin{tabular}{c c c c c c} 
+ \toprule
+ Arch & Conv1 & Conv2 & Conv3 x2 & Conv4 x2 & Conv5 x2 \\ [0.5ex] 
+ \hline
+ ResNet-18 & 7x7x64 & 3x3 max-pool & 3x3x128 & 3x3x256 & 3x3x512 \\ 
+ ResNet-18 (Real-Labeled-SD) & 3x3x1280 & - & 3x3x1280 & 3x3x2560 & 3x3x2560 \\
+ \bottomrule
+\end{tabular}
+\vspace{0.3cm}
+\caption{Comparison of Real-Labeled-SD's ResNet-18 classifier architecture with the original ResNet-18}
+\label{table:resnet18sd}
+\end{table}
+
+\end{document}

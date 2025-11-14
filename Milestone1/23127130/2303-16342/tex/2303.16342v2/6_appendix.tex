@@ -1,0 +1,226 @@
+%\section{Appendix}
+
+In this supplemental, we provide the following additional material to the main paper:
+\begin{enumerate}
+    \item[A] Latent caption extraction details
+    \item[B] Extraction of CLIP region representations
+    \item[C] Mix-and-separate training strategy and $\mathcal{L}_{\text{mask}}$
+    \item[D] Dataset details
+        \begin{enumerate}
+            \item MUSIC
+            \item SOLOS
+            \item AudioSet
+        \end{enumerate}
+    \item[E] Implementation details
+    \item[F] Additional ablation experiments
+        \begin{enumerate}
+            \item weights for $\mathcal{L}_{\text{Audio-language}}$ and $\mathcal{L}_{\text{Tri-modal}}$
+            \item shared parameters for audio U-Net encoder $\mathcal{E}$
+            \item Bounding box experiment
+        \end{enumerate}
+    \item[G] Discussion of limitations of \modelabb
+    \item[H] Predicted separated audio samples
+\end{enumerate}
+
+\section{Latent caption extraction}
+We provide an illustration of our latent caption extraction operation (Section \textcolor{red}{3.1}) in Figure~\ref{fig:latent_extraction} and a more detailed description of the entire operation. As mentioned earlier, we extract a latent caption from each unlabeled video to provide pseudo-language supervision. Given a video $V$, we begin by encoding its center frame using the CLIP visual encoder: $f^V_{\text{center}} = g^V(V_{\text{center}})$. Symmetrically, we seek to extract a language representation that corresponds to the encoded center frame semantically, described next. %Given a natural language query $Q$, it is first tokenized and each token is encoded with its Byte Pair Encoding (BPE) representation. This representation is then passed into the CLIP language transformer $g^L$, which is used to compute the final language representation for the entire query. 
+
+The encoding function of the CLIP language transformer encoder $g^L$ provides a mechanism that is amenable to searching for latent captions that already exist in its learnt vocabulary, which allows us to freeze its parameters and leverage its strong visual-semantic alignment with the vision modality. Instead of using the trained token embeddings, we introduce a learnable token parameter $p$ and pass it into the language encoder $g^L$. We adopt the simple objective function of maximizing the cosine similarity between the center frame representation and the output of the language encoder, which allows us to update the weights of $p$ through gradient back-propagation. We formulate the optimization operation mathematically as:
+\begin{equation}
+    p^* = \argmax_{p} sim\left(f^V_{center}, g^L(p)\right)
+\end{equation}
+where $sim(x,y)=x^T y/(\|x\| \|y\|)$ and $||.||$ denotes the $L_2$ norm operator. We compute the final latent caption of the video as $C^* = g^L(p^*)$. The latent captions are used in our proposed alignment objectives to provide pseudo-language supervision. The search time for parameter $p$ in Equation \textcolor{red}{1} is about $\sim$148 seconds per video on a RTX 2080 GPU for 5k iterations.
+
+\section{Extraction of spatiotemporal region representations from CLIP in Section \color{red} 3.1} \label{sec:latent_extraction}
+We begin by providing an overview of the 2D attention pooling layer in the CLIP Resnet visual encoders. By default, the CLIP visual encoder outputs a global visual representation for each input image. While we use the Resnet variants instead of the transformer-based architectures in CLIP, the former differs from the standard Resnet architecture in two ways. First, the CLIP variant contains three convolutional stems instead of one. Second, and more importantly, the CLIP Resnet variant also replaces the global average pooling (GAP) layer with a 2D self-attention operation, which contains the key, query and value projections. Next, we describe in more detail this self-attention layer and how we modify it for our task.
+
+\noindent\textbf{CLIP 2D attention pooling.} We begin by extracting a set of spatial region representations from an input image $\mathcal{I}$ as: $f^I = g^V(I) \in \mathbb{R}^{HW \times D}$, where $H$, $W$ and $D$ are the downsampled height, width and channel dimensions. Recall that a self-attention operation involves the use of keys, queries, and values. The CLIP model computes an average image representation as the query vector: $\overline{f}^I = \frac{1}{HW} \sum\limits_{j=1}^{HW} f^I_j$, where $f^I_j$ denotes the $j$-th row of $f^I$. Then, it computes a final representation for the entire image as follows:
+\begin{equation}
+    \begin{aligned}
+    K &= \overline{f}^I W_K \in \mathbb{R}^{1 \times D}\\    
+    Q &= f^I W_Q \in \mathbb{R}^{HW \times D} \\
+    V &= f^I W_V \in \mathbb{R}^{HW \times D}
+  \end{aligned}
+\end{equation}
+where $W_K$, $W_Q$ and $W_V$ are the key, query and value projection matrices, respectively and $W_K$, $W_Q$ and $W_V \in \mathbb{R}^{D\times D}$. Lastly, we compute the final contextualized image representation as:
+\begin{equation}
+    f^I_{\text{global}} = W_L\left(V^\top \operatorname{softmax}\left(\frac{\left(Q K^\top\right)}{\sqrt{D}}\right)\right)
+\end{equation}
+where $W_L$ is the final language projection layer that maps the visual representations into the joint visual-semantic embedding space and $W_L \in \mathbb{R}^{D\times D}$ . 
+
+\noindent\textbf{Modified attention operation.} Our Multiple Instance Learning formulation necessitates the presence of region representations in each input frame since we are predicting a spectrogram mask for each region. Additionally, we require these region representations to be well-aligned with the language modality such that a region should have a high similarity with the language query if its visual concept is semantically consistent with that of the query. Consequently, we extract a set of spatiotemporal region representations $f^V_{\text{conv}}$ for our input video $V$ with $T$ frames. We encode the $t$-frame as: $f^V_{t, \text{conv}} = g^V(V_t) \in \mathbb{R}^{HW \times D}$. Finally, we compute the set of language-aligned spatiotemporal region representations by projecting them through the value and language projection layers as follows:
+\begin{equation}
+    \begin{aligned}
+    f^V_{\text{val}} &= W_V f^V_{\text{conv}} \\
+    f^V &= W_L f^V_{\text{val}}
+    \end{aligned}
+\end{equation}
+We pass this set of spatiotemporal region representations into our audio separation model $\mathcal{M}$ along with an input audio spectrogram to predict a mask. 
+
+\section{Mix-and-separate training objective in Section \color{red} 3.2}
+Given an input video $V$, we begin by using the CLIP visual encoder to extract a set of language-grounded spatiotemporal region representations $f^V \in \mathbb{R}^{T \times H \times W \times D}$. For the $j$-th spatiotemporal region, we tile its visual representation by the factor $H^A W^A$ and concatenate them with the audio bottleneck representations (Figure~\ref{fig:visual_forward_model}) along the channel dimension: $f^{AV}_j = concat(f^A, tile(f^V_j))$, where $f^{AV}_j$ has the dimensions $\mathbb{R}^{H^A \times W^A \times 2D}$. We pass the concatenated representations into the decoder $\mathcal{D}$ consisting of a series of upsampling convolutional layers to generate a real-valued ratio mask: $\hat{M}_j = \mathcal{D}(f^{AV}_j) \in \mathbb{R}^{F \times N}$. To predict the separated audio source, each element of the mask is multiplied with the corresponding location in the input spectrogram: $\hat{A}^S_j = \hat{M}_j \odot A^S$, where $\odot$ denotes the Hadamard product. The mask is then applied to the input spectrogram to predict the audio component corresponding to the video: $\hat{A}^S_j = \hat{M}_j \odot A^S$.
+
+To train the audio U-Net decoder $\mathcal{D}$ to predict spectrogram masks given fused audio-visual and audio-text representation inputs, we use the self-supervised ``mix-and-separate" learning objective since we do not have ground-truth audio source annotations within each training video. Specifically, we synthetically combine the audio of multiple videos and the goal is to use the visual information within each video to separate its corresponding audio waveform. This objective allows us to compute ground-truth ratio spectrogram masks for training without annotations. Next, we describe the generation process of the ground-truth ratio masks for a pair of videos which is also commonly used in prior work \cite{zhao2018sound,gao2019co}; the same process is generalizable to any number of input videos. 
+Given a pair of ground-truth audio spectrograms $A_1^S$ and $A_2^S$, we compute their ratio masks as follows:
+\begin{equation}
+    M_1 = \frac{A_1^S}{A_1^S + A_2^S} \quad\text{and}\quad 
+    M_2 = \frac{A_2^S}{A_1^S + A_2^S}
+\end{equation} 
+We adopt the mask prediction loss \cite{zhao2018sound, gao2019co, chatterjee2021visual} to train the audio U-Net decoder $\mathcal{D}$ for audio separation. Given the pair of predicted masks $\hat{M_1}$ and $\hat{M_2}$, we compute the mask prediction loss as:
+\begin{equation}
+    \mathcal{L}_{mask} = || \hat{M}_1 - M_1 ||_1 + || \hat{M}_2 - M_2 ||_1
+\end{equation}
+We note that it is also possible to compute the above-mentioned L1 regression loss using the ground-truth audio spectrograms but prior work \cite{gao2019co,zhao2018sound} has demonstrated it is more numerically stable to use the ratio masks for supervision.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.45\textwidth]{Figures/visual_forward_model_figure_v1.pdf}
+    \caption{\textbf{Audio-visual separation approach in \modelabb.} We infer a predicted spectrogram mask for each spatiotemporal region and aggregate them to compute a final prediction for the input video.}
+    \label{fig:visual_forward_model}
+\end{figure}
+
+\section{Ablation experiments}
+\noindent\textbf{Ablation over region MIL mask prediction vs video-level prediction. } We evaluate the effectiveness of learning to perform source separation at the region level as compared to the video level in Table~\ref{tab:prediction_level}. To perform video-level spectrogram mask prediction, we adopt the same video aggregation function in Sound of Pixels \cite{zhao2018sound}, where the region representations are maxpooled over the channel dimension to compute a final video representation that is passed into the audio U-Net decoder $\mathcal{D}$ (Figure~\ref{fig:visual_forward_model}). We note that our proposed alignment objectives are used in the training of both model variants. We observe that training a model to perform region-level predictions under the MIL formulation results in a significant performance gain over performing video-level predictions, which validates our hypothesis that a model trained to perform video-level predictions may not be able to identify candidate objects that emit sound.
+
+%\textbf{Ablation over effectiveness of different query modalities. }  To understand the key challenges in the task of audio source separation based on multimodal queries, we conduct an ablation over queries of different modalities using the simple ``mix-and-separate" model shown in Figure~\ref{fig:forward_pass}. In our experiments, we only use the mask prediction loss to train the different models. The language query is constructed using the object class. As shown in Table~\ref{tab:solos_modality_ablation}, we experiment with different visual and language encoders. To begin, we observe that the natural language modality provides the stronger signal for training in the task of audio source separation. On average, using language queries results improves the final NSDR performance by approximately 2 dB as compared to using video queries. We hypothesize that this is due to the possibility of the videos containing complex visual scenes with multiple visible objects and there is no explicit information on sound-emitting object candidates. These results are indicative of the importance of learning to perform audio separation based on natural language queries, regardless of whether the language query is used directly for separation or to specify the query object that is visible in the input video. Furthermore, we also see that there is not much difference in the final performance between using the CLIP language encoder that is trained on image-text pairs and the BERT-base \cite{devlin2018bert} language model that is trained only on large text corpuses. While there is a marginal improvement when we use the CLIP language encoder instead of the BERT-base encoder, the difference in performance suggests that we are still not exploiting the visual information contained in it as effectively as possible. Additionally, we observe that using the CLIP visual representations actually leads to a drop in performance as compared to using those of an ImageNet-pretrained Resnet18 encoder.
+
+\noindent\textbf{Effect of sharing parameters in U-Net encoder $\mathcal{E}$. } Prior work \cite{gao2019co} learns a separate audio encoder for encoding the predicted audio waveforms to classify them according to discrete audio category labels. Here, we aim to determine the benefit of using shared parameters for our audio encoder component of the U-Net model $\mathcal{E}$ in Table~\ref{tab:shared_audio_encoder_params}. In this case, unlike prior work \cite{gao2019co}, we observe that using a shared audio U-Net encoder to encode the input audio spectrogram for source separation and the predicted spectrogram for the two new losses is integral to improving the final performance of our trained model on audio-visual separation.
+
+\noindent\textbf{Ablation over weights of $\mathcal{L}_{\text{Audio-language}}$ and $\mathcal{L}_{\text{Tri-modal}}$.} We report the results of our ablation over the weights of our proposed audio-language and tri-modal consistency alignment objectives in Table~\ref{tab:solos_sop_loss_weights_ablation}. The results of adding the audio-language consistency loss seem to validate our initial hypothesis that using a lower weight term for this loss is beneficial. As discussed earlier in Section \textcolor{red}{3.1}, this is similar to the multimodal contrastive formulation used for training joint vision-language foundation models such as CLIP and ALIGN. Thus, there is a high probability that we are treating some latent captions as false negatives for each video even though they may contain similar sounding objects. Setting a low weight helps to alleviate this negative consequence. However, we observe that the audio-language consistency loss is still very helpful for improving audio-visual source separation as well as learning a strong transitive alignment between the audio and natural language modality. The reported results also suggest that adding the tri-modal consistency loss also helps to improve performance significantly. In this case, we note that this alignment objective is formulated as a KL divergence minimization problem and does not require negative samples. Consequently, it may not be as important to use a low weight for this term as compared to the audio-language consistency objective.
+
+\begin{table}[h]
+\begin{center}
+\begin{tabular}{|c|ccc|}
+\hline
+Prediction & SDR  & SIR   & SAR  \\
+\hline 
+Video-level & 6.72 & 11.47 & 10.58 \\
+Region-level & \textbf{8.58} & \textbf{14.16} & \textbf{12.35} \\
+\hline 
+\end{tabular}
+\end{center}
+\caption{\textbf{Comparison between video-level and region-level audio predictions with our trained model on the SOLOS dataset.}}
+\label{tab:prediction_level}
+\end{table}
+
+\noindent\textbf{Replacing regions with bounding boxes.}
+\begin{table}[t]
+\centering
+    \begin{tabular}{|c|ccc|}
+    \hline
+      &  SDR $\uparrow$ & SIR $\uparrow$ & SAR $\uparrow$ \\
+      \hline
+      Regions & 8.58  & 14.16 & 12.35 \\
+Boxes & 8.32 & 13.63 & 12.22 \\
+     \hline
+    \end{tabular}
+    \caption{\textbf{Evaluation on SOLOS.} We evaluate our trained model by replacing spatiotemporal region representations with those of detected bounding boxes and their representations.}
+    \label{tab:bbox_eval}
+\end{table}
+To determine if our approach can generalize well to pre-extracted bounding boxes during inference, we evaluate our trained model by replacing spatiotemporal region representations with those of bounding boxes during inference. We encode each bounding box as an image representation separately. Note that this is different from the region representations that are extracted from the modified self-attention operation in CLIP visual encoder (Section~\ref{sec:latent_extraction}). Consequently, our trained models may not generalize well to the different visual representations used during training and inference. We report our results in Table~\ref{tab:bbox_eval}, where we observe that using bounding box representations in our trained models leads to a slightly lower performance in audio-visual separation. %It is likely that our trained models do not generalize well to bounding box representations since they are not used during training. 
+%We hypothesize that we will achieve better performance when we train the model with these bounding box representations from the beginning.
+
+%\begin{table}[h]
+%\begin{center}
+%\begin{tabular}{|c|c|ccc|}
+%\hline
+%Base encoder & Modality & NSDR  & SIR   & SAR  \\
+%\hline BERT-Base \cite{devlin2018bert} & Text & 9.50 & 14.11 & 12.62 \\
+%CLIP RN-50 \cite{radford2021learning} & Text & 9.94 & 14.90 & 14.02 \\
+%ImageNet RN-18 \cite{he2016deep} & Visual & 7.23 & 13.89 & 12.13 \\
+%CLIP RN-50 \cite{radford2021learning} & Visual & 6.74 & 12.43 & 12.02 \\
+%\hline 
+%\end{tabular}
+%\end{center}
+%\caption{\textbf{Ablation over using queries of different modalities for source separation on the SOLOs dataset.}}
+%\label{tab:solos_modality_ablation}
+%\end{table}
+
+\noindent\textbf{Visualizations of latent captions.} To understand what the latent captions encode, we provide some examples of their attention maps with respect to the video frames in Figure~\ref{fig:latent_concept_attn_map}. Interestingly, we observe that a latent caption is capable of describing multiple instances of the same object in the middle visualization, where it is focusing on all three clarinets.
+
+\begin{table*}[t]
+\begin{center}
+\begin{tabular}{|c|ccc|ccc|ccc|}
+\hline
+Shared audio &    & SOLOS &   &    & MUSIC & &    & Audioset & \\
+encoder params & SDR $\uparrow$ & SIR $\uparrow$ & SAR $\uparrow$ &  SDR $\uparrow$ &  SIR $\uparrow$ & SAR $\uparrow$ & SDR $\uparrow$ & SIR $\uparrow$ & SAR $\uparrow$\\
+\hline 
+No & 7.52 & 12.68 & 10.22 & 7.39 & 13.25 & 9.81 & 3.27 & 6.48 & 11.51 \\
+Yes & \textbf{8.58} & \textbf{14.16} & \textbf{12.35} & \textbf{8.08} & \textbf{13.97} & \textbf{11.33} & \textbf{11.33} & \textbf{7.62} & \textbf{13.20} \\
+\hline 
+\end{tabular}
+\end{center}
+\caption{\textbf{Ablation over using shared parameters for audio U-Net encoder.} We observe that using a common audio encoder $\mathcal{E}$ to encode both mixed and predicted audio inputs for separation and localization, respectively, helps to improve performance on audio-visual separation.}
+\label{tab:shared_audio_encoder_params}
+\end{table*}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.5\textwidth]{Figures/latent_caption_extraction.png}
+    \caption{\textbf{Extraction of latent captions for pseudo-supervision.} We formulate the extraction mechanism as an optimization process and learn the weights of the parameter $p$ by maximizing the cosine similarity between the final visual and language representations.}
+    \label{fig:latent_extraction}
+\end{figure}
+
+\section{Datasets}
+We train and evaluate our proposed \modelabb approach as well as other baselines on the widely-used SOLOS, MUSIC and AudioSet datasets which we describe below.
+
+\noindent\textbf{MUSIC \cite{zhao2018sound}. } The MUSIC dataset consists of videos that are downloaded from YouTube using queries about various musical instruments. It contains approximately 536 and 149 solo and duet videos, respectively. The entire set is comprised of videos containing 11 instrument categories: accordion, acoustic guitar, cello, clarinet, erhu, flute, saxophone, trumpet, tuba, violin and xylophone. Since the original splits of the dataset are not released, we adopt the same splits as \cite{gao2019co}, where the first and second videos in each instrument category are used as validation / test data and the rest are used for training.
+
+\noindent\textbf{SOLOS\cite{montesinos2020solos}. } Similar to the MUSIC dataset, the SOLOS dataset contains 755 videos of musical videos that span 13 instrument categories. These videos are obtained from YouTube where the authors use queries of instruments as well as the `solo' or `auditions' tag. Unlike the MUSIC dataset, the SOLOS dataset does not contain duet videos. 
+
+\noindent\textbf{AudioSet-Unlabeled \cite{gemmeke2017audio}. } AudioSet is a dataset that contains over two million 10 second video clips spanning 632 audio event classes that are sourced from YouTube. Compared to the MUSIC and SOLOS datasets, the audio clips in AudioSet are generally much noisier due to the presence of background sounds. Following prior work \cite{gao2019co}, we filter the video clips according to 15 musical instrument categories and select those from the `unbalanced' split for training and the `balanced' split for validation and testing. 
+
+\section{Implementation details}
+We implement our proposed approach using the Pytorch deep learning library \cite{paszke2019pytorch}. Consistent with prior work \cite{zhao2018sound,gao2019co}, we downsample the audio clips to 11 kHz and use a Hann window size of 1022 samples\footnote{While it is common to use powers of 2 as FFT size, we use 1022 as opposed to 1024 to be consistent with previous literature.} and a hop length of 256 samples in the STFT operation. This step results in an audio spectrogram of dimensions 512 x 256, which is re-sampled on a log-frequency scale to compute a final spectrogram of dimensions 256 x 256. We use the CLIP Resnet50 model \cite{radford2021learning} and its language encoder to extract a latent caption for each video as well as encode visual and language representations for audio separation. We set the dimension of the audio U-Net bottleneck features $D$ to be the same as that of CLIP embedding space, which is 1024. We freeze the CLIP encoders during training and train the audio U-Net from scratch using a base learning rate of 4e-3. We train all models for 100 epochs with the SGD optimizer as well as using a linear warmup of 1000 steps and anneal the learning rate using a cosine decay schedule. We train our full model using 4 Quadro 6000 GPUs for approximately 8 days.
+
+\begin{table}[t]
+\begin{center}
+\begin{tabular}{|c|c|ccc|}
+\hline
+$\mathcal{L}_{\text{Audio-language}}$ & $\mathcal{L}_{\text{Trimodal}}$ & SDR $\uparrow$ & SIR $\uparrow$  & SAR $\uparrow$ \\
+weight & weight &   &   &  \\
+\hline 0.0 & 0.0 & 5.47 & 10.55 & 10.95 \\
+1e-1 & 0.0 & 6.09 & 11.77 & 10.77 \\
+1e-2 & 0.0 & 8.08 & 13.74 & 12.18 \\
+1e-3 & 0.0 & 7.45 & 13.40 & 11.11  \\
+1.0 & - & 1.24 & 4.97 & 11.27 \\
+- & 1e-1 & 8.02 & 13.82 & 11.76 \\
+0.0 & 1e-2 & 7.92 & 13.49 & 11.65 \\
+0.0 & 1e-3 & 8.10 & 13.84 & 11.79 \\
+0.0 & 1.0 & 6.81 & 12.61 & 11.00 \\
+1e-3 & 1e-2 & 8.58 & 14.16 & 12.35 \\
+\hline 
+\end{tabular}
+\end{center}
+\caption{\textbf{Ablation results over the weights of the audio-language and tri-modal consistency alignment objectives on SOLOs.} We observe that the inclusion of the audio-language and tri-modal consistency alignment objectives is beneficial for audio-visual separation.}
+\label{tab:solos_sop_loss_weights_ablation}
+\end{table}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.5\textwidth]{Figures/positive_learnable_concept_attn_v2.pdf}
+    \caption{\textbf{Visual attention of latent captions.} We see that the latent captions tend to focus on salient foreground objects.}
+\label{fig:latent_concept_attn_map}
+\end{figure}
+
+\section{Limitations} While we have demonstrated that our proposed \modelabb approach is able to generalize well to free-form natural language queries for source separation, we observe that it is only able to handle visually descriptive adjectives such as \emph{person playing a small trumpet} instead of \emph{a loud trumpet}. We hypothesize that this limitation is due to a higher likelihood of visually descriptive adjectives appearing in the alt text of the pretraining dataset used by CLIP. Additionally, we only focus on separating sounds of different object classes. Our approach does not generalize well to discriminating between sounds from multiple instances of the same class (\cf, Fig {\color{red} 5} middle showing that we can detect the clarinets but not distinguish the different instances). An example of such a challenging task is audio-visual speech separation, where there are two or more people speaking simultaneously and the goal is to separate for the speech for each person. Similar to existing audio-visual speech separation approaches~\cite{ephrat2018looking,rahimi2022reading}, future work can aim to address this limitation by leveraging representations of different instances and additional information in the form of object labels and speech narrations.
+
+\section{Demo video with predicted audio component generations}
+We provide a demo video where we evaluate our trained models on random videos in the wild which contain two instruments. The video contains 4 evaluation samples on the task of audio-language source separation in the input videos. Additionally, we also localize the separated audio sources in the corresponding video frames. For the first task, our objective is to separate an audio input based on a natural language query and the goal of the second task is to localize the predicted separated audio in its corresponding video. Note that we use our full \modelabb model that is trained with our proposed audio-language and tri-modal consistency alignment objectives. For each evaluation sample, we provide the following in order:
+\begin{enumerate}
+    \item Input video with mixed audio input (composed of two different instruments)
+    \item Separated audio predicted by the full \modelabb model of the first instrument
+    \item Attention heatmap between the first separated audio in (2) and the center frame
+    \item Separated audio predicted by the full \modelabb model of the second instrument
+    \item Attention heatmap between the second separated audio in (4) and the center frame
+\end{enumerate}
+We observe that our full \modelabb model, that is trained without ground-truth text annotation or object bounding boxes, is generally able to separate the audio inputs based on natural language queries. 
+%We provide sample predicted audio generated by our trained model on the SOLOS dataset in the attached video. The video contains 10 evaluation samples on the tasks of audio-language source separation and audio grounding in the input videos. For the first task, our objective is to separate an audio input based on a natural language query and the goal of the second task is to localize the predicted separated audio in its corresponding video. We compare the predictions of our full \modelabb model to a baseline variant that is trained only with the mask prediction loss to determine the contributions of our proposed audio-language and tri-modal consistency alignment objectives. For each evaluation sample, we provide the following in order:
+%\begin{enumerate}
+%    \item Input video with mixed audio input (composed of two different instruments)
+%    \item Separated audio predicted by the baseline model
+ %   \item Separated audio predicted by the full \modelabb model
+%    \item Ground-truth audio
+%    \item Attention heatmap between the separated audio in (3) and the center frame
+%\end{enumerate}
+%We generally observe that our full \modelabb model, that is trained with our proposed alignment objectives, is better able to separate the audio inputs based on natural language queries than the baseline model. In particular, we hear that the separated audio predicted by the baseline model is often very similar to the mixed audio input. 

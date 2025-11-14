@@ -1,0 +1,276 @@
+\section{\name}%
+\label{sec:method}
+
+We start by discussing the necessary background and notation on diffusion models in \cref{s:background}, and then we introduce our method in \cref{s:3ddiff}, \cref{s:BLDM}, and \cref{s:details}.
+
+\subsection{Diffusion Models}\label{s:background}
+
+Given $N$ i.i.d.~samples $\{x^i\}_{i=1}^{N}$ from (an unknown) data distribution $p(x)$, the task of generative modeling is to find the parameters $\theta$ of a parametric model $p_\theta(x)$ that best approximate $p(x)$.
+\emph{Diffusion models} are a class of likelihood-based models centered on the idea of defining a forward diffusion (noising) process $q(x_t | x_{t-1})$, for $t \in [0, T]$.
+The noising process converts the data samples into pure noise, \ie, $q(x_T) \approx q(x_T | x_{T-1}) = \mathcal{N}(0, I)$.
+The model then learns the reverse process $p(x_{t-1} | x_t)$, which iteratively converts the noise samples back into data samples starting from the purely Gaussian sample $x_T$.
+
+The Denoising Diffusion Probabilistic Model (DDPM)~\cite{ho2020denoising}, in particular, defines the noising transitions using a Gaussian distribution, setting
+\begin{equation}
+q(x_t | x_{t-1}) := \mathcal{N}(x_t; \sqrt{\alpha_t}x_{t-1}, (1-\alpha_t)I). %
+\end{equation}
+Samples can be easily drawn from this distribution by using the reparameterization trick:
+\begin{equation}\label{eqn:x_t|x_t-1}
+x_t := \sqrt{\alpha_t}x_{t-1} + \sqrt{1-\alpha_t}\epsilon
+~~~\text{where}~~~
+\epsilon \sim \mathcal{N}(0, I).
+\end{equation}
+One similarly defines the reverse denoising step using a Gaussian distribution:
+\begin{equation}\label{eq:denoiser_introduction}
+p_{\theta}(x_{t-1} | x_t)
+:=
+\mathcal{N}(x_{t-1}; \sqrt{\alpha_{t}}\mathcal{D}_{\theta}(x_{t}, t), (1-\alpha_t)I),
+\end{equation}
+where, the $\mathcal{D}_{\theta}$ is the denoising network with learned parameters $\theta$.
+The sequence $\alpha_t$ defines the noise schedule as:
+\begin{equation}
+\alpha_t = 1 - \beta_t,
+\quad \beta_t \in [0, 1],
+\quad \text{s.t.~}
+\beta_t > \beta_{t-1} \forall t \in [0, T].
+\end{equation}
+We use a linear time schedule with $T=1000$ steps.
+
+The denoising must be applied iteratively for sampling the target distribution $p(x)$.
+However, for training the model we can draw samples $x_t$ directly from $q(x_t | x_0)$ as:
+\begin{align}
+x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1 - \bar\alpha_t}\epsilon \quad
+\text{where, } \bar\alpha_t = \prod_{i=0}^{t}\alpha_i.
+\end{align}
+It is common to use the network $\mathcal{D}_\theta(x_t, t)$ to predict the noise component $\epsilon$ instead of the signal component $x_{t-1}$ in \cref{eqn:x_t|x_t-1}; which has the interpretation of modeling the score of the marginal distribution $q(x_t)$ up to a scaled constant~\cite{ho2020denoising, luo2022understanding}.
+Instead, we employ the ``$x_0$-formulation'' from \cref{eq:denoiser_introduction}, which has recently been explored in the context of diffusion model distillation~\cite{salimans2022progressive} and modeling of text-conditioned videos using diffusion \cite{ho2022imagen}.
+The reasoning behind this design choice will become apparent later.
+
+\paragraph{Training.}
+
+Training the ``$x_0$-formulation'' of a diffusion model $\mathcal{D}_{\theta}$ comprises minimizing the following loss:
+\begin{equation} \label{eq:loss_diffusion_denoise}
+\mathcal{L} = \| \mathcal{D}_{\theta}(x_t, t) - x_0 \|^2,
+\end{equation}
+encouraging $\mathcal{D}_{\theta}$ to denoise sample
+$
+x_t \sim \mathcal{N}(\sqrt{\bar\alpha_t}x_0, (1 - \bar\alpha_{t})I)
+$
+to predict the clean sample $x_0$.
+ 
+\paragraph{Sampling.}
+Once the denoising network $\mathcal{D}_{\theta}$ is trained, sampling can be done by first starting with pure noise, \ie, $x_T \sim \mathcal{N}(0, I)$, and then iteratively refining $T$ times using the network $\mathcal{D}_{\theta}$, which terminates with a sample from target data distribution $x_0 \sim q(x_0) = p(x)$:
+\begin{equation}\label{eq:sampling_diffusion}
+x_{t-1} \sim \mathcal{N}(\sqrt{\bar\alpha_{t-1}} \mathcal{D}_{\theta}(x_t, t), (1 - \bar\alpha_{t-1})I).
+\end{equation}
+
+
+
+
+
+
+
+\subsection{Learning 3D Categories by Watching Videos}\label{s:3ddiff}
+
+\paragraph{Training data.}
+
+The input to our learning procedure is a dataset of $N \in \mathbb{N}$ video sequences
+$
+\{ s^i \}_{i=1}^{N}
+$,
+each depicting an instance of the same object category (\eg, car, carrot, teddy bear).
+Each video
+$
+s^i = (I^i_j, P^i_j)_{j=1}^{N_\text{frames}}
+$
+comprises $N_\text{frames}$ pairs $(I^i_j, P^i_j)$, each consisting of an RGB image
+$
+I^i_j \in \real^{3 \times H \times W}
+$ 
+and its corresponding camera pose $P^i_j \in \real^{4 \times 4}$, represented as a $4 \times 4$ camera matrix.
+
+
+Our goal is to train a generative model $p(V)$ where $V$ is a representation of the shape and appearance of a 3D object;
+furthermore, we aim to learn this distribution using only the 2D training videos $\{ s^i \}_{i=1}^N$.
+
+\paragraph{3D feature grids.}
+As 3D representation $V$ we pick \emph{3D feature voxel grids}
+$
+V \in \real^{d^V \times S\times S\times S}
+$
+of size $S \in \mathbb{N}$ containing $d^V$-dimensional latent feature vectors.
+Given the voxel grid $V$ representing the object from a certain video $s$, we can reconstruct any frame
+$
+(I_j,P_j) \in s
+$
+of the video as
+$
+I_j = r_\zeta(V, P_j)
+$
+by the means of the \emph{rendering function}
+$
+r_\zeta(V, P_j): 
+\real^{d^V \times S\times S\times S} \times \real^{4 \times 4} 
+\mapsto 
+\real^{3 \times H \times W}
+$,
+where $\zeta$ are the function parameters (see \cref{s:details} for details).
+
+Next, we discuss how to build a diffusion model for the distribution $p(V)$ of feature grids.
+One might attempt to directly apply the methodology of \cref{s:background}, setting $x=V$, but this does not work because we have no access to ground-truth feature grids $V$ for training; instead, these 3D models must be inferred from the available 2D videos while training.
+We solve this problem in the next section.
+
+
+
+
+
+
+
+    
+
+\subsection{Bootstrapped Latent Diffusion Model}
+\label{s:BLDM}
+
+In this section, we show how to learn the distribution $p(V)$ of feature grids from the training videos $s$ alone.
+In what follows, we use the symbol $\mathcal{V}$ as a shorthand for $p(V)$.
+
+The training videos provide RGB images $I$ and their corresponding camera poses $P$, but no sample feature grids $V$ from the target distribution $\mathcal{V}$.
+As a consequence, we also have no access to the noised samples
+$
+V_t \sim \mathcal{N}(\sqrt{\bar\alpha_{t}}V_0, (1 - \bar\alpha_{t}) I)
+$
+required to evaluate the denoising objective \cref{eq:loss_diffusion_denoise} and thus learn a diffusion model.
+
+To solve this issue, we introduce the BLDM (\emph{Bootstrapped Latent Diffusion Model}).
+BLDM can learn the denoiser-cum-generator
+$
+\mathcal{D}_\theta
+$ 
+given samples $\bar V \sim \mathcal{\bar V}$ from an \emph{auxiliary distribution} $\mathcal{\bar V}$, which is closely related but not identical to the target distribution $\mathcal{V}$.
+
+\paragraph{The auxiliary samples $\bar V$.} %
+
+\new{As} shown in \cref{fig:pipeline}, our idea is to obtain the auxiliary samples $\bar V$ as a (learnable) function of the corresponding training videos $s$.
+To this end, we use a design strongly inspired by Warp-Conditioned-Embedding (WCE)~\cite{henzler2021unsupervised}, which demonstrated compelling performance for learning 3D object categories.
+Specifically, given a training video $s$ containing frames $I_j$, we generate a grid
+$
+\bar V \in \real^{d^V \times S \times S \times S}
+$
+of auxiliary features
+$
+\bar V_{:mno} \in [-1, 1]^{d_V}
+$
+by projecting the 3D coordinate $\bx^V_{mno}$ of the each grid element $(m,n,o)$  to every video frame $I_j$, sampling corresponding 2D image features, and aggregating those into a single $d_V$-dimensional descriptor per grid element.
+The 2D image features are extracted by a frozen encoder (\new{we use the ResNet-32 encoder} $E$~\cite{he2016deep}).
+This process is detailed in the supplementary material.
+
+\paragraph{Auxiliary denoising diffusion objective.}
+
+The standard denoising diffusion loss \cref{eq:loss_diffusion_denoise} is unavailable in our case because the data samples $V$ are unavailable.
+Instead, we leverage the ``$x_0$-formulation'' of diffusion to employ an alternative diffusion objective which does not require knowledge of $V$.
+Specifically, we replace \cref{eq:loss_diffusion_denoise} with a \emph{photometric loss}
+\begin{equation} \label{eq:loss_aux_diffusion_denoise}
+\mathcal{L}_\text{photo} := \| r_\zeta(\mathcal{D}_\theta(\bar V_t, t), P_j) - I_j \|^2,
+\end{equation}
+which compares the rendering $r_\zeta(\mathcal{D}_\theta(\bar V_t, t), P_j)$
+of the denoising
+$\mathcal{D}_\theta(\bar V_t, t)$
+of the noised auxiliary grid $\bar V_t$ to the (known) image $I_j$ with pose $P_j$.
+\Cref{eq:loss_aux_diffusion_denoise} can be computed because the image $I_j$ and camera parameters $P_j$ are known and $\bar V_t$ is derived from the auxiliary sample $\bar V$, whose computation is given in the previous section.
+
+\paragraph{Train/test denoising discrepancy.}
+
+Our denoiser $\mathcal{D}_\theta$ takes as input a sample $\bar V_t$ from the noised \textit{auxiliary} distribution $\bar{\mathcal{V}}_t$ instead of the noised \emph{target} distribution $\mathcal{V}_t$.
+While this allows to learn the denoising model by minimizing \cref{eq:loss_aux_diffusion_denoise}, it prevents us from drawing samples from the model at test time.
+This is because, during training,  $\mathcal{D}_\theta$ learns to denoise the auxiliary samples $ \bar V \in \mathcal{\bar V}$ (\new{obtained} through fusing image features into a voxel-grid), but at test time we need instead to draw target samples $V \in \mathcal{V}$ as specified by \cref{eq:sampling_diffusion} per sampling step.
+We address this problem by using a bootstrapping technique that we describe next.
+    
+\paragraph{Two-pass diffusion bootstrapping.}
+
+
+\begin{figure*}
+\centering%
+\includegraphics[width=0.95\linewidth]{figures/vp_change.pdf}\\\vspace{0.03cm}
+\includegraphics[width=0.99\linewidth]{figures/fig_vpconsistency_camera_ready.pdf}%
+\caption{
+\textbf{View consistency. }
+Evaluation of the consistency of the shape renders under camera motion.
+While our results~(top) remain consistent,  pi-GAN~\cite{chan2021pi}'s results~(bottom) suffer from significant appearance variations across view changes.
+\label{fig:qualitative_vp}
+}
+\end{figure*}
+
+
+
+
+
+In order to remove the discrepancy between the training and testing sample distributions for the denoiser $\mathcal{D}_\theta$, we first use the latter to obtain `clean' voxel grids from the training videos during an initial denoising phase, and then apply a diffusion process to those, finetuning $\mathcal{D}_\theta$ as a result.
+
+
+Our bootstrapping procedure rests on the assumption that once $\mathcal{L}_\text{photo}$ is minimized,
+the denoisings $\mathcal{D}_\theta(\bar V_t, t)$ of the auxiliary grids $\bar V \sim \mathcal{\bar V}$ follow the clean data distribution $\mathcal{V}$, \ie, 
+$\mathcal{D}_{\theta^\star}(\bar V_t, t) \sim \mathcal{V}$
+for the optimal denoiser parameters $\theta^\star$ that minimize $\mathcal{L}_\text{photo}$. Simply put, the denoiser $\mathcal{D}_\theta$ learns to denoise \textit{both} the diffusion noise and the noise resulting from imperfect reconstructions.
+Note that our assumption $\mathcal{D}_{\theta^\star}(\bar V_t, t) \sim \mathcal{V}$ is reasonable since recent single-scene neural rendering methods \cite{mildenhall20nerf:,lombardi2019neural,chen2022tensorf} have demonstrated successful recovery of high-quality 3D shapes solely by optimizing the photometric loss via differentiable rendering.
+
+Given that $\mathcal{D}_{\theta^\star}$ is now capable of generating clean data samples, we can expose it to the noised version of the clean samples $V$ by executing a second denoising pass in a recurrent manner.
+To this end, we define the \emph{bootstrapped photometric loss} $\mathcal{L}'_\text{photo}$:
+\begin{equation} \label{eq:two_pass_bootstrapp}
+\mathcal{L}'_\text{photo} := \| r_\zeta(\mathcal{D}_\theta(\epsilon_{t'}(\mathcal{D}_\theta(\bar V_t, t), t'), P_j)  - I_j \|^2,
+\end{equation}
+with $\epsilon_{t'}(Z) \sim \mathcal{N}(\sqrt{\bar\alpha_{t'}} Z, (1 - \bar\alpha_{t'})I)$ denoting the diffusion of input grid $Z$ at time $t'$.
+Intuitively, \cref{eq:two_pass_bootstrapp} evaluates the photometric error between the ground truth image $I$ and the rendering of the doubly-denoised grid $
+\mathcal{D}_\theta(\epsilon_{t'}(\mathcal{D}_\theta(\bar V_t, t), t'))
+$.
+
+\subsection{Implementation Details}%
+\label{s:details}
+
+
+\paragraph{Training details.}
+
+\name training finds the optimal model parameters $\theta, \zeta$ by minimizing the sum of the photometric and the bootstrapped photometric losses
+$
+\mathcal{L}_\text{photo} + \mathcal{L}'_\text{photo}
+$
+using the Adam optimizer with an initial learning rate 
+$5\cdot 10^{-5}$ (decaying ten-fold whenever the total loss plateaus) until convergence is reached.
+
+In each training iteration, we randomly sample 10 source views $\{ I^i \}$ from a randomly selected training video $s$ to form the grid of auxiliary features $\hat V$. 
+The auxiliary features are noised to form $\hat V_t$ and later denoised with $\mathcal{D}_\theta(V_t)$.
+Afterwards $\mathcal{D}_\theta(V_t)$ is noised and denoised again during the two-pass bootstrap procedure.
+To avoid two rendering passes in each training iteration (one for $\mathcal{L}_\text{photo}$ and the second for $\mathcal{L}'_\text{photo}$), we randomly choose to optimize either $\mathcal{L}_\text{photo}$ or $\mathcal{L}'_\text{photo}$ with 50-50 probability in each iteration.
+The photometric losses compare renders $r_\zeta(\cdot, P_j)$ of the denoised voxel grid to 3 different target views (different from the source views). 
+
+
+\paragraph{Rendering function $r_\zeta$.}
+
+The differentiable rendering function $r_\zeta(V, P_j)$ from \cref{eq:loss_aux_diffusion_denoise,eq:two_pass_bootstrapp} uses Emission-Absorption (EA) ray marching as follows.
+First, given the knowledge of the camera parameters $P_j$, a ray $\bru \in \mathcal{S}^2$ is emitted from each pixel $\bu \in \{0, \dots, H-1\} \times \{0, \dots, W-1\}$ of the rendered image $\hat I_j \in \real^{3 \times H \times W}$. 
+We sample 
+$N_S$ 3D points \new{$(\bp_i)_{i=1}^{N_S}$} on each ray at regular intervals $\Delta \in \real$.
+For each point $\bp_i$, we sample the corresponding voxel grid feature $V[\bp_i] \in \real^{d^V}$, where $V[\cdot]$ stands for trilinear interpolation.
+The feature $V[\bp_i]$ is then decoded by an MLP as
+$
+f_\zeta(V[\bp_i], \bru) := (\sigma_i, \bc_i)
+$
+with parameters $\zeta$ to obtain the density $\sigma_i \in [0, 1]$ and the RGB color $\bc_i \in [0, 1]^3$ of each 3D point.
+The MLP $f$ is designed so that the color $\bc$ depends on the ray direction $\bru$ while the density $\sigma$ does not, similar to NeRF \cite{mildenhall2020nerf}.
+Finally, EA ray marching renders the $\bru$'s pixel color
+$
+\bc_{\bru} = \sum_{i=1}^{N_S} w(\bp_i) \bc_i
+$ as a weighted combination of the sampled colors.
+The weights are defined as
+$
+w(\bp_i) = T_{i} - T_{i+1}
+$
+where
+$
+T_i = e^{-\sum_1^{i-1} \sigma_i \Delta}
+$.
+
+
+
+
+
+

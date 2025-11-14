@@ -1,0 +1,75 @@
+
+\section{Auto-regressive Motion Planner}
+
+We present Auto-regressive Motion Planner~(ARMP), a framework for generating physically plausible motions that can be used for legged robot navigation tasks in indoor environments. An overview of our method is presented in Fig. \ref{fig: Overview}. This framework consists of three components: (1) a motion library that contains a set of physically valid motions, (2) a motion planner that predicts the next state from the current state and the high-level commands, and (3) a trajectory blender that smoothes the target trajectory with the future trajectory predicted by the planner module. The details of each part are provided by the following subsections.
+
+\subsection{Constructing Motion Library Via Trajectory Optimization } \label{sec:data_generation}
+
+
+We construct a motion library $\mathcal{X}$ for training ARMP by collecting a set of physically feasible trajectories $\{\bm\tau^1, \bm\tau^2, \cdots, \bm\tau^N\}$. Each trajectory $\bm\tau^i$ is defined as a set of states $\{\mathbf{x}_1, \mathbf{x}_2, \cdots, \mathbf{x}_{T_i}\}$, where $T_i$ is the trajectory length which can be varied for each motion.  A more detailed definition of the state vector will be described in the following section.
+
+
+In theory, our method is agnostic to how we generate these trajectories, so different methods can be applied for producing motion trajectories. For instance, we can generate trajectories by rolling out expert-designed controllers. However, designing controllers that can perform a large range of motions is not straightforward and requires significant expertise and human labor. Alternatively, reinforcement learning methods offer an automated way of motion generation. However, these methods suffer from issues such as sample inefficiency or unnatural result motions. In this work, we leverage the trajectory optimization method for generating motions. Compared to manually designing controllers and reinforcement learning, trajectory optimization can produce reliable motion trajectories without considerable engineering effort.  
+
+Our trajectory optimization is based on TOWR~\cite{winkler2018gait}. We use a Single Rigid Body Dynamics(SRBD) model, where the state of a robot is simplified into root's position $r(t)$, orientation $w(t)$, and four end effector positions $p_j(t)$. This model assumes that the mass of the legs is negligible to that of the body, ignoring momentum produced by joint velocities and fixing the robot's inertia to the one in nominal configuration. Instead of optimizing the joint position and joint torques directly, we optimize the end-effector position $p_j(t)$ and ground reaction force $f_j(t)$ so that our optimization variables lie in Cartesian coordinates. To enforce a feasible kinematic structure, we constrain our end-effector position to a cuboid whose center is at each end-effector’s nominal position. We additionally apply friction pyramid constraints to prevent slipping. We enforce our force to be always pushing when in contact, and set it to 0 when it is in a swing phase. The feet in the stance phase should have a z-position equal to the terrain height and the feet in the swing phase should have a z-position greater than the terrain height. Overall, the optimization equations are as follow:
+\begin{equation*}
+\begin{aligned}  
+    \bar{p}_j(t), \bar{f}_j(t) &= \argmin C(p_j(t), f_j(t)) \\
+    \text{s.t.} \ M \ddot{r}(t) &= \sum_{j=1}^{4} f_j(t) - M g \\
+    I \dot{w}(t) + w(t) \times I w(t) &= \sum_{j=1}^{4} f_j(t) \times (r(t) - p_j(t)) \\
+    p_i &\in \text{Cuboid}_i(r(t))\\ % ee in cuboid
+    (p_i)_z &\geq \text{TerrainHeight}(p_i)\\ % above terrain
+    0 \leq (f_i)_z &\leq \mu \max\{|(f_i)_x|, |(f_i)_y|\}\\ % friction pyramid with pushing
+    f_i &= 0 \text{ for swing foot}\\ % swing
+    (p_i)_z &= \text{TerrainHeight}(p_i) \text{ fot stance foot.}\\ % on terrain on stance
+\end{aligned}
+\end{equation*}
+Here, $g$ denotes gravity constant and the robot's mass $M$ and inertia in body frame $I$ are assumed to be constant over time.
+Please refer to the paper~\cite{winkler2018gait} for the detailed description of the constraints
+
+The state($r(t), p_i(t)$) and force($f_i(t)$) trajectories are parameterized using Hermite polynomials and optimized via IPOPT~\cite{ifopt} interfaced by IFOPT~\cite{wachter2006implementation}.  
+
+% \subsection{Motion Planner Design and Learning}
+\subsection{Learning-based Motion Planner Design}
+Our autoregressive motion planner aims to predict a feasible next state from the current state and the user input based on the constructed motion library. We represent such an autoregressive motion planner as a neural network and train it via supervised learning. 
+The input \jhc{to the network} at $i$-th time step is composed of:
+\begin{itemize}
+    \item robot state: $\mathbf{x}_i = \{ \mathbf{r}_i,\dot{\mathbf{r}_i}, \mathbf{w}_i, \mathbf{e}_i, \dot{\mathbf{e}_i}\}$,
+    \item surrounding robot root trajectory: $\mathbf{t}_i = \{\mathbf{t}_i^p, \mathbf{t}_i^d, \mathbf{t}_i^{\dot{p}}, \vec{t}_i^{v}\}$.
+\end{itemize}
+The first input to the neural network is the robot state $\mathbf{x}_i$, where $\vec{r}_i \in \mathbb{R}^3$ and $\dot{\vec{r}_i} \in \mathbb{R}^3$ are robot's position and velocity, $\vec{w}_i \in \mathbb{R}^6$ is robot's orientation, and $\vec{e}_i \in \mathbb{R}^{12}$, $\dot{\vec{e}_i} \in \mathbb{R}^{12}$ are end-effectors' positions and velocities.
+The second input is a surrounding root trajectory with $K$ horizon steps, where the half are for history and the rest are for desired future. Here, $\vec{t}_i^p \in \mathbb{R}^{2 K}$ are planar position trajectory, $\vec{t}_i^d \in \mathbb{R}_i^{2 K}$ are planar  direction trajectory,  $\vec{t}^{\dot{p}} \in \mathbb{R}^{2 K}$ are planar  velocity trajectory, and $\vec{t}_i^{v} \in \mathbb{R}^{K}$ are desired speed. We use K=12 in our work which represents a two-second trajectory. 
+%\jhc{We additionally add 21 sensors to sense obstacles within 1m range parallel to the forward facing direction to react accordingly to obstacles.} %automatic jumping on obstacles.}
+
+The output of the planner are the next robot state $\mathbf{x}_{i+1}$ and the predicted future trajectory  $\mathbf{t'}_{i+1} =\{\mathbf{t'}_{i+1}^p, \mathbf{t'}_{i+1}^d, \mathbf{t'}_{i+1}^{\dot{p}}\}$
+where $\mathbf{t'}_{i+1}^p \in \mathbb{R}^{K}$, $\mathbf{t'}_{i+1}^d \in \mathbb{R}^{K}$, $\mathbf{t'}_{i+1}^{\dot{p}} \in \mathbb{R}^{K}$. 
+All features of the input and output are designed in the robot's local coordinate at the $i$-th time step.
+
+During planning, the motion planner takes the current state and surrounding root trajectory to generate the next state and predicted root trajectory. The output is then worked as the input for the next time step. Different motions can be generated by varying the future root trajectory according to the high-level command with an autoregressive blending process. Overall, the control diagram can be best seen in Fig.~\ref{fig: Overview}.
+
+
+\subsection{Target Trajectory Blending}
+\label{sec:trajectory blending}
+When providing the run-time input for the motion planner, the future root trajectory $\mathbf{t}_i^p, \mathbf{t}_i^d$ is generated by blending the predicted future trajectory from the motion planner and a target trajectory from the high-level command to create a desired future trajectory for the next input. Here, we utilize trajectory blending technique frequently used in kinematic animation \cite{holden2017phase, zhang2018mode}:
+% \begin{equation}
+%     \text{TrajectoryBlend}(\vec{a}_0, \vec{a}_1, t, \sigma) = (1 - t^\sigma) \vec{a_0} + t^\sigma \vec{a_1},
+% \end{equation}
+
+\begin{equation}
+    \vec{t}_i^p(z) = (1- z^{\sigma_p}) \vec{t'}_i^p(z) + t^{\sigma_p} \vec{\hat{t}}_i^p(z), z \in [0,1]
+\end{equation}
+where $\vec{t}_i^p(z)$ denotes desired trajectory's planar position $z$ seconds after $i$-th timestep, and $\vec{t'}_i^p$ and $\vec{\hat{t}}_i^p$ corresponds to that of predicted and target trajectories.
+The values $\vec{t'}_i^p(z)$ at future time $z$ is obtained by linearly interpolating neural-net generated predicted trajectory.
+Target trajectory $\vec{\hat{t}}_i^p(z)$ is manipulated by user commands such as target linear and angular velocities.
+Here, $\sigma_p > 0$ defines responsiveness with respect to user command.
+Trajectory blending for other features such as planar direction $\vec{t}_i^d (z)$ and velocity $\vec{t}_i^{\dot{p}}(z)$ are done in a similar fashion.
+
+
+% Choose correct place to put.
+This target trajectory method enables fluent integration with navigation frameworks~\cite{habitat19iccv,szot2021habitat}, where navigation restrictions due to walls or obstacles are represented by navigation mesh~\cite{van2016comparative}.
+In complex indoor scenes, we generate a navigation mesh to constrain our target trajectory to the navigable area before blending it with the future predicted trajectory for generating the desired future trajectory which is used as an input for the autoregressive planner.
+
+Our target trajectory is constrained inside the navigation mesh either by sliding or stopping at the boundary of the navigable area. Even though this constraining process is done before the blending process, the desired future trajectory tends to remain inside this navigable area since all input target trajectories are hard constrained to this area.
+
+This autoregressive method ensures the motion planner generates physically feasible motions while following the high-level command. We will demonstrate it in Section \ref{sec: result}.
+

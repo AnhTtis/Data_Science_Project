@@ -1,0 +1,171 @@
+\section{Method}
+
+\begin{figure*}[t]
+  \centering
+   \includegraphics[width=\linewidth]{figure/method_v5.pdf}
+
+   \caption{\textbf{Method Overview.} We leverage panoptic prior in the form of semantic voxel grids and instance object layout to build a 3D-aware generative model for urban scenes. Our model takes as input a global noise vector $\bz_{wld}$ for the entire scene, $K$ noise vectors $\{\bz^k_{obj}\}_{k=1}^K$ for objects, and a sampled panoptic prior $\bV,\bO\sim p_{\cV,\cO}$. We decompose the scene into sky, stuff, and objects. The stuff generator is conditioned on the semantic voxel grid $\bV$ to preserve its semantic and geometry information. The objects are generated in the canonical object coordinate system guided by $\bO$. Combined with the sky generator, a feature map $\bI_\bF$ is obtained via volume rendering. We further leverage neural rendering to output the RGB image $\hat{\bI}$ and object patches $\hat{\bP}_k$. The full model is optimized jointly with adversarial losses $\cL_{adv}^{\bI}$ and $\cL_{adv}^{\bP}$ applied to the full image and object patches, respectively, as well as a reconstruction loss $\cL_{rec}$ for stuff regions. }
+   \label{fig:method}
+\end{figure*}
+
+\label{sec:method}
+In UrbanGIRAFFE, our goal is to build compositional generative feature fields of urban scenes with control over camera pose and scene contents.
+To address this challenging task, we decompose the urban scene into three main components, including uncountable stuff, countable objects, and sky, see \figref{fig:method} for an overview. We assume prior distributions are provided for both stuff and objects in order to disentangle the complicated urban scenes. 
+Given a camera pose, we render a composited feature map and generate the target image via neural rendering. Our model is trained end-to-end with adversarial and reconstruction losses. 
+
+In this section, we first introduce the prior distributions of stuff and objects, respectively. Next, we introduce our compositional generative model for urban scene generation. Finally, we describe the sampling strategy, loss functions and implementation details.
+
+
+\subsection{Panoptic Prior}
+We assume a prior distribution of the scene layout is given in order to train our generative model, which we refer to as ``panoptic prior''.
+The panoptic prior briefly describes the spatial distributions of countable objects and uncountable stuff within a certain region. Let $\bV,\bO\sim p_{\cV,\cO}$ denote a stuff layout $\bV$ and an object layout $\bO$ sampled from the joint distribution $p_{\cV,\cO}$. We now elaborate on the layout representation of $\bO$ and $\bV$, respectively.
+
+\boldparagraph{Countable Object}
+Following GIRAFFE, the layout distribution of countable objects (\eg, cars) is represented in the form of a set of 3D bounding boxes. A sample $\bO = \{ \bo_1, \bo_2,..\bo_K\}$ depicts a joint distribution of $K$ objects in one scene, where $K$ may vary for different scenes. Here, each object $\bo$ is represented by a 3D bounding box parameterized by its rotation $\bR\in SO(3)$, translation $\bt \in \nR^3$, and size $\bs \in \nR^3$:
+\[
+ \bo_k = \{\bR_k, \bt_k, \bs_k\}
+\]
+In this work, we leverage bounding boxes released by publicly available dataset~\cite{Liao2022PAMI} to form the distribution $p_\cO$. This distribution can be obtained from real-world images, e.g., by applying a 3D object detection method. 
+
+\boldparagraph{Uncountable Stuff}
+Unlike countable objects, there are many indispensable entities that are either uncountable (\eg, road and terrain) or sometimes too cluttered to be separated (\eg, trees). To address this problem, we represent uncountable stuff in the form of semantic voxel grids $\bV\in \nR^{H_v \times W_v \times D_v \times {L}}$, where each voxel stores a one-hot semantic label of length $L$.
+
+
+
+\subsection{Compositional Urban Scene Generator}
+Our generator follows the idea of GIRAFFE~\cite{Niemeyer2021CVPR} which represents the urban scene as a compositional neural feature fields. A key difference is that we model the background using a stuff generator conditioned on a semantic voxel grid, assisted with a sky generator to model sky and far regions. The stuff and the sky generator share a global latent code $\bz_{wld}\in\cN(\mathbf{0},\mathbf{I})$, whereas each object has its own latent code $\bz_{obj} = \{ \bz_{obj}^k\in\cN(\mathbf{0},\mathbf{I}) \}_{k=1}^{K}$ to ensure the diversity of object shape and appearance in a scene. We now describe each of these generators in detail.
+
+\boldparagraph{Object Generator} %
+For objects, we follow existing compositional methods to generate each object $k$ in a normalized object coordinate space~\cite{Liao2020CVPRa,Niemeyer2021CVPR}:
+\begin{equation}
+G_\theta^{obj}: (\gamma(\bx^k_{obj}), \bz^k_{obj}) \mapsto (\bff^k_{obj}, \sigma^k_{obj})
+\end{equation}
+where $G_\theta^{obj}$ denotes the object generator that maps a 3D point $\bx^k_{obj}$ encoded by positional encoding $\gamma(\cdot)$ and a noise vector $\bz^k_{obj}$ to a feature vector $\bff^k_{obj}\in\nR^{M_f}$ and density $\sigma^k_{obj}$. Here, $\bx^k_{obj}$ denotes a 3D point in the $k$th normalized object coordinate which is transformed to the world coordinate given the object transformation $\{\bR, \bt, \bs\}$. 
+\begin{equation}
+\label{eq:transform}
+\bx_{wld} = \bR(\bs \odot \bx^k_{obj})+ \bt
+\end{equation}
+Generating objects in this canonical space enables information sharing across different objects, thus allowing for learning a complete shape from many single-view object images. With the learned complete shape, we can control the rotation, translation, and appearance of each individual object.
+
+
+
+
+\boldparagraph{Stuff Generator}
+Our stuff generator generates feature fields for the uncountable stuff condition on the semantic voxel grid $\bV$. Inspired by 2D semantic image synthesis~\cite{Park2019CVPRa,Schonfeld2021ICLR}, we use the semantic voxel grid to modulate the stuff generation. More specifically, our stuff generator consists of a \textit{feature grid generator} $G^{vol}_\theta$ and a \textit{MLP head} $G^{stf}_\theta$. The feature grid generator first maps the noise vector $\bz_{wld}$ to a feature grid $\bPsi \in \nR^{H_v\times W_v\times D_v \times M_v}$ conditioned on the semantic voxel grid $\bV \in \nR^{H_v \times W_v \times D_v \times L}$:
+\begin{align}
+G_\theta^{vol}: (\bz_{wld}, \bV)  &\mapsto \bPsi  
+\end{align}
+In practice, $G^{vol}_\theta$ is a 3D convolutional neural network. The semantic condition $\bV$ is injected at multiple resolutions using spatially-adaptive normalization, see \figref{fig:SPADE3D} as an illustration.
+Given a 3D point $\bx_{wld}$, we trilinearly interpolate a feature vector $\Psi(\bx_{wld})\in\nR^{M_v}$. Next, we map $\bx_{wld}$ and $\Psi(\bx_{wld})$ to the final stuff feature $\bff_{stf}\in\nR^{M_f}$ and density $\sigma_{stf}$ using the MLP head:
+\begin{align}
+G_\theta^{stf}: (\Psi(\bx_{wld}) , \gamma(\bx_{wld})) &\mapsto (\bff_{stf}, \sigma_{stf}) 
+\end{align}
+where $\gamma(\cdot)$ denotes positional encoding.
+
+\begin{figure}[t]
+  \centering
+   \includegraphics[width=\linewidth]{figure/stuff_generator.pdf}
+   \caption{\textbf{Feature Grid Generator} $G_{\theta}^{vol}$ as a part of the stuff generator. We adopt spatially-adaptive normalization to inject the semantic condition $\bV$ and the noise vector $\bz_{wld}$  at multiple resolutions. }
+   \label{fig:SPADE3D}
+\end{figure}
+
+
+
+\boldparagraph{Sky Generator}
+The stuff generator cannot model regions far from the semantic voxel grid, \eg, sky. Therefore, we model the sky and other far regions as an infinitely far away dome following \cite{Hao2021ICCV,Rematas2022CVPR}. Specifically, we use a sky generator $G_{\theta}^{sky}$ to map a ray direction $\bd$ to a sky feature vector $\bff_{sky}\in\nR^{M_f}$.
+\[
+ G_{\theta}^{sky}: ( \bz_{wld}, \bd)  \mapsto \bff_{sky}
+\] 
+Note that the global latent code $\bz_{wld}$ is used to ensure the style consistency between sky and other semantics within an urban scene. 
+
+\boldparagraph{Compositional Volume Rendering}
+We accumulate feature vectors of objects, stuff, and sky on each ray via compositional volume rendering.
+We first sample points from the object and stuff generators independently (the sampling strategy will be elaborated in \secref{sec:sample}).
+Next, we sort all points wrt. their distances to the camera center and accumulate their feature vectors via volume rendering. Finally, the sky feature is added to non-opaque regions. 
+
+Formally, let $\{\bx_i\}_{i=1}^{M}$ denote $M$ sorted points on a ray, compositing of $\bx_{wld}$ sampled for the stuff generator and $\bx_{obj}^k$ sampled for the object generators (transformed to the world coordinate system via \eqref{eq:transform}). $\bff_i$ and $\sigma_i$ denote the corresponding feature vector and density at $\bx_i$. The volume rendering is 
+  \begin{align}
+    \pi^{vol}: \{  \bff_i, \sigma_i, \bff_{sky} \}_{i=1}^{M} &\mapsto \bF %
+  \end{align}
+Specifically, $\bF$ is obtained via numerical integration as
+\begin{align}
+    \bF = \sum_{i=1}^{N} T_i \alpha_i \bff_i + (1- \sum_{i=1}^{N} T_i \alpha_i )\bff_{sky} \\
+    \alpha_i = 1-e^{ (-\sigma_i\delta_i)} \quad  T_i   = \prod_{j=1}^{i-1}\left(1-\alpha_j\right)
+\end{align}
+where $T_i$ and $\alpha_i$ denote transmittance and alpha value of a sample point $\bx_i$.
+
+
+  
+
+
+
+
+
+\boldparagraph{2D Neural Rendering}
+  Following~\cite{Niemeyer2021CVPR}, we adopt a neural renderer to transform the rendered feature map to an output RGB image at the target resolution. This allows us to scale to a higher resolution without extensive computation burden.
+ More specifically, our 2D neural renderer $\pi^{neural}_{\theta}$  maps the feature image $ \bI_\bF \in \nR^{H_f \times W_f \times M_f}$ and the noise vector $\bz_{wld}$ to the RGB image $\hat{\bI} \in \nR^{H \times W \times 3}$ at the target resolution. Here, $\bz_{wld}$ is adopted to enable content-aware upsampling.
+  \begin{align}
+    \pi_\theta^{neural}: (\bI_\bF, \bz_{wld} ) &\mapsto \hat{\bI} %
+  \end{align}
+
+\boldparagraph{Object Patch Rendering}
+In addition to the full image $\hat{\bI}$, we further generate a set of object patches, see \figref{fig:method} as an illustration. We upsample object masks obtained from volume rendering to segment the objects after neural rendering. Please refer to the supplementary for more details.  
+
+
+
+\subsection{Sampling Strategy}
+\label{sec:sample}
+We use the panoptic prior to guide the sampling of volume rendering, effectively reducing the required number of sampling points and improving rendering efficiency. 
+
+\boldparagraph{Ray-Voxel Intersection Sampling for Stuff} Inspired by existing methods~\cite{Hao2021ICCV,Liu2020NIPS}, we use the ray-voxel intersection sampling strategy to determine sampling locations for the stuff generator. For each ray, we find the first $4$ non-empty voxels that the ray hit, and then sample $M_{vol}$ points within these voxels. This effectively reduces the number of required sampling points by avoiding sampling in the empty space and occluded regions.
+
+\boldparagraph{Ray-Box Intersection for Object}
+For objects, we also leverage the 3D bounding boxes to reduce the number of samples in the empty space. Given a ray, we first calculate the ray-box intersections for each bounding box parameterized by $(\bR, \bt, \bs)$. Next, we sample $M_{obj}$ points within each bounding box by uniform sampling between the intersections. We use the stratified sampling strategy following~\cite{Mildenhall2020ECCV}, i.e., a random shift is added to the sampled points.
+
+
+
+
+
+
+\subsection{Loss Functions}
+
+We train the entire model end-to-end using adversarial training aided by a reconstruction loss for stuff regions.
+
+\boldparagraph{Adversarial Loss}
+We apply an adversarial to the composited image. Let $G_\theta$ denote the full conditional generator that maps the noise vectors and the panoptic prior to a full RGB image:
+\begin{equation}
+G_\theta: (\bz_{wld}, \bz_{obj} , \bV, \bO) \mapsto \hat{\bI}
+\end{equation}
+We apply the non-saturated adversarial loss with R1-regularization~\cite{Mescheder2018ICML}:
+\begin{align}\nonumber
+ & \cL_{adv}^{\bI}  =  \nE_{\bI \sim p_{\cD}}
+\left[
+f(-D^{\bI}_\phi(\bI))
+\,-\, \lambda {\Vert \nabla D_\phi^\bI(\bI)\Vert}^2 \right] + \\ 
+& \nE_{\bz_{wld},\bz_{obj}\sim \cN,\bV,\bO\sim p_{\cV,\cO}}
+\left[f(D_\phi^{\bI}(G_\theta(\bz_{wld},\bz_{obj},\bV,\bO)))\right]
+\end{align}
+Note that the visual quality of objects like cars is essential for urban scenes. Unfortunately, objects do not always occupy a large area in urban images. Our experiments show that using scene-level adversarial training alone fails to generate photorealistic objects. Inspired by existing methods~\cite{Gadde2021ICCV, Xu2022ARXIV}, we adopt object-level discriminative training by feeding the object patches $\hat{\bP}$ to another object discriminator $D_\phi^\bP$, leading to the object-level adversarial loss $\cL_{adv}^{\bP}$ similar to $\cL_{adv}^{\bI}$.
+
+
+
+
+\boldparagraph{Stuff Reconstruction Loss}
+For our conditional stuff generator, we observe that using adversarial loss alone struggles to generate photorealistic results. One possible reason is that learning generative 3D feature fields for complex stuff regions is more challenging than the object-centric generation. 
+To stabilize adversarial training and improve the quality of synthesized images, we further leverage reconstruction loss for stuff regions. 
+Following~\cite{Hao2021ICCV}, our reconstruction loss is a combination of the MSE loss and perceptual loss $l_{vgg}$~\cite{Johnson2016ECCV}:
+\begin{align*}
+    \cL_{recon} = \mathbb{E} \big[\left\lVert \bM \odot( \bI - \hat{\bI}) \right\rVert_2^2 + \lambda_{vgg} l_{vgg}(\bM\odot \bI, \bM\odot\hat{\bI}) \big] 
+\end{align*}
+where $\bI$ and $\hat{\bI}$ are paired samples, and $\bM$ denotes a mask that filters out object regions based on the projected 3D projecting boxes $\bO$.
+Since our stuff generator is a conditioned generative model depending on the semantic voxel grid, adding the reconstruction loss is reasonable as the appearance is highly relevant to the corresponding semantic label. This provides stronger supervision that $\bz_{wld}$ only needs to model the variation within the same semantic class. 
+
+\subsection{Implementation Details}
+
+We use 3D CNNs with 5 spatially-adaptive normalization blocks for the feature grid generator $G_\theta^{vol}$. We set $H_v=W_v=D_v=64$ for all experiments, i.e., the semantic voxel grids are at the resolution of $64^3$.  We use $M_v=16$ channels for the feature grid $\bPsi$ to avoid large memory consumption.  The MLP head $G_\theta^{stf}$ of the stuff generator is an 8-layer ReLU MLP with a hidden dimension of 256. The object generator $G_\theta^{obj}$ is also a 8-layer ReLU MLP with a hidden dimension of 128. In terms of the sky generator $G_\theta^{sky}$, a 5-layer MLP with a hidden dimension of 256 is adopted. All these MLP generators output feature vectors of dimension $M_f=32$.
+
+
+During training, we sample camera poses along plausible driving trajectories given a semantic voxel grid. 
+Regarding ray marching, we sample $M_{obj} = 12$ points within each object's bounding box and $M_{vol}=6$ within each voxel.
+We use the Adam optimizer with a batch size of 16. The learning rates of the discriminator and the generator are $1 \times 10^{-4}$ and $2 \times 10^{-4}$, respectively. 
+During inference, we generate images using a moving averaged model with an exponential decay of $0.999$ for the weights. 

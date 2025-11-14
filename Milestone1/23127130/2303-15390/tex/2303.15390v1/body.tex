@@ -1,0 +1,743 @@
+
+\section{Introduction}
+
+% Real-world perception systems are often bottlenecked by strict inference-time latency and memory constraints.
+% For example, maintaining low in autonomous vehicles, low latency is required to safely react to the environment, and in AR/VR, low memory usage is mandated by lightweight wearable hardware.
+In many applications, the performance of perception systems is bottlenecked by strict inference-time constraints.
+This can be due to limited compute (as in mobile computing), a need for strong real-time performance (as in autonomous vehicles), or both (as in augmented/virtual reality).
+These constraints are particularly crippling for settings with high-resolution sensor data.
+Even with optimizations like model compression~\cite{cheng2017survey} and quantization~\cite{37631}, it is common practice to downsample inputs during inference. 
+
+However, running inference at a lower resolution undeniably destroys information. 
+While some information loss is unavoidable, the usual solution of uniform downsampling assumes that each pixel is equally informative towards the task at hand.
+To rectify this assumption, Recasens~\etal~\cite{recasens2018learning} propose Learning to Zoom (LZ), a nonuniform downsampler that samples more densely at salient (task-relevant) image regions.
+They demonstrate superior performance relative to uniform downsampling on human gaze estimation and fine-grained image classification. However, this formulation warps the input image and thus requires labels to be invariant to such deformations.
+
+\begin{figure}
+\centering
+\includegraphics[width=\linewidth]{figures/demo.png}
+\caption{LZU is characterized by "zooming" the input image, computing spatial features, then "unzooming" to revert spatial deformations. LZU can be applied to any task and model that makes use of internal 2D features to process 2D inputs. We show visual examples of output tasks including 2D detection, semantic segmentation, and 3D detection from RGB images.}
+\label{fig:teaser}
+\end{figure}
+
+Adapting LZ downsampling to tasks with spatial labels is trickier, but has been accomplished in followup works for semantic segmentation (LDS~\cite{jin2021learning}) and 2D object detection (FOVEA~\cite{thavamani2021fovea}). LDS~\cite{jin2021learning} does not unzoom during learning, and so defines losses in the warped space. This necessitates additional regularization that may not apply to non-pixel-dense tasks like detection. FOVEA~\cite{thavamani2021fovea} {\em does} unzoom bounding boxes for 2D detection, but uses a special purpose solution that avoids computing an inverse, making it inapplicable to pixel-dense tasks like semantic segmentation.
+Despite these otherwise elegant solutions, there doesn't seem to be a general task-agnostic solution for intelligent downsampling.
+
+% \begin{figure*}
+% \centering
+% \includegraphics[width=.78\linewidth]{figures/LZU_architecture.png}
+% \caption{LZU is characterized by "zooming" the input image, computing spatial features, then "unzooming" to revert spatial deformations. LZU can be applied to any task and model that makes use of internal 2D features to process 2D inputs. We show visual examples of output tasks including 2D detection, semantic segmentation, and 3D detection from RGB images.}
+% \label{fig:teaser}
+% \end{figure*}
+
+% \begin{table*}[t]
+% \centering
+% \begin{threeparttable}
+% \scriptsize
+% \caption{Summary of task-agnostic generalization of LZU. For each of the below tasks, we evaluate LZU and compare to a uniform downsampling baseline and prior work. We also train a soft uniform downsampling "upper bound" at a higher input resolution. For segmentation, our baseline's performance (55.4) varies from the reported performance in~\cite{jin2021learning} (54).
+% Details on the choice of dataset, model, and input resolution are provided in Tables~\ref{tab:det-avhd},~\ref{tab:seg},~and~\ref{tab:3ddet}.\chittesh{I don't think we need this, since the accuracy-latency plots are a strictly better version of this.}
+% }
+% \label{tab:summary}
+% \begin{tabular}{ccccccc}
+% \toprule
+% & \multicolumn{2}{c}{2D Detection} & \multicolumn{2}{c}{Semantic Segmentation} & \multicolumn{2}{c}{3D Detection} \\
+% \cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+% Method & Acc (mAP) & Lat (ms) & Acc (mIoU) & Lat (ms) & Acc (NDS) & Lat (ms) \\
+% \midrule
+% Baseline & 22.6 & 45.8 & 54 / 55.4 & 27.0 & 27.5 & 58.3 \\
+% % \midrule
+% Prior Work & 24.9~\cite{thavamani2021fovea} & 47.7 & 54 $\to$ 55~\cite{jin2021learning} & $\geq$33.8 \tnote{1} & -- & -- \\
+% % Prior Work & 24.9~\cite{thavamani2021fovea} & +1.9 & 54 $\to$ 55~\cite{jin2021learning} & +$\geq$3.4 \tablefootnote{According to the reference implementation of~\cite{jin2021learning}, the forward "zoom" takes 3.4ms, and the inference-time inversion takes 70.13s. We suspect that inversion is not optimized, so we provide a lower bound on the latency.} & -- & -- \\
+% LZU & 25.2 & 46.5 & 55.4 $\to$ 56.8 & 29.3 & 29.3 & 58.7 \\
+% % \midrule
+% Upper Bound & 29.5 & 68.5 & 55.4 $\to$ 65.3 & 42.5 & 31.2 & 87.9 \\
+% \bottomrule
+% \end{tabular}
+% \begin{tablenotes}
+% \item[1] According to the reference implementation of~\cite{jin2021learning}, the forward "zoom" takes 3.4ms, and the inference-time inversion takes 70.126s. We suspect that inversion is not optimized, so we provide a lower bound on the latency, assuming that inversion is at least as expensive as forward "zooming".
+% \end{tablenotes}
+% \end{threeparttable}
+% \end{table*}
+
+Our primary contribution is a general framework in which we zoom in on an input image, process the zoomed image, and then {\em un}zoom the output back with an inverse warp. Learning to Zoom and Unzoom (LZU) can be applied to {\em any} network that uses 2D spatial features to process 2D spatial inputs (Figure~\ref{fig:teaser}) {\em with no adjustments to the network or loss}. To unzoom, we approximate the zooming warp with a piecewise bilinear mapping. This allows efficient and differentiable computation of the forward and inverse warps.
+
+To demonstrate the generality of LZU, we demonstrate performance a variety of tasks: \emph{object detection} with RetinaNet~\cite{lin2017focal} on Argoverse-HD~\cite{li2020towards}, \emph{semantic segmentation} with PSPNet\cite{zhao2017pyramid} on Cityscapes~\cite{cordts2016cityscapes}, and \emph{monocular 3D detection} with FCOS3D~\cite{wang2021fcos3d} on nuScenes~\cite{nuScenes}. In our experiments, to maintain favorable accuracy-latency tradeoffs, we use cheap sources of saliency (as in~\cite{thavamani2021fovea}) when determining where to zoom. On each task, LZU increases performance over uniform downsampling and prior works with minimal additional latency.
+
+Interestingly, for both 2D and 3D object detection, we also see performance boosts even when processing low resolution input data. While prior works focus on performance improvements via intelligent downsampling~\cite{recasens2018learning,thavamani2021fovea}, our results show that LZU can also improve performance by intelligently {\em up}sampling (suggesting that current networks struggle to remain scale invariant for small objects, a well-known observation in the detection community~\cite{lin2014microsoft}).
+
+\section{Related Work}
+
+We split related work into two sections. The first discusses the broad class of methods aiming to improve efficiency by paying "attention" to specific image regions. The second delves into works like LZU that accomplish this by differentiably resampling the input image.
+
+\subsection{Spatial Attentional Processing}
+
+By design, convolutional neural networks pay equal "attention" (perform the same computations) to all regions of the image. In many cases, this is suboptimal, and much work has gone into developing attentional methods that resolve this inefficiency.
+
+One such method is Dynamic Convolutions~\cite{verelst2020dynamic}, which uses sparse convolutions to selectively compute outputs at only the salient regions. 
+Similarly, gated convolutions are used in \cite{kong2019pixel, xie2020spatially}.
+% , which additionally uses dynamic spatial pooling, and in \cite{xie2020spatially}, which additionally fills in outputs at nonsalient regions using interpolation.
+Notably, these methods implement "hard" attention in that the saliency is binary, and non-salient regions are ignored completely. 
+
+Deformable Convolutions~\cite{dai2017deformable, zhu2019deformable} provides a softer implementation of spatial attention by learning per pixel offsets when applying convolutions, allowing each output pixel to attend adaptively to pixels in the input image. SegBlocks~\cite{verelst2020segblocks} also provides a softer attention mechanism by splitting the image into blocks and training a lightweight reinforcement learning policy to determine whether each block should be processed at a high or low resolution. This is akin to our method, which also has variable resolution, albeit in a more continuous manner. Our method is also generalizable to tasks in which it's infeasible to "stitch" together outputs from different blocks of the image (e.g. in detection where an object can span multiple blocks).
+
+\subsection{Spatial Attention via Differentiable Image Resampling}
+
+Spatial Transformer Networks~\cite{jaderberg2015spatial} introduces a differentiable method to resample an image. They originally propose this to invert changes in appearance due to viewpoint, thereby enforcing better pose invariance.
+
+Learning to Zoom (LZ)~\cite{recasens2018learning} later adapts this resampling operation to "zoom" on salient image regions, acting as a spatial attention mechanism. Their key contribution is a transformation parameterized by a saliency map such that regions with higher saliency are more densely sampled. However, this deforms the image, requiring the task to have non-spatial labels.
+
+Followup works~\cite{marin2019efficient, thavamani2021fovea, jin2021learning} adapt LZ downsampling to detection and semantic segmentation. For object detection, FOVEA~\cite{thavamani2021fovea} exploits the fact that image resampling is implemented via an inverse mapping to map predicted bounding boxes back into the original image space. This allows all processing to be done in the downsampled space and the final bounding box regression loss to be computed in the original space. However, when there are intermediate losses, as is the case with two-stage detectors containing region proposal networks (RPNs)~\cite{ren2015faster}, this requires more complex modifications to the usual delta loss formulation, due to the irreversibility of the inverse mapping.
+For semantic segmentation, Jin~\etal~\cite{jin2021learning} apply LZ downsampling to both the input image and the ground truth and computes the loss in the downsampled space. This is elegant and model-agnostic but leads to misalignment between the training objective and the desired evaluation metric. In the extreme case, the model learns degenerate warps that sample "easy" parts of the image to reduce the training loss. To address this, they introduce additional regularization on the downsampler. Independently,~\cite{marin2019efficient} handcraft an energy minimization formulation to sample more densely at semantic boundaries. 
+
+In terms of warping and unwarping, the closest approach to ours is Dense Transformer Networks~\cite{li2017dense}, which also inverts deformations introduced by nonuniform resampling. However, their warping formulation is not saliency-based, which makes it hard to work with spatial or temporal priors and also makes it time-consuming to produce the warping parameters.
+Additionally, they only show results for semantic segmentation, whereas we show that our formulation generalizes across spatial vision tasks.
+% Additionally, they only apply their warping formulation to semantic segmentation, by inverse transforming the final 2D map of logits. In LZU, we extend this to other tasks by recognizing that intermediate feature maps can be inverted as well.
+% For efficiency, they also approximate the inverse mapping by using the forward mapping and "splatting" logits onto their nearest neighbors. In LZU, we use the more tractable class of separable warps, to be able to compute the exact inverse while maintaining efficiency.
+
+\section{Background}
+
+Since our method is a generalization of previous works~\cite{recasens2018learning,thavamani2021fovea,jin2021learning}, we include this section as a condensed explanation of prerequisite formulations critical to understanding LZU.
+
+\subsection{Image Resampling}
+
+Suppose we want to resample an input image $\bI(\bx)$ to produce an output image $\bI'(\bx)$, both indexed by spatial coordinates $\bx \in [0,1]^2$. 
+Resampling is typically implemented via an {\em inverse} map $\calT: [0,1]^2 \to [0,1]^2$ from output to input coordinates~\cite{beier1992feature}.
+For each output coordinate, the inverse map computes the source location from which to "steal" the pixel value, i.e. $\bI'(\bx) = \bI(\calT(\bx))$.
+In practice, we are often given a discretized input image $\bI \in \R^{H \times W \times C}$ and are interested in computing a discretized output $\bI' \in \R^{H' \times W' \times C}$. 
+To do so, we compute $\bI'(\bx)$ at grid points $\bx \in \mathrm{Grid}(H',W')$, where $\mathrm{Grid}(H,W) := \mathrm{Grid}(H) \times \mathrm{Grid}(W)$ and $\mathrm{Grid}(D) := \{\frac{d-1}{D-1} : d \in [D]\}$. However, $\calT(\bx)$ may return non-integer pixel locations at which the exact value of $\bI$ is unknown. In such cases, we use bilinear interpolation to compute $\bI(\calT(\bx))$. As proven in~\cite{jaderberg2015spatial}, such image resampling is differentiable with respect to $\calT$ and $\bI$. 
+
+\subsection{Saliency-Guided Downsampling}
+\label{sec:saliency-downsampling}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/LZ_steps.png}
+\caption{
+Illustration of $\calT_\mathrm{LZ}$~\cite{recasens2018learning}. Suppose we have a saliency map $\bS \in \R^{h\times w}$ (visualized in the background) and want a warped image of size $H' \times W'$. (1) We start with a uniform grid of sample locations $\mathrm{Grid}(h, w)$. (2) Grid points are "attracted" to nearby areas with high saliency. (3) Applying this "force" yields $\calT_\mathrm{LZ}[\mathrm{Grid}(h,w)]$. (4) Bilinear upsampling yields $\widetilde\calT_\mathrm{LZ}[\mathrm{Grid}(H', W')]$.
+}
+\label{fig:LZ_downsampling}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/LZ_variants.png}
+\caption{
+Examples of the anti-cropping ($\mathrm{ac}$) and separable ($\mathrm{sep}$) variants of $\calT_\mathrm{LZ}$ from~\cite{thavamani2021fovea}.
+}
+\label{fig:LZ_downsampling_variants}
+\end{figure}
+
+When using nonuniform downsampling for information retention, it is useful to parameterize $\calT$ with a saliency map $\bS(\bx)$ representing the desired sample rate at each spatial location $\bx \in [0,1]^2$~\cite{recasens2018learning}.
+Recasens~\etal~\cite{recasens2018learning} go on to approximate this behavior by having each sample coordinate $\calT(\bx)$ be "attracted" to nearby areas $\bx'$ with high saliency $\bS(\bx')$ downweighted according to a distance kernel $k(\bx,\bx')$, as illustrated in Figure~\ref{fig:LZ_downsampling}. Concretely, $\calT_{\mathrm{LZ}}(\bx) = (\calT_{\mathrm{LZ}, x}(\bx), \calT_{\mathrm{LZ}, y}(\bx))$, where
+\begin{equation}
+    \calT_{\mathrm{LZ}, x}(\bx) =
+    \frac{\int_{\bx'} \bS(\bx') k(\bx, \bx') \bx'_x\,d\bx'}{\int_{\bx'} \bS(\bx') k(\bx, \bx') \,d\bx'},
+\end{equation}
+\begin{equation}
+    \calT_{\mathrm{LZ}, y}(\bx) =
+    \frac{\int_{\bx'} \bS(\bx') k(\bx, \bx') \bx'_y \,d\bx'}{\int_{\bx'} \bS(\bx') k(\bx, \bx') \,d\bx'}.
+\end{equation}
+
+\cite{thavamani2021fovea} proposes \emph{anti-cropping} and \emph{separable} variants of this downsampler. The anti-cropping variant $\calT_{\mathrm{LZ,ac}}$ prevents the resampling operation from cropping the image. The separable variant marginalizes the saliency map $\bS(\bx)$ into two 1D saliency maps $\bS_x(x)$ and $\bS_y(y)$, and replaces the kernel $k(\bx, \bx')$ with a two 1D kernels $k_x$ and $k_y$ (although generally $k_x = k_y$).
+Then, $\calT_{\mathrm{LZ,sep}}(\bx) = \left(\calT_{\mathrm{LZ,sep,x}}(\bx_x), \calT_{\mathrm{LZ,sep,y}}(\bx_y)\right)$ where
+\begin{equation}
+\calT_{\mathrm{LZ,sep,x}}(x) = 
+\frac{\int_{x'} \bS_x(x')k_x(x, x')x'\,dx'}{\int_{x'} \bS_x(x')k_x(x, x')\,dx'},
+\end{equation}
+\begin{equation}
+\calT_{\mathrm{LZ,sep,y}}(y) = 
+\frac{\int_{y'} \bS_y(y')k_y(y, y')y'\,dy'}{\int_{y'} \bS_y(y')k_y(y, y')\,dy'}.
+\end{equation}
+This preserves axis-alignment of rectangles, which is crucial to object detection where bounding boxes are specified via corners. We refer to the above method and all variants as \emph{LZ downsamplers}, after the pioneering work "Learning to Zoom"~\cite{recasens2018learning}. Examples of each variant are shown in Figure~\ref{fig:LZ_downsampling_variants}.
+
+% \subsection{Saliency Parameterizations}
+
+% But how does one efficiently derive a saliency map in the first place? One option is to train a shallow convolutional network that maps a uniformly downsampled input image $\bI_d \in \R^{h \times w \times C}$ to the corresponding saliency $\bS \in \R^{h \times w}$.
+% %This can be thought of taking a quick glance at the input to better inform where to focus computation.
+% \citet{recasens2018learning} use this parameterization with a ResNet-18~\cite{he2016deep} pretrained on the ImageNet dataset~\cite{deng2009imagenet} for the tasks of human gaze estimation and fine-grained classification. Likewise, \citet{jin2021learning} use this parameterization with an even shallower 3-layer CNN for semantic segmentation.
+
+% Another option is to exploit temporal priors in the video setting.
+
+% If the dataset has intrinsic spatial biases (e.g. if objects are roughly centered), one can also use a fixed saliency map for each input image. 
+
+% Another option is to exploit temporal and spatial priors in the dataset. \citet{thavamani2021fovea} 
+% talk about using temporal/spatial priors for saliency, learning a fixed saliency map, include discussion on hyperparameters in these settings
+
+\section{Method}
+
+We begin by discussing our general technique for warp inversion. Then, we discuss the LZU framework and how we apply warp inversion to efficiently "unzoom".
+
+\subsection{Efficient, Differentiable Warp Inversion}
+\label{sec:warp-inv}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\columnwidth]{figures/warp_approx.png}
+    \caption{Given a warp $\calT$, we construct an approximation $\widetilde\calT$ designed for efficient inversion. As illustrated, $\widetilde\calT$ is a piecewise tiling of simpler invertible maps. This allows us to approximate the inverse $\widetilde\calT^{-1}$, even when $\calT^{-1}$ lacks a closed form.}
+    \label{fig:warp_approximation}
+\end{figure}
+
+Suppose we have a continuous map $\calT: [0,1]^2 \to [0,1]^2$.
+% We first note that ensuring the invertibility of $\cal T$ is not trivial; e.g., cropping is a lossy transformation, implying that the inverse "uncrop" does not exist. Similarly, warping two source pixels to the same target location is also a non-invertible transformation. \chittesh{Not sure what the previous two sentences add, because we're not actually doing much to ensure invertibility.}
+Our primary technical innovation is an efficient and differentiable approximation of $\calT^{-1}$, even in cases where $\calT$ has no closed-form inverse.
+
+Since $\calT$ is potentially difficult to invert, we first approximate it as $\widetilde\calT$, a piecewise tiling of simpler invertible transforms (illustrated in Figure~\ref{fig:warp_approximation}). Formally,
+\begin{equation}
+    \widetilde\calT = \bigcup_{\substack{i \in [h-1]\\j \in [w-1]}} \widetilde\calT_{ij},
+\end{equation}
+where the $ij$-th tile $\widetilde\calT_{ij}$ is any bijective map from the rectangle formed by corners $R_{ij}=\{\frac{i-1}{h-1}, \frac{i}{h-1}\} \times \{\frac{j-1}{w-1}, \frac{j}{w-1}\}$ to quadrilateral $\calT[R_{ij}]$. For our purposes, we choose bilinear maps as our tile function, although homographies could work just as well. Then, so long as $\widetilde\calT$ is injective (if each of the tiles $\widetilde\calT_{ij}$ is nondegenerate and no two tiles overlap), we are guaranteed a well-defined left inverse $\widetilde\calT^{-1}: [0,1]^2 \to [0,1]^2$ given by
+\begin{equation}
+    \widetilde\calT^{-1}(\bx) = 
+    \begin{cases}
+    \widetilde\calT^{-1}_{ij}(\bx) & \text{if }\bx \in \mathrm{Range}(\widetilde\calT_{ij}) \\
+    0 & \text{else}
+    \end{cases}. \label{eq:inf}
+\end{equation}
+
+Equation \ref{eq:inf} is {\bf efficient} to compute, since determining if $\bx \in \mathrm{Range}(\widetilde\calT_{ij})$ simply involves checking if $\bx$ is in the quadrilateral $\calT[R_{ij}]$ and computing the inverse $\widetilde\calT^{-1}_{ij}$ of a bilinear map amounts to solving a quadratic equation~\cite{wolberg1990digital}.
+This efficiency is crucial to maintaining favorable accuracy-latency tradeoffs. $\widetilde\calT^{-1}$ is guaranteed to be {\bf differentiable} with respect to $\calT$, since for each $\bx \in \widetilde\calT[R(i,j)]$, the inverse bilinear map can be written as a quadratic function of the four corners of tile $ij$ (see Appendix~\ref{sec:bilinear-maps} for exact expression).
+This allows gradients to flow back into $\calT$, letting us learn the parameters of the warp.
+
+In the case of LZ warps, $\calT_{\mathrm{LZ}}$ has no closed form inverse to the best of our knowledge. 
+Because $\calT_{\mathrm{LZ}}[\mathrm{Grid}(h, w)]$ has no foldovers~\cite{recasens2018learning}, $\widetilde\calT_{\mathrm{LZ}}$ must be injective, implying its inverse $\widetilde\calT_{\mathrm{LZ}}^{-1}$ is well-defined.
+
+When applying an LZ warp, saliency can be learned (with trainable parameters) or unlearned (with fixed parameters), and fixed (invariant across frames) or adaptive (changes every frame).
+Adaptive saliency maps require efficient warp inversion since a different warp must be applied on every input. Learned saliency maps require differentiability. We note that fixed unlearned saliency maps do not technically require efficiency or differentiability, and most of our current results show that such saliency maps are already quite effective, outperforming prior work. We posit that LZU would shine even more in the learned adaptive setting, where it could make use of temporal priming for top-down saliency.
+
+% In practice, given a discretized input image $\bI \in \R^{H \times W \times d}$, to produce a warped image $\bI' \in \R^{H' \times W' \times d}$, we evaluate $\calT[\mathrm{Grid}(H', W')]$ to determine for each grid point where to sample the input image. Because $\calT$ is difficult to invert, let us approximate it with another map $\widetilde\calT$ that is designed for easy inversion. Given a grid rectangle $R(i,j) = [\frac{i-1}{H'-1}, \frac{i}{H'-1}] \times [\frac{j-1}{W'-1}, \frac{j}{W'-1}]$ for $i \in [H']$ and $j \in [W']$,
+% we define $\widetilde\calT$ within $R(i,j)$ by bilinearly interpolating the values at the corners, making $\widetilde\calT$ a continuous piecewise bilinear map. More precisely, letting $\mathrm{BilinearTransformation}_{ij}$ be the $ij$-th bilinear map, the overall approximation is given by
+% \begin{equation}
+%     \widetilde\calT(\bx) = 
+%     \mathrm{BilinearTransformation}_{ij}(\bx) \qquad \text{for } \bx \in R(i,j).
+% \end{equation}
+% Furthermore, so long as $\widetilde\calT$ is injective (if each of the bilinear maps is nondegenerate/invertible and no two bilinear maps overlap), we are guaranteed a well-defined left inverse $\widetilde\calT^{-1}: [0,1]^2 \to [0,1]^2$ given by
+% \begin{equation}
+%     \widetilde\calT^{-1}(\bx) = 
+%     \begin{cases}
+%     \mathrm{BilinearTransformation}^{-1}_{ij}(\bx) & \text{if }\bx \in \widetilde\calT[R(i,j)] \\
+%     0 & \text{else}
+%     \end{cases}. \label{eq:inf}
+% \end{equation}
+%This formulation ensures that the inverse is valid up to any crops $\widetilde\calT^{-1}(\widetilde\calT(\bx)) = \bx, \forall \bx \in [0,1]^2$ with the following properties \deva{check this edit}:
+% Eq \ref{eq:inf} is {\bf efficient} to compute, since determining if $\bx \in \widetilde\calT[R(i,j)]$ simply involves checking if $\bx$ is in a quadrilateral and computing the inverse of a bilinear map amounts to solving a quadratic equation~\cite{wolberg1990digital}.
+% This efficiency is crucial to maintaining favorable accuracy-latency tradeoffs. $\widetilde\calT^{-1}$ is guaranteed to be {\bf differentiable} with respect to $\calT$, since for each $\bx \in \widetilde\calT[R(i,j)]$, the inverse bilinear map $\mathrm{BilinearTransformation}^{-1}_{ij}$ can be written as a quadratic function of the four corners of tile $ij$. %$\calT(\frac{i-1}{H'-1}, \frac{j-1}{W'-1})$, $\calT(\frac{i}{H'-1}, \frac{j-1}{W'-1})$, $\calT(\frac{i-1}{H'-1}, \frac{j}{W'-1})$, $\calT(\frac{i}{H'-1}, \frac{j}{W'-1})$. \chittesh{how to better phrase this? provide an explicit gradient if possible}
+% %\end{enumerate}
+% %When applying this inverse approximation to our work, Property (1) is crucial to maintaining favorable accuracy-latency tradeoffs, and Property (2)
+% This allows gradients to flow back into $\calT$, letting us learn the parameters of the warp.
+
+% In the case of LZ warps, $\calT_{\mathrm{LZ}}$ has no closed form inverse to the best of our knowledge. 
+% Because $\calT_{\mathrm{LZ}}[\mathrm{Grid}(H', W')]$ has no foldovers~\cite{recasens2018learning}, $\widetilde\calT_{\mathrm{LZ}}$ must be injective, implying its inverse $\widetilde\calT_{\mathrm{LZ}}^{-1}$ is well-defined.
+
+\subsection{Learning to Zoom and Unzoom}
+\label{sec:lzu}
+
+In the Learning to Zoom and Unzoom (LZU) framework, we use existing LZ downsamplers (see Section~\ref{sec:saliency-downsampling}) to "zoom" in on the input image, compute spatial features, and then use our warp inversion formulation to "unzoom" and revert any deformations in the feature map, as shown in Figure~\ref{fig:teaser}. This framework is applicable to all tasks with 2D spatial input and all models with some intermediate 2D spatial representation.
+
+Notice that a poorly approximated inverse warp $\widetilde\calT^{-1}$ would lead to misaligned features and a drop in performance.
+As a result, we use the approximate forward warp $\widetilde\calT$ instead of the true forward warp $\calT$, so that the composition of forward and inverse warps is \textit{actually} the identity function.
+See Appendix~\ref{sec:approximations} for a discussion of the associated tradeoff.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/axis_unzoom.png}
+    \caption{Inverting each axis of a separable warp. 
+    LZU first evaluates the forward warp $\calT_\mathrm{LZ,sep,x}$ (solid blue arrows) at a uniform grid of target locations (blue points).
+    The resulting source locations are shown as red points.
+    LZU then approximates the warp in between these samples via a \textit{linear} transform; this piecewise linear map is $\widetilde\calT_\mathrm{LZ,sep,x}$ (dotted blue arrows).
+    To evaluate the inverse $\widetilde\calT^{-1}_\mathrm{LZ,sep,x}$ (dotted green arrows), we must determine for each green point which red points it falls between and invert the corresponding linear transform. An example is shown in the top-right. 
+    }
+    \label{fig:unzoom-axis}
+\end{figure}
+
+To maintain favorable accuracy-latency tradeoffs, we make several optimizations to our forward and inverse warps. As done in previous works~\cite{jin2021learning,recasens2018learning,thavamani2021fovea}, for the forward warp or "zoom," instead of computing $\calT_{\mathrm{LZ}}[\mathrm{Grid}(H', W')]$, we compute $\calT_{\mathrm{LZ}}[\mathrm{Grid}(h, w)]$ for smaller $h \ll H'$ and $w \ll W'$ and bilinearly upsample this to get $\widetilde\calT_{\mathrm{LZ}}[\mathrm{Grid}(H', W')]$. This also reduces the complexity of computing the inverse, by reducing the number of cases in our piecewise bilinear map from $H'\cdot W'$ to $h\cdot w$.
+
+We explore efficient implementations of both separable and nonseparable warp inversion, but we find experimentally that nonseparable warps perform no better than separable warps for a strictly higher latency cost, so we use separable warps for our experiments. Details for efficiently inverting nonseparable warps are given in Appendix~\ref{sec:nonsep-inversion}.
+For separable warps $\calT_{\mathrm{LZ,sep}}$, we invert each axis separately and take the Cartesian Product:
+\begin{align}
+\widetilde\calT_{\mathrm{LZ,sep}}^{-1}[\mathrm{Grid}&(H', W')]
+= \\
+&\widetilde\calT_{\mathrm{LZ,sep,x}}^{-1}[\mathrm{Grid}(H')]
+\times
+\widetilde\calT_{\mathrm{LZ,sep,y}}^{-1}[\mathrm{Grid}(W')]. \nonumber
+\end{align}
+This further reduces our problem from inverting a piecewise bilinear map with $h \cdot w$ pieces to inverting two piecewise \emph{linear} maps with $h$ and $w$ pieces each. Figure~\ref{fig:unzoom-axis} visualizes how to invert each axis.
+
+When unwarping after feature pyramid networks (FPNs)~\cite{lin2017feature}, we may have to evaluate the inverse $\widetilde\calT_{\mathrm{LZ}}^{-1}$ at multiple resolutions $\mathrm{Grid}(H', W')$, $\mathrm{Grid}(H' / 2, W' / 2)$, etc. In practice, we evaluate $\widetilde\calT_{\mathrm{LZ}}^{-1}[\mathrm{Grid}(H', W')]$ and then approximate the inverse at lower resolutions via bilinear downsampling.
+This is surprisingly effective (see Appendix~\ref{sec:approximations}) and leads to no observable loss in performance.
+
+% \begin{table*}[t]
+% \centering
+% % \begingroup
+% \footnotesize
+% \setlength{\tabcolsep}{4pt} % Default value: 6pt
+% % RetinaNet~\cite{lin2017focal} on Argoverse-HD~\cite{li2020towards} \\
+% % \resizebox{\columnwidth}{!}{%
+% \begin{tabular}{rlccccccc}
+% \toprule
+% Scale & Method  & AP & AP$_{50}$ & AP$_{75}$ & AP$_{S}$ & AP$_{M}$ & AP$_{L}$ & Latency (ms) \\
+% \midrule
+% 0.25x & Uniform & 10.5&	18.0&	9.9	&0.3&	5.2	&38.6&\textbf{23.3}\\
+% 0.25x & LZU, fixed & \textbf{12.4}	&22.6&	11.2&	1.0	&\textbf{7.1}&	\textbf{39.2}&23.6\\
+% 0.25x & LZU, adaptive &12.3	&\textbf{22.8}&	\textbf{11.3}&	\textbf{1.4}&	6.6	&38.0 \\
+% \midrule
+% 0.5x  & Uniform & 22.6	& 38.7	& 21.7	& 3.7	& 22.1	& \textbf{53.1} & \textbf{36.0} \\
+% 0.5x  & FOVEA~\cite{thavamani2021fovea} & 24.9	& 40.3	& \textbf{25.3}	& \textbf{7.1}	& \textbf{27.7}	& 50.6 & 37.9 \\
+% 0.5x & LZU, fixed & 25.2	& 42.1&	24.8&	5.5	&26.7&	51.8 & 36.4 \\
+% 0.5x  & LZU, adaptive & \textbf{25.3}	& \textbf{43.0} &	24.6 &	6.1 &	25.9 &	52.6 & 39.9 \\
+% 0.5x  & LZU, adaptive w/o cascaded saliency & 22.8&	39.3&	22.3&	5.1	&22.7&	48.9 & 39.9 \\
+% \midrule
+% 0.75x  & Uniform & 29.5	& 48.4 &	29.6&	9.1&	32.4&	\textbf{55.1} & \textbf{62.9} \\
+% 0.75x & LZU, fixed & \textbf{30.8}	&\textbf{50.4}&	\textbf{31.8}&	\textbf{10.9}&	\textbf{33.5}	&54.1	&63.5 \\
+% 0.75x & LZU, adaptive & 26.5&	44.6&	26.7&	8.3	&28.7&	48.7 \\
+% \midrule
+% 1x & Uniform & 31.9&	51.5&	33.1&	11.4&	35.9&	54.5&	\textbf{98.3}\\
+% 1x & LZU, fixed & \textbf{32.6}&	\textbf{52.8}&	\textbf{34.0}&	\textbf{13.2}&	36.0	&\textbf{54.7}	&99.3\\
+% 1x & LZU, adaptive & 32.0&	52.4&	33.1&	12.5&	\textbf{36.3}&	52.9	& \\
+% \bottomrule
+% \end{tabular}
+% % }
+% % \endgroup
+% \caption{2D object detection results of RetinaNet~\cite{lin2017focal} on Argoverse-HD~\cite{li2020towards}.
+% LZU consistently outperforms the uniform downsampling baseline and prior work, with additional latency less than $4$ms.
+% Fixed LZU uses a dataset-wide spatial prior, and adaptive LZU uses a temporal prior based on previous frame detections.
+% While the saliency hyperparameters (finetuned at $0.5$x scale) generalize well across scales in the fixed model, they struggle at $1$x in the adaptive model and perform below the uniform baseline at $0.75$x.
+% We find that using cascaded saliency (see Section~\ref{sec:2ddet}) is crucial when training adaptive LZU.}
+% \label{tab:det-avhd}
+% \end{table*}
+
+Finally, as introduced in~\cite{thavamani2021fovea}, we can also use a fixed warp to exploit dataset-wide spatial priors, such as how objects are concentrated around the horizon in many autonomous driving datasets. This allows us to cache forward and inverse warps, greatly reducing additional latency.
+
+% \begin{figure}[h]
+% \begin{minted}[mathescape,
+%               linenos,
+%               numbersep=5pt,
+%               gobble=0,
+%               frame=lines,
+%               framesep=2mm,
+%               fontsize=\footnotesize]{python}
+% def forward(self, img):
+%     feats = extract_feats(img)
+%     return self.task_head(feats)
+
+% def forward_lzu(self, img):
+%     # zoom
+%     upsampled_grid, grid = generate_grid(...)
+%     warped_imgs = F.grid_sample(img, upsampled_grid)
+%     # compute
+%     warped_feats = self.extract_feats(warped_imgs)
+%     # unzoom
+%     inverse_grid = invert_grid(grid, shape=warped_feats.shape)
+%     feats = F.grid_sample(warped_feats, inverse_grid)
+%     return self.task_head(feats)
+% \end{minted}
+% \caption{Example implementation of LZU in PyTorch showing the code changes needed to use LZU with a given base model. \texttt{generate\_grid} is an abstraction for any function generating a bilinearly upsampled warp without foldovers, and \texttt{invert\_grid} is an abstraction for our warp inversion method. \chittesh{todo: break generate\_grid into generate\_saliency and LZ stuff. the point should be that it's easy to integrate.}}
+% \label{fig:code_snippet}
+% \end{figure}
+
+% For $(y,x) \in R(i,j)$,
+% \begin{equation}
+% \widetilde\calT^{-1}(y, x) =
+% \frac{1}{(H'-1)(W'-1)}
+% \begin{bmatrix}
+% r_j - x
+% &
+% x - l_j
+% \end{bmatrix}
+% \begin{bmatrix}
+% \calT^{-1}(t_i, l_j) & \calT^{-1}(b_i, l_j)
+% \\
+% \calT^{-1}(t_i, r_j) & \calT^{-1}(b_i, r_j)
+% \end{bmatrix}
+% \begin{bmatrix}
+% b_i - y
+% \\
+% y - t_i
+% \end{bmatrix}.
+% \end{equation}
+
+\section{Experiments}
+\label{sec:exp}
+
+First, we compare LZU to naive uniform downsampling and previous works on the tasks of 2D object detection and semantic segmentation. We include ablations to evaluate the effectiveness of training techniques and explore the upsampling regime. Then, we evaluate LZU on monocular 3D object detection, a task which no previous works have applied "zooming" to. We perform all timing experiments with a batch size of 1 on a single RTX 2080 Ti GPU. Figure~\ref{fig:qualitative-results} contains qualitative results and analysis across all tasks. Full implementation details and hyperparameters are given in Appendix~\ref{sec:impl-details}.
+
+\subsection{2D Object Detection}
+\label{sec:2ddet}
+
+\begin{table}[t]
+\centering
+% \begingroup
+\footnotesize
+\setlength{\tabcolsep}{2pt} % Default value: 6pt
+% RetinaNet~\cite{lin2017focal} on Argoverse-HD~\cite{li2020towards} \\
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{rlccccccc}
+\toprule
+Scale & Method  & AP & AP$_{50}$ & AP$_{75}$ & AP$_{S}$ & AP$_{M}$ & AP$_{L}$ & Lat (ms) \\
+\midrule
+0.25x & Uniform & 10.5&	18.0&	9.9	&0.3&	5.2	&38.6&\textbf{23.3}\\
+0.25x & LZU, fixed & \textbf{12.4}	&22.6&	11.2&	1.0	&\textbf{7.1}&	\textbf{39.2}&23.6\\
+0.25x & LZU, adaptive &12.3	&\textbf{22.8}&	\textbf{11.3}&	\textbf{1.4}&	6.6	&38.0 & 26.4 \\
+\midrule
+0.5x  & Uniform & 22.6	& 38.7	& 21.7	& 3.7	& 22.1	& \textbf{53.1} & \textbf{36.0} \\
+0.5x  & FOVEA~\cite{thavamani2021fovea} & 24.9	& 40.3	& \textbf{25.3}	& \textbf{7.1}	& \textbf{27.7}	& 50.6 & 37.9 \\
+0.5x & LZU, fixed & 25.2	& 42.1&	24.8&	5.5	&26.7&	51.8 & 36.4 \\
+0.5x  & LZU, adaptive & \textbf{25.3}	& \textbf{43.0} &	24.6 &	6.1 &	25.9 &	52.6 & 39.3 \\
+0.5x  & LZU, adaptive & 22.8&	39.3&	22.3&	5.1	&22.7&	48.9 & 39.3 \\
+&  w/o cascade sal. \\
+\midrule
+0.75x  & Uniform & 29.5	& 48.4 &	29.6&	9.1&	32.4&	\textbf{55.1} & \textbf{62.9} \\
+0.75x & LZU, fixed & \textbf{30.8}	&\textbf{50.4}&	\textbf{31.8}&	\textbf{10.9}&	\textbf{33.5}	&54.1	&63.5 \\
+0.75x & LZU, adaptive & 26.5&	44.6&	26.7&	8.3	&28.7&	48.7 &66.3 \\
+\midrule
+1x & Uniform & 31.9&	51.5&	33.1&	11.4&	35.9&	54.5&	\textbf{98.3}\\
+1x & LZU, fixed & \textbf{32.6}&	\textbf{52.8}&	\textbf{34.0}&	\textbf{13.2}&	36.0	&\textbf{54.7}	&99.3\\
+1x & LZU, adaptive & 32.0&	52.4&	33.1&	12.5&	\textbf{36.3}&	52.9	& 102.0 \\
+\bottomrule
+\end{tabular}
+}
+% \endgroup
+\caption{2D object detection results of RetinaNet~\cite{lin2017focal} on Argoverse-HD~\cite{li2020towards}.
+Fixed LZU uses a dataset-wide spatial prior, and adaptive LZU uses a temporal prior based on previous frame detections.
+LZU consistently outperforms the uniform downsampling baseline and prior work across all scales, with additional latency less than $4$ms.
+We hypothesize that the drop in AP$_L$ is because objects that are already large benefit less from zooming.
+Still, this drawback is offset by larger improvements on small and medium objects.
+}
+\label{tab:det-avhd}
+\end{table}
+
+
+\begin{table}[t]
+% \resizebox{\columnwidth}{!}{%
+\setlength{\tabcolsep}{3pt} % Default value: 6pt
+\footnotesize
+\centering
+2D Object Detection
+\vspace{0.5em}
+\begin{tabular}{rccccc@{\hskip 0.3cm}rcccc}
+    \toprule
+    \multicolumn{5}{c}{Uniform Resampling} & & \multicolumn{5}{c}{LZU Resampling} \\
+    \cmidrule(){1-5} \cmidrule(){7-11}
+    & \multicolumn{4}{c}{From} & & &  \multicolumn{4}{c}{From} \\
+    \cmidrule(r){2-5}\cmidrule(){8-11}
+    To~~ & 0.25x & 0.5x & 0.75x & 1x & & To~~ & 0.25x & 0.5x & 0.75x & 1x \\
+    \cmidrule(r){1-1}\cmidrule(r){2-5}\cmidrule(r){7-7}\cmidrule(){8-11}
+    0.25x & 10.5 &	\textcolor{blue}{10.5} &	\textcolor{blue}{10.5}&	\textcolor{blue}{10.5}
+    & & 0.25x & {\textbf{11.7}}&	\textcolor{blue}{\textbf{12.4}} &	\textcolor{blue}{\textbf{12.4}}&	\textcolor{blue}{\textbf{12.4}}\\
+    0.5x &\textcolor{red}{17.0}& 22.6 &	\textcolor{blue}{22.6}&	\textcolor{blue}{22.6} & & 0.5x &\textcolor{red}{\textbf{20.9}}&	\textbf{24.8}&	\textcolor{blue}{\textbf{24.8}}&	\textcolor{blue}{\textbf{25.2}}\\
+    0.75x &\textcolor{red}{\textbf{23.5}}&	\textcolor{red}{28.5}&	29.5 &	\textcolor{blue}{29.5} & & 0.75x &\textcolor{red}{22.5}&	\textcolor{red}{\textbf{29.4}}&	{\textbf{30.0}}&	\textcolor{blue}{\textbf{30.8}}\\
+    1x& \textcolor{red}{13.5}	&\textcolor{red}{28.4}&	\textcolor{red}{30.9}&	31.9 & & 1x& \textcolor{red}{\textbf{22.1}}	&\textcolor{red}{\textbf{30.7}}&	\textcolor{red}{\textbf{31.2}}&	{\textbf{32.6}} \\
+    \bottomrule
+\end{tabular}
+Monocular 3D Object Detection
+\begin{tabular}{rccccc@{\hskip 0.3cm}rcccc}
+    \toprule
+    \multicolumn{5}{c}{Uniform Resampling} & & \multicolumn{5}{c}{LZU Resampling} \\
+    \cmidrule(){1-5} \cmidrule(){7-11}
+    & \multicolumn{4}{c}{From} & & &  \multicolumn{4}{c}{From} \\
+    \cmidrule(r){2-5}\cmidrule(){8-11}
+    To~~ & 0.25x & 0.5x & 0.75x & 1x & & To~~ & 0.25x & 0.5x & 0.75x & 1x \\
+    \cmidrule(r){1-1}\cmidrule(r){2-5}\cmidrule(r){7-7}\cmidrule(){8-11}
+    0.25x & 21.8 &	\textcolor{blue}{21.8} &	\textcolor{blue}{21.8}&	\textcolor{blue}{21.8}
+    & & 0.25x & {\textbf{22.5}}&	\textcolor{blue}{\textbf{23.5}} &	\textcolor{blue}{\textbf{23.4}}&	\textcolor{blue}{\textbf{23.4}}\\
+    0.5x &\textcolor{red}{25.4}& 27.5 &	\textcolor{blue}{27.5}&	\textcolor{blue}{27.5} & & 0.5x &\textcolor{red}{\textbf{27.0}}&	{\textbf{29.2}}&	\textcolor{blue}{\textbf{29.1}}&	\textcolor{blue}{\textbf{29.3}}\\
+    0.75x &\textcolor{red}{27.6}&	\textcolor{red}{30.3}&	30.5 &	\textcolor{blue}{30.5} & & 0.75x &\textcolor{red}{\textbf{29.0}}&	\textcolor{red}{\textbf{31.6}}&	{\textbf{31.6}}&	\textcolor{blue}{\textbf{31.8}}\\
+    1x& \textcolor{red}{28.4}	&\textcolor{red}{30.7}&	\textcolor{red}{31.1} &	31.2 & & 1x& \textcolor{red}{\textbf{30.1}}	&\textcolor{red}{\textbf{32.5}}&	\textcolor{red}{\textbf{32.7}}&	{\textbf{32.6}} \\
+    \bottomrule
+\end{tabular}
+\caption{2D and 3D object detection results in the \textcolor{red}{upsampling} and \textcolor{blue}{downsampling} regimes, using the "Uniform" and "LZU, fixed" models from Tables~\ref{tab:det-avhd} and~\ref{tab:3ddet}. LZU is surprisingly effective even in the upsampling regime! This demonstrates that simply allocating more pixels to small objects (without retaining extra information) can help performance, suggesting that detectors still struggle with scale invariance for small objects.}
+\label{tab:upsampling}
+% }
+\end{table}
+
+% \begin{figure}
+% \centering
+% \includegraphics[width=0.7\linewidth]{figures/accuracy-latency-2d.png}
+% \caption{Plotting the accuracy-latency tradeoff for 2D detection on Argoverse-HD~\cite{li2020towards} shows that \textit{fixed LZU} is Pareto optimal.}
+% \label{fig:2d-accuracy_latency}
+% \end{figure}
+
+% \begin{figure}
+% \centering
+% \includegraphics[width=0.8\linewidth]{figures/accuracy-latency-seg.png}
+% \caption{Accuracy-FLOPS tradeoff for semantic segmentation on Cityscapes~\cite{cordts2016cityscapes}. We use FLOPS in lieu of latency to enable fair comparisons (ES~\cite{marin2019efficient} only reports FLOPS and LDS~\cite{jin2021learning} has an unoptimized implementation). The curves for ES and LDS are adjusted relative to our uniform baseline using percent changes in FLOPS and accuracy. Although LDS boasts large improvements in raw accuracy at each scale, it also incurs a greater cost via its relatively expensive saliency generator. Overall, the Pareto frontier is very competitive, with ES dominating at $64\times64$, LDS at $128\times128$, and LZU at $256\times256$.}
+% \label{fig:seg-accuracy_latency}
+% \end{figure}
+
+% \begin{figure}[t]
+% \centering
+% \includegraphics[width=\columnwidth]{figures/8_qualitative_results.jpg}
+% \caption{
+% Examples of the success and failure cases of LZU.
+% Rows A, B, F, and G depict examples where zooming in on the horizon helps the detector pick up smaller objects. 
+% On the other hand, sometimes zooming leads to false negatives, such as the black car in Row C and objects near the edge of the image in Row H.
+% For segmentation, note the consistently improved quality near the center of the image.
+% }
+% \label{fig:qualitative-results}
+% \end{figure}
+
+% \begin{figure*}[t]
+% \centering
+% \includegraphics[width=0.66\linewidth]{figures/6_qualitative_results.jpg}
+% \caption{
+% Examples of the success and failure cases of LZU. Rows A and E depict examples where zooming in on the horizon helps the detector pick up smaller objects. On the other hand, sometimes zooming leads to false negatives, such as the black car in Row B and objects near the edge of the image in Row F. For segmentation, note the consistently improved quality near the center of the image.
+% }
+% \label{fig:qualitative-results}
+% \end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.93\linewidth]{figures/6x4_qualitative_results.png}
+\caption{
+Examples of the success and failure cases of LZU.
+Rows A and E show examples where zooming in on the horizon helps the detector pick up smaller objects.
+On the other hand, sometimes zooming leads to false negatives, such as the black car in Row B and objects near the edge in Row F.
+For segmentation, LZU consistently improves quality near the center of the image.
+The last column shows the saliency map used in each case and the resulting spatial magnification ratios.
+For the Argoverse-HD~\cite{li2020towards} dataset, the magnification ratio at the center is nearly $2$x, meaning the "zoom" is preserving nearly all information in that region, at the cost of information at the corners.
+}
+\label{fig:qualitative-results}
+\end{figure*}
+
+For 2D object detection, we evaluate LZU using RetinaNet~\cite{lin2017focal} (with a ResNet-50 backbone~\cite{he2016deep} and FPN~\cite{lin2017feature}) on Argoverse-HD~\cite{li2020towards}, an object detection dataset for autonomous driving with high resolution $1920 \times 1200$ videos.
+For our baselines, we compare to uniform downsampling and FOVEA~\cite{thavamani2021fovea}, a previous work that applies LZ downsampling to detection by unwarping bounding boxes. We keep the same hyperparameters and setup as in FOVEA~\cite{thavamani2021fovea}.
+Experiments are run at $0.25$x, $0.5$x, $0.75$x, and $1$x scales, to measure the accuracy-latency tradeoff. 
+
+Our LZU models "unzoom" the feature map at each level after the FPN~\cite{lin2017feature}. We adopt the low-cost saliency generators introduced in~\cite{thavamani2021fovea} --- a "fixed" saliency map exploiting dataset-wide spatial priors, and an "adaptive" saliency map exploiting temporal priors by zooming in on detections from the previous frame. When training the adaptive version, we simulate previous detections by jittering the ground truth for the first two epochs. For the last epoch, we jitter \textit{detections} on the current frame to better simulate previous detections; we call this "cascaded" saliency. To determine saliency hyperparameters, we run grid search at $0.5$x scale on splits of the training set (details in Appendix~\ref{sec:sens-saliency},~\ref{sec:impl-details}). We use a learning rate of $0.01$ and keep all other training settings identical to the baseline. Latency is measured by timing only the additional operations (the "zoom" and "unzoom") and adding it to the baseline. This is done to mitigate the impact of variance in the latency of the backbone and detector head.
+
+\begin{figure*}
+\centering
+\includegraphics[width=\linewidth]{figures/cost_performance_curves.png}
+\caption{
+Plotting the accuracy-latency/FLOPs tradeoffs reveals the Pareto optimal methods for each task.
+Fixed LZU is Pareto optimal for both 2D and 3D object detection, outperforming uniform downsampling and FOVEA~\cite{thavamani2021fovea}.
+For semantic segmentation, we use FLOPs in lieu of latency to enable fair comparisons (ES~\cite{marin2019efficient} only reports FLOPS and LDS~\cite{jin2021learning} has an unoptimized implementation).
+Although LDS boasts large improvements in raw accuracy at each scale, it also incurs a greater cost due to its expensive saliency generator.
+Overall, the Pareto frontier for segmentation is very competitive, with ES dominating at $64\times64$, LDS at $128\times128$, and LZU at $256\times256$.
+}
+\label{fig:cost-performance}
+\end{figure*}
+
+\begin{table*}[t]
+\centering
+\footnotesize
+% \resizebox{\columnwidth}{!}{%
+\setlength{\tabcolsep}{2pt} % Default value: 6pt
+\begin{tabular}{@{}rlccccccccccccccccccccc@{}}
+\toprule
+& & & \multicolumn{19}{c}{IOU} \\
+\cmidrule(lr){4-22}
+\multirow{-2}{*}{\raggedright\shortstack{Crop\\Size}} & Method & mIOU & road & swalk & build. & wall & fence & pole & tlight & sign & veg. & terr. & sky & person & rider & car & truck & bus & train & mbike & bike & \multirow{-2}{*}{\shortstack{Latency\\(ms)}} \\ \midrule
+64 & Uniform & 26.4 & \textbf{93.9} & 35.6 & 68.6 & 3.5 & \textbf{2.9} & \textbf{0.5} & \textbf{0.0} & \textbf{0.1} & 72.5 & 21.1 & \textbf{76.0} & 26.8 & 0.9 & \textbf{57.1} & 8.9 & \textbf{16.9} & \textbf{8.0} & \textbf{0.0} & 8.2 & \textbf{15.5} \\
+64 & LZU, fixed & \textbf{26.7} & 93.4 & \textbf{36.1} & \textbf{68.9} & \textbf{5.8} & 2.3 & 0.4 & \textbf{0.0} & 0.0 & \textbf{72.6} & \textbf{23.4} & 75.9 & \textbf{29.4} & \textbf{1.2} & 56.7 & \textbf{15.0} & 10.2 & 4.1 & \textbf{0.0} & \textbf{11.7} & 16.9 \\ \midrule
+128 & Uniform & 39.3 & 96.3 & 54.0 & 78.4 & \textbf{15.0} & 7.9 & \textbf{8.1} & 8.5 & 16.6 & 81.2 & 34.4 & \textbf{86.7} & 42.9 & 13.8 & 74.4 & \textbf{22.9} & 41.6 & 24.4 & 10.2 & 29.6 & \textbf{16.1} \\
+128 & LZU, fixed & \textbf{41.7} & \textbf{96.4} & \textbf{55.2} & \textbf{78.7} & 12.7 & \textbf{13.4} & \textbf{8.1} & \textbf{11.4} & \textbf{19.0} & \textbf{81.7} & \textbf{39.0} & 86.5 & \textbf{45.7} & \textbf{17.9} & \textbf{76.8} & 21.9 & \textbf{48.2} & \textbf{31.7} & \textbf{11.6} & \textbf{36.3} & 18.0 \\ \midrule
+256 & Uniform & 53.6 & 97.5 & 64.0 & 84.7 & 20.0 & 19.0 & \textbf{22.1} & 34.8 & 41.6 & \textbf{87.0} & 41.9 & \textbf{91.2} & 59.3 & 33.7 & 84.1 & 39.2 & 62.9 & \textbf{57.9} & 27.7 & 49.1 & \textbf{19.1} \\
+256 & LZU, fixed & \textbf{55.1} & \textbf{97.7} & \textbf{67.0} & \textbf{84.9} & \textbf{24.4} & \textbf{24.4} & 21.3 & \textbf{35.2} & \textbf{42.9} & \textbf{87.0} & \textbf{44.5} & 90.7 & \textbf{61.5} & \textbf{35.7} & \textbf{85.7} & \textbf{40.8} & \textbf{67.9} & 52.8 & \textbf{29.3} & \textbf{53.4} & 21.2 \\ \midrule
+512 & Uniform & 63.8 & \textbf{98.3} & 73.3 & \textbf{88.8} & 29.2 & 34.3 & \textbf{40.6} & 54.4 & 61.6 & \textbf{90.7} & \textbf{47.7} & \textbf{94.0} & \textbf{72.7} & \textbf{50.6} & 89.1 & 45.6 & 72.1 & 59.1 & 44.5 & 64.9 & \textbf{32.3} \\
+512 & LZU, fixed & \textbf{64.2} & \textbf{98.3} & \textbf{73.4} & 88.6 & \textbf{30.0} & \textbf{35.7} & 38.8 & \textbf{56.0} & \textbf{63.8} & 90.4 & 47.0 & 93.4 & 72.4 & 43.9 & \textbf{90.1} & \textbf{50.5} & \textbf{76.4} & \textbf{59.6} & \textbf{45.4} & \textbf{65.3} & 34.4 \\ \bottomrule
+\end{tabular}
+% }
+\caption{Full semantic segmentation results of PSPNet~\cite{zhao2017pyramid} on Cityscapes~\cite{cordts2016cityscapes}. At each resolution, LZU outperforms uniform downsampling.
+}
+\label{tab:seg-full}
+\end{table*}
+
+Results are given in Table~\ref{tab:det-avhd}. We outperform both uniform downsampling and FOVEA in all but one case, while incurring an additional latency of less than $4$ms.
+The one exception is adaptive LZU at $0.75$x, which is evidence that our adaptive saliency hyperparameters, chosen at $0.5$x scale, struggle to generalize to other resolutions.
+We also confirm that using cascaded saliency to train adaptive LZU is crucial. Although adaptive LZU outperforms fixed LZU at $0.5$x scale, plotting the accuracy-latency curves (Figure~\ref{fig:cost-performance}) reveals that fixed LZU is Pareto optimal at all points.
+
+Finally, we explore how LZU performs in the \textit{upsampling} regime. We reuse the same models trained in our previous experiments, testing them with different pre-resampling resolutions. Results are shown in Table~\ref{tab:upsampling}. In this regime, LZU consistently outperforms uniform downsampling, even though information retention is no longer a factor.
+
+% \paragraph{Synthetic Video COCO} Then, we evaluate on COCO~\cite{lin2014microsoft}, a standard object detection dataset with 80 categories and smaller images with side length at most $640$ pixels and variable aspect ratios. We run experiments at $\geq$0.5x scale, by scaling the longer side to $320$ pixels, and at $\geq$1x scale, by scaling the longer side to $640$ pixels. For our baseline, again we train and test vanilla RetinaNet with uniform downsampling. No prior works have applied "zooming" to COCO, so we only compare to this naive baseline.
+% we train from an ImageNet-pretrained backbone for $12$ epochs using a batch size of $16$, a step learning schedule of $0.1$ at epochs $8$ and $11$, a learning rate of $0.01$. All other settings are the same as with Argoverse-HD. \chittesh{TODO: add latencies for COCO if time}
+
+% Again, our LZU model "unzooms" feature maps at each level after the FPN~\cite{lin2017feature}.
+% Unlike Argoverse-HD~\cite{li2020towards}, which has a strong dataset-wide prior of small objects near the center, the distribution of small objects in COCO is more arbitrary.
+% So we choose to use an adaptive saliency map based on previous detections, as in~\cite{thavamani2021fovea}. However, since COCO is not a video dataset, we simulate previous detections by jittering ground truths from the current frame. 
+% Essentially, this assumes we have almost perfect knowledge on where to zoom.
+% We train and test with a jitter of $\calN(0, 10)$ pixels in the x and y directions. All other training settings are identical to the baseline.
+
+% Results are given in Table~\ref{tab:det-coco}. LZU improves on the uniform downsampling baseline at both resolutions. Performance increases come mostly at lower bounding box overlap thresholds (AP$_{50}$ as opposed to AP$_{75}$), suggesting that LZU is good at detecting the presence of objects but struggles more at precisely localizing them.\chittesh{Improvements are also less in magnitude than with Argoverse-HD~\cite{li2020towards}, perhaps because...} Interestingly, we see performance improvements even in the \textit{upsampling} regime of $640\times 640$ ($\geq1$x) scale. In this regime, the "zoom" simply allocates more pixels and computation to salient regions (without extra information retention), and it seems even this can prompt performance gains.
+
+% \begin{table}[t]
+% \centering
+% \caption{2D object detection results of RetinaNet on Synthetic Video COCO. 
+% Since COCO~\cite{lin2014microsoft} is not a video dataset, we simulate detections on the previous frame by jittering ground truths from the current frame. This assumes almost perfect knowledge on where to zoom. 
+% LZU outperforms uniform downsampling at both resolutions.
+% Importantly, at the $640 \times 640$ resolution, LZU is "learning" to adaptively upsample (by up to $3$x on smaller images)!}
+% \label{tab:det-coco}
+
+% \vspace{1em}
+% \begin{tabular}{cccccccc}
+% \toprule
+% Resolution & Method & AP & AP$_{50}$ & AP$_{75}$ & AP$_{S}$ & AP$_{M}$ & AP$_{L}$ \\
+% \midrule
+% $320\times320$ ($\geq$0.5x) & Uniform & 24.6&	39.5&	\textbf{25.7}&	\textbf{3.5}&	26.6&	43.9 \\
+% & LZU, adaptive & \textbf{24.9}&	\textbf{41.1}&	25.6&	3.4	&\textbf{27.7}&	\textbf{44.5} \\
+% \midrule
+% $640\times640$ ($\geq$1x) & Uniform & 33.0	&51.1&	34.9&	14.0&	37.5&	47.8 \\
+% & LZU, adaptive & \textbf{33.4}&	\textbf{53.9}&	34.9&	\textbf{15.3}&	\textbf{38.6}&	\textbf{48.0} \\
+% \bottomrule
+% \end{tabular}
+% \vspace{-0.5em}
+% \end{table}
+
+% \begin{table}[t]
+% \centering
+% \caption{Ablation studies with RetinaNet on Argoverse-HD. All experiments are run at 0.5x scale. We find it very helpful to train the last epoch with cascaded saliency, meaning we approximate previous detections using predictions on the current frame instead of the ground truth labels. We also find that LZU is beneficial \emph{even when no downsampling is performed} and thus no information gain is to be had. We implement this by first uniformly downsampling inputs to 0.5x scale and then "zooming" in on the downsampled image. This suggests that LZU can provide accuracy benefits even in the absence of high-resolution sensor data.}
+% \label{tab:det-ablations}
+
+% \vspace{1em}
+% \begin{tabular}{ccccccc}
+% \toprule
+% Method    & AP & AP$_{50}$ & AP$_{75}$ & AP$_{S}$ & AP$_{M}$ & AP$_{L}$ \\
+% \midrule
+% Uniform & 22.6&	38.7&	21.7&	3.7	&22.1&	53.1 \\
+% \midrule
+% Full model w/o cascaded saliency & 22.8&	39.3&	22.3&	5.1	&22.7&	48.9 \\
+% Full model w/o information gain & 24.0 &	41.7&	23.0&	5.4	&24.5&	51.2 \\
+% Full model (LZU, adaptive) & 25.3	& 43.0 &	24.6 &	6.1 &	25.9 &	52.6 \\
+
+% \bottomrule
+% \end{tabular}
+% \end{table}
+
+\subsection{Semantic Segmentation}
+
+% \begin{table}[t]
+%     \centering
+%     \footnotesize
+%     \setlength{\tabcolsep}{2pt} % Default value: 6pt
+%     \begin{tabular}{rlcccc}
+%     \toprule
+%     Size & Method & mIOU & $\Delta$mIOU\% & GFLOPS & Lat (ms) \\
+%     \midrule 
+%     64 & Uniform (theirs) & 29 & & 4.20 \\
+%     64 & ES~\cite{marin2019efficient} & 32 & 10.3 & 4.37 \\
+%     64 & LDS~\cite{jin2021learning} & 36 & \textbf{24.1} \\
+%     64 & Uniform (ours) & 26.4 & & 2.84 \\
+%     64 & LZU, fixed & 26.7 & 1.1 & 2.87 \\
+%     \midrule
+%     128 & Uniform (theirs) & 40 \\
+%     128 & ES~\cite{marin2019efficient} & 43 & 7.5 \\
+%     128 & LDS~\cite{jin2021learning} & 47 & \textbf{17.5} \\
+%     128 & Uniform (ours) & 39.3 \\
+%     128 & LZU, fixed & 41.7 & 6.1\\
+%     \midrule
+%     256 & Uniform (theirs) & 54 \\
+%     256 & ES~\cite{marin2019efficient} & 54 & 0.0 \\
+%     256 & LDS~\cite{jin2021learning} & 55 & 1.9 \\
+%     256 & Uniform (ours) & 53.6 \\
+%     256 & LZU, fixed & 55.1 & \textbf{2.9} \\
+%     \midrule
+%     512 & Uniform (ours) & 63.8 \\
+%     512 & LZU, fixed & 64.2 & 0.6 \\
+%     \bottomrule
+%     \end{tabular}
+%     \caption{Comparing semantic segmentation results of PSPNet~\cite{zhao2017pyramid} on Cityscapes~\cite{cordts2016cityscapes} to prior work. Due to differing implementation, the performance of our baseline varies from the reported values. We test at three input resolutions and report results relative to the uniform downsampling baseline. At each resolution, LZU outperforms uniform downsampling. At $256\times 256$, we outperform prior works. At $64 \times 64$ and $128\times 128$, we are worse than Optimal Edge~\cite{marin2019efficient} and LDS~\cite{jin2021learning}, perhaps because "unzooming" features at such small scales is more destructive. We also posit the performance losses from such aggressive downsampling factors (across all methods) may be too impractical for deployment, and so focus on the $256\times256$ downsampling regime.}
+%     \label{tab:seg}
+% \end{table}
+
+For our semantic segmentation experiments, we compare to previous works ES~\cite{marin2019efficient} and LDS~\cite{jin2021learning}, so we adopt their setup.
+We test the PSPNet~\cite{zhao2017pyramid} model (with a ResNet-50 backbone~\cite{he2016deep} and FPN~\cite{lin2017feature}) on Cityscapes~\cite{cordts2016cityscapes}. Cityscapes is an urban scene dataset with high resolution $1024 \times 2048$ images and $19$ classes. We perform our experiments at several image scales ($64\times 64$, $128 \times 128$, $256\times 256$, and $512\times 512$), taken by resizing a centered square crop of the input image. Our simple baseline trains and tests PSPNet with uniform downsampling. To reduce overfitting, we allot 500 images from the official training set into a mini-validation split.
+We train our model on the remaining training images and evaluate at 10 equally spaced intervals on the mini-validation split.
+We choose the best performing model and evaluate it on the official validation set.
+
+For our LZU model, we unzoom spatial features after the FPN and use a fixed saliency map. Inspired by the idea of zooming on semantic boundaries~\cite{marin2019efficient}, we generate our fixed saliency by averaging the ground truth semantic boundaries over the train set. Notably, our saliency hyperparameters are chosen qualitatively (for producing a reasonably strong warp) and tested one-shot.
+
+We report our full results in Table~\ref{tab:seg-full} and compare to previous works in Table~\ref{tab:seg}. Since our baseline results are slightly different than reported in previous works~\cite{marin2019efficient,jin2021learning}, we compare results using a percent change relative to the corresponding baseline. We find increased performance over the baseline at all scales, and at $256\times 256$, we beat both previous works with only $2.3$ms of additional latency. Plotting the accuracy-FLOPs tradeoff (Figure~\ref{fig:cost-performance}) reveals that the large improvements of LDS~\cite{jin2021learning} at $64\times64$ and $128\times128$ input scales come at significant cost in FLOPs. In actuality, ES~\cite{marin2019efficient} is Pareto optimal at $64\times64$ and $128\times128$, LDS~\cite{jin2021learning} at $128\times128$, and LZU at $256\times256$. We hypothesize that further improvements might be possible using an adaptive, learned formulation for saliency.
+
+\subsection{Monocular 3D Object Detection}
+
+\begin{table}[t]
+\centering
+\footnotesize
+% \resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}cr@{~}lr@{~}lr@{~}l@{}}
+\toprule
+& \multicolumn{6}{c}{Downsampled Resolution}\\
+\cmidrule{2-7}
+\rule{0pt}{1.1em} Method & \multicolumn{2}{c}{$64 \times 64$} & \multicolumn{2}{c}{$128\times128$} & \multicolumn{2}{c}{$256\times256$} \\
+\midrule
+Uniform (theirs) & \multicolumn{2}{c}{29} & \multicolumn{2}{c}{40} & \multicolumn{2}{c}{54} \\
+Uniform (ours) & \multicolumn{2}{c}{26.4} &	\multicolumn{2}{c}{39.3} &	\multicolumn{2}{c}{53.6} \\
+\midrule
+ES~\cite{marin2019efficient} & 32 &(+10.3\%) & 43 &(+7.5\%) & 54 &(+0.0\%) \\
+LDS~\cite{jin2021learning} & 36 &(\textbf{+24.1\%}) & 47& (\textbf{+17.5\%}) & 55 &(+1.9\%) \\
+LZU, fixed & 
+26.7 &(+1.1\%) &
+41.7& (+6.1\%) &
+55.1& (\textbf{+2.9\%}) \\
+% LZU (adaptive) & TODO & TODO & 56.3 (+1.6\%) \\
+\bottomrule
+\end{tabular}
+% }
+\caption{Semantic segmentation results of PSPNet~\cite{zhao2017pyramid} on Cityscapes~\cite{cordts2016cityscapes}, in mIOU. Due to differing implementation, the performance of our baseline varies from reported values, so we report relative improvements. At $256\times 256$, we outperform prior works. At $64 \times 64$ and $128\times 128$, LZU performs worse than prior work, perhaps because "unzooming" features at such small scales is more destructive. We posit the performance losses from such aggressive downsampling factors (across all methods) may be too impractical for deployment, and so focus on the $256\times256$ regime.
+}
+\label{tab:seg}
+\end{table}
+
+\begin{table}[t]
+\centering
+% \begingroup
+% DEVA: My trick here is to use resizebox
+\resizebox{\columnwidth}{!}{%
+\setlength{\tabcolsep}{2pt} % Default value: 6pt
+\footnotesize
+\begin{tabular}{rlcccccccc}
+\toprule
+Scale & Method & NDS & mAP & mATE & mASE & mAOE  & mAVE & mAAE & Lat (ms) \\
+\midrule
+0.25x & Uniform & 21.8&	11.4&	\textbf{96.7}&	32.6&	90.1&	\textbf{125.0}&	\textbf{19.8} & \textbf{54.7} \\
+0.25x & LZU, fixed & \textbf{23.4}&	\textbf{13.1}&	96.8&	\textbf{31.9}&	\textbf{82.7}&	129.4&	20.0 & 55.1 \\
+\midrule
+0.5x & Uniform & 27.5 &	17.5&	90.1&	28.8&	75.5&	131.6&	17.8 & \textbf{58.1} \\
+0.5x & LZU, fixed & \textbf{29.3}	&\textbf{20.1}&	\textbf{88.9}&	\textbf{28.3}&	\textbf{73.9}	&\textbf{130.6}&	\textbf{16.7}& 58.5 \\
+\midrule
+0.75x & Uniform & 30.5&	21.0&	87.3&	27.9&	\textbf{67.0}&	\textbf{132.8}&	17.5 & \textbf{59.2} \\
+0.75x & LZU, fixed & \textbf{31.8}&	\textbf{22.4}&	\textbf{83.8}&	\textbf{27.5}&	67.2&	134.6&	\textbf{15.9} & 59.7 \\
+% 3 & 2 w/o high-res inputs & 29.2&	19.9&	89.1&	28.3&	73.1&	128.5&	17.3 & +0.4 \\
+\midrule
+1x & Uniform &31.2&	22.4&	\textbf{84.2}&	\textbf{27.4}&	70.9&	\textbf{129.6}&	\textbf{17.4} & \textbf{88.7} \\
+1x & LZU, fixed &\textbf{32.6}&	\textbf{24.8}&	84.6&	27.5&	\textbf{68.2}&	131.6&	18.3& 89.4 \\
+\bottomrule
+\end{tabular}
+}
+% \endgroup
+\caption{
+3D object detection results of FCOS3D~\cite{wang2021fcos3d} on nuScenes~\cite{nuScenes}.
+Higher NDS and mAP is better, and lower is better on all other metrics.
+Intuitively, size is an important cue for depth, and image deformations would stifle this signal. Suprisingly, this is \textit{not} the case.
+LZU improves upon the uniform downsampling baseline at all scales with less than $1$ms of additional latency. Notably, LZU at $0.75$x scale even outperforms uniform downsampling at $1$x.
+}
+% . Methods (1-3) are trained at tested at $0.5$x input scale, and latencies for (2, 3) are reported relative to the baseline (1).  and closes roughly half the gap to the $1$x upper bound (4)! As with 2D detection, we see improvements even in the absence of high-resolution input data (3).}
+\label{tab:3ddet}
+\end{table}
+
+% \begin{figure}
+% \centering
+% \includegraphics[width=0.7\linewidth]{figures/accuracy-latency-3d.png}
+% \caption{Plotting the accuracy-latency tradeoff for FCOS3D~\cite{wang2021fcos3d} on nuScenes~\cite{nuScenes} shows that LZU is more Pareto efficient than uniform downsampling.}
+% \label{fig:3d-accuracy_latency}
+% \end{figure}
+
+Finally, we evaluate LZU on monocular 3D object detection. To the best of our knowledge, no previous work has applied LZ downsampling to this task. The closest existing solution, FOVEA~\cite{thavamani2021fovea}, cannot be extended to 3D object detection, because 3D bounding boxes are amodal and cannot be unwarped in the same manner as 2D bounding boxes. For our base model, we use FCOS3D~\cite{wang2021fcos3d}, a fully convolutional model, with a ResNet-50 backbone~\cite{he2016deep} and FPN~\cite{lin2017feature}. For our dataset, we use nuScenes~\cite{nuScenes}, an autonomous driving dataset with multi-view $1600 \times 900$ RGB images for 1000 scenes and 3D bounding box annotations for 10 object classes. As is standard practice, we use the nuScenes Detection Score (NDS) metric, which is a combination of the usual mAP and measures of translation error (mATE), scale error (mASE), orientation error (mAOE), velocity error (mAVE), and attribute error (mAAE). We run experiments at $0.25$x, $0.5$x, $0.75$x, and $1$x scales and test against a uniform downsampling baseline. We train for 12 epochs with a batch size of 16 with default parameters as in MMDetection3D~\cite{mmdet3d2020}.
+% and momentum SGD with a learning rate of 0.001, momentum of 0.9, weight decay of 1e-4, doubled learning rate on bias parameters with no weight decay, L2 gradient clipping, a step learning rate schedule with drops at epochs 8 and 11, and a linear learning rate warmup for the first 500 iterations.
+
+For our LZU model, again we unzoom post-FPN features and use a fixed saliency map. Inspired by FOVEA~\cite{thavamani2021fovea}, our fixed saliency is generated by using kernel density estimation on the set of projected bounding boxes in the image space. We reuse the same saliency hyperparameters from 2D detection. All other training settings are identical to the baseline.
+
+Results are given in Table~\ref{tab:3ddet}. LZU performs consistently better than uniform downsampling, with less than $1$ms of additional latency.
+Specifically, LZU improves mAP and the aggregate metric NDS, with mixed results on mATE, mASE, mAOE, mAVE, and mAAE.
+Since the latter five metrics are computed on only \textit{true positives}, this demonstrates that LZU increases overall recall, while maintaining about equal performance on true positives.
+Plotting the accuracy-latency curves (Figure~\ref{fig:cost-performance}) shows that LZU is Pareto optimal. We also repeat the same upsampling experiments as performed in 2D object detection. Results, shown in Table~\ref{tab:upsampling}, reaffirm the viability of LZU in the upsampling regime.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We propose LZU, a simple attentional framework consisting of "zooming" in on the input image, computing spatial features, and "unzooming" to invert any deformations. To unzoom, we approximate the forward warp as a piecewise bilinear mapping and invert each piece. LZU is highly general and can be applied to any task with 2D spatial input and any model with 2D spatial features. We demonstrate the versatility of LZU empirically on a variety of tasks and datasets, including monocular 3D detection which has never been done before. We also show that LZU may even be used when high-resolution sensor data is unavailable. For future work, we can consider alternatives to the "unzoom" formulation that are perhaps less destructive than simple resampling of features.
+
+{\bf Broader impact.} Our work focuses on increasing the efficiency and accuracy of flagship vision tasks (detection, segmentation, 3D understanding) with high-resolution imagery. We share the same potential harms of the underlying tasks, but our approach may increase privacy concerns as identifiable information may be easier to decode at higher resolutions (e.g., facial identities or license plates). Because our approach is agnostic to the underlying model, it is reproducible with minimal changes to existing codebases.
+
+\bigskip
+
+\noindent {\bf Acknowledgements:} This work was supported by the CMU Argo AI Center for Autonomous Vehicle Research.

@@ -1,0 +1,362 @@
+\section{Cost-Driven Plan Selection}\label{sec:plan_selection}
+% {\color{blue} Todo: we first discuss the motivation of cost-aware tree transformations. Then, the first thing is how to define the cost. When defining the cost of SPARQL-UO, we first regard BGP as a ``black box''. Then, we say of course different BGP execution model leads to different costs, resulting in different final query plans..So, we use gStore and Jena as examples, to define BGP costs..But, our SPARQL-UO processing framework is independent on the underline BGP part.}
+
+In the previous section, we have established that there are differences in terms of efficiency among different semantics-preserving BE-tree transformations. This is the classical cost-based query plan selection problem. In this section, we introduce the cost model for evaluating a \emph{merge} or \emph{inject} transformation, and the algorithm based on it that decides the transformations to be performed given an original BE-tree.
+
+Our cost model handles the BE-tree, and thus operates on a higher level than BGP evaluation. Nevertheless, our cost model still relies on estimations of the evaluation costs and result sizes of BGPs, which are obtainable as long as the workings of the underlying BGP evaluation engine are transparent. In addition, such estimations can often be directly obtained from the plan generation module of the underlying BGP evaluation engines \cite{DBLP:journals/pvldb/MhedhbiS19}. For completeness, we briefly introduce the BGP cost model of gStore \cite{DBLP:journals/pvldb/ZouMCOZ11} and Jena \cite{Wilkinson:Jena2}, the two systems on which we implement our approach for  experimentation in Section \ref{subsubsec:cost_bgp}.
+
+\subsection{Cost Models}
+
+\subsubsection{Cost Model for SPARQL-UO}\label{subsubsec:cost_uo}
+
+The basic idea of our cost model is the insight drawn from the previous examples (Figures \ref{fig:example_optional} and \ref{fig:example_union}): SPARQL-UO query execution cost is made up of two main components:  the cost of evaluating BGPs and the cost of combining partial results through \texttt{UNION}, \texttt{OPTIONAL}, or implicit \texttt{AND} operations. We are primarily concerned with the cost difference caused by a transformation, which we call \emph{$\Delta$-cost}. A transformation is expected to improve efficiency only when its $\Delta$-cost is negative, indicating a decrease in cost; naturally we are looking for the transformation with the most negative $\Delta$-cost.
+
+% In terms of BGP evaluation cost, although some BGPs will contain more triples after transformation, it is possible for both its evaluation cost and result size to decrease due to a change in the join order given by the BGP evaluation engine, brought about by a higher selectivity that the transformation introduces. (This shall be elucidated in Section \ref{subsubsec:cost_bgp}.)
+
+% The estimated cost of operations, on the other hand, can be estimated if the approximate sizes of the results of the operands and the system implementation of the operations are known. For example, in the case of $P_1$ \texttt{UNION} $P_2$, if we know the estimated result sizes $|\widetilde{[\![P_1]\!]_D}|$ and $|\widetilde{[\![P_2]\!]_D}|$, the cost of \texttt{UNION} can be estimated by $|\widetilde{[\![P_1]\!]_D}| + |\widetilde{[\![P_2]\!]_D}|$ in a system that performs \texttt{UNION} on sorted bags of results in a merge-join-like fashion. In addition, the result size after performing \texttt{UNION} or \texttt{OPTIONAL} on the operands can also be estimated if we assume that the results fit some known distribution. In the previous example, if we assume there is no overlapping values on the same variable between the operands' results, then the result size after \texttt{UNION} can also be estimated by $|\widetilde{[\![P_1]\!]_D}| + |\widetilde{[\![P_2]\!]_D}|$.
+
+% Lay out the cost model equations, refer to them in algorithms
+% Functions -> actualize
+
+\begin{figure}[ht]
+	\centering
+	\includegraphics[scale=0.45]{figure/union_optional_cost-colored.pdf}
+	\vspace{-0.1in}
+	\caption{Estimating the $\Delta$-cost for the \emph{merge} transformation}
+	\label{fig:union_cost}
+	\vspace{-0.1in}
+\end{figure}
+
+In the following, we discuss how to estimate the $\Delta$-cost. Consider a part of BE-tree shown in Figure \ref{fig:union_cost} that contains a \texttt{UNION} node with two  children group graph pattern nodes, $P_2$ and $P_3$ that have  BGP child nodes, $B_2^{i_2}$ and $B_3^{i_3}$, respectively. Assume that  $B_2^{i_2}$ and $B_3^{i_3}$ are coalescable with $P_1$. According to condition (2) in Definition \ref{def:merge}, at most one of $P_2$ and $P_3$ lacks a coalescable BGP child node, which is represented by $B_2^{i_2}$ or $B_3^{i_3}$ as an empty node.
+
+% only one of $B_2^{i_2}$ and $B_3^{i_3}$ may be empty, indicating that $P_2$ or $P_3$ does not have a coalescable BGP child node.
+
+A \emph{merge} transformation only affects a BGP node ($P_1$) and the BGP child nodes of its sibling \texttt{UNION} node ($B_2^{i_2}$ and $B_3^{i_3}$). After the transformation, the constituent triple patterns of these BGP nodes may change, but the occurrence of these nodes are maintained (for empty BGP nodes resulting from transformations are retained). Also, since the transformation preserves the query semantics, the evaluation results of $P_1$'s parent node will not change. Therefore, the cost difference caused by \emph{merge} is local to these nodes and their siblings, as shown in Figure \ref{fig:union_cost}(a). The local cost of the BE-tree before the \emph{merge} transformation $t_m$ can then be estimated as follows, where $l(\cdot)$ and $r(\cdot)$ denote all the sibling nodes to the left and right of the node $\cdot$, respectively:
+
+% TODO: weights on the BGP and algebra costs, as well as how to determine them
+{\small
+\begin{align}
+    cost(t_m) &= cost(t_m, BGP) + cost(t_m, algebra) \label{eq:cost_overall} \\
+    cost(t_m, BGP) &= cost({P_1}) + cost({B_2^{i_2}}) + cost({B_3^{i_3}}) \label{eq:union_cost_BGP} \\
+    cost(t_m, algebra) &= f_{AND}(|res({P_1})|, |res(l({P_1}))|, |res(r({P_1}))|) \nonumber \\
+    &+ f_{AND}(|res({B_2^{i_2}})|, |res(l({B_2^{i_2}}))|, |res(r({B_2^{i_2}}))|) \nonumber \\
+    &+ f_{AND}(|res({B_3^{i_3}})|, |res(l({B_3^{i_3}}))|, |res(r({B_3^{i_3}}))|) \nonumber \\
+    &+ f_{UNION}(|res(P_2)|, |res(P_3)|) \label{eq:union_cost_algebra}
+\end{align}}
+
+%Note that $l(\cdot)$ and $r(\cdot)$ denote all the sibling nodes to the left and right of the node $\cdot$, respectively.
+
+$cost(t_m, BGP)$ can be directly obtained according to the BGP evaluation engine. $cost(t_m, algebra)$ is due to the possible change in the result sizes of the affected BGP nodes. In the case of \emph{merge}, $cost(t_m, algebra)$ consists of the cost of performing implicit \texttt{AND} between the affected BGP nodes and their left and right siblings, and of performing \texttt{UNION} on $P_2$ and $P_3$. The costs of algebraic operations are functions on the result sizes of their operands ($f_{AND}$ and $f_{UNION}$ in Equation \ref{eq:union_cost_algebra}). These functions may differ based on different implementations of these algebraic operations. In our experiments, to fit the system we choose to build our implementation upon, $f_{AND}$ is set to be the product of its arguments, and $f_{UNION}$ is set to be the sum of its arguments.
+
+Note that we need to also estimate the result sizes of some nodes for $\Delta$-cost estimation. A BGP node's result size can be estimated by invoking or simulating an estimation module of the underlying BGP evaluation engine. The result sizes of other types of nodes need to be estimated based on an assumed distribution of data. In our experiments, we simply estimate the result size of any join (including \texttt{AND} and \texttt{OPTIONAL}) to be the product of the result sizes of the joined graph patterns, and the result size of \texttt{UNION} to be the sum of the result sizes of the \texttt{UNION}'ed graph patterns.
+
+Suppose after the \emph{merge} transformation, the affected nodes are turned into ${P_1}^\prime$, ${B_2^{i_2}}^{\prime}$ and ${B_3^{i_3}}^\prime$. To estimate the local cost after $t_m$ (denoted as $cost(t_{m}^\prime)$), we simply replace $P_1$, $B_2^{i_2}$ and $B_3^{i_3}$ in Equations \ref{eq:union_cost_BGP} and \ref{eq:union_cost_algebra} by ${P_1}'$, ${B_2^{i_2}}'$ and ${B_3^{i_3}}'$.
+Consequently, the $\Delta$-cost of \emph{merge} can be estimated as follows:
+
+{\small
+\begin{align}
+\Delta cost(t_m) = cost(t_{m}^\prime) - cost(t_m)
+\end{align}}
+
+%When considering whether to make a \emph{merge} transformation, we locate the affected nodes, and estimate the $\Delta$-cost. The transformation is expected to improve efficiency when the $\Delta$-cost is negative.
+
+\nop{
+\begin{figure}[ht]
+	\centering
+	\includegraphics[scale=0.65]{new_figure/optional_cost.pdf}
+	\vspace{-0.1in}
+	\caption{Estimating the $\Delta$cost for the \emph{inject} transformation}
+	\label{fig:optional_cost}
+	\vspace{-0.3in}
+\end{figure}
+}
+The case is similar for the \emph{inject} operation (Figure \ref{fig:union_cost}(b)). The local cost of the BE-tree before the \emph{inject} transformation $t_i$ can then be estimated as follows:
+
+{\small
+\begin{align}
+      cost(t_i) &= cost(t_i, BGP) + cost(t_i, algebra) \label{eq:optional_cost_overall} \\
+    cost(t_i, BGP) &= cost({P_1}) + cost({B_2^{i_2}}) \label{eq:optional_cost_BGP} \\
+    cost(t_i, algebra) &= f_{AND}(|res({P_1})|, |res(l({P_1}))|, |res(r({P_1}))|) \nonumber \\
+    &+ f_{AND}(|res({B_2^{i_2}})|, |res(l({B_2^{i_2}}))|, |res(r({B_2^{i_2}}))|) \nonumber \\
+    &+ f_{OPTIONAL}(|res({P_1})|, |res(P_2)|) \label{eq:optional_cost_algebra}
+\end{align}}
+
+Suppose after the \emph{inject} transformation, the affected nodes are turned into ${P_1}^\prime$ and ${B_2^{i_2}}^\prime$. To estimate the local cost after $t_i$, we simply replace $P_1$ and $B_2^{i_2}$ in Equations \ref{eq:optional_cost_BGP} and \ref{eq:optional_cost_algebra} by ${P_1}^\prime$ and ${B_2^{i_2}}^\prime$.
+The $\Delta$-cost of \emph{inject} is then computed as follows:
+
+{\small
+\begin{align}
+    \Delta cost(t_i) = cost(t_{i}^\prime) - cost(t_i)
+\end{align}}
+
+\subsubsection{Cost Model for BGP}\label{subsubsec:cost_bgp} Although the underlying BGP cost model is transparent to our SPARQL-UO cost model (see Equations \ref{eq:union_cost_BGP} and \ref{eq:optional_cost_BGP}), for the completeness of exposition, we briefly introduce the BGP cost models employed by gStore and Jena. The evaluation of BGPs consists of joins. Thus the cost of a BGP plan $T$ is the sum of the costs of each executed join operation $j$:
+{\small
+\begin{align}
+    cost(T) = \sum_{j \in T} cost(j) \nonumber
+\end{align}}
+% BGP evaluation in gStore uses two types of joins: worst-case optimal (WCO) join and binary join. WCO extends the results of a BGP by the mappings of a vertex, while the binary join combines the results of two BGPs sharing a common vertex.
+BGP evaluation in gStore uses the worst-case optimal (WCO) join, which  is concerned with all the edges labeled with the required predicate that links existing query vertices and the newly extended vertex. For each result tuple on the existing vertices, all such edges need to be scanned at least once to check whether this tuple can be extended to match the newly extended vertex. Suppose the set of existing vertices is $\{v_1, \cdots, v_{k-1}\}$, and the newly extended vertex is $v_k$. The cost of a WCO join can then be estimated as follows:
+{\small
+\begin{align}
+    & cost(WCOJoin(\{v_1, \cdots, v_{k-1}\}, v_k)) \nonumber \\
+    & = card(\{v_1, \cdots, v_{k-1}\}) \times \min_{i \in [1, k-1]} average\_size(v_i, p) \nonumber
+\end{align}}
+where $card(\{v_1, \cdots, v_{k-1}\})$ indicates the estimated \emph{cardinality} -- the estimated number of result tuples on the query vertex set $\{v_1, \cdots, v_{k-1}\}$; and $average\_size(v_i, p)$ indicates the average number of edges (\emph{i.e.,} triples) with $p$ as predicate and $v_i$ as subject or object, depending on the direction of the edge between $v_i$ and $v_k$ in the query.
+
+On the other hand, BGP evaluation in Jena uses the binary join, which is conceptually akin to a hash-join in relational databases. It first hashes the result tuples of the BGP with a smaller result size on the common vertices. Then, for each result tuple of the other BGP, the hash index is probed to find compatible matches that can be combined. Suppose the two BGPs to be combined have query vertex sets $V_1$ and $V_2$, respectively. The cost of a binary join can then be estimated as follows:
+{\small
+\begin{align}
+    & cost(BinaryJoin(V_1, V_2)) \\
+    & = 2 \times \min (card(V_1), card(V_2)) + \max (card(V_1), card(V_2)) \nonumber
+\end{align}}
+where the first part of the sum indicates the cost of building the hash index, and the second part indicates the cost of probing it.
+
+The above cost estimation formulas rely on the cardinality estimation of query vertex sets. Cardinality estimation starts from single triple patterns, whose query vertex set’s exact cardinality can be obtained reading the pre-built indexes of the RDF store using the constants as key. Each time that a new query vertex is added to the set, we sample the candidate result set, and collate how many result tuples can be generated from the sample by extending to the new query vertex. The estimated cardinality is updated by scaling up based on the previous estimation in proportion to the ratio between the number of extended result tuples and the sample size:
+{\small
+\begin{align}
+    card(V_k) = \max (\frac{\#extend}{\#sample} \times card(V_{k-1}), 1) \nonumber
+\end{align}}
+
+Note that more sophisticated cardinality estimation approaches and BGP cost models (such as \cite{10.1145/3178876.3186003}) are orthogonal to our contribution in this paper. Experimental results show that our approach optimize SPARQL-UO query processing significantly by considering the simple but effective BGP cost models and cardinality estimation methods shown above. 
+
+%Since the cardinality of all the query vertices is an estimation of the complete BGP’s result size, we obtain it as a byproduct of the cost estimation process.
+
+%The reason why our \emph{merge} and \emph{inject} operations may also speed up BGP evaluation is that by potentially introducing more selective triples, both the cardinalities and the size of connections may decrease, leading to more efficient BGP plans.
+
+
+
+\subsection{Cost-Driven Transformation}
+
+% {\color{blue} This subsection should focus on the transformation algorithms.}
+In this subsection, we discuss BE-tree transformation algorithms that leverage the cost model discussed above to decide on transformations for obtaining the most efficient query plan for execution.
+% by Algorithm \ref{alg:bgpe}.
+
+%Having designed a cost model to evaluate the \emph{merge} and \emph{inject} transformations, we subsequently develop algorithms that, given a BE-tree, decides what transformations to perform on it so the resulting tree is expected to yield higher efficiency when executed by Algorithm \ref{alg:bgpe}.
+
+\subsubsection{Transforming a Single Tree Level}
+
+%As introduced above, the \emph{merge} and \emph{inject} transformations induced by Theorems \ref{thm:union_eq} and \ref{thm:optional_eq} are both targeted at a node and its sibling \texttt{UNION} or \texttt{OPTIONAL} node on the same level.
+
+%Before moving on to handle the intricate relations between transformations across different tree levels,
+We first concentrate on the simpler case where  only  transformations at a single level are considered.
+
+% Conceptually, we need to propagate the costs from the BGP nodes upward until we reach the root node and get the estimation of the total cost of the BE-tree, before we can compare the expected efficiency of this tree to the others. However, since there are many possible transformations, each of which makes only local changes to the BE-tree, propagating to the root every time will lead to much repeated computation.
+
+% When considering whether to make a \emph{merge} or \emph{inject} transformation, we simply compare the $\Delta$-costs of the original tree and the transformed tree. If the $\Delta$-cost of the transformed tree is lower, we make the transformation; otherwise, we keep the tree as it is. Since there may be multiple viable sub-BGPs for a transformation, we also select the sub-BGP that incur the lowest $\Delta$-cost.
+
+% 0.25 column
+When a BGP node only has a sibling \texttt{UNION} or \texttt{OPTIONAL} node, deciding the transformations is already covered by the cost model introduced in Section \ref{subsubsec:cost_uo}. However, in reality, multiple sibling \texttt{UNION} or \texttt{OPTIONAL} nodes may be viable for transformation. Note that according to Theorems \ref{thm:union_eq} and \ref{thm:optional_eq}, a merged BGP is removed from its original position, while an injected BGP maintains its original occurrence. This means that a BGP can only be merged with one of its sibling \texttt{UNION} nodes, but can be injected into multiple sibling \texttt{OPTIONAL} nodes. Therefore, in order to decide on a \emph{merge} transformation, we need to look holistically at all the \texttt{UNION} nodes at that level, and choose the transformation that incurs the lowest $\Delta$cost. On the other hand, \emph{inject} transformations are mutually independent, so we scan over each \texttt{OPTIONAL} node to the right of the BGP node, and decide individually which ones are worthy of a transformation based on the $\Delta-$cost.
+
+% 1 column (including algorithm)
+The transformation decision at a single level of the BE-tree is given in Algorithm \ref{alg:single_level}. The transformation happens at the level of the children of the input group graph pattern node $P$. Note that the \emph{merge} transformation of a BGP node can only be determined and performed after iterating over all its sibling UNION nodes (Line 14), while the \emph{inject} operation is decided individually on each sibling \texttt{OPTIONAL} node (Line 16). The subroutines that compute the $\Delta$-cost of each possible transformation is presented in Algorithm \ref{alg:subroutines}.
+
+\begin{algorithm}[ht]\small
+	\caption{\small Single-level BE-tree transformation}
+	\label{alg:single_level}
+	\SetKwInOut{KwIn}{Input}
+	\KwIn{RDF dataset $D$, BE-tree $T(Q)$, a group graph pattern node $P$}
+	
+	\SetKwFunction{FMain}{SingleLevelTransform}
+	\SetKwFunction{FMerge}{DecideMerge}
+	\SetKwFunction{FInject}{DecideInject}
+	\SetKwProg{Fn}{Function}{:}{}
+	\SetKw{Continue}{continue}
+	\Fn{\FMain{$D, T(Q), P$}}
+	{
+		\ForEach{$P_1$ in the child nodes of $P$}
+		{
+		    \If {$P_1$ is a BGP node}
+		    {
+		        minUnionCost $\leftarrow 0$\;
+		        % subBGPglobal $\leftarrow$ empty BGP\;
+		        targetUNION $\leftarrow$ empty node\;
+		        \ForEach{\texttt{UNION} node $u$ in the child nodes of $P$}
+		        {
+		            minUnionCostCur $\leftarrow$ \FMerge($P_1$, $u$)\;
+		            \If{minUnionCostCur $<$ minUnionCost}
+		            {
+		                minUnionCost $\leftarrow$ minUnionCostCur\;
+		                % subBGPglobal $\leftarrow$ subBGPlocal\;
+		                targetUNION $\leftarrow$ $U$\;
+		            }
+		        }
+		        \If{minUnionCost $< 0$}
+		        { Perform \emph{merge} on subBGPglobal and targetUNION }
+		        \ForEach{\texttt{OPTIONAL} node $o$ to the right of $P_1$ in the child nodes of $P$}
+		        { \FInject($P_1$, $O$)\; }
+		    }
+		}
+	}
+\end{algorithm}
+	
+\begin{algorithm}[ht]\small
+	\caption{\small Subroutines for BE-tree transformation}
+	\label{alg:subroutines}
+	\SetKwInOut{KwIn}{Input}
+	
+	\SetKwFunction{FMain}{SingleLevelTransform}
+	\SetKwFunction{FMerge}{DecideMerge}
+	\SetKwFunction{FInject}{DecideInject}
+	\SetKwProg{Fn}{Function}{:}{}
+	\SetKw{Continue}{continue}
+	\Fn{\FMerge{$P_1, U$}}
+	{
+	    \nop{\If{maximal common sub-BGP of $U$ is coalescable with $P_1$}
+	    {
+	        Add the maximal common sub-BGP to $P_1$\;
+	        Subtract the maximal common sub-BGP from $U$\;
+	    }}
+	    \If{constraints are violated}{\Return 0\;}
+	    originalCost $\leftarrow$ local cost (Equations \ref{eq:cost_overall}, \ref{eq:union_cost_BGP} and \ref{eq:union_cost_algebra})\;
+	    minUnionCostCur $\leftarrow$ 0\;
+	    % \ForEach{sub-BGP $sub$ of $P_1$}
+	    % {
+	        % \If{constraints are violated}{\Continue\;}
+	        \ForEach{child group graph pattern node $P_j$ of $U$}
+	        {
+	            $BSet_j \leftarrow \{B_j^i | B_j^i$ is a BGP child node of $P_j$ coalescable with $P_1 \}$\;
+	            \If{$BSet_j = \emptyset$}
+	            { Add an empty BGP node to $BSet_j$\; }
+	        }
+	        \ForEach{tuple $(B_2^{i_2}, B_3^{i_3}, \cdots)$ drawn from $BSet_2, BSet_3, \cdots$}
+	        {
+	            Perform \emph{merge} on $P_1$ and $U$\;
+	            transformedCost $\leftarrow$ local cost (Equations \ref{eq:cost_overall}, \ref{eq:union_cost_BGP} and \ref{eq:union_cost_algebra})\;
+	            $\Delta$cost $\leftarrow$ transformedCost - originalCost\;
+	            \If{$\Delta$cost $<$ minUnionCostCur}
+	            {
+	                minUnionCostCur $\leftarrow$ $\Delta$cost\;
+	                % subBGPlocal $\leftarrow$ $sub$\;
+	            }
+	            Undo \emph{merge}\;
+	        }
+	    % }
+	    \Return minUnionCostCur\;
+	}
+	\Fn{\FInject{$P_1, O$}}
+	{
+	    \If{constraints are violated}{\Return\;}
+	    originalCost $\leftarrow$ local cost (Equations \ref{eq:cost_overall}, \ref{eq:optional_cost_BGP} and \ref{eq:optional_cost_algebra})\;
+	    % minOPTIONALCostCur $\leftarrow$ 0\;
+	    % \ForEach{sub-BGP $sub$ of $P_1$}
+	    % {
+	        % \If{constraints are violated}{\Continue\;}
+	        \ForEach{BGP child node $B_2^i$ of $O$'s child group graph pattern node $P_2$ coalescable with $P_1$}
+	        {
+	            Perform \emph{inject} on $P_1$ and $U$ (coalescing $sub$ with $B_2^i$)\;
+	            transformedCost $\leftarrow$ local cost (Equations \ref{eq:cost_overall}, \ref{eq:optional_cost_BGP} and \ref{eq:optional_cost_algebra})\;
+	            $\Delta$cost $\leftarrow$ transformedCost - originalCost\;
+	            \If{$\Delta$cost $\geq$ 0}
+	            {
+	              Undo \emph{inject}\;  
+	              % minOPTIONALCostCur $\leftarrow$ $\Delta$cost\;
+	                % subBGPlocal $\leftarrow$ $sub$\;
+	            }
+	            % Undo \emph{inject}\;
+	        }
+	    % }
+	    % \If{minOPTIONALCostCur $<$ 0}
+	    % { Perform \emph{inject} on subBGPlocal and $O$\; }
+	}
+\end{algorithm}
+
+\subsubsection{Handling Multiple Levels}
+
+% From the BE-tree perspective, the BGPs correspond to the leaf nodes, and the operations correspond to the internal nodes. Obtaining the estimations of BGP evaluation costs from the underlying engine means that the estimated costs of the leaf nodes are known. Then we can propagate the estimations in a bottom-up approach, and finally obtain the estimated cost at the root node, which represents the estimated cost of evaluating this BE-tree. Having obtained the estimated cost of evaluating each possible semantically correct BE-tree, we simply select the one with the lowest estimated cost for execution.
+
+% 1.5~2 columns (including algorithm)
+Handling the entire BE-tree, which often consists of multiple levels is particularly challenging because of the possible interdependence between transformations across different levels. For example, if we consider transforming the group graph pattern $\{P_1 \ \texttt{OPTIONAL} \ \{P_2 \ \texttt{OPTIONAL} \ P_3\}\}$ ($P_1$, $P_2$ and $P_3$ are all coalescable BGPs), 
+there are $2^3$ possible transformations involving whether $P_1$ is injected into $P_2$, whether $P_2$ is injected into $P_3$, and whether $P_1$ is injected into $P_3$. This results in a plan space that 
+% whether each of them $P_2$ should be injected into another produces $2^3$ possible transformations in total, which
+is exponential in terms of the depth of the BE-tree. In fact, we conjecture that finding the optimal transformation on the entire BE-tree is an NP-hard combinatorial optimization problem.
+
+In order to balance the time complexity and the efficiency of the transformed tree, we propose a greedy strategy to decide on the transformations on the entire BE-tree (Algorithm \ref{alg:multi_level}). Specifically, we traverse the BE-tree in a post-order depth-first fashion. Only when all the child nodes of a group graph pattern node have been traversed (Lines 4-12) do we consider the possible transformations on the level of its children (Line 13, which invokes Algorithm \ref{alg:single_level}). In this way, we ensure that all the lower levels have been appropriately transformed before considering transforming the current level, and the entire transformed tree is guaranteed to be more efficient than the original without expensive backtracking.
+
+\begin{algorithm}[ht]\small
+	\caption{\small Multi-level BE-tree transformation}
+	\label{alg:multi_level}
+	\SetKwInOut{KwIn}{Input}
+	\KwIn{RDF dataset $D$, BE-tree $T(Q)$}
+	
+	\SetKwFunction{FMain}{MultiLevelTransform}
+	\SetKwFunction{FSingle}{PostOrderTraverse}
+	\SetKwFunction{FPrev}{SingleLevelTransform}
+	\SetKwProg{Fn}{Function}{:}{}
+	\SetKw{Continue}{continue}
+	\Fn{\FMain{$D, T(Q)$}}
+	{
+		\FSingle($D, T(Q), Q$)\;
+	}
+	\Fn{\FSingle{$D, T(Q), P$}}
+	{
+		\ForEach{$P_1$ in the child nodes of $P$}
+		{
+		    \If{$P_1$ is a group graph pattern node}
+		    { \FSingle($D, T(Q), P_1$)\; }
+		    \ElseIf{$P_1$ is a \texttt{UNION} node}
+		    {
+		        \ForEach{child group graph pattern node $P_i$ of $P_1$}
+		        { \FSingle($D, T(Q), P_i$)\; }
+		    }
+		    \ElseIf{$P_1$ is an \texttt{OPTIONAL} node}
+		    {
+		        Get the child group graph pattern node $P_2$ of $P_1$\;
+		        \FSingle($D, T(Q), P_2$)\;
+		    }
+		}
+		\FPrev($D, T(Q), P$)\;
+	}
+\end{algorithm}
+
+% Oops, no time for FILTER
+
+% 0.25 column
+% TODO: update the line number after modifying Algorithm 1
+After applying the transformations, the BE-tree still maintains the tree structure and has the same node types. The semantic correctness of the transformed BE-tree is guaranteed by Theorems \ref{thm:union_eq} and \ref{thm:optional_eq}. Therefore, the evaluation algorithm (Algorithm \ref{alg:bgpe}) can still be invoked to evaluate the transformed BE-tree.
+% However, in the case of \texttt{OPTIONAL}, there is one more optimization called \emph{candidate pruning} that can be incorporated into the evaluation algorithm. Because of the semantics of the left-outer-join (${\tiny \textbf{\textifsym{d|><|}}}$, Definition \ref{def:eval}), the results obtained up to the left adjacent sibling node of the \texttt{OPTIONAL} node constrains the results of the \texttt{OPTIONAL}-right group graph pattern on the common variables. Consequently, when \texttt{OPTIONAL}-right group graph patterns are evaluated (Algorithm \ref{alg:bgpe}, Line 19), the results of the common variables can be passed down as an additional argument to serve as the candidate results for those variables in the \texttt{OPTIONAL}-right group graph pattern, which prunes the search space for subgraph matching.
+
+% TODO: add treatment of FILTER
+% Note that although our proposed optimizations are targeted at \texttt{UNION} and \texttt{OPTIONAL} expressions, \texttt{FILTER} will still be supported, because Algorithm \ref{alg:bgpe} will be invoked on the transformed BE-tree.
+
+\section{Query-Time Optimization: Candidate Pruning}\label{sec:cand_pruning}
+
+In the previous section, we introduced how to generate different SPARQL-UO query plans by BE-tree transformations and select an effective plan based on the cost estimation prior to execution. In this section, we present \emph{candidate pruning}, a query-time optimization incorporated into Algorithm \ref{alg:bgpe} to enhance efficiency.
+
+% Note: nested group graph patterns are not handled here (Line 5 of Algorithm \ref{alg:bgpe}), but it can be incorporated (in the cost-driven transformation as well)
+% Nested group graph patterns are basically useless without other expressions such as FILTER and BIND
+The basic idea of candidate pruning is also drawn from Theorems \ref{thm:union_eq} and \ref{thm:optional_eq}. The equivalence between the evaluation results implies that the results of the \texttt{UNION}'ed or \texttt{OPTIONAL}-right group graph patterns are constrained by those of the outer graph pattern regarding the common variables.
+\nop{A similar constraint exists for nested group graph patterns, according to the following theorem (the proof is obvious due to Definition \ref{def:eval}):
+
+\begin{theorem}
+	For any graph pattern $P_1$ and $P_2$ and any \\ RDF dataset $D$, we have
+    \begin{equation}
+        [\![P_1 \ \texttt{AND} \ \{P_2\}]\!]_D = [\![\{P_1 \ \texttt{AND} \ P_2\}]\!]_D. \nonumber
+    \end{equation}
+\label{thm:nested_eq}
+\end{theorem}}
+Therefore, when a \texttt{UNION}, \texttt{OPTIONAL} or group graph pattern node is encountered during evaluation, we can set the current results on the common variables as \emph{candidate results} when executing the child BGPs of that node. Figure \ref{fig:candidate_pruning} shows the mechanism of candidate pruning for an \texttt{OPTIONAL} query: the results of the variable \texttt{?x} from the already evaluated graph patterns serve as the candidate results of \texttt{?x} for the child BGP of the \texttt{OPTIONAL}-right group graph pattern, pruning redundant matchings of \texttt{?x} that will be materialized if the BGP is evaluated independently.
+
+\begin{figure}
+    \centering
+    \includegraphics[scale=0.5]{figure/candidate_pruning1-colored.pdf}
+    \caption{Candidate pruning for \texttt{OPTIONAL}}
+    \label{fig:candidate_pruning}
+    \vspace{-0.3in}
+\end{figure}
+
+The discussion above establishes that candidate pruning preserves semantic correctness. However, to achieve a pruning effect, we need to ensure that the size of the candidate results is
+% small enough. Concretely, only when the size of the candidate results is
+smaller than the size of the actual results of the BGP. A smaller candidate result size also reduces the overhead incurred by scanning them and setting them as candidates. We adopt an adaptive threshold on the candidate result size. The cost model for BGP (Section \ref{subsubsec:cost_bgp}) invoked as part of tree transformation provides an estimate of the actual BGP result size, which we employ as the threshold on candidate result size whenever possible. When no such estimate is available, we set the threshold based on the dataset size. (Please refer to Section \ref{Sec:experiments} for the threshold setting in our experiments.)
+% since the fewer candidate results we have, the more of the search space of subgraph matching can be pruned, and the less overhead is incurred by scanning them and setting them as candidates. Therefore, we need to define a threshold on the size of the current result for it to serve as candidates for a BGP. We set the threshold to be the estimated result size of the BGP, since this likely indicates a pruning effect.
+
+To implement candidate pruning, we modify Algorithm \ref{alg:bgpe} as follows (Note that the results can be passed as arguments in the form of pointers to prevent expensive copying):
+
+\begin{itemize}
+	\item Add a third argument \emph{cand}, which denotes the candidate results, to the \texttt{BGPBasedEvaluation} function;
+	\item Pass the current results \emph{r} as the third argument to \\ \texttt{BGPBasedEvaluation} when processing a \texttt{UNION}, \texttt{OPTIONAL} or group graph pattern node (Lines 7, 9, 15 and 19);
+	\item Pass \emph{cand} as the third argument to \texttt{EvaluateBGP} (Line 11). Only when the size of \emph{cand} is smaller than the threshold is it set as the candidate results of the BGP.
+\end{itemize}
+
+Tree transformation and candidate pruning, which take effect prior to and during query execution, respectively, are complementary to each other. Prior to execution, high-selectivity BGPs are targeted by \emph{merge} or \emph{inject} transformations, which breaks up graph patterns with large overall results that originally cannot be handled by candidate pruning. Tree transformation also supplies candidate pruning with estimates of the BGP result sizes. On the other hand, while tree transformations are constrained to be performed level-by-level due to the vast plan space, candidate pruning can transmit the pruning effect of small results across levels during execution. For example, when processing a query with the group graph pattern $\{P_1 \ \texttt{OPTIONAL} \ \{P_2 \ \texttt{OPTIONAL} \ P_3\}\}$, $P_1$ cannot be injected into $P_3$ by the greedy transformation strategy even if it is selective, but its results can serve as candidates for $P_3$ via $P_2$. In the special case where there is only a BGP node to the left of the \texttt{UNION} or \texttt{OPTIONAL} node, performing transformations on the BGP is equivalent to candidate pruning. In this case, tree transformation is skipped to evade the additional overhead.
+
+% Introduce Jena's stream execution in the experiments section. Point out the similarities and differences compared with candidate pruning, and explain how we conducted the experiments.

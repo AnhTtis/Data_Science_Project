@@ -1,0 +1,157 @@
+\section{Method} 
+Given a 3D model of a rigid object, our goal is to estimate its 6D pose $[\bm{R}|\bm{t}] \in SE(3)$, where $\bm{R}$ and $\bm{t}$ represent the rotation matrix and translation vector respectively.
+Therefore, we propose an asymmetric encoder-decoder architecture\footnote{The encoder part is relatively larger than the decoder part.}, called \method, that predicts 2D-3D correspondences between pixel space and object coordinates, which can then be directly used to estimate the relative camera-to-object transformation using the well-established \gls{PnP} algorithm~\cite{Lepetit_undated-le}.
+Inspired by~\cite{Park2019-ny}, our model additionally predicts the error of estimated model coordinates to exclude erroneous correspondences in the \gls{PnP} step.
+This enables increased robustness in cases where the CAD models are imperfect due to 3D reconstruction, modeling errors, or other deteriorating circumstances. 
+In addition, we propose the addition of surface region segmentation as an auxiliary task to address the issue of object symmetries~\cite{Hodan2020-dz}, similar to~\cite{Wang2021-sj}. 
+To further improve the estimated pose, we use the predicted error map to formulate different object pose hypotheses.
+At last, we refine all hypotheses using a probabilistic refinement~\cite{Stoiber2020-gb} and select the pose estimate with the highest probability. 
+
+\subsection{Learning-based Monocular 6D Pose Estimation}
+\label{subsec:pose_estimation}
+As visualized in Figure~\ref{fig:overview} we decouple detection from pose estimation and input a cropped, square RGB image $\bm{I} \in \mathbb{N}^{h\text{x}w\text{x}3}$ of a detected object to our network.
+In the following, we elaborate further on each particular output.
+
+\subsubsection{Dense Correspondence Regression}\label{meth:dense}
+Our goal is to regress the coordinates of model points $\bm{q}=[x,y,z]^\mathsf{T}\in \mathbb{R}^3$ on the surface of an object in its inertial frame for each object image coordinate $\bm{p}= [u, v]^\mathsf{T}\in\mathbb{N}^2$. 
+
+Hence, \method~outputs a matrix $\widehat{\bm{I}}_{\tilde{q}} \in \mathbb{R}^{h\text{x}w\text{x}3}$, where each pixel location corresponds to the normalized object's coordinates $\bm{\tilde{q}}$.
+Each channel represents one of the three coordinate axes.
+To generate the coordinate target $\bm{I}_{\tilde{q}}$ we render the object using its approximate 3D model to obtain $\bm{I_{q}}$ and normalize it. 
+Simultaneously, we use the rendering to determine the target object mask $\bm{I}_{o} \in \mathbb{Z}_{2}^{h\text{x}w}$. 
+It should be noted, that these renderings are based on the approximate CAD model available and do not have to be the ground truth.
+
+We apply the $L_1$ loss only on the pixel within the object mask ${\bm{I}_o}$:
+\begin{equation}
+	\loss_{\tilde{q}} = \norm{\bm{I}_{o} \odot (\widehat{\bm{I}}_{\tilde{q}} - \bm{I}_{\tilde{q}})}_{1} ,
+\end{equation}
+where $\odot$ denotes element-wise multiplication. 
+
+In addition, our method also outputs a confidence map $\widehat{\bm{I}}_o \in \mathbb{R}^{h\text{x}w}$ where each pixel represents a score whether it belongs to the object or not.
+
+To learn the object segmentation, we employ the \gls{BCE} loss
+\begin{equation}
+	\loss_{o} = \gls{BCE}(\widehat{\bm{I}}_o, \bm{I_{o}}) .
+\end{equation}
+
+\subsubsection{Coordinate Prediction Error Estimation}
+Given both maps, one could directly estimate an object's 6D pose by applying a threshold on the confidence $\widehat{\bm{I}}_o$ and forwarding the corresponding 3D points of $\widehat{\bm{I}}_{\tilde{q}}$ to the \gls{PnP} algorithm.
+
+In this case, the PnP post-processing exclusively relies on the predicted object mask and equally considers all estimated corresponding model coordinates.
+However, due to deteriorating visual effects, occlusions, or modeling errors many of those coordinates can be erroneous (see~\ref{subsubsec:exp:error}).
+Although the \gls{RANSAC} voting scheme employed with most \gls{PnP} approaches handles outliers effectively, these prediction errors accumulate and deteriorate the final rotation and especially translation estimates. 
+This is one of the reasons, why Li~\etal\cite{Li2019-tq} propose an additional network to directly predict the translation.
+In this work, we address this issue by excluding possibly erroneous correspondences, inspired by~\cite{Park2019-ny}.
+
+We add an additional output channel which is trained to predict the $L_1$ error of the predicted model coordinates at each foreground pixel location $\bm{I}_e= \norm{\bm{I}_{o} \odot (\widehat{\bm{I}}_{\tilde{q}} - \bm{I}_{\tilde{q}})}_{1}$ without reducing it.
+We employ a bounded mean squared error as the training loss 
+\begin{equation}
+	\loss_{e} = min(\norm{\widehat{\bm{I}}_e - \bm{I}_e}^2_2, 1)
+\end{equation}
+for the predicted error map $\widehat{\bm{I}}_e$.
+As our experiments show (cf.~\ref{subsubsec:exp:error}), this extra output channel does not reduce the coordinate prediction performance, even when learning with high-quality CAD models, and without requiring an extra network head for translation estimation.
+
+Further, since $\bm{I}_e$ is calculated online and only requires $\bm{I}_o$ and $\bm{I}_{\tilde{q}}$, no additional label generation or data-loading logic is required such that any existing 2D-3D dense correspondence method can be extended with only a few lines of code.
+% We will show in \todo{EXPERIMENTS} that adding this extra target to training does not deteriorate the coordinate prediction performance, even when learning with excellent CAD models. 
+% In addition, the error prediction module comes with very little computational and software development overhead. 
+% It can be added to any 2D-3D dense correspondence method in a few lines of code. 
+% Since the target is calculated online, no additional data-loading logic is required.
+
+\subsubsection{Surface Region Segmentation}
+Satellites and many other objects can exhibit strong symmetries which can drastically impair the performance of pose estimation methods. 
+Correspondence-based methods map local features in the input to 3D model coordinates and hence assume a one-to-one relationship. 
+In the case of many-to-many correspondences, these methods trade-off possible locations and can return the average, which is often non-viable~\cite{Hodan2020-dz}. 
+
+To this end, we add an auxiliary task that learns to classify sub-regions on the target object, inspired by~\cite{Wang2021-sj, Hodan2020-dz}.
+We cast this as a multi-class segmentation and create $n$ region classes applying farthest-point sampling.
+
+In essence, we calculate the $n$ model points farthest away from each other. 
+Then, we classify each surface point depending on which farthest point it is closest to. 
+The resulting segmentation map is one-hot encoded which leads to the training target $\bm{I}_r \in \mathbb{Z}_{2}^{h\text{x}w\text{x}n}$. % with one channel per surface region. 
+
+Similar to $\loss_{\tilde{q}}$, the related loss $\loss_{r}$ only considers foreground pixels %similar to the error and coordinates loss functions 
+and uses \gls{CE} 
+\begin{equation}
+	\loss_{r} = \gls{CE}(\bm{I}_o \odot \widehat{\bm{I}}_r, \bm{I}_r) .
+\end{equation}
+
+% The surface region segmentation $\widehat{\bm{I_r}}$ is only used during training and not used in the \gls{PnP} step.
+
+\noindent\textbf{Training.} The total loss, consisting of coordinates $\loss_{\tilde{q}}$, foreground segmentation $\loss_{o}$, error prediction $\loss_{e}$, and surface region segmentation $\loss_{r}$ loss is 
+\begin{equation}
+	\loss = \alpha \cdot \loss_{\tilde{q}} + \beta \cdot \loss_{o} +  \gamma \cdot \loss_{e} + \delta \cdot \loss_{r} ,
+\end{equation}
+
+scaled by weights $\alpha, \beta, \gamma, \delta$. 
+We evaluate different backbones and decoders and detail those in the experiment section. 
+
+\subsection{Learned Region-based Pose Refinement}
+In this work, we build on the probabilistic, region-based approach developed in \cite{Stoiber2020-gb, Stoiber2022-ka}.
+In general, region-based methods use image statistics to differentiate between a foreground that corresponds to the object and a background.
+They then try to find the pose that best explains this segmentation.
+While region-based techniques work very well in a wide variety of scenarios, many methods only use simple color histograms to differentiate between the object and the background.
+Thus, such approaches require distinct RGB colors to be viable.
+To overcome this limitation and use region-based refinement in the hard visual conditions of orbital pose estimation, where color alone does not provide strong information, we incorporated the learned features from Section~\ref{meth:dense}.
+In addition to learned color, they are able to include information from global object appearances such as texture or geometry.
+
+During the optimization, information is only considered along so-called correspondence lines.
+Correspondence lines are defined by a center $\bm{c}\in\mathbb{R}^2$ and a normal vector $\bm{n}\in\mathbb{R}^2$ that are projected from the view of a sparse viewpoint model closest to the current pose estimate.
+Given a line coordinate $r\in \mathbb{R}$ and the corresponding image coordinate $\bm{p} = \bm{c}+r\bm{n}$, a correspondence line $\bm{l}$ maps a scalar $r\in \mathbb{R}$ to an image value $\bm{\tau} = \bm{l}(r)=\bm{I}(\bm{p})$, with $\bm{\tau} \in \{0,...,255\}^3$.
+Like other approaches, we approximate the probability distributions $p(\bm{\tau} \mid m_\textrm{f})$ and $p(\bm{\tau} \mid m_\textrm{b})$ of foreground and background colors, with color histograms.
+They are calculated by sampling pixels along correspondence lines on either side of the contour.
+Given a specific pixel color $\bm{\tau}$, the distributions can be used to calculate the color-based pixel-wise posteriors of the foreground and background model $m_\textrm{f}$ and $m_\textrm{b}$ as
+\begin{equation} \label{eq:ref:pwp}
+	p(m_i \mid  \bm{\tau}) = \frac{p(\bm{\tau}\mid m_i)}{p(\bm{\tau} \mid  m_\textrm{f}) + p(\bm{\tau} \mid  m_\textrm{b})} , \quad i\in\{\textrm{f}, \textrm{b}\}.
+\end{equation}
+
+In general, color histograms alone can be brittle if the foreground and background exhibit similar color statistics.
+We therefore incorporate the learned confidences $p_{\psi}(m_f \mid \bm{p})=\bm{\widehat{I}}_o(\bm{p})$ and $p_{\psi}(m_b \mid \bm{p})=1-\bm{\widehat{I}}_o(\bm{p})$, parameterized by the neural network weights $\psi$, from the pose estimator as salient features.
+In order to retain information from both sources, we average the color-based pixel-wise posteriors and the learned confidences as follows
+\begin{equation} \label{eq:method:pwp_theta}
+	p_i = \frac{1}{2}(p(m_i \mid  \bm{\tau}) + p_{\psi}(m_i \mid \bm{p})), \quad i\in\{\textrm{f}, \textrm{b}\}.
+\end{equation}
+Due to the overconfidence of learned segmentation maps, most values in $\widehat{\bm{I}}_o$ are either $0$ or $1$. 
+As a result, we cannot treat the learned confidence as a probability, otherwise, the learned confidence dominates the calculation of the probabilities.
+
+Like in our previous work~\cite{Stoiber2022-lq}, we combine measurements from individual pixels along the correspondence line $\bm{l}$ to compute the probability of the contour location $d\in\mathbb{R}$ as follows
+\begin{equation}
+	p(d\mid \bm{\pazocal{D}}_{\bm{l}} ) \propto \prod_{r\in\omega}h_\textrm{f}(r-d)p_\textrm{f}(r) + h_\textrm{b}(r-d)p_\textrm{b}(r),
+\end{equation}
+with the correspondence line domain $\omega$  and the smoothed step functions $h_\textrm{f}$ and $h_\textrm{b}$.
+Detailed information about those functions can be found in \cite{Stoiber2020-gb, Stoiber2022-ka}.
+The contour location $d$ relative to the center $\bm{c}$ depends on the 6D pose variation $\bm{\theta}$ and can be calculated as follows
+\begin{equation}
+	d(\bm{\theta}) = \bm{n}^\top\big(\bm{\pi}(\bm{q}(\bm{\theta}))-\bm{c}\big),
+\end{equation}
+where $\bm{q}$ is the 3D model point from the sparse viewpoint model that was used to establish $\bm{c}$, given in the camera frame, and $\bm{p}=\bm{\pi} (\bm{q})$ denotes the pinhole camera model. 
+
+Finally, information from valid correspondence lines is combined to estimate the probability of the pose variation
+\begin{equation} \label{eq:method:probability}
+	p(\bm{\theta}\mid \bm{\pazocal{D}}) \propto \prod_{i=1}^{n}p(d_{i}(\bm{\theta})\mid\bm{\pazocal{D}}_{{\bm{l}}i} )^\frac{s_\textrm{h} s^2}{{\sigma_\textrm{r}}^2 {\bar{n}_i}^2},
+\end{equation}
+with the scale $s\in \mathbb{N}^+$, the user-defined standard deviation $\sigma_\textrm{r}$, the slope parameter $s_\textrm{h} \in \mathbb{R}^+$, and the normal component $\bar{n}_i=\norm{\bm{n}_i}_{max}$.
+While the standard deviation can be used to define the overall uncertainty, all other parameters are part of a scale-space formulation that improves efficiency.
+For a detailed explanation, please refer to~\cite{Stoiber2020-gb, Stoiber2022-ka}.
+
+To refine pose estimates, Eq.~(\ref{eq:method:probability}) is iteratively maximized using Newton optimization with Tikhonov regularization, considering both learned and color-based region information.
+In addition, the formulation also allows the calculation of a probability that assesses the confidence of a particular estimate. 
+
+\subsection{Multi-Hypothesis Testing}
+\label{subsec:multi_hypothesis}
+Given a probabilistic formulation that enables the comparison of different pose estimates in Eq.~(\ref{eq:method:probability}), we can now utilize the error prediction map $\widehat{\bm{I}}_e$ more efficiently. 
+
+If the error threshold is just set to a static value, we have to find a trade-off between very accurate estimates and being robust to difficult samples. 
+Consider the case, that the model is very confident about its current correspondence prediction. 
+In that case, we only want to take the very best 2D-3D correspondences into account for \gls{PnP}. 
+In contrast, if the visual conditions are challenging it is often beneficial to set the threshold to a higher value and consider more correspondences. % for the pose estimation. 
+
+Using Eq.~\ref{eq:method:probability} of the refiner, we are able to estimate poses at different error thresholds $\varepsilon \in [0,1]$, refine each individual pose, and subsequently, compare the resulting probability. 
+In the end, we choose the pose estimate with the highest probability, given the color statistics and learned confidence map $\widehat{\bm{I}}_o$.
+\begin{figure*}[t]
+    \centering
+    \def\svgwidth{\textwidth}
+    \import{images/}{examples.pdf_tex}
+    \caption{Qualitative results of \method~on SPEED+~\cite{Park2021-jr} test samples. The top row depicts the input image while the bottom one shows a wireframe model with an estimated pose projected on the image. The left and right areas show samples from the \texttt{sunlamp} and \texttt{lightbox} categories respectively.}
+    \label{fig:speedplus_samples}
+\vspace{-4mm}
+\end{figure*}

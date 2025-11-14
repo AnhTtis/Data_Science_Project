@@ -1,0 +1,199 @@
+\section{Method} \label{sec:method}
+
+
+Let $\{I_j^i\}$ $(j=1 \ldots N, i=1 \ldots M)$ be multi-view frames of a person's head performing diverse expressions, where $N$ is the number of frames and $M$ is the total number of cameras. Our goal is to create a high-quality volumetric avatar of the person's head, which can be built in a reasonable time and rendered under novel views and expressions at unprecedented photorealism and accuracy.
+Humans are capable of performing extremely diverse and extreme expressions. Our model should be able to capture these in a multi-view consistent manner with a high degree of photorealism.
+%
+As shown in Fig.~\ref{fig:method} (a), we have 4 components. Our model drives the avatar from a monocular image encoded via a CNN-based image network $E_\gamma$. We then have an MLP-based deformation network $A_\theta$, which can map a point in the world coordinate system to a canonical space conditioned on the image encoding. We learn features in the canonical space using a multiresolution hash grid $A_\alpha$. The features in the grid are interpreted to infer color and density values using an MLP-based network $A_\beta$. 
+Given any camera parameters, 
+we use volumetric integration to render the avatar.
+%
+In the following, we provide details about the capture setup and data pre-processing step (Sec.~\ref{subsec:dataset}), describe the scene representation of our model (Sec.~\ref{subsec:representation}), and formulate various objective functions used for model training (Sec.~\ref{subsec:obj_functions}).
+
+\input{figures/mv_capture}
+\subsection{Data Capture}
+\label{subsec:dataset}
+\paragraph{\textbf{Capture Setting.}}
+Our approach is trained using multi-view images captured from a 360-degree camera rig.
+%
+The rig is equipped with 24 Sony RXO II cameras, which are hardware-synced and record 4K resolution videos at $25$ frames per second. The cameras are positioned in such a way that they capture the entire human head, including the scalp hair. The rig is covered by LED strips to ensure uniform illumination. In our setup, we recorded a total of $16$ identities performing a wide variety of facial expressions and head movements.
+Please see Fig.~\ref{fig:rig} for a sample identity captured from multiple viewpoints. For a more detailed description of our dataset, please refer to Sec.~\ref{sec:datasets}.
+
+\paragraph{\textbf{Preprocessing}.}
+Cameras are calibrated using a static structure with a large number of distinctive features. Here, we use Metashape \cite{metashape} to estimate the extrinsic and intrinsic parameters. We also perform background subtraction using the matting approach of Lin~\etal~\cite{lin2021_back_mattv2} to remove any static elements from the scene, e.g., wires, cameras, etc. To simplify background subtraction, a diffused white sheet was placed inside the rig, with holes for each of the camera lenses.
+
+
+  
+\subsection{Scene Representation}
+\label{subsec:representation}
+
+%
+We parameterize our model using Neural Radiance Fields inspired by the state-of-the-art novel view synthesis method NeRF~\cite{mildenhall2022_nerf}. Since the original method is slow to train and render, we utilize a multiresolution hash grid-based representation to make our model efficient, akin to instant NGP \cite{mueller2022_instant-ngp}.
+%
+As both original NeRF and instant NGP were proposed for static scene reconstruction, we seek to model the dynamic performance of the head, including facial expressions. 
+To this end, we represent our model, $A$ as 
+%
+\begin{equation}
+    A : (\rvx, \rvv, \rve) \rightarrow (\rvc, \sigma) \; \text{,}
+\end{equation}
+where $\rvx \in \mathbb{R}^3$ is a point in $3D$, $\rvv \in \mathbb{S}^2$ is the viewing direction,
+%
+$e \in \mathbb{R}^{256}$ represents the latent vector obtained from the image encoding network $E_\gamma$. This latent vector parameterizes deformations due to expressions and head movements.
+%
+Furthermore, $\rvc$ and $\sigma$ are the color and density values, respectively.  
+%
+Mathematically, instant NGP parameterizes $A$ with two modules. The first module is based on a multiresolution hash grid, denoted $A_\alpha$, and the second module is parameterized by an MLP, denoted $A_\beta$. The latter takes features looked up from $A_\alpha$ and decodes a given point $\rvx$ and view direction $\rvv$ into $\rvc$ and $\sigma$.
+%
+To model dynamic variations of the input driving performance, we introduce another module, denoted $A_\theta$, which takes as input a point in world space and expression latent vector, and regresses a deformation field that converts the world point $x$ to a canonical space, as follows:
+%
+\begin{equation}
+\label{eq:can_point}
+    \rvx_o = A_\theta(\rvx, \rve) + \rvx \; \text{.}
+\end{equation}
+%
+We learn the radiance field in this canonical space using $A_\alpha$ and $A_\beta$, and parameterize the operator $A_\theta$ using a linear MLP.
+%
+One could also naively provide the driving image latent code directly to $A_\beta$ instead of modeling a deformation field to canonical space. 
+%
+However, we show in our experiments (see Sec.~\ref{sec:ablation_study}) that such a naive parameterization creates artifacts. Thus, learning a deformation field is critical in reducing the artifacts.
+
+%
+Once we have the radiance field representation of the scene, we use standard volumetric integration to synthesize color $\rmC$  for each ray $\rvr(t) = \rvo + t\rvd$, with near and far bounds $t_n$ and $t_f$, as follows:
+%
+\begin{align}
+\rmC(\rvr) &= \int_{t_n}^{t_f} T(t) \sigma(\rvr(t)) \rvc(\rvr(t)) dt \nonumber \; \text{,}\\
+\text{where} \quad T(t) &= \text{exp}(-\int_{t_n}^{t}\sigma(\rvr(s)) ds).
+\label{eq:nerf_vol_int}
+\end{align}
+
+\paragraph{\textbf{Efficient ray marching.}}
+As in instant NGP, we improve efficiency by skipping regions that do not contribute to the final color based on the coarse occupancy grid. The occupancy grid typically spans $64^3$ resolution, with each cell represented by a single bit. 
+%
+The occupancy grid is updated at regular intervals by evaluating the density of the model in the corresponding region in space.
+%
+The high in each bit represents the corresponding $3D$ region that has density above a certain threshold. Note that only these regions contribute to the final rendering.  
+%
+As our scene is dynamic, we make certain changes to suit this setting. We initialize $G$ separated occupancy grids corresponding to $G$ uniformly sampled frames. 
+We update each of these grids independently for $200,000$ iterations. 
+Then, we take the union of all the grids to create a single occupancy grid 
+ that we utilize for the rest of the training and novel view synthesis. 
+
+
+\subsection{Encoder}
+\label{subsec:encoder}
+ %
+Our model is conditioned on a latent vector $\rve$ to drive the avatar.
+%
+%
+In the literature, some methods use expression parameters obtained from face tracking using an existing morphable model~\cite{gafni2021_dynamic-nerf, athar2022rignerf}.
+%
+Other methods parameterize the latent vector obtained from an image encoder~\cite{raj21_pixel-aligned}. 
+%
+Using an image encoder is advantageous since it can capture diverse expressions as opposed to expression parameters obtained from a 3DMM. 
+%
+Typically, tracking pipelines utilize linear morphable models that have limited expressivity and are prone to tracking errors \cite{mallikarjun2021_learning-complete}.
+%
+In this paper, we rely on image encoder $E_\gamma$ to parameterize the dynamics of the human head 
+because it allows us to capture diverse and extreme expressions faithfully, which is the main focus of our paper. We parameterize $E_\gamma$ using a CNN-based network, which receives as input an image $\rmI$ and outputs the encoding vector $\rve$. 
+Specifically, we adopt a pre-trained VGG-Face model~\cite{Parkhi15} as our encoder and add a custom linear layer at the end. During training, we finetune all the VGG layers as well as the custom layer.
+
+
+\subsection{Objective Function}
+\label{subsec:obj_functions}
+
+Given the above representation of our model, we learn the parameters of $E_\gamma, A_\theta, A_\alpha$, and $A_\beta$ modules in a supervised manner using multi-view image and perceptual constraints as well as dense temporal correspondences:
+
+%
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{L2} + \lambda_{perc} \mathcal{L}_{perc} + \lambda_{of} \mathcal{L}_{of} \; \text{.}
+    \label{eq:obj_function}
+\end{equation}
+
+\paragraph{\textbf{Reconstruction Losses.}} 
+Given camera extrinsic and model representation, we render images and employ image reconstruction loss, $\mathcal{L}_{L2}$ using L2 loss between ground truth and rendered images. This term introduces multi-view constraints to train our model. 
+%
+However, L2 loss alone could result in missing some high-frequency details, which are perceptually very important.
+%
+As a result, we introduce a widely used patch-based perceptual loss $\mathcal{L}_{perc}$, based on a pre-trained VGG Face network~\cite{Parkhi15}. We use the output of the first $6$ layers obtained from an input patch size of $64\times64$ to compute this loss term.
+
+\paragraph{\textbf{Optical flow based Loss.}}
+As our dataset consists of sparse views and hash grid-based representation has localized features, 
+a model trained only with $\mathcal{L}_{L2}$ and $\mathcal{L}_{perc}$ losses tend to overfit training views, resulting in artifacts when rendering novel views.
+%
+To mitigate it, we propose a novel loss term $\mathcal{L}_{of}$ based on pre-computed $2D$ optical flow between concurrent frames. 
+%
+The motivation behind this loss term is to propagate pixel correspondences to the 3D canonical space with the aim to regularize the dynamic scene and mitigate the model's artifacts when trained with sparser views.
+%
+We achieve this by enforcing the canonical points of neighboring temporal frames to be close to each other for the points near the surface of the avatar.
+
+Mathematically, let $p^t$, $p^{t+1}$ be the corresponding pixels between consecutive frames obtained using $2D$ optical flow. For these pixels, we first obtain their corresponding expected depth values through volume rendering. The corresponding $3D$ points $x^t$, $x^{t+1}$ associated with expected depth can be considered to be close to the surface. We find the corresponding points in the canonical space using $A_\theta$, as defined in Eq.~\ref{eq:can_point}. Let $x_o^t$ and $x_o^{t+1}$ be the corresponding points in the canonical space. We enforce all such points to be close between them by employing an L1 loss, similar to ~\cite{kasten2021layered}:
+\begin{equation}
+\label{eq:flow}
+    \mathcal{L}_{of} = \| x_o^t - x_o^{t+1} \|_1 \; .
+\end{equation}
+
+%
+%
+
+\iffalse
+\paragraph{\textbf{Expression Latent Consistency Loss}}
+%
+Let the encoder be ${E_\gamma}$.
+%
+As mentioned (in Sec.~\ref{subsec:encoder}) the image encoder-based solution is prone to over-fitting to training camera pose images and struggles to work with novel views.
+%
+We take advantage of the superior quality of the reconstructed avatar to make our encoder robust to novel views. 
+%
+In specific, we start our image encoder ($E_\gamma$) training with a single frontal camera ($C_f$) frames and use the expression latent to completely train the rest of the model ($A$).
+%
+Once sufficiently trained, we now can synthesize our avatar to perform any novel view rendering under any expression conditioned on frames from $C_f$.
+%
+We now fix the parameters of the decoder($A$) and train only image encoder($E_\gamma$) with  data synthetically generated from other camera views. 
+%
+This can be supervised using the same loss as in Eq.~\ref{eq:obj_function}.
+%
+Naively training with the augmented images still doesn't generalize well as the latent code for different views could converge to different representation.
+%
+We propose another loss term called expression latent consistency, $\mathcal{L}_{code}$ that enforces the expression latent obtained from image encoder from different view to be close to each other.
+%
+Let $e_f^{t}$ be the expression latent obtained for frame $t$ from camera $C_f$ and $e_i^{t}$ be latent for the frame $t$ from any other camera $i$, that can observe expression changes. We have,
+\begin{equation}
+    \mathcal{L}_{code} = \| e_f^{t} - e_i^{t} \|_2
+\end{equation}
+This helps in training an encoder that can generalize better. We later show the same in Sec.~\ref{sec:ablation_study}.
+\fi
+
+Please refer to Fig.~\ref{fig:method} (b) for an illustration of the proposed loss term.
+
+
+\subsection{Implementation Details}\label{sec:implementation_details}
+
+%
+We use $5$ layered MLP as our deformation network $A_\theta$.
+%
+We provide hash encoding parameters and their ranges used in our experiments in Tab.~\ref{tab:hashgrid_parameters}.
+%
+Our radiance field network $A_\beta$ is parameterized by a $5$ layer-deep MLP.
+%
+We set $\lambda_{perc}=0.1$ and $\lambda_{of}=0.2$ in our experiments.
+%
+We also follow a PyTorch implementation~\cite{tang2022_torch-ngp} of instant NGP~\cite{mueller2022_instant-ngp} to employ error map-based pixel sampling while training, for better convergence. Specifically, we maintain a $128$x$128$ resolution error map for each training image, which is updated in every iteration to reflect the pixel-wise $L_2$ error. This is then used to sample rays where errors are the highest at each iteration. 
+%
+Finally, we update our encoder $E_\gamma$, deformation network $A_\theta$, hash grid $A_\alpha$ and radiance field $A_\beta$ with learning rates $1e-5$, $1e-3$, $1e-2$ and $1e-3$, respectively. Our model is trained for $500,000$ iterations.
+We have observed that model convergence is faster than in MVP~\cite{lombardi21_mvp}. It takes about $12$ hours to converge, as opposed to the $50$ hours required by MVP with the same GPU resources.
+
+
+\begin{table}[]
+\centering
+\begin{tabular}{ll}
+\toprule
+    Parameter                                   &   Values \\ \hline
+    Number of levels                            &   $16$     \\
+    Max. entries per level (hash table size)    &   $2^{14}$   \\
+    Number of feature dimensions per entry      &   $2$     \\
+    Coarsest resolution                         &   $16$     \\      
+    Finest resolution                           &   $2048$     \\ \hline
+\end{tabular}
+\caption{Different parameters used for defining the hash grid.}
+\label{tab:hashgrid_parameters}
+\end{table}

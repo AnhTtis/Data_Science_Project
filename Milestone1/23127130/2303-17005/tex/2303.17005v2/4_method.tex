@@ -1,0 +1,217 @@
+% !TEX root = main.tex
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%                                Method                                %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Filter Description}
+\label{sec:filter_description}
+
+In this section, we will present the tightly-coupled multi-sensors fusion based on the state-of-art MSCKF \cite{MSCKF_Mourikis_2007} framework.
+For underwater robots, we further present the measurement update equations for the DVL and pressure sensor, followed by our keyframe selection strategy.
+
+\subsection{State Vector} 
+We follow the notation in~\cite{OpenVINS_Geneva_2020} and define the system state to be $\mathbf{x}_k$ at the time step, $k$.
+As shown in Eq.~\ref{eq:states} to \ref{eq:states_3}, the system state consists of the current IMU state, $\mathbf{x}_{IMU}$ and the clone state, $\mathbf{x}_{C}$, which contains $n$ past IMU poses.
+In Eq.~\ref{eq:states_2} and \ref{eq:states_3}, ${^{I_k}_{G}}\bar{q}$ \cite{IndirectKF-Trawny-2005} is the unit quaternion representing the rotation from the global frame $\{G\}$ to the IMU frame $\{{I_k}\}$ at time $k$,
+${^G}\mathbf{p}_{I_k}$ and ${^G}\mathbf{v}_{I_k}$ are the IMU position and velocity with respect to $\{G\}$, 
+$\mathbf{b}_g$ and $\mathbf{b}_a$ describe the biases of the angular velocity and linear acceleration measured by the gyro and accelerometer in an IMU. 
+The cloned IMU poses are denoted by $\{{^{I_i}_{G}}\bar{q}$ and $ {^G}\mathbf{p}_{I_i}\}, i \in [1,n]$.
+\vspace{-2ex}
+\begin{align}
+\mathbf{x}_k  &= 
+        \left[ 
+               \begin{array}{cc} 
+                 \mathbf{x}_{IMU}^\top  & 
+                 \mathbf{x}_{Clone}^\top 
+               \end{array} 
+        \right]^\top 
+        \label{eq:states} \\
+\mathbf{x}_{IMU} &= 
+        \left[ 
+               \begin{array}{ccccc} 
+                 {^{I_k}_{G}}\bar{q}^\top  & 
+                 {^G}\mathbf{p}_{I_k}^\top &
+                 {^G}\mathbf{v}_{I_k}^\top &
+                 \mathbf{b}_g^\top     &
+                 \mathbf{b}_a^\top 
+               \end{array} 
+        \right]^\top 
+        \label{eq:states_2} \\
+\mathbf{x}_{Clone} &= 
+        \left[ 
+               \begin{array}{ccccc} 
+                 {^{I_1}_{G}}\bar{q}^\top  & 
+                 {^G}\mathbf{p}_{I_1}^\top &
+                 \cdots &
+                 {^{I_n}_{G}}\bar{q}^\top     &
+                 {^G}\mathbf{p}_{I_n}^\top 
+               \end{array} 
+        \right]^\top 
+        \label{eq:states_3}
+\end{align}
+
+In this paper, we define $\mathbf{x}=\hat{\mathbf{x}} \boxplus \tilde{\mathbf{x}}$, 
+where $\mathbf{x}$ is the true state, $\hat{\mathbf{x}}$ is estimation, $\tilde{\mathbf{x}}$
+is the error state, and the $\boxplus$ operation maps the vector to a given manifold
+\cite{Manifold-Fusion_Hertzberg_2013}. For quaternions, we define the quaternion boxplus 
+operation using the left quaternion error in Eq.~\ref{eq:q_manifold} where $\boldsymbol{\theta}$ is the Euler angles.
+\begin{equation}
+\label{eq:q_manifold}
+    \bar{q} \boxplus \delta \boldsymbol{\theta} 
+        \triangleq 
+    \left[ \begin{array}{c} \dfrac{1}{2}\delta  \boldsymbol{\theta}  \\ 1 
+           \end{array} 
+    \right] \otimes \bar{q}
+\end{equation}
+
+\subsection{IMU Propagation}
+The state is propagated from $k-1$ to $k$ time step using the generic nonlinear IMU kinematics model  \cite{Fundamental-Inertial-Nav_Chatfield_1997} with IMU measurements, including linear accelerations (${^I}\mathbf{a}_m$) and angular velocities (${^I}\bm{\omega}_m$).
+\begin{align}\label{eq:prop_nonlinear}
+    \mathbf{x}_k = f(\mathbf{x}_{k-1}, {^I}\mathbf{a}_m, {^I}\boldsymbol{\omega}_m, \mathbf{n}_I)
+\end{align}
+where $\mathbf{n}_I = \left[ 
+                        \begin{array}{cccc} 
+                            \mathbf{n}_g^\top    & 
+                            \mathbf{n}_a^\top    &
+                            \mathbf{n}_{\omega g}^\top &
+                            \mathbf{n}_{\omega a}^\top        
+                        \end{array} 
+                    \right]^\top $,
+including the zero-mean Gaussian noise ($\mathbf{n}_g$ and $\mathbf{n}_a$) and the random walk bias noise ($\mathbf{n}_{\omega g}$ and $\mathbf{n}_{\omega a}$) for the gyroscope and accelerometer.
+The estimated state and propagated covariance are:
+\begin{align}\label{eq:propagated}
+    \mathbf{\hat{x}}_{k|k-1} & = 
+        f(\mathbf{\hat{x}}_{k-1|k-1}, {^I}\mathbf{a}_m, {^I}\boldsymbol{\omega}_m, \mathbf{0}) \\
+    \mathbf{P}_{k|k-1}       & = 
+        \boldsymbol{\Phi}_{k|k-1} \mathbf{P}_{k-1|k-1} \boldsymbol{\Phi}_{k|k-1}^\top +
+        \mathbf{G}_{k-1} \mathbf{Q} \mathbf{G}_{k-1}^\top
+\end{align}
+where $\mathbf{\hat{x}}_{k|k-1}$ denotes the estimated state at time $k$ given the measurements at time $k-1$, $\boldsymbol{\Phi}_{k|k-1}$ and $\mathbf{G}_{k-1}$ are system Jacobian and noise Jacobian of the nonlinear system \cite{MSCKF_Mourikis_2007}, and $\mathbf{Q}$ is a discrete-time covariance matrix of IMU noise $\mathbf{n}_I$.
+
+% \subsection{State Augmentation}
+
+% When the image keyframe is determined, IMU state will propagate forward to the timestep of the image. 
+% The propagated inertial state is cloned to $\mathbf{x}_C$, and the covariance matrix is augmented using the equation below.
+
+% \begin{align}\label{eq:cov_aug}
+% \mathbf{P}_{k|k}     = \left[ 
+%                           \begin{array}{c} 
+%                              \mathbf{I}_{(15+6n)}       \\ 
+%                              \mathbf{J}
+%                           \end{array} 
+%                          \right] 
+%                          \mathbf{P}_{k|k}  
+%                          \left[ 
+%                           \begin{array}{c} 
+%                              \mathbf{I}_{(15+6n)}       \\ 
+%                              \mathbf{J} 
+%                           \end{array} 
+%                          \right]^\top                   
+% \end{align}
+% where the Jacobian $\mathbf{J}$ is given by:
+% \begin{align}\label{eq:cov_aug_J}
+% \mathbf{J} = 
+%   \left[ 
+%     \begin{array}{cccc} 
+%        \mathbf{I}_{3\times3} & \mathbf{0}_{3\times3}  &
+%        \mathbf{0}_{3\times9} & \mathbf{0}_{3\times6n} \\ 
+%        \mathbf{0}_{3\times3} & \mathbf{I}_{3\times3}  &
+%        \mathbf{0}_{3\times9} & \mathbf{0}_{3\times6n}
+%     \end{array} 
+%   \right]                 
+% \end{align}
+
+\subsection{DVL Velocity Measurement Update}
+
+% measurement function
+The DVL velocity measurement is defined in Eq.~\ref{eq:dvl_measurement} which is a function of the linear and angular velocity in the IMU frame, the relative transformation (${^I_D}\mathbf{R}$ and ${^I}\mathbf{p}_D$) between the IMU frame and the DVL frame, and the rotation (${^{I_k}_G}\mathbf{R}$) from the global frame to the IMU frame.
+We also have the measurement noise $\mathbf{n}_D \thicksim \mathcal{N}(\mathbf{0}, \mathbf{R}_D)$, and the skew-symmetric matrix of the IMU's angular velocity denoted by
+$\lfloor {^{I_k}}\bm{\omega} \rfloor_\times$.
+For EKF update, the Jacobian matrix $\mathbf{H}_{D,k}$ with respect to the state, $\mathbf{x}_k)$ can be found in \cite{INS-DVL-Pressure_Zhao_2022}.
+\begin{align}\label{eq:dvl_measurement}
+    \mathbf{z}_{D,k} = h_D(\mathbf{x}_k)+ \mathbf{n}_D 
+                     = {^I_D}\mathbf{R}^\top 
+                     ({^{I_k}_G}\mathbf{R} {^G}\mathbf{v}_{I_k} + \lfloor {^{I_k}}\bm{\omega} \rfloor_{\times} {^I}\mathbf{p}_D)
+                     + \mathbf{n}_D
+\end{align}
+
+\subsection{Pressure Measurement Update}
+The pressure measurement can be written in Eq.~\ref{eq:z_measurement} where $\mathbf{s}=[\begin{array}{ccc} 0 & 0 & 1 \end{array}]$ used for selecting the third dimension, ${^P}\mathbf{P}_{in} = [\begin{array}{ccc} 0 & 0 & {^P}p_{in} \end{array}]^\top$ and ${^P}p_{in}$ are the pressure measurement at the initial position, ${^P}\mathbf{P}_{k} = [\begin{array}{ccc} 0 & 0 & {^P}p_{k} \end{array}]^\top$ and ${^P}p_k$ is the pressure measurement at timestamp $k$, the three rotation matrices (${^D_P}\mathbf{R}$, ${^I_D}\mathbf{R}$, and ${^{I_k}_G}\mathbf{R}^\top$) are used to transform the pressure measurement into the global frame, and $n_{p_z}$ is a zero-mean white Gaussian noise. 
+For EKF update, the Jacobian matrix $\mathbf{H}_{p_z}$ with respect to the state, $\mathbf{x}_k)$, can be found in \cite{INS-DVL-Pressure_Zhao_2022}.
+\begin{align}\label{eq:z_measurement}
+    z_{p_z,k} 
+        = h_{p_z}(\mathbf{x}_k)+ n_P
+        = \mathbf{s} {^{I_k}_G}\mathbf{R}^\top {^I_D}\mathbf{R} {^D_P}\mathbf{R} 
+           ({^P}\mathbf{P}_{in} - {^P}\mathbf{P}_{k}) + n_{p_z}
+\end{align}
+
+\subsection{Visual Measurement Update}
+
+We perform point feature tracking on a selected image and use the feature tracking results in multiple sequential images (or keyframe images) to update the system state and covariance. 
+For a well-calibrated camera, the measurement of a feature in the camera frame $\{C_i\}$ is the perspective projection of its 3D position 
+$\prescript{C_i}{}{\mathbf{p}}_{f} =[\prescript{C_i}{}{x},\prescript{C_i}{}{y},
+\prescript{C_i}{}{z}]^\top$ onto the normalized plane, which is given by Eq.~\ref{eq:cam_measurement} where $\prescript{C_i}{}{\mathbf{p}}_{f}$ is given by Eq.~\ref{eq:pf}.
+In Eq.~\ref{eq:cam_measurement} and \ref{eq:pf}, $\pi(\cdot)$ is the perspective projection function, function $\tau(\cdot)$ transforms a point based on the given transformation matrix,
+$\mathbf{n}_C$ is the zero-mean white Gaussian noise for camera measurement,
+$\{ \prescript{C}{I}{\mathbf{R}}, \prescript{C}{}{\mathbf{p}}_{I} \}$ is the extrinsic calibration between IMU and camera,
+$\{ \prescript{I_k}{G}{\mathbf{R}}, \prescript{G}{}{\mathbf{p}}_{I_k} \}$ 
+is the cloned IMU pose at image time $k$,
+$\prescript{G}{}{\mathbf{p}}_{f}$ is the feature's 3D position in the global frame. 
+\begin{align}\label{eq:cam_measurement}
+\mathbf{z}_{C,i} 
+  &= \pi(\prescript{C_i}{}{\mathbf{p}}_{f}) + \mathbf{n}_C 
+   = \left[ 
+        \begin{array}{c} 
+           \prescript{C_i}{}{x}/\prescript{C_i}{}{z} \\
+           \prescript{C_i}{}{y}/\prescript{C_i}{}{z}
+        \end{array} 
+     \right] + \mathbf{n}_C   
+\end{align}
+\vspace{-3ex}
+\begin{align}\label{eq:pf}
+\prescript{C_i}{}{\mathbf{p}}_{f}
+  = \tau(\prescript{G}{}{\mathbf{p}}_{f},  
+     \prescript{C}{I}{\mathbf{T}} \prescript{I_k}{G}{\mathbf{T}} ) 
+  = \prescript{C}{I}{\mathbf{R}} \prescript{I_k}{G}{\mathbf{R}} 
+     (\prescript{G}{}{\mathbf{p}}_{f} - \prescript{G}{}{\mathbf{p}}_{I_k}) 
+     + \prescript{C}{}{\mathbf{p}}_{I}
+\end{align}
+
+For each feature, we compute the residual using the Jacobian matrices of the measurement function (Eq.~\ref{eq:cam_measurement}) with respect to the state and feature ($\mathbf{H}_{x}$ and $\mathbf{H}_{f}$)
+\begin{align}\label{eq:res_cam_linearized}
+\mathbf{\tilde{z}}_{C_k} 
+  = \mathbf{H}_{x} \tilde{\mathbf{x}}_k +
+    \mathbf{H}_{f} \prescript{G}{}{\tilde{\mathbf{p}}}_{f} +
+    \mathbf{n}_C              
+\end{align}
+Next, we apply the left nullspace~\cite{MSCKF_Mourikis_2007} of the feature Jacobian to convert Eq.~\ref{eq:res_cam_linearized} to \ref{eq:res_cam_nullspace}, and used it for EKF update.
+\begin{align}\label{eq:res_cam_nullspace}
+\mathbf{N}^\top\mathbf{\tilde{z}}_{C_k} 
+  = \mathbf{N}^\top\mathbf{H}_{x} \tilde{\mathbf{x}}_k +
+    \mathbf{N}^\top \mathbf{n}_C              
+\end{align}
+
+\subsection{Keyframe Marginalization}
+
+During underwater exploration, the vehicle may hover or move closer for detailed visual investigation.
+While hovering will cause a small translation between two consecutive image frames, the vertical movements will cause a small feature disparity within two successful tracking steps.
+Both cases will lead to degraded triangulation results, which brings in bad visual updates for state estimation.
+In~\cite{MSCKF-Hovering_Kottas_2013}, the authors propose a marginalization strategy that updates features in a consistent way for the hovering case.
+However, in a more general way, we intend to use keyframe marginalization to handle more degenerate motions.
+Inspired by the keyframe-based visual SLAM~\cite{ORB-SLAM3_Campos_2021}, we have implemented a strategy to insert the IMU clones based on three criteria, feature numbers, motion constraint, and scene constraint.
+If a new image has more than 50 features detected, its translation (estimated from DVL-IMU fused odometry) has exceeded 0.1m, and more than 10\% of the features from the previous frame have disappeared, this new image will be treated as a keyframe.
+
+When we reach the maximum number of keyframes, the algorithm will perform a marginalization similar to the one in S-MSCKF~\cite{S-MSCKF_Sun_2018}. 
+While the standard MSCKF \cite{MSCKF_Mourikis_2007} uses the feature measurements in several poses (one-third of slide window evenly spaced), we will only use the feature measurements in two keyframes (the oldest one and the second-latest shown in Fig.~\ref{fig:feat_marg}) for standard MSCKF-feature update to reduce the computational cost.
+We also implemented another change during marginalization.
+Instead of removing two poses that were used in marginalization from the state matrix, our method will keep the second-latest pose even though it was used for marginalization.
+The second-latest pose is saved because of the following reasons.
+Any non-max-tracked features (i.e., $f_{j+1}$ in Fig.~\ref{fig:feat_marg}) detected in second-latest pose will have minimum impact on the update because these features only have one measurement when doing the marginalization.
+However, keeping these features and the pose will allow us to use them in the future for sufficient MSCKF-feature updates.
+
+\vspace{-3ex}
+\textbf{\begin{figure}[h] \centering
+\includegraphics[width=0.32\textwidth,height=0.16\textwidth]{images/feat_marg.png}
+    \caption{The feature marginalization when clones at maximum.} \label{fig:feat_marg}
+\end{figure}}

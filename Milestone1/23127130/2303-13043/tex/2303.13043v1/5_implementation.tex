@@ -1,0 +1,75 @@
+\section{Analysis-by-Synthesis Vision Transformer}
+\label{sec:implem}
+
+\begin{figure*}[t]
+\begin{center}
+\centerline{\includegraphics[width=2\columnwidth]{figures/model.png}}
+\caption{\textbf{Design of \model}. (a) Four steps to every single inference. The operations in each step are colored as purple and others as gray. \model first passes the image through the feedforward path. The output tokens are then reweighted by their similarity with the prior vector $\xi$ and fed back through the decoders to each self-attention module as the top-down input for the final feedforward run. (b) The top-down input to self-attention is added to the value matrix while other parts stay the same.   }
+\label{fig:model}
+\end{center}
+\vskip -0.3in
+\end{figure*}
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% \subsection{Variational Approximation to Bayesian Inference}
+% \label{sec:variational}
+
+Inspired by the connection between top-down attention and AbS, we propose to achieve top-down attention by building a vision transformer that performs AbS (\cref{eq:abs}), \ie, if the network has input $\bfh$ and latent representation $\bfz_\ell$ after each layer $\ell$ (which means $\bfz_L$ is the output), the final latent representation should approximate $\bfz_1^\ast, \cdots, \bfz_L^\ast$. Since directly solving \cref{eq:abs} requires an iterative optimization which would be extremely costly, in this work, we adopt a variational approximation to \cref{eq:abs}. Specifically, we optimize a variational loss
+\begin{equation}\footnotesize
+\label{eq:var_loss}
+\begin{split}
+    \mathcal{L}_{var}&= -\sum_{\ell=0}^{L-1} \log p(\bfz_\ell | \bfz_{\ell+1}) - \log p(\bfz_L) \\
+    &= \sum_{\ell=0}^{L-1} \left(\frac{1}{2}||\bfP_\ell \tbfu_\ell - \mathit{g}_\ell(\bfz_{\ell+1})||_2^2 + \lambda||\tbfu_\ell||_1 \right) - \log p(\bfz_L) 
+\end{split}
+\end{equation}
+where $\bfz_0 = \bfh$. However, as stated below, there are several caveats we need to work around when training a network with \cref{eq:var_loss} in real-world tasks.
+
+\minisection{The sparsity regularization}. Since the practical model we build in this work is based on self-attention (\cref{sec:design}), which neither has a sparsity constraint nor solves the SR explicitly~\cite{shi2022visual}, we remove the sparsity regularization by setting $\lambda = 0$, which makes $-\log p(\bfz_\ell | \bfz_{\ell+1}) = \frac{1}{2}||\bfP_\ell \tbfu_\ell - \mathit{g}_\ell(\bfz_{\ell+1})||_2^2 = \frac{1}{2}||\bfz_\ell - \mathit{g}_\ell(\bfz_{\ell+1})||_2^2$.
+
+\minisection{Jointly training the decoder $\mathit{g}_\ell$}. Normally, optimizing \cref{eq:var_loss} requires knowing the generation process $\mathit{g}_\ell$ beforehand, which in our case is unknown. This can be addressed by training $\mathit{g}_\ell$ jointly with the whole network, similar to VAE~\cite{kingma2013auto}. It is natural to use $\mathit{g}_\ell$ also as the feedback path of the network, as shown in \cref{sec:design}.
+
+\minisection{Trade-off between the generative and discriminative power}. The variational loss forces each $\bfz_{\ell+1}$ to be capable of generating $\bfz_\ell$. However, we find empirically that enforcing a strong generative power on the feature will harm its discriminative power in the setting of supervised learning. %\footnote{This may not be a problem for unsupervised learning, but we leave the exploration for future work.} 
+To address this, for each term $-\log p(\bfz_\ell| \bfz_{\ell+1})$ we stop the gradient on $\bfz_\ell$ and $\bfz_{\ell+1}$, \ie, $-\log p(\bfz_\ell| \bfz_{\ell+1}) = \frac{1}{2}||\mathit{sg}(\bfz_\ell) - \mathit{g}_\ell(\mathit{sg}(\bfz_{\ell+1}))||_2^2$, where $\mathit{sg}(\cdot)$ is stop-gradient. In this way, only the decoder $\mathit{g_\ell}$ receives the gradient.
+
+\minisection{The variable prior}. Rigorously speaking, variational methods only approximate AbS with a fixed prior $p(\bfz_L)$. However, top-down attention should be able to flexibly attend to different objects by changing different priors. The question is, how can we learn a variational model that generalizes to different priors? In this work, we adopt a simple trick called Meta-amortized VI~\cite{wu2020meta}. Concretely, we assume the prior $p_\xi(\bfz_L)$ depends on some parameter $\xi$, which can be a sentence or a class prototype cueing what objects to look at in the image. Then we make the model adaptable to $\xi$ during inference to approximate AbS with prior $p_\xi(\bfz_L)$ given any $\xi$. See the design details in \cref{sec:design}.
+
+\vspace{1.3mm}
+After applying these tricks, our variational loss becomes 
+\begin{equation}\small
+\label{eq:var_loss_2}
+    \mathcal{L}_{var} = \frac{1}{2} \sum_{\ell=0}^{L-1} ||\mathit{sg}(\bfz_\ell) - \mathit{g}_\ell(\mathit{sg}(\bfz_{\ell+1}))||_2^2  - \log p_\xi(\bfz_L),
+\end{equation}
+which contains layer-wise reconstruction loss and a prior loss. We also try cosine similarity instead of $\ell_2$ distance for reconstruction and get similar results. In \cref{sec:design}, we will show how to build a ViT with prior-conditioned top-down modulation and train it with \cref{eq:var_loss_2}.
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{\model Design}
+\label{sec:design}
+
+
+\cref{fig:model} (a) shows the proposed \model which is built upon ViT~\cite{dosovitskiy2020image}. Every single inference consists of 4 steps: (i) pass the image through the feedforward encoder, (ii) modulate the output tokens with a prior vector $\xi$, (iii) send the tokens back through the feedback decoder to intermediate layers, and (iv) run the feedforward path again but with each self-attention layer also receiving the top-down tokens as input.
+
+Within the whole pipeline, the feedforward encoder has the same architecture as regular ViT. For the feedback path, we use a single token-wise linear transform for each layer-wise decoder $\mathit{g}_\ell$. The design of token modulation with prior $\xi$ and the self-attention with top-down input are introduced below:
+
+\minisection{Design of token modulation with $\xi$}. The purpose is to modify the tokens to carry the information about the prior $p_\xi$ when fed back to the network. The prior is parameterized by $\xi$, which may be a language embedding or a class prototype telling the network which objects to look at. Therefore, we instantiate the modulation as a simple spatial reweighting, \ie, $\bfz_L^i \to \alpha \cdot \mathit{sim}(\xi, \bfz_L^i) \cdot \bfz_L^i$, where $\bfz_L^i$ is the $i$-th output token, $\mathit{sim}$ is the cosine similarity clamped to $[0, 1]$, and $\alpha$ is a scaling factor controlling the scale of the top-down signal, which is set to 1 by default. In this way, only the tokens with high  similarity to $\xi$ are sent back, and others are (softly) masked out. Note that the design here is for simplicity and may not be suitable for general usage. For example, when dealing with transparent images where two objects overlap, spatial reweighting cannot separate two objects away.
+    
+\minisection{Design of self-attention with top-down input}. From the analogy between self-attention and sparse reconstruction (\cref{eq:sa_sr}), the value matrix in SA corresponds to the reconstructed input signal, and the query and key serve as the dictionary. Since the top-down attention in AbS (\cref{eq:abs_dyn2}) adds a top-down signal to the input while keeping the dictionary untouched, it is natural to design the top-down version of self-attention by simply adding the top-down signal to the value and keep query and key as the same, as illustrated in \cref{fig:model} (b). We will show in \cref{sec:exp_model_design} that this is better than an arbitrary design where we add the top-down signal to the query, key, and value.
+
+\vspace{1.3mm}
+In this paper, we focus on supervised learning and train the model on two types of tasks. One is Vision-Language (V\&L) tasks such as VQA and zero-shot image retrieval, where the language acts as a prior to cue the model where to look at. The other one is image understanding, such as ImageNet classification and semantic segmentation, which do not have a specific prior. When training the network, we optimize the supervised loss as well as the variational loss (\cref{eq:var_loss_2}), \ie, 
+\begin{equation}\small
+    \mathcal{L} =  \frac{1}{2} \sum_{\ell=1}^L ||\mathit{sg}(\bfz_\ell) - \mathit{g}_\ell(\mathit{sg}(\bfz_{\ell+1}))||_2^2  - \log p_\xi(\bfz_L) + \mathcal{L}_{sup},
+\end{equation}
+where $\bfz_\ell$ is the $\ell$-th layer's output after the whole inference cycle, $\mathit{sg}$ is stop-gradient, and $\mathit{g}_\ell$ is the $\ell$-th layer's decoder. The form of prior $p_\xi$ depends on the task. For V\&L tasks, $\xi$ is the text embedding and we use a CLIP-style prior~\cite{radford2021learning}:
+\begin{equation}\small
+\label{eq:clip_loss}
+    p_\xi(\bfz_L) = \frac{\exp\{\xi^T \bfz_L\}}{\exp\{\xi^T \bfz_L\} + \sum_k \exp\{\xi^T \bfz_-^k\}},
+\end{equation}
+where the negative samples $\bfz_-^k$ are the output from other images. For image classification and segmentation where no specific prior is available,  we set $\xi$ as a trainable query vector that is independent of the input image, and we choose an uninformative prior that does not contribute to the gradient, \ie, $\nabla \log p_\xi(\bfz_L) = 0$.
+%We empirically show that the query $\xi$ actually learns to coarsely detect the foreground object.
+
+

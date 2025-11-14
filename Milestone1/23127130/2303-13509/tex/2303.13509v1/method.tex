@@ -1,0 +1,351 @@
+% !TEX root = ../iccv_review.tex
+
+\section{Methodology}\label{sec:methods}
+
+This section elaborates on the detailed formation of P3Former (Sec. Fig.~\ref{fig:Overview}). We start with a panoptic segmentation baseline that simplifies and unifies the cumbersome frameworks in LiDAR-based panoptic segmentation (Sec. \ref{sec:baseline}).
+To address the challenges hindering this paradigm from performing well in \emph{things} categories, we propose the Mixed-parameterized Positional Embedding (MPE) to distinguish geometrically alike instances while also fitting the prior distribution of instances (Sec. \ref{sec:positional_encoding}).
+Apart from its conventional usage, the MPE provides robust positional guidance for the entire segmentation process. Specifically, it serves as the low-level positional features, paralleling high-level voxel features in position-aware segmentation(Sec. \ref{sec:positional_aware_seg}). Furthermore, 
+we replace the masked cross-attention map with the combined masks generated from PA-Seg, making the masked attention focus on small instances while also simplifying the attention structure (Sec. \ref{sec:mfa}).
+For more detailed information, please refer to Sec. \ref{sec:implementation}.
+
+
+% \begin{figure}[h!]
+%   \centering
+%   \includegraphics[width=\linewidth]{figures/f4.pdf}
+%   \caption{\methodname~Overview}
+%   \label{fig:Overview}
+% \end{figure}
+
+
+\subsection{Baseline}\label{sec:baseline}
+%LiDAR-based panoptic segmentation aims to assign both semantic labels and instance ids  to a set of point clouds scanned by LiDAR. 
+The baseline mainly consists of two parts: the backbone and the segmentation head. The backbone converts raw points into sparse voxel features, while the segmentation head predicts panoptic segmentation results through learnable queries~\cite{K-Net,maskformer,mask2former}.
+
+\myparagraph{Backbone.}\label{sec:backbone}
+In this work, we choose Cylinder3D~\cite{Cylinder3D} as our backbone for feature extraction due to its good generalization capability for panoptic segmentation~\cite{DS-Net}. 
+%Since our goal is to demonstrate that a simple framework can be sufficiently effective, improvements on the backbone~\cite{EfficientLPS, GPS3Net, SCAN} are orthogonal to this paper and can be studied in future research.
+
+The backbone takes raw points $P\in \mathbb{R}^{\mathrm{N_P}\times 4}$ ($x,y,z,r$) as input. Through voxelization and sparse convolution, it outputs sparse voxel features $F\in \mathbb{R}^{\mathrm{V}\times \mathrm{D}}$. Here $\mathrm{N_P}$ is the number of points, $r$ is the reflection factor, $\mathrm{V}$ is the number of sparse voxel features, and $\mathrm{D}$ is the feature dimension.
+
+\myparagraph{Segmentation Head.}\label{sec:head}
+We follow the backbone to use voxel representation rather than points as the input to the segmentation head to keep the framework efficient. Vanilla unified segmentation heads consist of two components: \emph{One-go Predicting} and \emph{Query updating}. In \emph{One-go Predicting}, each query predicts one object mask and its category, including things and stuff. The process is as follows:
+\begin{equation}\label{prediction}
+C = f_{C}(Q),\quad M_F = f_{MF}(Q)F^T,
+\end{equation}
+where $f_{C}$ and $f_{MF}$ are different MLP layer.
+
+To make the predictions more adaptive to specific objects, queries need to be updated according to different inputs.
+\emph{Query updating} commonly consists of several transformer-based layers. The inputs of layer $l$ are voxel feature $F$, queries $Q_{l-1}\in \mathbb{R}^{\mathrm{N}\times \mathrm{D}}$, and mask predictions $M_{l-1}\in \mathbb{R}^{\mathrm{V}\times \mathrm{N}}$ from layer $l-1$. The outputs are updated query $Q_{l}$. Here $N$ is the query number. \emph{Query updating} can be formulated as
+\begin{equation}
+Q_{l} = \mathrm{Updating}(Q_{l-1}, M_{l-1}, F).
+\end{equation}
+The process can be further decomposed into three parts: Cross-Attention, Self-attention, and Feed-Forward Network (FFN), following the practice of~\cite{mask2former}. These can be generally formulated as
+\begin{equation}
+Q_{Il} = \mathrm{CrossAttn}(Q_{l-1}, M_{l-1}, F),
+\end{equation}
+and
+\begin{equation}
+Q_{l} = \mathrm{FFN}(\mathrm{SelfAttn}(Q_{Il}))),
+\end{equation}
+respectively. Here we ignore the expression of the $Add\&Norm$ layer for writing simplicity.
+
+The simple and unified framework can obtain competitive results on \emph{stuff} categories compared to previous methods. However, the performance on \emph{things} classes is not ideal due to the special challenges in LiDAR-based scenes.
+
+\subsection{Mixed-parameterized Positional
+Embedding}\label{sec:positional_encoding}
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=\linewidth]{MPE_cmp_crop.pdf}
+  \caption{Queries' positional attention distributions of different positional embedding in Bird-Eye-View.}
+  \label{fig:pe_cmp}
+\end{figure}
+
+
+Distinguishing instances with the same geometry, texture, and colors is one of the biggest challenges for a unified segmentation structure. As shown in Fig.\ref{fig:teaser}-(a), separating these donuts is one representative hard task for unified segmentation methods in 2D. Unfortunately, such ``donuts" exist nearly everywhere in LiDAR-based scenes: 3D instances don't have information like texture and color. Meanwhile, they are highly geometrically alike if they belong to the same category, e.g., the "car" category shown in Fig.\ref{fig:teaser}-(b). The main indicator we can utilize is their positional difference.
+
+Positional embedding is a good choice to encode positional information into features.
+We first formulate positional embedding in Cartesian parameterization, noted as CPE:
+\begin{equation}
+	\mathrm{CPE} = f_C([x_i, y_i, z_i]).
+\end{equation}
+Here $f_C$ is a linear transformation layer followed by a normalization layer.
+It promisingly enhances instances' discriminability and promotes the performance of the framework. However, this positional embedding parameterization doesn't offer any distribution prior of LiDAR-based scenes. Consequently, to cover instances as many as possible, each query has learned to attend to a big region (Fig.~\ref{fig:pe_cmp}-(a)). While in a crowded scene that contains many relatively small instances, one query would attend to too many instances, which may have negative impacts on the following refinement.
+
+Unlike instances in images that are almost randomly distributed in the picture, instances from LiDAR scans have strong spatial cues (i.e. instances have different distribution patterns depending on distances from the ego vehicle).
+Learning the distribution prior is helpful for queries to locate small instances in big scenes. Thus, we design a Polar-parameterized positional embedding to help queries fit the distribution, noted as PPE:
+\begin{equation}
+	\mathrm{PPE} = f_P([\rho_i, \theta_i, z_i]),
+\end{equation}
+where $\rho_i = \sqrt{x_i^2+y_i^2}$, $\theta_i = \mathrm{arctan}(y_i/x_i)$, and $f_P$ is also a linear transformation layer followed by a normalization layer. It efficiently helps queries to learn ring-shaped attention (Fig.~\ref{fig:pe_cmp}-(b)).
+However, it introduces another problem: instances within the same scan distance are commonly more geometrically alike because of the same point sparsity and scan angle. So they are likely to be segmented as one, although they may not be close in the Cartesian parameterization space.
+
+Based on the observations mentioned above, we propose Mixed Parameterized Positional Embedding (MPE) to leverage the merits of Cartesian and Polar Parameterizations together. Experiments show that simple addition brings ideal promotion above single-format positional embedding. The formulation of MPE is
+\begin{equation}
+	\mathrm{MPE} = f_P([\rho_i, \theta_i, z_i]) + f_C([x_i, y_i, z_i]),
+\end{equation}
+
+We encode MPE into voxel features $F$ and get $F_P$:
+\begin{equation}
+	F_P = F + MPE,
+\end{equation}
+which replaces $F$ in the above operations.
+
+Fig.~\ref{fig:pe_cmp}-(c) demonstrates that MPE maintains ring-like distribution prior while also emphasizing the difference in Cartesian space. 
+Fig.~\ref{fig:mpe}-(d) shows that MPE successfully pulls away the distance of instances in the MPE space and makes instances more distinguishable. 
+
+Besides, MPE is involved in mask prediction and masked cross-attention, leading to Position-Aware Segmentation (PA-Seg) and Masked Focal Attention (MFA).
+
+
+
+%and thus alleviate the problem of over-segmentation more effectively, 
+
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=\linewidth]{figures/posvis_v2.pdf}
+%   \caption{Analysis and visualizations of different positional encoding (P. E.) formats.}
+%   \label{fig:pe}
+%   \vspace{-10pt}
+% \end{figure}
+
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth,height=0.75\linewidth]{mpe_crop.pdf}
+  \caption{PCA (Principal Component Analysis) of different parameterized positional encoding. Different instances are dyed in origin, green, purple, and blue, respectively. Best viewed in color.}
+  \label{fig:mpe}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{scale_crop.pdf}
+  \caption{Distribution comparisons of instance relative scale between COCO~\cite{coco} and SemanticKITTI~\cite{SemanticKITTI}. Here instance relative scale= $\sqrt{\mathrm{A_i}/A_s}$ following~\cite{sst}, where $A_i$ is the mask area of one instance, $A_s$ is the mask area of the whole scene.}
+  \label{fig:crowd}
+\end{figure}
+
+% \begin{table*}[t]
+%   \footnotesize
+%   \begin{center}
+%   \caption{\centering Comparisons of LiDAR panoptic segmentation performance on SemanticKITTI test split. * We don't use TTA for fair comparison.}
+%   \label{tab:benchmark:SemanticKITTI:test}
+%     \scalebox{0.90}{\tablestyle{8pt}{1.0}
+%     \begin{tabular}{l|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}p{0.6cm}<{\centering}}
+    
+%     method & PQ & $\mathrm{PQ^{\dag}}$ &RQ & SQ & $\mathrm{PQ^{Th}}$ & $\mathrm{RQ^{Th}}$ & $\mathrm{SQ^{Th}}$ & $\mathrm{PQ^{St}}$ & $\mathrm{RQ^{St}}$ & $\mathrm{SQ^{St}}$ & FPS\\
+    
+%     \hline
+%     \specialrule{0.05em}{3pt}{3pt}
+%     RangeNet++~\cite{Rangenet++}/PointPillars~\cite{PointPillars} & 37.1 & 45.9 & 75.9 & 47.0 & 20.2 & 75.2 & 25.2 & 49.3 & 62.8 & 76.5 & 2.4\\
+%     LPSAD~\cite{LPSAD}                   & 38.0 & 47.0 & 48.2 & 76.5 & 25.6 & 31.8 & 76.8 & 47.1 & 60.1 & 76.2 & 11.8\\
+%     Panoster~\cite{Panoster}                & 52.7 & 59.9 & 64.1 & 80.7 & 49.4 & 58.5 & 83.3 & 55.1 & 68.2 & 78.8 & -\\
+%     Panoptic-PolarNet~\cite{Panoptic-PolarNet}       & 54.1 & 60.7 & 65.0 & 81.4 & 53.3 & 60.6 & 87.2 & 54.8 & 68.1 & 77.2 & 11.6\\
+%     DS-Net~\cite{DS-Net}                  & 55.9 & 62.5 & 66.7 & 82.3 & 55.1 & 62.8 & 87.2 & 56.5 & 69.5 & 78.7 & 2.1\\
+%     EfficientLPS~\cite{EfficientLPS}            & 57.4 & 63.2 & 68.7 & 83.0 & 53.1 & 60.5 & 87.8 & 60.5 & 74.6 & 79.5 & - \\
+%     GP-S3Net~\cite{GPS3Net}                & 60.0 & 69.0 & 72.1 & 82.0 & 65.0 & 74.5 & 86.6 & 56.4 & 70.4 & 78.7 & - \\
+%     SCAN~\cite{SCAN}                    & 61.5 & 67.5 & 72.1 & 84.5 & 61.4 & 69.3 & 88.1 & 61.5 & 74.1 & 81.8 & 12.8\\
+%     Panoptic-PHNet~\cite{PHNet}         & 61.5 & 67.9 & 72.1 & 84.8 & 63.8 & 70.4 & 90.7 & 59.9 & 73.3 & 80.5 & 11.0  \\
+%     \hline
+%     \specialrule{0.05em}{3pt}{3pt}
+%     % \methodname\ (NeurIPS)             & 62.9 & 67.7 & 73.9 & 84.5 & 62.0 & 69.2 & 89.2 & 63.6 & 77.4 & 81.0 \\
+%     \methodname             & \textbf{64.9} & \textbf{70.0} & \textbf{75.9} & \textbf{84.9} & \textbf{67.1} & \textbf{74.1} & \textbf{90.6} & \textbf{63.3} & \textbf{77.2} & \textbf{80.7} & 11.6\\
+%     \end{tabular}}
+%   \end{center}
+% \end{table*}  
+
+% \begin{table*}[t]
+%   \footnotesize
+%   \begin{center}
+%   \caption{Comparisons of LiDAR panoptic segmentation performance on nuScenes dataset}
+%   \label{tab:benchmark:nuScenes} 
+%   \scalebox{0.90}{\tablestyle{8pt}{1.0}
+%     \begin{tabular}{l|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}}
+    
+%     method & PQ & $\mathrm{PQ^{\dag}}$ &RQ & SQ & $\mathrm{PQ^{Th}}$ & $\mathrm{RQ^{Th}}$ & $\mathrm{SQ^{Th}}$ & $\mathrm{PQ^{St}}$ & $\mathrm{RQ^{St}}$ & $\mathrm{SQ^{St}}$\\
+%     \hline
+%     \specialrule{0.05em}{3pt}{3pt}    
+%     % \hline
+%     % \multicolumn{12}{c}{\texttt{val}} \\
+
+%     DS-Net~\cite{DS-Net}         & 42.5 & 51.0 & 83.6 & 50.3 & 32.5 & 38.3 & 83.1 & 59.2 & 84.4 & 70.3 \\
+%     EfficientLPS~\cite{EfficientLPS}   & 59.2 & 62.8 & 82.9 & 70.7 & 51.8 & 62.7 & 80.6 & 71.5 & 84.1 & 84.3 \\
+%     GP-S3Net~\cite{GPS3Net}       & 61.0 & 67.5 & 72.0 & 84.1 & 56.0 & 65.2 & 85.3 & 66.0 & 78.7 & 82.9 \\
+%     SCAN~\cite{SCAN}           & 65.1 & 68.9 & 75.3 & 85.7 & 60.6 & 70.2 & 85.7 & 72.5 & 83.8 & 85.7 \\
+%     Panoptic-PHNet~\cite{PHNet} & 74.7 & 77.7 & 84.2 & 88.2 & 74.0 & 82.5 & 89.0 & 75.9 & 86.9 & 76.5  \\
+%     \hline
+%     \specialrule{0.05em}{3pt}{3pt}
+%     \methodname                 & \textbf{75.9} & \textbf{78.9} & \textbf{84.7} & \textbf{89.7} & \textbf{76.9} & \textbf{83.3} & \textbf{92.0} & 75.4 & \textbf{87.1} & \textbf{86.0}\\
+%     % \methodname    & \textbf{69.1} & \textbf{72.1} & \textbf{78.0} & \textbf{88.2} & \textbf{67.0} & \textbf{73.5} & \textbf{90.4} & \textbf{72.7} & \textbf{85.4} & 84.4 \\
+%     % \hline
+%     % \hline
+%     % \multicolumn{12}{c}{\texttt{test}} \\
+%     % \specialrule{0.05em}{0pt}{3pt}    
+%     % \methodname    \\
+%     \end{tabular}}
+%   \end{center}
+% \end{table*}  
+
+\subsection{Position-Aware Segmentation}\label{sec:positional_aware_seg}
+
+Although the proposed positional embedding strategy can effectively enhance positional information, it is insufficient to deal with small objects, particularly in crowded situations (Fig.~\ref{fig:crowd}-(b)), which are also common in LiDAR-based scenes. We count the relative instances scale distribution in Fig.~\ref{fig:crowd}-(a).
+It shows the relative scales of instances in LiDAR-based are much smaller than in images.
+This observation requires our segmentation head to be more position-aware to discriminate small instances in a crowd.
+
+We rethink the traditional mask prediction (Eq.~\ref{prediction}) which only depends on voxel features. Vanilla voxel features generated from the hourglass-like backbone mainly capture high-level geometric information and lack low-level positional information. The embedded MPE partially compensates for the drawback.
+However, such an operation just uses the MPE implicitly. To this end, we directly predict masks from MPE so queries can explicitly acquire low-level information about a specific position. The formulation is
+\begin{equation}\label{MPE_prediction}
+	M_P = f_{MP}(Q)\cdot \mathrm{MPE},
+\end{equation}
+where $M_P$ is position mask and $f_{MP}$ is a MLP layer.
+
+It's worth noting that we supervise $M_F$ and $M_P$ separately. We simply use the binary ground truth instance masks $G_M$ as the learning targets of $M_P$. This is feasible because, in LiDAR-based scenes, instances are concentrated in small local regions and don't overlap with each other. It shares the same function of center heatmaps used in previous methods, while our solution is more succinct and doesn't need to generate pseudo centers of instances.
+
+We add $M_F$ and $M_P$ together to get the final masks $M$, which contain both high-level geometric and low-level positional information. Experiments show that queries with explicit positional awareness will quickly converge to a local region and focus on a small instance.
+
+
+\begin{table*}[t]
+  \footnotesize
+  \begin{center}
+  \caption{\centering Comparisons of LiDAR panoptic segmentation performance on SemanticKITTI test split. * We don't use TTA for a fair comparison.}
+  \label{tab:benchmark:SemanticKITTI:test}
+    \scalebox{0.90}{\tablestyle{8pt}{1.0}
+    \begin{tabular}{l|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}p{0.6cm}<{\centering}}
+    
+    Methods & PQ & $\mathrm{PQ^{\dag}}$ &RQ & SQ & $\mathrm{PQ^{Th}}$ & $\mathrm{RQ^{Th}}$ & $\mathrm{SQ^{Th}}$ & $\mathrm{PQ^{St}}$ & $\mathrm{RQ^{St}}$ & $\mathrm{SQ^{St}}$ & FPS\\
+    
+    \hline
+    \specialrule{0.05em}{3pt}{3pt}
+    RangeNet++~\cite{Rangenet++}/PointPillars~\cite{PointPillars} & 37.1 & 45.9 & 75.9 & 47.0 & 20.2 & 75.2 & 25.2 & 49.3 & 62.8 & 76.5 & 2.4\\
+    LPSAD~\cite{LPSAD}                   & 38.0 & 47.0 & 48.2 & 76.5 & 25.6 & 31.8 & 76.8 & 47.1 & 60.1 & 76.2 & 11.8\\
+    KPConv~\cite{KPConv}/PointPillars~\cite{PointPillars} & 44.5 & 52.5 & 54.4 & 80.0 & 32.7 & 38.7 & 81.5 & 53.1 & 65.9 & 79.0 & 1.9\\    
+    Panoster~\cite{Panoster}                & 52.7 & 59.9 & 64.1 & 80.7 & 49.4 & 58.5 & 83.3 & 55.1 & 68.2 & 78.8 & -\\
+    Panoptic-PolarNet~\cite{Panoptic-PolarNet}       & 54.1 & 60.7 & 65.0 & 81.4 & 53.3 & 60.6 & 87.2 & 54.8 & 68.1 & 77.2 & 11.6\\
+    DS-Net~\cite{DS-Net}                  & 55.9 & 62.5 & 66.7 & 82.3 & 55.1 & 62.8 & 87.2 & 56.5 & 69.5 & 78.7 & 2.1\\
+    EfficientLPS~\cite{EfficientLPS}            & 57.4 & 63.2 & 68.7 & 83.0 & 53.1 & 60.5 & 87.8 & 60.5 & 74.6 & 79.5 & - \\
+    GP-S3Net~\cite{GPS3Net}                & 60.0 & 69.0 & 72.1 & 82.0 & 65.0 & 74.5 & 86.6 & 56.4 & 70.4 & 78.7 & - \\
+    SCAN~\cite{SCAN}                    & 61.5 & 67.5 & 72.1 & 84.5 & 61.4 & 69.3 & 88.1 & 61.5 & 74.1 & 81.8 & 12.8\\
+    Panoptic-PHNet~\cite{PHNet}         & 61.5 & 67.9 & 72.1 & 84.8 & 63.8 & 70.4 & 90.7 & 59.9 & 73.3 & 80.5 & 11.0  \\
+    \hline
+    \specialrule{0.05em}{3pt}{3pt}
+    % \methodname\ (NeurIPS)             & 62.9 & 67.7 & 73.9 & 84.5 & 62.0 & 69.2 & 89.2 & 63.6 & 77.4 & 81.0 \\
+    \methodname             & \textbf{64.9} & \textbf{70.0} & \textbf{75.9} & \textbf{84.9} & \textbf{67.1} & \textbf{74.1} & \textbf{90.6} & \textbf{63.3} & \textbf{77.2} & \textbf{80.7} & 11.6\\
+    \end{tabular}}
+  \end{center}
+\end{table*}  
+
+\begin{table*}[t]
+  \footnotesize
+  \begin{center}
+  \caption{Comparisons of LiDAR panoptic segmentation performance on nuScenes dataset}
+  \label{tab:benchmark:nuScenes} 
+  \scalebox{0.90}{\tablestyle{8pt}{1.0}
+    \begin{tabular}{l|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}|p{0.4cm}<{\centering}p{0.4cm}<{\centering}p{0.6cm}<{\centering}}
+    
+    Methods & PQ & $\mathrm{PQ^{\dag}}$ &RQ & SQ & $\mathrm{PQ^{Th}}$ & $\mathrm{RQ^{Th}}$ & $\mathrm{SQ^{Th}}$ & $\mathrm{PQ^{St}}$ & $\mathrm{RQ^{St}}$ & $\mathrm{SQ^{St}}$\\
+    \hline
+    \specialrule{0.05em}{3pt}{3pt}    
+    % \hline
+    % \multicolumn{12}{c}{\texttt{val}} \\
+
+    DS-Net~\cite{DS-Net}         & 42.5 & 51.0 & 83.6 & 50.3 & 32.5 & 38.3 & 83.1 & 59.2 & 84.4 & 70.3 \\
+    EfficientLPS~\cite{EfficientLPS}   & 59.2 & 62.8 & 82.9 & 70.7 & 51.8 & 62.7 & 80.6 & 71.5 & 84.1 & 84.3 \\
+    GP-S3Net~\cite{GPS3Net}       & 61.0 & 67.5 & 72.0 & 84.1 & 56.0 & 65.2 & 85.3 & 66.0 & 78.7 & 82.9 \\
+    SCAN~\cite{SCAN}           & 65.1 & 68.9 & 75.3 & 85.7 & 60.6 & 70.2 & 85.7 & 72.5 & 83.8 & 85.7 \\
+    Panoptic-PHNet~\cite{PHNet} & 74.7 & 77.7 & 84.2 & 88.2 & 74.0 & 82.5 & 89.0 & 75.9 & 86.9 & 76.5  \\
+    \hline
+    \specialrule{0.05em}{3pt}{3pt}
+    \methodname                 & \textbf{75.9} & \textbf{78.9} & \textbf{84.7} & \textbf{89.7} & \textbf{76.9} & \textbf{83.3} & \textbf{92.0} & 75.4 & \textbf{87.1} & \textbf{86.0}\\
+    % \methodname    & \textbf{69.1} & \textbf{72.1} & \textbf{78.0} & \textbf{88.2} & \textbf{67.0} & \textbf{73.5} & \textbf{90.4} & \textbf{72.7} & \textbf{85.4} & 84.4 \\
+    % \hline
+    % \hline
+    % \multicolumn{12}{c}{\texttt{test}} \\
+    % \specialrule{0.05em}{0pt}{3pt}    
+    % \methodname    \\
+    \end{tabular}}
+  \end{center}
+\end{table*}  
+
+\subsection{Masked Focal Attention}\label{sec:mfa}
+The integrated mask $M$, which is augmented with position-focusing awareness, can be leveraged as the cross-attention map for query-feature interaction.
+Vanilla segmentation heads adopt \emph{Masked Cross Attention}, which is
+\begin{equation}\label{MaskCrossAttention}
+	Q_{Il} = \mathrm{softmax}(A_{l-1} + q_lk_l^T)v_l + Q_{l-1},
+\end{equation}
+where $q_l = f_q(Q_{l-1})$, $k_l = f_k(F)$, $v_l = f_v(F)$. $f_q(\cdot), f_k(\cdot), f_v(\cdot)$ are all linear transformations. The attention mask $A_{l-1}$ at feature location $v \in V$ is
+\begin{equation}
+A_{l-1}(v)=\left\{
+\begin{array}{rcl}
+	    0 & & if\ M_{l-1}(v) > 0,\\
+	    -\infty & & otherwise.
+\end{array}
+\right.
+\end{equation}
+
+Here the attention map generated by $q_lk_l^T=f_q(Q_l)f_v(F)^T$ resembles mask prediction $M_F$ in Eq.~\ref{prediction} which only uses high-level features $F$. Inspired by Sec.~\ref{sec:positional_aware_seg}, we can leverage masks $M$ from position-aware segmentation as the attention map.
+So Eq.~\ref{MaskCrossAttention} can be reformulated to
+\begin{equation}
+	Q_{Il} = \mathrm{softmax}(A_{l-1} + M)v_l + Q_{l-1}.
+\end{equation}
+We refer to it as \emph{Masked Focal Attention} since the attention features inherit the merit of position-aware masks and focus more on small instances. 
+
+
+\subsection{Training and Inference}\label{sec:implementation}
+During training, since the number of predictions $N$ is larger than the pre-defined number of classes, we adopt bipartite matching and set prediction loss to assign ground truth to predictions with the smallest matching cost. For inference, we simply use \emph{argmax} to determine the final panoptic results.
+
+
+\myparagraph{Loss Functions. }
+Our loss function is composed of a classification loss, a feature-seg loss, and a position-seg loss. We choose focal loss~\cite{focalloss}~$l_{f}$ for the classification loss $L_{c}$. The feature-seg loss $L_{fs}$ is a weighted summation of binary focal loss $l_{bf}$ and dice loss~\cite{dice_loss}~$l_{df}$. We use dice loss $l_{fp}$ for the position-seg loss $L_{ps}$. The full loss function $L$ can be formulated as $L=L_{c}+L_{fs}+L_{ps}$, while $L_{c}=\lambda_{f}l_{f}$, $L_{fs}=\lambda_{bf}l_{bf}+\lambda_{df}l_{df}$, $L_{ps}=\lambda_{fp}l_{fp}$. In our experiments, we empirically set $\lambda_{f}:\lambda_{bf}:\lambda_{df}:\lambda_{fp}=1:1:2:0.2$.
+
+\myparagraph{Hungarian Assignment. }
+Following~\cite{DETR,maskformer,K-Net}, we adopt the Hungarian assignment strategy to build one-to-one matching between our predictions and ground truth. The formation of matching cost is the same as our loss function.
+
+\myparagraph{Inference. }
+Unlike previous LiDAR-based panoptic segmentation methods that need manually designed fusion strategies on semantic and instance segmentation results, we only need to perform \emph{argmax} among $N$ mask predictions to get the final panoptic results with the dimensions of $1\times \mathrm{V}$.
+
+\myparagraph{Iterative Refinement. }
+We stack the Transformer layer several times to refine learnable queries in our framework. During training, we supervise the results predicted by queries before interaction and after each refinement layer with our loss functions. The classification loss is not required for queries before interaction because, at that time, learnable queries are not conditional on specific semantic classes. For inference, we use the results predicted by the finally refined queries.
+
+% \begin{table*}[t]
+%   \begin{center}
+%   \caption{Ablation studies of Point K-Net on SemanticKITTI validation set}
+%   \label{tab:ablation:components}
+%   \scalebox{0.90}{\tablestyle{8pt}{1.0}
+%     \begin{tabular}{cccccc|p{0.6cm}<{\centering}p{0.6cm}<{\centering}p{0.9cm}<{\centering}p{0.6cm}<{\centering}p{0.6cm}<{\centering}p{0.6cm}<{\centering}}
+    
+%     Baseline & Mixed P.E. & SP & Polarmix & 6-layer/256-dim & Large backbone& PQ & RQ & SQ & $\mathrm{PQ^{Th}}$ & $\mathrm{PQ^{St}}$ & mIoU \\
+%     \hline
+%     \specialrule{0.05em}{3pt}{3pt}
+%       \checkmark  &                &            &            &            && 58.0 & 68.5 & 74.6 & 59.6 & 57.0 & 64.0\\
+%       \checkmark  &   \checkmark   &            &            &            && 59.8 & 70.8 & 72.7 & 62.4 & 57.9 & 64.7\\
+%       \checkmark  &   \checkmark   & \checkmark &            &            && 60.9 & 70.9 & 75.7 & 65.1 & 57.9 & 65.2\\
+%       \checkmark  &   \checkmark   & \checkmark & \checkmark &            && 61.4 & 71.3 & 75.9 & 66.6 & 57.7 & 65.5\\
+%       \checkmark  &   \checkmark   & \checkmark & \checkmark & \checkmark && 62.5 & 72.4 & 76.1 & 69.0 & 57.8 & 66.5\\
+%       \checkmark  &   \checkmark   & \checkmark & \checkmark & \checkmark & \checkmark & 62.8 & 72.5 & 76.4 & 69.5 & 58.2 & 66.6\\
+%     \end{tabular}}
+%   \end{center}
+% \end{table*}
+
+% \begin{table*}[t]
+%       \begin{center}  \caption{Ablation studies on Model Setting. Here $N_L$ indicates iterative layer numbers, $N_Q$ indicates the query number and $N_D$ indicates the feature dimension. ``$^{\dag}$": We measure the latency with the official codebase released by the authors on our hardware for reference.}
+%     \begin{threeparttable} %添加此处
+%   \label{tab:ablation:setting}
+%   \scalebox{0.90}{\tablestyle{8pt}{1.0}
+%     \begin{tabular}{c|cccc|cccc|cc}
+%     Model & $\mathrm{N_{L}}$ & $\mathrm{N_{Q}}$ & $\mathrm{N_{D}}$ & Backbone Size & PQ & RQ & SQ & IoU & Model Size & FPS \\
+%     \hline
+%     \specialrule{0.05em}{3pt}{3pt}
+%       Cylinder3D & & - & & 1x & 56.4 & 67.1 & 76.5 & 63.5 & - & -\\
+%       DS-Net     & & - & & 1x & 57.7 & 68.0 & 77.6 & 63.5   & 221M & $2.1^{\dag}$ \\
+%     \specialrule{0.05em}{3pt}{3pt} 
+%                  % & 3 & 64 & 64 & &&&&& \\
+%       ~\methodname  & 3 & 128 & 128 & 0.5x & 61.4 & 71.3 & 75.9 & 65.5 & 77M  & 19.7\\
+%                    & 6 & 128 & 256 & 0.5x & 62.5 & 72.4 & 76.1 & 66.5 & 120M & 14.2\\
+%                    & 6 & 128 & 256 & 1x   & 62.5 & 72.3 & 76.2 & 66.4 & 279M & 12.5\\
+%                    & 6 & 128 & 256 & 1.5x & 62.8 & 72.5 & 76.4 & 66.6 & 559M & 11.6\\
+%     \end{tabular}}
+% %     \begin{tablenotes} %添加此处
+% % 		\item \small{}
+% %      \end{tablenotes} %添加此处
+%     \end{threeparttable} %添加此处
+%      \end{center}
+% \end{table*}
+

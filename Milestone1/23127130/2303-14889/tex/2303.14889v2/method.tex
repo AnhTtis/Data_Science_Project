@@ -1,0 +1,354 @@
+\section{Method}
+% \vspace{-5pt}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/rl_model_and_policy.pdf}
+    % \vspace{-5pt}
+    \caption{The overall architecture of the world model in \model{}. \textbf{Left:} The world model has three branches to explicitly disentangle controllable and noncontrollable state transitions, as well as the static components from visual data. 
+    \textbf{Right:} Illustration of calculating variance in different branches. Given the different action signals, our objective is to minimize the diversity of state transitions in the action-free branch and maximize the diversity of those in the action-conditioned branch. 
+   }
+    \label{fig:rl_model_and_policy}
+    \vspace{-5pt}
+\end{figure*}
+
+
+In this section, we present the technical details of \model{} for decoupling and leveraging controllable and noncontrollable dynamics for visual MBRL. 
+% 
+The overall pipeline is based on Dreamer \cite{hafner2019dream}, where we learn the world model from a dataset of past experience, learn behaviors from imagined sequences of compact model states, and execute the behavior policy in the environment to grow the experience dataset.
+
+
+In \sect{sec:inverse_dynamics}, we first introduce the three-branch world model and its training objectives of \textit{inverse dynamics}. 
+%
+In \sect{sec:variance}, we propose the \textit{min-max variance constraints} to regularize the dynamics representations in each state transition branch to enhance disentanglement learning and avoid training collapse. 
+%
+In \sect{sec:spare-dependency}, we present a network structure to model the phenomenon that future noncontrollable dynamics can be sparsely influenced by current controllable dynamics.
+%
+In \sect{sec:behavior-learning}, we present an actor-critic method that is trained on the imaginations of the decoupled world model latent states, so that the agent may consider possible future states of noncontrollable dynamics in behavior learning.
+%
+Finally, in \sect{sec:Policy-Deployment}, we discuss how our model is deployed to interact with the environment.
+
+
+
+\subsection{World Models with Dynamics Isolation}
+\label{sec:wm}
+
+
+Inspired by prior research \citep{slotattention,rim} that demonstrates the efficacy of modular structures for disentanglement learning, we use an architecture with multiple branches to model different dynamics independently, according to their respective physical laws. 
+%
+Each individual branch tends to present robust features, even when the dynamic patterns in other branches undergo changes.
+%
+Specifically, our three-branch model, illustrated in the left panel of \fig{fig:rl_model_and_policy}, disentangles visual observations into controllable dynamics state $s_t$, noncontrollable dynamics state $z_t$, and a time-invariant component of the environment.
+%
+The action-conditioned branch models the controllable state transition $p(s_{t+1} \mid s_t, a_t)$. 
+%
+It follows the RSSM architecture from PlaNet \citep{hafner2019learning} to use a recurrent neural network $\texttt{GRU}_s(\cdot)$, the deterministic hidden state $h_t$, and the stochastic state $s_t$ to form the transition model, where the GRU keeps the historical information of the controllable dynamics. 
+%
+The action-free branch models $p(z_{t+1} \mid z_t)$ with similar network structures. The transition models with separate parameters can be written as follows:
+% \vspace{2pt}
+\begin{equation}
+  \begin{split}
+  p(\tilde{s}_t \mid s_{<t}, a_{<t}) = p(\tilde{s}_t \mid h_t), \\ 
+  p(\tilde{z}_t \mid z_{<t}) = p(\tilde{z}_t \mid h_t^\prime), \\ 
+  \end{split}
+\end{equation}
+where $ h_t = \texttt{GRU}_s(h_{t-1}, s_{t-1}, a_{t-1}), \ h_t^\prime = \texttt{GRU}_z(h_{t-1}^\prime, z_{t-1})$.
+We here use $\tilde{s}_t$ and $\tilde{z}_t$ to denote the prior representations.
+%
+We optimize the transition models with posterior representations that are derived from $s_t \sim q(s_t \mid h_{t}, o_t, a_{t-1})$ and $z_t \sim q(z_t \mid h_{t}^\prime, o_t, a_{t-1})$. 
+%
+We learn the posteriors from the observation at current time step $o_t \in \mathbb{R}^{3 \times H \times W}$ by a shared encoder $\texttt{Enc}_{\theta}$ and subsequent branch-specific encoders $\texttt{Enc}_{\phi_1}$ and $\texttt{Enc}_{\phi_2}$.
+%
+Notably, we feed actions into both $\texttt{Enc}_{\phi_1}$ and $\texttt{Enc}_{\phi_2}$, which differs from our previous work \citep{paniso}. In the static branch, where there is no state transition, we only use an encoder $\texttt{Enc}_{\phi_3}$ and a decoder $\texttt{Dec}_{\varphi_3}$ to model simple time-invariant information in the environment.
+
+
+\subsubsection{Inverse Dynamics}
+\label{sec:inverse_dynamics}
+To enable disentanglement representation learning that corresponds to the control signals, we introduce the training objective of \textit{inverse dynamics}. 
+%
+This objective encourages the action-conditioned branch to learn a more deterministic state transition based on specific actions, while the action-free branch learns the remaining noncontrollable dynamics independent of the control signals.
+% 
+Accordingly, we design an \textit{Inverse Cell} of a $2$-layer MLP to infer the actions that lead to certain transitions of the controllable states:
+% \vspace{1pt}
+\begin{equation}
+    \label{eq:inverse}
+    \text{Inverse dynamics:} \quad \tilde{a}_{t-1}=\texttt{MLP}(s_{t-1}, s_t),
+\end{equation}
+where the inputs are the posterior representations in the action-conditioned branch.
+%
+By learning to regress the true behavior $a_{t-1}$, the Inverse Cell facilitates the action-conditioned branch to isolate the representation of the controllable dynamics.
+%
+We respectively use the prior state $\tilde{s}_t$ and the posterior state ${z}_t$ to generate the controllable visual component $\hat{o}_t^s \in \mathbb{R}^{3 \times H \times W}$ with mask $M^s_t \in \mathbb{R}^{1 \times H \times W}$ and the noncontrollable component $\hat{o}_t^z \in \mathbb{R}^{3 \times H \times W}$ with $M^z_t \in \mathbb{R}^{1 \times H \times W}$. 
+%
+By further integrating the static information extracted from the first $K$ frames, we have
+\begin{equation}  
+% \vspace{-5pt}
+    \label{eq:combine_rl}
+     \hat{o}_{t} = M_{t}^s \odot \hat{o}_t^s + M_{t}^z \odot \hat{o}_t^z +  (1-M_{t}^s - M_{t}^z) \odot \hat{o}^b,
+\end{equation}
+where $\hat{o}^b = \texttt{Dec}_{\varphi_3}(\texttt{Enc}_{\theta, \phi_3}(o_{1:K})))$.
+
+
+For reward modeling, we have two options concerning the action-free branch. First, we may regard noncontrollable dynamics as irrelevant noises that do not contribute to the task and therefore do not involve $z_t$ in imagination.
+%
+In other words, the policy and predicted rewards would solely rely on controllable states, \textit{e.g.}, $p(r_t \mid s_t)$.  
+%
+Alternatively in other cases, we need to consider the influence of future noncontrollable states on the agent's decision-making process and incorporate the action-free components during behavior learning.
+%
+To achieve this, we train the reward predictor to model $p(r_t \mid s_t, z_t)$ in the form of MLPs.
+
+
+For a training sequence of $(o_t, a_t, r_t)_{t=1}^T$ sampled from the replay buffer, the world model can be optimized using the following loss functions, where $\alpha$, $\beta_1$, and $\beta_2$ are hyper-parameters:
+% \vspace{-4pt}
+\begin{equation}
+\label{eq:loss}
+\begin{split}
+\mathcal{L}_\text{base} = &\mathbb{E} \ \{
+\sum_{t=1}^{T} \underbrace{-\ln p(o_{t} \mid h_{t}, s_{t}, h^\prime_t, z_{t})}_{\text {image log loss }}  +\underbrace{\alpha \ell_2(a_t, \tilde{a}_{t})}_{\text {action loss }}\\
+&\underbrace{-\ln p(r_{t} \mid h_{t}, s_{t}, h^\prime_t, z_{t})}_{\text {reward log loss }} 
+ \underbrace{- \ln p(\gamma_{t} \mid h_{t}, s_{t}, h^\prime_t, z_{t})}_{\text {discount log loss }}  \\ 
+ &+\underbrace{\beta_1 \mathrm{KL}[q(s_{t} \mid h_{t}, o_{t}) \mid p(s_{t} \mid h_{t})]}_{\mathrm{KL} \text { divergence in the action-conditioned branch }} \\ &+\underbrace{\beta_2 \mathrm{KL}[q(z_{t} \mid h^\prime_{t}, o_{t}) \mid p(z_{t} \mid h^\prime_{t})]}_{\mathrm{KL} \text { divergence in the action-free branch }}\}.
+\end{split}
+\end{equation}
+
+\vspace{-4pt}
+
+
+
+
+\subsubsection{Training Collapse and Min-Max Variance Constraints}
+\label{sec:variance}
+
+
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/collapse_nips.pdf}
+    % \vspace{-5pt}
+    \caption{A showcase of training collapse that the action-conditioned branch in the original version of Iso-Dream dominates the learning process of both controllable and noncontrollable dynamics. The corresponding results of \model{} are shown in \fig{fig:dmc-visual}.}
+    \label{fig:collapse}
+    \vspace{-5pt}
+\end{figure}
+
+
+
+
+Despite modeling inverse dynamics, for the original Iso-Dream, we find that it is still challenging for the world model to isolate controllable and noncontrollable dynamics. 
+%
+We observed in the preliminary experiments that the disentanglement results were unstable over multiple runs of world model training, and that the action-conditioned branch occasionally learned mismatched representations of noncontrollable state transitions.
+%
+An example is shown in \fig{fig:collapse}.
+%
+It implies that most useful information may collapse into the action-conditioned branch while the action-free branch learns almost nothing, which we call ``\textit{training collapse}''.
+%
+This phenomenon arises due to the inherent limitations of the training objective in inverse dynamics, which may not always ensure the complete exclusion of action-independent state transitions, particularly when the action-conditioned network branch possesses a strong capacity for modeling dynamics.
+
+
+
+
+To keep the state transition branches from training collapse, we propose the \textit{min-max variance constraints}, whose key idea is to (i) maximize the diversity of outcomes in the action-conditioned branch given distinct action inputs and (ii) minimize the diversity of outcomes in the action-free branch under similar conditions.
+%
+To this end, unlike in the original Iso-Dream, we make the action-free branch also aware of the action signal during the world model learning process. But for behavior learning and policy deployment, we simply set the input action to $0$-values. 
+
+
+There is an information-theoretic interpretation behind calculating variance. In order to investigate the connection between dynamics and action signals, the world model is enforced to identify the dynamics that provide information about our beliefs regarding the action signals. The expected information gain can be expressed as the conditional entropy of state and action:
+\begin{equation}  
+% \vspace{-5pt}
+     I(s_{t}; a_{t-1}{\mid}s_{t-1}) = H(s_{t}{\mid}s_{t-1}) - H(s_{t}{\mid}s_{t-1}, a_{t-1}).
+\end{equation}
+
+
+As shown in \fig{fig:rl_model_and_policy} (right), for the action-conditioned branch, we maximize the mutual information between the state and action signal to focus on the state transition of a specific action.
+%
+Given a batch of hypothetical actions $\{a_{t-1}^i{\mid}i \in [1, n]\}$, for the same controllable state $s_{t-1}$, we have different state transitions based on these actions:
+$\tilde{s}_t^i \sim p(\tilde{s}_t^i {\mid} s_{t-1}, a_{t-1}^i), \ i\in[1, n]$.
+% \begin{equation}  
+%      \tilde{s}_t^i \sim p(\tilde{s}_t^i {\mid} s_{t-1}, a_{t-1}^i), \ i\in[1, n].
+% \end{equation}
+The empirical variance is used to approximate the information gain, and the objective can be written as
+\begin{equation} 
+\begin{split}
+% \vspace{-5pt}
+     L_{s} &= \max \sum\limits_t^{T} \mathrm{Var}(\tilde{s}_t^i) = \max \sum\limits_t^{T} \frac{1}{n-1} \sum\limits_i(\tilde{s}_t^i - \bar{s}_t)^2, \\
+     \bar{s}_t &= \frac{1}{n} \sum\limits_i \tilde{s}_t^i, \quad  i\in[1, n].
+\end{split}
+\end{equation}
+On the contrary, in the action-free branch, we minimize the variance of output states resulting from different actions, penalizing the diversity of state transitions:
+\begin{equation} 
+\begin{split}
+% \vspace{-5pt}
+     L_{z} &=  \min \sum\limits_t^{T} \mathrm{Var}(\tilde{z}_t^i) =  \min \sum\limits_t^{T} \frac{1}{n-1} \sum\limits_i(\tilde{z}_t^i - \bar{z}_t)^2, \\
+     \bar{z}_t &= \frac{1}{n} \sum\limits_i \tilde{z}_t^i, \quad  i\in[1, n].
+\end{split}
+\end{equation}
+The overall training objective of the world model is
+\begin{equation} 
+\begin{split}
+\label{eq:all_loss}
+% \vspace{-5pt}
+     L_\text{all} = L_\text{base} + L_\text{var},
+\end{split}
+\end{equation}
+where $L_\text{var} = \lambda_1 L_s + \lambda_2 L_z$. $\lambda_1$ and $\lambda_2$ are hyper-parameters.
+% the cosine similarity.
+
+For convenience, we only use two opposite actions $\{a_t, -a_t\}$ in the action-conditioned branch, and use the action set $\{a_t, 0, -a_t\}$ in the action-free branch to figure out $L_s$ and $L_z$. As for subsequent learning, we use $a_t$ and $0$ in the action-conditioned and action-free branches, respectively. 
+%
+
+
+\subsubsection{Sparse Dependency between Decoupled States}
+\label{sec:spare-dependency}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.85\linewidth]{figures/sparse_model.pdf}
+    % \vspace{-5pt}
+    \caption{
+    The dependency gate involves a binary gate that can either be open ($w_t=1$) or closed ($w_t=0$). When the gate is open, the transition of the next noncontrollable state $\tilde{z}_{t+1}$ takes into account the dependency between $\tilde{s}_t$ and $\tilde{z}_t$.}
+    \label{fig:sparse_model}
+    \vspace{-5pt}
+\end{figure}
+
+
+In certain situations, the controllable and noncontrollable dynamics are not entirely independent, as shown in \fig{fig:sparse_vis}. This is particularly true in autonomous driving, where the actions of the ego-agent can influence the behavior of other vehicles, causing them to steer or slow down. To accurately predict future noncontrollable states based on current controllable states, it is essential to account for these sparse dependencies.
+
+
+
+To achieve effective modeling of sparse dependency, it is essential to identify the moment when controllable states exert a significant influence on noncontrollable states. 
+%
+In order to facilitate this, we present a compact module called the \textit{dependency gate}, which connects the previously isolated action-free and action-conditioned branches, as shown in \fig{fig:rl_model_and_policy} (left).
+%
+We unfold the detailed structure dependency gate in time (see \fig{fig:sparse_model}), where the controllable state $\tilde{s}_t$ and noncontrollable state $\tilde{z}_t$ are concatenated and passed through a fully connected layer represented by $f(\tilde{s}_t,\tilde{z}_t)$. A sigmoid function is then applied as an activation signal to control the gate, which is formulated as
+\begin{equation}
+\label{sparse_gate}
+\delta_t(w_t=1{\mid}\tilde{s}_t, \tilde{z}_t)=\left\{
+\begin{aligned}
+1,& \quad \mathrm{sigmoid}(f(\tilde{s}_t, \tilde{z}_t)) \geq 0.5, \\
+0,& \quad \mathrm{otherwise}.
+\end{aligned}
+\right.
+\end{equation}
+When the gate detects a dependency between controllable and noncontrollable states ($w_t = 1$), the subsequent noncontrollable state $\tilde{z}_{t+1}$ is determined by both $\tilde{s}_t$ and $\tilde{z}_t$ using the action-free transition, which is defined as follows: 
+\begin{equation}
+\label{eq:sparse}
+\tilde{z}_{t+1} \sim p(\tilde{z}_{t+1} \mid \tilde{z}_t, w_t \odot \tilde{s}_t).
+\end{equation}
+
+
+
+% \texttt{// Environment interaction} \tcc*[r]{xxx}
+% \vspace{-3pt}
+\subsection{Behavior Learning in Isolated Imaginations}
+\label{sec:behavior-learning}
+% \vspace{-3pt}
+Thanks to the decoupled world model, we can optimize agent behavior to adaptively consider the relationship between available actions and potential future states of the noncontrollable dynamics. 
+%
+A practical example is autonomous driving, where the movement of other vehicles can be naturally viewed as noncontrollable but predictable components. 
+%
+As shown in \fig{fig:policy}, we here propose an improved actor-critic learning algorithm that \textit{(i) allows the action-free branch to foresee the future ahead of the action-conditioned branch, and (ii) exploits the predicted future information of noncontrollable dynamics to make more forward-looking decisions}.
+
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/policy.pdf}
+    % \vspace{-5pt}
+    \caption{The agent learns \textit{future-dependent} policies in world model's imaginations through a \textit{future state attention} mechanism.
+   }
+    \label{fig:policy}
+    \vspace{-5pt}
+\end{figure}
+
+
+%%%%%%
+\begin{algorithm*}[t] 
+  \caption{\model{} (Highlight: Our modifications to \textcolor{MyDarkBlue}{behavior learning} \& \textcolor{MyDarkGreen}{policy deployment} of the original Dreamer)}  
+  \label{alg:algorithm}  
+  \small
+  \textbf{Hyper-parameters: }{$L$: Imagination horizon; $\tau$: Window size for future state attention}
+  \begin{algorithmic}[1]
+    \State Initialize the replay buffer $\mathcal{B}$ with random episodes. 
+    \While{not converged}
+    \For{update step $c = 1 \dots C$}
+        \State \texttt{// Representation learning} 
+        \State Draw data sequences $\left\{\left(o_{t}, a_{t}, r_{t}\right)\right\}_{t=1}^{T} \sim \mathcal{B}$. 
+        \State Compute the controllable state $s_t \sim q(s_t {\mid} h_t, o_t, a_{t-1})$ and the noncontrollable state $z_t \sim q(z_t {\mid} h^{\prime}_t, o_t, a_{t-1})$. 
+        \State Compute world model loss using Eq. \eqref{eq:all_loss} and update model parameters. 
+        % 
+        \State \texttt{// Behavior learning}  
+        \For{time step $i = t \dots t+L$}
+        \State \textcolor{MyDarkBlue}{Compute the next noncontrollable state $\tilde{z}_{i+1}$ using Eq. \eqref{eq:sparse}.}
+        \State \textcolor{MyDarkBlue}{Roll-out the noncontrollable states $\{\tilde z_j\}_{j=i+2}^{i+\tau}$ from $\tilde{z}_{i+1}$ through the action-free branch alone.} 
+        \State \textcolor{MyDarkBlue}{Compute latent state $e_i \sim \texttt{Attention}(\tilde s_i, \tilde z_{i: i+\tau})$ using Eq. \eqref{eq:attention}.}
+        \State \textcolor{MyDarkBlue}{Imagine an action ${a}_i \sim \pi (a_i {\mid} e_i)$.} 
+        \State \textcolor{MyDarkBlue}{Predict the next controllable state $\tilde s_{i+1} \sim p(\tilde s_{i}, {a}_{i})$ using the action-conditioned branch alone.}
+        \EndFor
+        \State Update the policy and value models in Eq. \eqref{eq:ac-model} using estimated rewards and values.
+    \EndFor
+    % 
+    % 
+    \State \texttt{// Environment interaction} 
+    \State $o_{1} \leftarrow$ \texttt{env.reset}() %\tcc*[r]{Environment interaction}
+    \For{time step $t = 1\dots T$}
+    % \textcolor{MyDarkGreen}{
+    % $h_t = \texttt{GRU}_s(h_{t-1}, s_{t-1}, a_{t-1}),  h_t^\prime = \texttt{GRU}_z(h_{t-1}^\prime, z_{t-1})$.} \\
+    \State Calculate the posterior representation $s_{t} \sim q\left(s_{t} \mid h_t, o_{t}, a_{t-1}\right), z_{t} \sim q\left(z_{t} \mid h_t^\prime, o_{t}, a_{t-1}\right)$. 
+    % 
+    \State \textcolor{MyDarkGreen}{Compute the next noncontrollable state $\tilde{z}_{t+1} \sim p(\tilde{z}_{t+1}{\mid}z_{t}, w_t \odot s_{t})$ using Eq. \eqref{eq:sparse}.}
+    \State \textcolor{MyDarkGreen}{Roll-out the noncontrollable states $\tilde{z}_{t+2:t+\tau}$ from $\tilde{z}_{t+1}$ through the action-free branch alone.}
+    \State \textcolor{MyDarkGreen}{Generate $a_t \sim  \pi (a_t \mid s_t, z_t, \tilde{z}_{t+1:t+\tau})$ using future state attention in Eq. \eqref{eq:attention}.} 
+    \State $r_t, o_{t+1} \leftarrow$ \texttt{env.step}($a_t$)
+    \EndFor
+    \State Add experience to the replay buffer $\mathcal{B} \leftarrow \mathcal{B} \cup\{\left(o_{t}, a_{t}, r_{t}\right)_{t=1}^{T}\}$.
+    \EndWhile
+  \end{algorithmic}  
+\end{algorithm*}
+%%%%%%%%%%%%%% Alg end
+
+
+
+
+Suppose we are making decisions at time step $t$ in the imagination period.
+%
+A straightforward solution from the original Dreamer method is to learn an action model and a value model based on the isolated controllable state $\tilde{s}_t \in \mathbb{R}^{1 \times d}$. 
+%
+With the aid of an attention mechanism, we can establish a connection between it and future noncontrollable states. It is important to note that we only employ sparse dependency in the initial imagination step to obtain $\tilde{z}_{t+1}$, as the subsequent controllable states are not yet available at time step $t$. Once we have predicted a sequence of future noncontrollable states $\tilde{z}_{t:t+\tau} \in \mathbb{R}^{\tau \times d}$, where $\tau$ is the sliding window length from the present time, we explicitly compute the relations between them using the following equation:
+\begin{equation} 
+\begin{split}
+    \label{eq:attention}
+     e_t = \mathrm{softmax}(\tilde s_t \ \tilde{z}^T_{t:t+\tau}) \ \tilde{z}_{t:t+\tau} + \tilde s_t.
+\end{split}
+\end{equation}
+This equation allows us to dynamically adjust the horizon of future noncontrollable states using the attention mechanism.
+%
+In this way, $\tilde{s}_t$ evolves to a more ``\textit{visionary}'' representation $e_t \in \mathbb{R}^{1 \times d}$. We modify the action and value models in Dreamer \cite{hafner2019dream} as follows:
+% \vspace{-5pt}
+\begin{equation}
+\label{eq:ac-model}
+% \vspace{-5pt}
+% \renewcommand{\arraystretch}{1.2}
+\begin{split}
+    \text{Action model:}& \quad {a}_{t} \sim \pi(a_{t} \mid e_t ), \\
+    \text{Value model:}& \quad v_{\xi}(e_{t}) \approx \mathbb{E}_{\pi\left(\cdot \mid e_{t}\right)} \sum_{k=t}^{t+L} \gamma^{k-t} r_{k},
+\end{split}
+\end{equation}
+where $L$ is the imagination time horizon. 
+%
+As shown in \alg{alg:algorithm}, during imagination, we first use the action-free transition model to obtain sequences of noncontrollable states of length $L+\tau$, denoted by $\{\tilde{z}_i \}_{i=t}^{i+L+\tau}$.
+%
+At each time step in the imagination period, the agent draws an action ${a}_j$ from the visionary state $e_j$, which is derived from Eq. \eqref{eq:attention}. The action-conditioned branch uses the action ${a}_j$ in latent imagination and predicts the next controllable state $s_{j+1}$.
+%
+We follow DreamerV2 \citep{hafner2020mastering} to train our action model with the objective of maximizing the $\lambda$-return \citep{sutton2018reinforcement}, while our value model was trained to perform regression on the $\lambda$-return. For further information on the loss functions, please refer to Eq. (5-6) as detailed in the paper of DreamerV2 \citep{hafner2020mastering}.
+
+
+\subsection{Policy Deployment by Rolling out Noncontrollable Dynamics}
+\label{sec:Policy-Deployment}
+
+During policy deployment, as shown in Lines 22-24 in Alg. \ref{alg:algorithm}, the action-free branch predicts the next-step noncontrollable states $\tilde{z}_{t+1}$ using Eq. \eqref{eq:sparse} and then consecutively rolls out the future noncontrollable states $\tilde{z}_{t+2:t+\tau}$ starting from $\tilde{z}_{t+1}$. 
+%
+Similar to Eq. \eqref{eq:attention} used in the process of behavior learning, the learned future state attention network is used to adaptively integrate $s_t$, $z_t$ and $\tilde{z}_{t+1:t+\tau}$. 
+%
+Based on the integrated feature $e_t$, the \model{} agent then draws $a_t$ from the action model to interact with the environment.
+%
+As discussed in \sect{sec:challenges}, if the noncontrollable dynamics are irrelevant to the control task, the policy at each time step $t$ is generated using only the state of controllable dynamics when interacting with the environment.

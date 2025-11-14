@@ -1,0 +1,471 @@
+
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage[pagenumbers]{cvpr} % To force page numbers, e.g. for an arXiv version
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+
+\usepackage[numbers]{natbib}
+\usepackage[resetlabels]{multibib}
+\newcites{supp}{References}
+
+\usepackage[pagebackref,breaklinks,colorlinks,hypertexnames=false]{hyperref}
+
+\setcounter{tocdepth}{1}
+\newcommand{\nocontentsline}[3]{}
+\newcommand{\tocless}[2]{\bgroup\let\addcontentsline=\nocontentsline#1{#2}\egroup}
+
+\usepackage[capitalize]{cleveref}
+\crefname{section}{Sec.}{Secs.}
+\Crefname{section}{Section}{Sections}
+\Crefname{table}{Table}{Tables}
+\crefname{table}{Tab.}{Tabs.}
+
+\usepackage{float}
+\usepackage{bbm}
+\usepackage{dutchcal}
+\usepackage{multirow}
+% \usepackage{multicol}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+\setlength{\textfloatsep}{8pt}
+\setlength{\intextsep}{5pt}
+\setlength{\floatsep}{5pt}
+\setlength{\dbltextfloatsep}{5pt}
+\setlength{\dblfloatsep}{5pt}
+
+\newcommand{\topcaption}{%
+\setlength{\abovecaptionskip}{2pt}%
+\setlength{\belowcaptionskip}{2pt}%
+\caption}
+
+\begin{document}
+
+\title{Box-Level Active Detection}
+
+\author{Mengyao Lyu$^{1,2,3}$
+\: Jundong Zhou$^{1,2,3}$
+\: Hui Chen$^{1,2}$
+\: Yijie Huang$^{4}$
+\: Dongdong Yu$^{4}$\\
+\: Yaqian Li$^{4}$
+\: Yandong Guo$^{4}$
+\: Yuchen Guo$^{1,2}$
+\: Liuyu Xiang$^{5*}$
+\: Guiguang Ding$^{1,2}\thanks{Corresponding Authors.}$\quad
+\\
+$^{1}$Tsinghua University\: $^{2}$BNRist\: $^{3}$Hangzhou Zhuoxi Institute of Brain and Intelligence\\
+$^{4}$OPPO Research Institute\: $^{5}$Beijing University of Posts and Telecommunications\\
+{\tt\small 
+    \{mengyao.lyu,jundong.zhou\}@outlook.com\:
+    \{huangyijie,yudongdong,liyaqian,guoyandong\}@oppo.com
+}\\
+{\tt\small 
+    \{jichenhui2012,yuchen.w.guo\}@gmail.com\:
+    xiangly@bupt.edu.cn\:
+    dinggg@tsinghua.edu.cn\:
+    }
+}
+\maketitle
+
+\begin{abstract}
+   Active learning selects informative samples for annotation within budget, which has proven efficient recently on object detection. 
+   However, the widely used active detection benchmarks conduct \textbf{image-level evaluation}, which is unrealistic in human workload estimation and biased towards crowded images. 
+   Furthermore, existing methods still perform \textbf{image-level annotation}, but equally scoring all targets within the same image incurs waste of budget and redundant labels.
+   Having revealed above problems
+   and limitations, we introduce a \textbf{box-level active detection} framework that controls a box-based budget per cycle, prioritizes informative targets and avoids redundancy for fair comparison and efficient application.
+   
+   Under the proposed box-level setting, we devise a novel pipeline, namely \textbf{Complementary Pseudo Active Strategy (ComPAS)}. It exploits both human annotations and the model intelligence in a complementary fashion: an efficient input-end committee queries labels for informative objects only; meantime well-learned targets are identified by the model and compensated with pseudo-labels.
+   ComPAS consistently outperforms 10 competitors under 4 settings in a unified codebase. With supervision from labeled data only, it achieves 100\% supervised performance of VOC0712 with merely 19\% box annotations. On  the COCO dataset, it yields up to 4.3\% mAP improvement over the second-best method. 
+   ComPAS also supports training with the unlabeled pool, where it surpasses 90\% COCO supervised performance with 85\% label reduction.
+   Our source code is publicly available at \href{https://github.com/lyumengyao/blad}{https://github.com/lyumengyao/blad}.
+\end{abstract}
+
+\tocless\section{Introduction}
+\label{sec:intro}
+
+\begin{figure}[t]
+  \centering
+   \includegraphics[width=1\linewidth]{figures/img_box_levels.pdf}
+   \caption{Active detection methods evaluated on VOC0712 under image-level (Left) and box-level (Right) settings. BoxCnt is our hack that simply queries potentially the most crowded images, which demonstrates that image-level evaluation is highly biased.
+   Methods marked with * have specialized detector architectures.
+   }
+   \label{fig:image-level}
+\end{figure}
+
+
+Reducing the dependency on large-scale and well-annotated datasets for deep neural networks has received a growing interest in recent years, especially for the detection task, where the box-level annotation is highly demanding.
+Among data-efficient training schemes, active detection methods~\cite{agarwal2020cdal,kao2018localizationaware,Desai2019adaptiveswitch,choi2021gmm,yuan2021miaod,mi2022ActiveTeacherSemiSupervised,elezi2022NotAllLabels,roy2018qbc} iterate over detector training, performance evaluation, informative image acquisition and human annotation. 
+Despite recent progress, 
+previous pool-based active detection methods still 
+consider the subject of interest at the image-level: they conduct \textbf{image-level evaluation}, where the budget is controlled by the number of labeled images per cycle; afterwards, they perform exhaustive \textbf{image-level annotation}, where all instances of the same image are labeled. Such an image-level framework suffers from unfairness in model performance comparison and leads to a waste of annotation resources.
+
+On the one hand, existing methods under the image-level evaluation assume equal budget for every image.
+However, in real-world use cases, the workload of annotators is measured by bounding boxes~\cite{ren2020omniufo,gupta2019lvis}. 
+As the image-level budget fails to reflect actual box-based costs, active detection methods are allowed to obscurely gain an advantage by querying box supervision as much as possible until the image-based budget is run out. 
+In fact, according to our experiment shown in Fig.~\ref{fig:image-level}L, naively sampling potentially the most crowded images (dubbed as ``BoxCnt'') can surpass all elaborately designed methods, demonstrating the unfairness of image-level evaluation.
+On the other hand, during human annotation, simply performing image-level exhaustive annotation is wasteful, since the informativeness of different targets involved in the same image can vary sharply. 
+For example, a salient target of a common category might have been well-learned, whereas a distant or occluded variant could be more informative. As a result, annotating all instances amongst the same image as equals leads to a  waste of resources and redundant annotations (See Fig.~\ref{fig:violin}).
+
+
+After revealing the above problems and limitations, we propose a new \textbf{box-level active detection} framework towards fair comparison and non-redundant human annotation.
+For evaluation, our framework includes a more practical and unbiased criterion that controls the amount of queried boxes per cycle, enabling competing methods to be  assessed directly within realistic box-based budgets (as illustrated in Fig.~\ref{fig:image-level}R).
+Considering the annotation, we advocate a box-level protocol that prioritizes top-ranked targets for annotation and discards well-learned counterparts to avoid redundancy.
+Under the proposed framework, we develop a novel and efficient method namely \textbf{Com}plementary \textbf{P}seudo \textbf{A}ctive \textbf{S}trategy (\textbf{ComPAS}). It seamlessly integrates human efforts with model intelligence in actively acquiring informative targets via an \textit{input-end committee}, and meantime remedying the annotation of well-learned counterparts using \textit{online pseudo-labels}. 
+
+In consideration of the active acquisition, 
+concentrating resources on the most informative targets makes box-level informativeness estimation crucial.
+Among active learning strategies, multi-model methods, such as Ensemble~\cite{beluch2018ensemble} and MCDropout~\cite{gal2017mcdropout}, have demonstrated superiority.
+Built upon a model-end ensemble, query-by-committee methods select the most controversial candidates based on the voting of model members to minimize the version space~\cite{seung1992qbc,settles2012active}. 
+However, directly adapting them to detection not only multiplies the computational cost in the committee construction, but complicates the detection hypothesis ensemble on the box-level.
+Therefore, to harness the power of diversity without a heavy computational burden, orthogonal to model-end ensembles, we construct an input-end committee during the sampling stage. Variations are drawn from ubiquitous data augmentations and applied to unlabeled candidates, among which each perturbation can be considered as a \textit{cheap but effective committee} member towards version space minimization. 
+When it comes to the box-level hypothesis ensemble, instead of performing pair-wise label assignment among all members~\cite{roy2018qbc}, we \textit{reduce the ensemble burden} by analyzing the disagreement between predictions of a reliable reference 
+and other members.
+Then the disagreement is quantified for both classification and localization to exploit the rich information in annotations.
+
+Later during box-level annotation, the oracle only yields labels for challenging, controversial targets, leaving consistent ones unlabeled. 
+Those unlabeled targets would be considered as the background class during the following training cycles, which severely harms the performance and poses a new challenge.
+To compensate well-learned targets for missing annotation, we combine sparse ground truths with online pseudo-label generation, where in contrast to active sampling, confident model predictions are accepted as self-supervision signals.
+The proposed box-level pipeline supports both labeled-only and mixed-supervision learning settings w/ or w/o the unlabeled image pool involved during training, which makes a fairer comparison with fully- and semi-supervised state-of-the-arts (SOTAs).
+
+
+
+
+
+
+Our contributions can be summarized as follows: 
+\begin{itemize}
+    \itemsep-0.3em 
+    \item We propose a box-level active detection framework, where we control box-based budgets for realistic and fair evaluation, and concentrate annotation resources on the most informative targets to avoid redundancy.
+    \item We develop ComPAS, a novel method that seamlessly integrates model intelligence into human efforts via an input-end committee for challenging target annotation and pseudo-labeling for well-learned counterparts.
+    \item We provide a unified codebase with implementations of active detection baselines and SOTAs, under which the superiority of ComPAS is demonstrated via extensive experiments.
+\end{itemize}
+
+
+\tocless\section{Related Work}
+
+
+\begin{figure*}[t]
+  \centering
+   \includegraphics[width=1\linewidth]{figures/fig2.pdf}
+   \caption{Overview of our ComPAS pipeline for box-level active detection, which iterates between active acquisition via the input-end committee and complementary training based on pseudo-active synergy. Only workflow of sparsely labeled images is shown for generality.}
+   \label{fig:framework}
+\end{figure*}
+\textbf{Active scoring functions.}
+Pool-based active detection strategies rely on scoring functions to rank sample candidates for annotation, which can be categorized into uncertainty-based~\cite{choi2021gmm,roy2018qbc,yuan2021miaod,yoo2019learningloss,hetao}, diversity-based~\cite{sener2018coreset,agarwal2020cdal} and hybrid methods~\cite{wu2022EntropyBasedActiveLearning,mi2022ActiveTeacherSemiSupervised}.
+Uncertainty-based methods prioritize unconfident predictions based on posterior probability distributions~\cite{yuan2021miaod,gal2017mcdropout,beluch2018ensemble}, a specified loss prediction module~\cite{yoo2019learningloss}, or Gaussian mixture heads~\cite{choi2021gmm}.
+To avoid sampling bias~\cite{dasgupta2011samplingbias,ren2020survey} in batch mode active learning induced by uncertainty, another strategy is to promote diversity for a more representative dataset, which is achieved by core-set selection~\cite{sener2018coreset,agarwal2020cdal}.
+However, diversity-based methods incline to sample data points as far as possible
+to cover the data manifold without considering density. Thus, {hybrid} methods that make trade-offs between diversity and uncertainty are proposed~\cite{wu2022EntropyBasedActiveLearning,mi2022ActiveTeacherSemiSupervised}. 
+Besides adaption from classification-oriented methods, some recent research specially considers the localization subtask, of which the uncertainty is estimated via the inconsistency between RPN proposals and final predictions~\cite{kao2018localizationaware}, or a mixture density model~\cite{choi2021gmm}. However, they either impose limitations on the detector architecture, or require certain modifications to it, thus cannot be generalized. In contrast, our localization informativeness is efficiently estimated between stochastic perturbations of candidates without dependency on model architecture. 
+
+
+\textbf{Multi-model score ensemble.}
+Based on the above active scoring functions, multi-model methods ensemble different hypotheses obtained via multiple training repetitions~\cite{beluch2018ensemble}, stochastic forward passes~\cite{gal2017mcdropout}, different model scales~\cite{roy2018qbc} 
+or duplicated detection heads~\cite{choi2021gmm}.
+Despite their effectiveness because of increased variety, ensemble methods have not been widely discussed in detection due to the computational burden and the box-level ensemble difficulty.
+To reduce the computational cost,
+some of the previous methods attempted at altering model inputs, such as image flipping~\cite{elezi2022NotAllLabels} and noise interfering~\cite{kao2018localizationaware}, but those variations are simple and limited.
+During the result ensemble, unlike classification methods that can directly average over posterior distributions, existing adaptations towards detection mainly avoid the obstacles by image-level scoring followed by model-level aggregation~\cite{choi2021gmm}. However, when applied on the box-level, it requires pair-wise label assignment~\cite{roy2018qbc}, which further incurs computational cost.
+In contrast, our input-based committee promotes diversity via stronger positional and color perturbations applied on more input members, and disagreement is efficiently analyzed between a reference and members.
+
+
+
+
+
+
+
+
+
+\textbf{Implementation and evaluation.}
+While most recent research on active detection is still evaluated on the image-level, our analysis has revealed that it is unrealistic and heavily biased. Furthermore, we suggest box-level annotation, which is attempted but neither well-explored \cite{Desai2020boxlevel} nor applicable to the in-domain task~\cite{qbox}. To this end, we present a strong pipeline that integrates both human annotations and machine predictions on the box-level.
+We also note that previous active detection methods are compared without detector uniformity (\eg SSD~\cite{liu2016ssd}, Faster R-CNN~\cite{ren2015faster}, RetinaNet~\cite{lin2017retinafocal}), learning standardization (\eg runtime settings), benchmark consistency (VOC12/0712~\cite{everingham2010voc}, COCO2014/2017~\cite{lin2014microsoft}), and supervision differentiation (fully- or semi-supervised).
+To help advance reproducible research, we introduce a shared implementation of methods based on the same detector,
+train with similar procedures in a unified codebase, evaluate under the box-level criterion and support both labeled-only and mixed-supervision learning. 
+
+
+
+\tocless\section{ComPAS for Box-level Active Detection}
+\label{sec:method}
+
+
+\subsection{Problem Formulation}  
+The pipeline of the box-level active detection is initialized at the active learning cycle $t=0$. A small set of images $\mathit{L}_0$ is randomly sampled and fully annotated with bounding boxes, whereas the majority of images are remained unlabeled $\mathit{U}_0$. Based on the current data pools, a generic object detector $\mathbb M(\theta_0)$ is obtained, evaluated and used for inferring on the unlabeled pool. Then a scoring function evaluates the informativeness of each unlabeled candidate and queries an oracle for labels. 
+Different from image-level active detection methods that consider an image as the minimum annotation unit, we actively select top-ranked informative bounding box proposals for annotators to identify the objects of interest within the candidate regions. 
+Such protocol actively prompts annotators with the potential boxes for correction, rather than leaving them passively spotting, marking and verifying all instances for every class among an image, which greatly helps narrow down the spatial search space and semantic options.
+
+Since the first active sampling process $t \ge 1$, sparsely labeled images become available as $\mathit{S}_t$.
+Then the detector ${\mathbb M(\theta_t)}$ is updated accordingly, with labeled images only ($\mathit{L}_t\cup \mathit{S}_t$), or with all images involved ($\mathit{L}_t\cup \mathit{S}_t \cup \mathit{U}_t$) in the mixed-supervision setting. 
+In the subsequent active acquisition cycles, both sparsely labeled and unlabeled images are evaluated, among which top-ranked boxes with low overlap with existing ground truths are prompted for labels. This iteration repeats itself until the stopping criterion is reached. 
+
+As illustrated in Fig.~\ref{fig:framework}, under the box-level active detection scenario, we propose a Complementary Pseudo Active Strategy (ComPAS), where the synergy between hard ground truth mining during active sampling (Sec.~\ref{sec:active}) and easy pseudo-label generation (Sec.~\ref{sec:training}) is exploited. 
+
+
+\subsection{Active Acquisition via Input-end Committee}
+\label{sec:active}
+Ensemble-based active learning has proven effective for classification~\cite{gal2017mcdropout,beluch2018ensemble} as well as detection under the box-level evaluation (shown in Fig.~\ref{fig:image-level}). The ensemble is also dubbed as a \textit{committee}~\cite{seung1992qbc,roy2018qbc} when the disagreement amongst \textit{member} hypotheses is estimated.
+However, existing ensemble strategies mainly rely on model parameter duplication, referred to as model-end diversity, which induces extra computational cost.
+Furthermore, efficiently aggregating bounding box results is also non-trivial.
+Previous methods adapt the procedure via the instance-level integration to obtain image-level scores, followed by model-level averages~\cite{choi2021gmm,gal2017mcdropout,beluch2018ensemble} which cannot be applied to box-level detection. 
+Or otherwise, aggregating multiple sets of box results would incur pair-wise label assignment, due to the fact that we have to traverse every prediction from all other members to construct a committee for each instance~\cite{roy2018qbc}.
+
+Orthogonal to the model-end diversity in principle, we instead propose to introduce invariant transformations on the input-end. The posterior disagreement is thus estimated amongst multiple stochastic views of the input, which can be considered as committee members.
+Drawing variations from data augmentation instead of model ensemble greatly alleviates the burden of training. 
+To achieve complexity reduction for result assignment, inspired by the \textit{consensus} formulation~\cite{mccallum1998qbcconsensus,settles2012active}, we keep an exponential moving average (EMA) $\mathbb E(\theta')$ of the detector $\mathbb M(\theta)$ as a \textit{chairman} to generate box \textit{references}:
+\begin{equation}
+\label{eq:ema}
+    \theta'_{tr} = \alpha \theta'_{tr-1} + (1-\alpha)\theta_{tr},
+\end{equation}
+where $tr$ indicates the training step within one cycle. 
+As shown in Fig.~\ref{fig:framework}, the chairman model generates more reliable predictions~\cite{laine2017EMA} $\mathbb E(x)$ with regard to the input $x$. Meanwhile, the detector bears more diversity and produces competing hypotheses $\{b_m^j\}$ for a batch of $M$ stochastic augmentations $\mathcal{A}_m(x)$. Based on the chairman predictions as a reference, measuring disagreement between it and all other member hypotheses can effectively reduce the assignment complexity.
+Note that those augmentations are fed into the network as batches and run in parallel in practice, instead of being forwarded in multiple passes.
+Next, we detail our disagreement quantification for classification and localization.
+
+
+\textbf{Disagreement on classification.} 
+In estimating the potential value of a box to the classification branch, we prioritize controversial regions in the input space. Specifically, given the box candidates $\{b^i\}$ predicted by the chairman, 
+member boxes $\{b_m^j\}$ are assigned to each reference box in $\{ b^i\}$ using, though not limited to, the detector-defined assignment strategy, such as the max-IoU assigner. 
+
+Given a matched pair of boxes $\{ b^i, b^j_m\}$, we measure the classification disagreement based on the cross entropy between the one-hot chairman prediction $\textbf{q}^i$ and the  posterior predictive member distribution $\textbf{q}^j$:
+\begin{equation}
+\label{eq:ce}
+    d_c^{ij}=-\mathbb{E}_{\scalebox{0.8}{$\textbf{q}^i$}}[\log \textbf{q}^j].
+\end{equation}
+And the disagreement about box $b^i$ is aggregated among $M$ committee members:
+\begin{equation}
+\label{eq:cls_uncertainty}
+    d_c^i=\frac{1}{M}\sum_m^M\left(\frac{1}{k_{mi}}\sum_j^{k_{mi}} d_c^{ij}\right),
+\end{equation}
+where $k_{mi}$ denotes the number of positively matched member predictions in the $m$-th stochastic view.
+A larger value indicates higher disagreement amongst the input-end committee over a box candidate. It shows that the current model cannot consistently make invariant label predictions under varying degrees of image perturbations, and thus it should be queried for human annotations.
+
+\textbf{Disagreement on localization.} While it is straightforward to adopt the prediction distribution as the confidence indicator, $d_c$ can only reflect the committee disagreement on classification.
+Considering the multi-tasking nature of detection, we are motivated to measure the controversy over localization.
+
+Inspired by \cite{kao2018localizationaware,xu2021softteacher}, with multiple stochastic perturbations applied on the input, we estimate the variation of their box regression results. 
+The intuition behind it is that, if the predicted position is seriously interfered due to randomness, the judgment of the current model on the target concept might not be trustworthy, and thus should be aided by human annotations. The reverse applies when the predictions remain stable despite input variations.
+
+Specifically, with the same chairman-member label assigner used for the classification counterpart, a box reference $b^i$ is matched by multiple candidates $\{b^j_m\}$ generated by $M$ members. We apply respective inverse transformations on those boxes, which are aligned as $\{\mathcal{A}^{-1}_m(b^j_m)\}$ and fed into the localization branch of the chairman model $\mathbb E^{reg}$. Then the disagreement over the location of $b^i$ is measured based on the chairman re-calibrated boxes:
+\begin{equation}
+\label{eq:loc_stability}
+    d_r^i = \frac{1}{4}\sum_k^4 \hat 
+                 \sigma_k(\{{\mathbb E^{reg}}(\mathcal{A}^{-1}_m( b^j_m))\}).
+\end{equation}
+In doing so, the localization task is decomposed into four regression tasks based on coordinates. $\hat \sigma_k$ represents the standard deviation of the $k$-th coordinate, which is normalized by the average of box height and width.
+
+
+Overall, for the box-level detection task, our scoring function is formulated as follows:
+\begin{equation}
+\label{eq:scoring}
+    d^i=d_c^i \times d_r^i,
+\end{equation}
+based on which we rank all reference boxes for unlabeled regions, and provide labels for top-ranking boxes if they meet certain IoU-based criterion with interested targets during the annotation procedure.
+
+Measuring controversy in both classification and localization exploits human annotations at the bounding box level. 
+Built upon the scoring function, our voting committee is constructed with input-end stochasticity to avoid duplicated training, and the reference formulation further reduces assignment complexity in box-level active acquisition.
+With controversial regions of the input space being efficiently identified and annotated, the generalization error minimization is gradually achieved in subsequent cycles. 
+
+\subsection{Sparse- and Mixed-Supervision Training}
+\label{sec:training}
+Ever since the first active sampling, sparsely-labeled images are incorporated into the queried pool, where annotated targets provide additional information, and meantime unlabeled ones bring the noise.
+More severely, our setting prioritizes challenging targets, which we empirically found to be small-sized, distant or occluded, whereas salient and dominant objects are more likely to be left unlabeled. 
+As a result, the label absence of confident objects provides incorrect supervision signals, and proposals associated with them are mistakenly classified as hard negatives. If not properly handled, the sparse annotation problem would have a detrimental effect on the detection performance (See Sec.~\ref{sec:ablation}).
+
+Despite the significant label absence, as described in Sec.~\ref{sec:active}, the silver lining is that human annotations have been provided for targets that the previous detector fails to interpret, leaving the easier ones to be concerned about.
+We find the pseudo-label generation \textit{complementary} to it, where targets with confident model predictions are kept for self-training, while challenging targets with uncertain predictions are filtered out.
+With both active sparse training and pseudo-label generation, we can reduce noise incurred by missing labels, as well as alleviate the error accumulation of pseudo signals.
+To exploit labeled, sparsely labeled and optionally unlabeled images, we adopt the SOTA pseudo-label generation scheme inspired by \cite{liu2021unbiased,xu2021softteacher,tarvainen2017mean}.
+
+\textbf{Supervised loss for labeled images.}
+Fully labeled images $\{x^i_l\}$ from $\mathit{L}_t$ are fed into the detector and learned in a supervised way:
+\begin{equation}
+    \mathcal{L}_l = \frac{1}{N_l}\sum_i
+    \mathcal{L}_{cls}(x_l^i, y_l^i) + 
+    \mathcal{L}_{loc}(x_l^i, t_l^i),
+\end{equation}
+where $N_l$ is the number of fully labeled images, $y$ represents ground truth class labels and $t$ denotes corresponding box locations. $\mathcal{L}_{cls}$ and $\mathcal{L}_{loc}$ represent loss functions used by the detector for classification and localization respectively.
+
+As described in Eq.~\ref{eq:ema}, we keep a temporal smoothed version of the detector, which is also denoted as a \textit{teacher} model. Here we refer to it as \textit{chairman} following Sec.~\ref{sec:active} for consistency.
+
+\textbf{Pseudo-label generation.}
+The data batch is appended with randomly sampled sparse or unlabeled images if available. 
+The weakly augmented input image $x$ is processed by the chairman to generate pseudo-label candidates $\{b^i\}$ , while the strongly augmented version $\mathcal{A}(x)$ is fed into the detector to improve data diversity.
+
+In accordance with our acquisition strategy, pseudo-labels for classification and localization are filtered based on different criteria to ensure precision. 
+Specifically, we apply confidence thresholding with a high threshold $\lambda_c$ to obtain reliable boxes $\{\hat b_c^i\}$ for  classification. 
+With regard to localization, similar as in Eq.~\ref{eq:loc_stability}, we apply positional perturbations $\mathcal{a}(b^i)$ on pseudo-labels for the chairman model to refine. Candidates with predictive fluctuations lower than  a threshold $\lambda_r$ are kept to supervise the regression head, which is denoted as $\{\hat b_r^i\}$.
+
+\begin{figure*}[t]
+  \centering
+    \includegraphics[width=0.92\textwidth, trim={0 0.25cm 0 0.25cm}, clip]{figures/main_res2.pdf}
+   \caption{Box-level comparative results on (Left) VOC-semi, (Middle) COCO-sup and (Right) COCO-semi. Solid lines are performed with labeled-supervision, whereas dashed lines indicate training with unlabeled images.}
+   \label{fig:mainres}
+\end{figure*}
+\textbf{Pseudo-active synergy for sparse images.}
+Although the confidence thresholding is known to accumulate false negative errors due to the low recall of pseudo-labels, it is less likely to happen in our active sparse training setting. Because annotations of the most challenging targets have been provided. 
+For a sparsely labeled image $x_s$, the pseudo-active synergy is exploited as follows:
+\begin{equation}
+    \mathit{G}(y_s,\hat y_{sc}) = y_s \cup \{\hat y_{sc}^i \mid \mathit{IoU}(\hat b_{sc}^i, b_s^j) \le \lambda_g, \forall
+    b_s^j \in b_s\},
+\end{equation}
+where we supplement sparse ground truth labels $y_s$ with pseudo-labels $\hat y_{sc}$ whose corresponding boxes $\hat b_{sc}$ have less than $\lambda_g$ jaccard overlap with the ground truth ones. 
+And the same de-duplication process applies to the localization branch, which results in $\mathit{G}(t_s,\hat t_{sr})$.
+The supervision quality  for sparse images is thus enhanced after the completion:
+\begin{equation}
+\begin{aligned}
+\label{eq:sparse_det}
+    \mathcal{L}_s = \frac{1}{N_s}\sum_i^{N_s} 
+    & \mathcal{L}_{cls}(\mathcal{A}(x_s^i), \mathit{G}(y_s^i,\hat y_{sc}^i)) + \\
+    & \mathcal{L}_{loc}(\mathcal{A}(x_s^i), \mathit{G}(t_s^i,\hat t_{sr}^i)),
+\end{aligned}
+\end{equation}
+where $N_s$ is the number of sparsely labeled images.
+
+\textbf{Mixed-supervision with unlabeled images.}
+In the pool-based active learning scenario, unlabeled images are also available during training, which can be utilized to boost performance~\cite{elezi2022NotAllLabels,mi2022ActiveTeacherSemiSupervised,yuan2021miaod}.
+Without any human annotation available, the loss function is formulated as follows:
+\begin{equation}
+\label{eq:unlabel_det}
+\begin{aligned}
+    \mathcal{L}_u = \frac{1}{N_u}\sum_i^{N_u} (
+    \mathcal{L}_{cls}(\mathcal{A}(x_u^i), \hat y_{uc}^i) +
+    \mathcal{L}_{loc}(\mathcal{A}(x_u^i), \hat b_{ur}^i)),
+\end{aligned}
+\end{equation}
+in which ${N_u}$ denotes the number of unlabeled images, and $\hat y_{uc}$ and $\hat b_{ur}$ are pseudo-labels and boxes for the two subtasks after thresholding respectively.
+
+\textbf{Overall training objectives.}
+In the labeled-only setting, our objective function is formulated as $\mathcal{L}_l + \frac{N_s}{N_l}\mathcal{L}_s$, where we use the sample ratio $\frac{N_s}{N_l}$ to control the contributions of the sparse data flow. 
+Likewise, the objective function for the mixed-supervision setting is $\mathcal{L}_l + \frac{N_s}{N_l}\mathcal{L}_s + \frac{N_u}{N_l}\mathcal{L}_u$.
+
+In grouping hard annotations and easy pseudo-labels together, ComPAS strategy leverages both human brainpower and machine intelligence. It frees object detectors from image-level exhaustive annotations and greatly reduces labor costs.
+
+
+\tocless\section{Experiments}
+\subsection{General Setup}
+\textbf{Datasets.} We study previous and the proposed methods under the box-level evaluation setting on 1) PASCAL VOC0712~\cite{everingham2010voc} dataset, of which the trainval split contains 16,551 images with 40K boxes from 20 classes, and we validate on VOC07 test split; 2) Microsoft COCO~\cite{lin2014microsoft} dataset, which includes 118K images with about 860K boxes for 80 classes on the train2017 split, and 5K images for validation. 
+
+
+\textbf{Baselines and Evaluation.} 
+Depending on the holistic involvement of unlabeled images during training, existing active learning strategies are divided into \textbf{labeled-supervised} methods (Random, MeanEntropy, WhiteBoxQBC~\cite{roy2018qbc}, CoreSet~\cite{sener2018coreset}, LearningLoss~\cite{yoo2019learningloss}, MIAOD\footnote{MIAOD~\cite{yuan2021miaod} samples an unlabeled pool of the same size as the labeled pool, and thus is excluded from holistic mixed-supervision comparison.}~\cite{yuan2021miaod}, ALMDN~\cite{choi2021gmm}, MCDropout~\cite{gal2017mcdropout}, Ensemble~\cite{beluch2018ensemble} and our supervised-ComPAS (denoted as sComPAS)) and \textbf{mixed-supervised} ones (ActiveTeacher~\cite{mi2022ActiveTeacherSemiSupervised} and our mixed-ComPAS (mComPAS)). 
+Under different supervision and datasets, we refer to our experimental settings as \textbf{VOC-sup, VOC-semi, COCO-sup} and \textbf{COCO-semi}.
+
+On VOC0712 dataset, to initialize the labeled pool, we randomly sample images for exhaustive annotation until the budget of 3K boxes is reached, and append 1K boxes per cycle. 
+On COCO, images of 50K boxes are randomly sampled and annotated at first, and 20K boxes are labeled per cycle based on respective query strategies. 
+We conduct all experiments in the main paper for 10 cycles unless the fully supervised (FS) performance has been reached.
+We report mean average precision @0.5 (mAP50) for VOC0712 and  @0.5:0.95 (mAP) for COCO.  The mean and standard deviation of results for three independent runs are reported.
+
+\textbf{Implementation.} 
+Our detector implementation and training configurations are based on Faster R-CNN~\cite{ren2015faster} with ResNet-50~\cite{he2016resnet} backbone under the mmdetection~\cite{chen2019mmdetection} codebase. For a fair comparison, we re-implement MeanEntropy, WhiteBoxQBC~\cite{roy2018qbc}, CoreSet~\cite{sener2018coreset}, LearningLoss~\cite{yoo2019learningloss}, MIAOD~\cite{yuan2021miaod}, ALMDN~\cite{choi2021gmm}, MCDropout~\cite{gal2017mcdropout} and Ensemble~\cite{beluch2018ensemble} based on their respective public code (if available) or paper descriptions\footnote{We verify that the performance of our re-implementations with sufficient regularization and augmentation can surpass their reported results.}. Details of their implementations can be found in the supplementary material.
+
+In each independent run, the exact same data split is used for all methods, among which methods with specialized architectures have different initial performances (marked with *).
+During the training of each cycle, we train 12500 or 88000 iterations with a batch-size of 16 for VOC0712 or COCO datasets respectively to be consistent with the fully supervised setting.
+Unless otherwise stated, SGD optimizer is adopted with learning rates set as 0.01 or 0.02 for VOC0712 or COCO, which is decayed by 10 at 8/12$\times$ and 11/12$\times$ total iterations. 
+On VOC0712, we train from scratch in each cycle, whereas for COCO we fine-tune from the previous checkpoint for 0.3$\times$ iterations with 0.1$\times$ learning rate.
+In terms of the semi-supervision training of competitors and our mixed-supervision setting, we double the training iterations following the common practice, and leave the rest unchanged.
+For the proposed method, thresholds $\lambda_c, \lambda_r, \lambda_g$ are set as $0.9, 0.02$ and $0.4$ respectively, which are not specially tuned. We adopt $M$=10 committee members.
+Diverse augmentations (\eg flip, color distortion) are applied for all methods to make full use of available data.
+
+All experiments on VOC0712 were conducted on NVIDIA RTX 3090, and those of COCO were performed on Tesla V100.
+
+\begin{figure}[tp]
+    \centering
+    \hspace*{-0.5cm}\includegraphics[width=.36\textwidth, trim={0 0.2cm 0 0.2cm}, clip]{figures/voc_violin.pdf}
+   \caption{Violin plots showing the box-level score distributions of newly acquired images in each active learning cycle calculated by (Top) image-level MeanEntropy and (Bottom) box-level ComPAS. }
+   \label{fig:violin}
+\end{figure}
+
+\subsection{Main Results}
+\textbf{Image-level vs. box-level evaluation}. 
+The comparison between the image-level and box-level evaluation settings under VOC-sup is shown in Fig.~\ref{fig:image-level}. Although most of the SOTAs and our hacking method BoxCnt work well under the image-level evaluation, their scoring functions obscurely prioritize crowded images, or their highly ranked targets are severely interfered by invaluable counterparts from the same images. Thus, when evaluated under the box-level criterion, resources wasted on the latter ones emerge, and some previous conclusions are no longer tenable.
+
+\textbf{Performance comparison}. 
+Results under VOC-sup and COCO-sup are presented in Fig.~\ref{fig:image-level}R and Fig.~\ref{fig:mainres}M respectively.
+As can be seen, within the same box-based budgets, the proposed method outperforms baselines and SOTAs at each active learning cycle by a large margin. Under the labeled-supervision setting for VOC, we obtain 100\% supervised performance with only 9K ground truth boxes, which efficiently saves approximately 81\% label expenditure.
+The superiority of our method is also clearly demonstrated on COCO, where sComPAS can exploit rich knowledge from both human annotations and model intelligence. It consistently beats the second-best model-end ensemble-based method by a large margin, and outperforms it by 4.3\% mAP in the last cycle in a robust and efficient manner. 
+
+
+In leveraging the unlabeled pool, as shown in Fig.~\ref{fig:mainres}LR, we first notice that 
+the proposed active learning strategy retains its overall supremacy: surpassing the 100\% supervised performance requires less than 13\% boxes for mComPAS on VOC0712, and on the COCO dataset it only requires 15\% boxes to achieve 90\% fully supervised  capability. 
+In comparison, 
+ActiveTeacher~\cite{mi2022ActiveTeacherSemiSupervised} adopts an advanced semi-supervised model~\cite{sohn2020simple} for pseudo-label generation, but its acquisition function is solely based on predictive class distributions, which cannot exploit the pseudo-active synergy or well capture sample informativeness.
+
+Under four benchmark settings, the consistent improvements of ComPAS over active learning cycles demonstrate the effectiveness of the input-end committee in identifying informative targets to benefit the detector. Built upon it, our superior results over competitors further show that the proposed pipeline can maximize return over investment by the pseudo-active synergy on the box-level.
+
+
+\begin{figure}[tp]
+    \centering
+    \hspace*{-0.5cm}\includegraphics[width=.45\textwidth, trim={0 0.2cm 0 0.2cm}, clip]{figures/ablation.pdf}
+   \caption{Analysis on (Left) the extension from image-level annotation to the box-level and (Right) alternatives to the box-level active acquisition strategy on VOC0712.}
+   \label{fig:ablation}
+\end{figure}
+
+\subsection{Quantitative Analysis}
+\label{sec:ablation}
+
+\textbf{Redundant annotations in the image-level annotation}.
+We take MeanEntropy sampling, the best image-level single-model method, to demonstrate the redundancy problem. In Fig.~\ref{fig:violin}, MeanEntropy shows a long-tail phenomenon in the score distributions of newly acquired images, which gets even more acute in later cycles. It indicates that the scoring functions of image-level methods are interfered by less informative targets. Passively annotating them along with highly-ranked ones results in redundancy. 
+In contrast, our box-level method actively annotates valuable targets and leaves the rest unlabeled, maximizing the return over investment. As the iteration proceeds, the divergence between distributions of labeled and unlabeled boxes consistently increases, demonstrating the improvement of model capability and acquisition reliability. 
+ 
+Next, to show the extension of annotation protocol from image-level to the box-level, in Fig.~\ref{fig:ablation}L, we take MeanEntropy sampling as a baseline, and apply the box-level annotation protocol, ComPAS model design choices and our scoring function step-by-step under the VOC-sup setting.
+
+\textbf{Impact of box-level sparse annotation}. 
+Image-level exhaustive annotation (\textit{img-MeanEntropy}), despite the label redundancy, guarantees the stable training of detection models.
+When the annotation is disentangled into the box-level, without specific handling (\textit{box-Entropy-noPL}), the missing label problem has a detrimental effect on the model due to the incorrect supervision signal. 
+To alleviate the problem, we introduce pseudo-label generation for sparse images (\textit{box-Entropy}), where sparse labels for challenging targets are supplemented with confident model predictions via an IoU-based grouping strategy, which rectifies supervision signals and significantly boosts performance.
+However, we notice that it is outperformed by the image-level counterpart in later cycles, which indicates that the box-level annotation poses a greater challenge to the budget allocation, under which entropy-based sampling is not an optimal informativeness estimation solution. Thus, we propose \textit{box-ComPAS}, which is analyzed later in this section.
+
+
+\begin{figure}[tbp]
+  \centering
+    \hspace*{-0.1cm}\includegraphics[width=.48\textwidth]{figures/vis_complement2.pdf}
+  \caption{Qualitative results of targets top-ranked by our scoring functions (in green) and complementary pseudo-labels (in blue).} 
+   \label{fig:visuals}
+\end{figure}
+
+\textbf{ComPAS model design}.
+The pseudo-label generation scheme designed for sparse annotations of box-level methods can also be used to boost the performance for fully supervised training. To present the effect of it, we simply apply it on all labeled images for image-level MeanEntropy (\textit{img-MeanEntropy}). We first observe that pseudo-labeling is especially effective in the low data regime, but the performance increment  is limited in later cycles as the knowledge grows. We also note that our method retains superiority although only sparse images are fed for pseudo-labeling, which demonstrates that the effectiveness of ComPAS is attributed to informative box selection, while pseudo-labeling is mainly used to compensate for acquired knowledge.
+
+
+\textbf{Box-level scoring function}.
+Under the box-level annotation protocol, we experiment with alternatives to our  scoring function during the active acquisition stage, which includes Random, Entropy, our classification disagreement estimation $d_c$ in Eq.~\ref{eq:cls_uncertainty} alone, our localization disagreement estimation $d_r$ in Eq.~\ref{eq:loc_stability} alone, and the proposed classification-localization hybrid metric $d_c \times d_r$ presented in Eq.~\ref{eq:scoring}. All alternatives are performed with the input-end committee ensemble same as ours.
+As the results in Fig.~\ref{fig:ablation}R suggest, baseline methods, such as entropy-based sampling that performs well for image-level annotation, are not optimal box-level informativeness indicators. In contrast, $d_c$ estimates the cross entropy between the consensus and member prediction distributions, which well captures the classification informativeness. 
+But built upon $d_c$ and $d_r$, our hybrid metric further incorporates disagreement estimation about the localization subtask, benefiting both detection heads from human annotations. 
+It shows that our acquisition function reflects the challenge of boxes being correctly and robustly detected given the current level of knowledge, so that highly ranked boxes can play a complementary role with pseudo-labels in the subsequent training cycles.
+
+
+
+
+
+        
+
+
+\subsection{Qualitative Analysis.}
+The complementarity between actively queried targets (in green) and pseudo-labels (in blue) are visualized in Fig.~\ref{fig:visuals}. We present top-ranked boxes scored by our classification metric $d_c$, localization metric $d_r$ as well as the hybrid metric $d_c\times d_r$ respectively, and give the chairman-generated pseudo-labels from the same learning cycle.
+We empirically find that actively queried targets are more likely to be small, occluded or deviant, where the model fails to guarantee invariant predictions under strong input variations.
+In contrast, targets left by our scoring function tend to be salient and ubiquitous, whose online pseudo-labels usually get better and better in the next cycles and play a complementary role. 
+More visualizations are shown in the supplementary.
+
+
+
+\tocless\section{Conclusion}
+In this paper, we reveal the pitfalls of image-level evaluation for active detection and propose a realistic and fair box-level evaluation criterion. We then advocate efficient box-level annotation, under which we formulate a novel active detection pipeline, namely Complementary Pseudo Active Strategy (ComPAS) to exploit both human annotations and machine intelligence. It evaluates box informativeness based on the disagreement amongst a near-free input-end committee for both classification and localization to effectively query challenging targets. Meantime, the detector model addresses the sparse training problem by pseudo-label generation for well-learned targets. Under both labeled-only and mixed-supervision settings on VOC0712 and COCO datasets, ComPAS outperforms competitors by a large margin in a unified codebase. 
+
+\tocless\section{Acknowledgment}
+This work was partly supported by National Key R\&D Program of China (No. 2022ZD0119400), National Natural Science Foundation of China (Nos. 61925107, 62271281, U1936202), Zhejiang Provincial Natural Science Foundation of China under Grant (No. LDT23F01013F01), China Postdoctoral Science Foundation (BX2021161) and Tsinghua-OPPO JCFDT.
+
+\newpage
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{egbib}
+}
+
+\clearpage
+\input{supp}
+
+\end{document}

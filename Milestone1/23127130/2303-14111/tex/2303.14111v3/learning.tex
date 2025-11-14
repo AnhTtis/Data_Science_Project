@@ -1,0 +1,292 @@
+\section{Learning via Discrete Optimization}
+\label{sec:Learn}
+In this section, we present our learning algorithms for learning deterministic finite automata from a sample $\sample$ of unlabeled words.
+In all three setups, we reduce the tasks to a set of constraint optimization problems and solve them using state-of-the-art mixed-integer programming solvers (in our case, Gurobi~\cite{gurobi}).
+
+
+\subsection{Two-Bound DFA Learning}
+Recall that in the first setup, we are given a sample $\mathcal{S}$ and two bounds $\ell, u \in \mathbb{N}$ with $\ell \leq u \leq \abs{\sample}$.
+To learn a minimal DFA that fulfills these bounds, we apply a technique commonly used in automata learning to ensure minimality. 
+The idea is to encode the problem for an automaton of fixed size $n$ such that the encoding has two key properties:
+\begin{itemize}
+    \item There exists a feasible model if and only if there exists a DFA of size $n$ fulfilling the bounds on the acceptance.
+    \item This model contains sufficient information to construct such a DFA.
+\end{itemize}
+Starting with an automaton of size one and increasing the size whenever there is no feasible model guarantees to produce the minimal solution.
+
+We now describe the MILP model we use to learn a DFA of size $n$.
+Since we just check the existence of a suitable DFA in the first setup, we can choose any constant objective function, e.g., $\mathit{obj} = 1$.
+The set of linear inequalities $\Phi_{\sample, \ell, u}^n = \Phi_{\dfa}^n \land \Phi_\mathcal{B}$ consists of two kinds of constraints: 
+\emph{automata constraints} $\Phi_{\dfa}^n$, which encode a DFA of size $n$ and the runs on all words from the sample, and \emph{bound constraints} $\Phi_\mathcal{B}$ encoding the bounds on the acceptance.
+Throughout these constraints, we bound the introduced variables to only take on integer values between (and including) $0$ and $1$, thus simulating boolean variables.
+
+\paragraph{Automata constraints $\Phi_{\dfa}^n$} 
+The automata constraints are motivated by the SAT encoding of Biermann and Feldman~\cite{BiermannF72}.
+Without loss of generality, the states of the DFA form the set
+$Q = \{q_0, \dots, q_{n-1}\}$ where $q_0$ is the initial state.
+The alphabet $\Sigma$ of the DFA is the set of all symbols appearing
+in the sample $\sample$.
+To encode the transitions of the DFA we introduce variables $\delta_{q,a,q'}$ for $q,q' \in Q$ and $a \in \Sigma$.
+Intuitively, the variable $\delta_{q,a,q'}$ will be set to 1 if and only if the DFA has a transition from state $q$ to state $q'$ on reading $a$.
+Furthermore, we introduce variables $f_q$ for $q \in Q$, which indicate whether a state $q$ is a final state.
+To encode the runs of the DFA, we start by computing the set of all prefixes in the sample $\mathit{Pref}(\mathcal{S}) = \{ w \mid ww' \in \mathcal{S} \text{ and } w' \in \Sigma^*\}$.
+We then introduce a third kind of variable:
+$x_{w,q}$ for all $w \in \mathit{Pref}(\mathcal{S})$ and $q \in Q$.
+Intuitively, these variables indicate that after reading the prefix $w$ the DFA is in state $q$.\\
+%
+We now impose constraints on these variables to encode a DFA and its runs. 
+Being deterministic, there must be precisely one transition for each state $q$ and symbol $a$, which we can model by the following constraint:
+\begin{align}
+    \sum_{q' \in Q} \delta_{q,a,q'} = 1 \hspace{0.75cm} \forall q \in Q, \forall a \in \Sigma \label{eq:single-transition}
+\end{align}
+Furthermore, after reading a word $w$ the DFA can only be in one state and after reading the empty word $\epsilon$ the DFA is in the initial state, which we defined to be $q_0$.
+\begin{align}
+    \sum_{q \in Q} x_{w,q} = 1 \hspace{0.75cm} \forall w \in \mathit{Pref}(S) \hspace{0.75cm} \text{and} \hspace{0.75cm} x_{\epsilon,q_0} = 1 \label{eq:single-run}
+\end{align}
+
+Moreover, we encode a run based on the following observation:
+If the DFA is in some state $q$ after reading the word $w$ and there is a transition from $q$ to $q'$ on reading the symbol $a$, then the DFA is in state $q'$ after reading the word $wa$.
+As a constraint in MILP we get:
+\begin{align}
+    x_{w,q} + \delta_{q,a,q'} - 1 \leq x_{wa,q'} \hspace{0.75cm}  \forall q, q' \in Q, a \in \Sigma, \forall wa \in \mathit{Pref}(S) \label{eq:run}
+\end{align}
+Finally, we define the automata constraints $\Phi_{\dfa}^n$ to be the conjunction of Equations~\ref{eq:single-transition} to~\ref{eq:run} which concludes the encoding of a DFA of size $n$ and its runs.
+
+\paragraph{Bound constraints $\Phi_\mathcal{B}$}:
+To impose constraints on the number of accepted words, we need to track whether a word $w$ is accepted.
+This is the case if and only if after reading $w$ the DFA is in some state $q$ and this state is final.
+Intuitively, we could express this case as $x_{w,q} \cdot f_q$, however, this is not linear and thus not a valid MILP constraint.
+Instead, we exploit the fact that for Boolean variables the multiplication $x_{w,q} \cdot f_q$ is equivalent to the formula $x_{w,q} \land f_q$. 
+By introducing fresh variables $\alpha_{w,q}$ for $w \in \sample$ and $q \in Q$ to store the result, this conjunction can be modeled by the following set of constraints:
+\begin{align}
+    \alpha_{w,q} \geq x_{w,q} + f_q - 1, \quad
+    \alpha_{w,q} \leq x_{w,q}, \quad 
+    \alpha_{w,q} \leq f_q \hspace{0.75cm}\forall w \in \sample, \forall q \in Q \label{eq:accepting}
+\end{align}
+%
+Intuitively, the variables $\alpha_{w,q}$ indicate whether a word $w$ is accepted by the DFA (in the state $q$).
+Relying on these variables, we can encode the bounds on the acceptance as 
+\begin{align}
+    \sum_{w \in S} \sum_{q \in Q} \alpha_{w,q} \geq \ell
+    \hspace{0.75cm} \text{and} \hspace{0.75cm}
+    \sum_{w \in S} \sum_{q \in Q} \alpha_{w,q} \leq u 
+    \label{eq: bounds}
+\end{align}
+Then the bound constraints $\Phi_\mathcal{B}$ are defined as the conjunction of the above inequalities.
+
+After introducing the MILP model, we employ it to construct the minimal DFA that fulfills the given bounds on the acceptance.
+The idea is to check the feasibility of the MILP problem with constant objective function $\mathit{obj} = 1$ and linear inequalities $\Phi_{\sample, \ell, u}^n$ for increasing $n$ until either a solution is found or we reach $n = \abs{\mathit{Pref}(\mathcal{S})} + 2$.
+As argued above when proving decidability of Problem~\ref{problem:1}, the size of the prefix tree is a natural upper bound for the size of the DFA.
+Therefore, we can conclude that there exists no DFA fulfilling the given bounds on the sample when we exceed this size.
+In the case where a feasible model exists for some size $n$, we construct the corresponding DFA from this model based on the variables $\delta_{q,a,q'}$ and $f_q$.
+This procedure is described by Algorithm~\ref{alg:two-bounds}.
+\begin{algorithm}[tbp]
+	\caption{Learning with two bounds}\label{alg:two-bounds}
+	
+	\begin{algorithmic}[1]
+		\State \textbf{Input:} Sample $\sample$, Bounds $\ell, u \in \mathbb{N}$
+		\State $n\gets 0$
+		\Repeat
+		\State $n\gets n+1$
+		\State Construct $\Phi_{\sample, \ell, u}^n = \Phi_{\dfa}^n \land \Phi_\mathcal{B}$ and set $\mathit{obj} = 1$
+		\If{$\mathit{obj},\Phi_{\sample, \ell, u}^n$ has a feasible model (say $m$)}
+			\State \Return Construct DFA $\dfa$ using $m$
+		\EndIf
+		\Until{$n = \abs{\mathit{Pref}(\mathcal{S})} + 2$}
+		\State \Return There exists no DFA fulfilling the given bounds
+	\end{algorithmic}
+\end{algorithm}
+%
+The correctness of this algorithm is established by the following theorem:
+\begin{theorem}
+\label{thm:correctness-two-bounds}
+Given a sample $\sample$ and two natural numbers $\ell, u \in \mathbb{N}$ with $\ell \leq u \leq \abs{\sample}$, Algorithm~\ref{alg:two-bounds} terminates and outputs a minimal DFA $\dfa_{\sample}$ which accepts at least $\ell$ and at most $u$ words from $\sample$, if such a DFA exists.
+\end{theorem}
+
+\begin{proof} [of Theorem~\ref{thm:correctness-two-bounds}]	
+	We prove Theorem~\ref{thm:correctness-two-bounds} in three steps:
+	First, we explain how we construct a DFA from a feasible
+	model and proof that this automaton is well-defined and solves
+	Problem~\ref{problem:1}.
+	Afterwards, we show that a feasible model exists for a size $n$
+	if and only if there exists a DFA of that size fulfilling the bounds.
+	In the end, we establish termination and show that Algorithm~\ref{alg:two-bounds}
+	finds a DFA fulfilling the bounds if such a DFA exists.
+	By construction this DFA is minimal.
+	
+	For now let us assume we found a feasible model for some size $n$.
+	We show that the DFA $\dfa=(Q,\Sigma,q_I,\delta,F)$ given by
+	\begin{itemize}
+		\item $Q=\{q_0,\dots,q_{n-1}\},q_I=q_0;$
+		\item $\Sigma$ the symbols present in $\sample$;
+		\item $\delta:Q\times\Sigma\rightarrow Q,(q,a)\mapsto q'$
+			for $q\in Q,a\in\Sigma,$ and $q'\in Q$ such that
+			$\delta_{q,a,q'}$ = 1;
+		\item $F\coloneqq\{q\in Q\mid f_q = 1\};$
+	\end{itemize}
+	is well-defined and solves Problem~\ref{problem:1}.
+	First of all, Constraint \ref{eq:single-transition} ensures that the state-transition function $\delta$ is well-defined while $f_q$ simulating Boolean variables further ensures that $F$ is well-defined.
+	Next, we show that the variables $x_{w,q}$ correspond to the runs of words $w$ from $\sample$ in this well-defined DFA.
+	More precisely, we show that $x_{w,q}=1$ if $\dfa$ is in state $q\in Q$ after reading $w\in\mathit{Pref}(\mathcal{S})$ by induction over the prefix length $k=|w|$ (where we w.l.o.g. assume $\sample$ to be non-empty).
+	Note that Constraint \ref{eq:single-run} then also ensures the opposite
+	direction, i.e., that $\dfa$ is in state $q\in Q$ after reading
+	$w\in\mathit{Pref}(\mathcal{S})$ if $x_{w,q}=1$ (as $x_{w,\tilde{q}}=1$
+	for the true state $\tilde{q}$ and thus $x_{w,q'}=0\neq1$ for all other
+	states $q'\neq\tilde{q}$).
+	
+	\textit{Base case.} 
+	The only prefix of length $k=0$ obviously being the empty word
+	$\varepsilon$, Constraint \ref{eq:single-run} gives that
+	$x_{\varepsilon,q_0}=1$, showing the statement for prefixes of
+	length $k=0$.
+
+	\textit{Induction step.}
+	Assuming that the statement holds for any prefix of length less or equal to $k$. 
+	If no prefix of length $k+1$ exists in $\sample$, the induction is closed and the statement is proven for all prefixes.
+	Assume now that $wa\in\mathit{Pref}(\sample)$ is a prefix of length $k+1$.
+	Then $w$ is a prefix of length $k$ and thus fulfills for the state
+	$q$ reached after reading $w$ in $\dfa$ that $x_{w,q}=1$.
+	Writing $q'\coloneqq\delta(q,a)$, Constraint \ref{eq:run} and the
+	definition of $\delta$ then give \[x_{w,q} + \delta_{q,a,q'} - 1 = 1 \leq x_{wa,q'}\]
+	whence also $x_{wa,q'}=1$ as a Boolean variable.
+	As $wa$ was an arbitrary prefix of length $k+1$, this concludes the induction.
+	
+	While this proofs that the DFA $\dfa$ is well-defined, the bound constraints $\Phi_\mathcal{B}$ ensure that the number of accepted words is above the lower bound $\ell$ and below the upper bound $u$.
+	Hence, the DFA $\dfa$ is well-defined and solves Problem~\ref{problem:1}
+	
+	In a second step, we show that our MILP problem has a feasible
+	model for size $n$ if and only if there exists a DFA of size $n$
+	that accepts at least $\ell$ and at most $u$ words from $\sample$.
+
+	$(\Rightarrow):$ Given a feasible model for size $n$, we construct a DFA $\dfa$ as explained above.
+	As displayed this DFA $\dfa$ is well-defined and fulfills the bounds on the acceptance.
+
+	$(\Leftarrow):$ Given a DFA $\dfa$ of size $n$ which accepts at
+	least $\ell$ and at most $u$ words from $\sample$, let the model
+	be given by the natural interpretation of the variables:
+	\begin{align*} 
+		\delta_{q,a,q'} & \coloneqq\begin{cases}
+			1&\text{if }\delta(q,a)=q',\\
+		    0&\text{otherwise,}
+		\end{cases}\\
+		f_q & \coloneqq\begin{cases}
+			1&\text{if }q\in F,\\
+		    0&\text{otherwise,}
+		\end{cases}\\
+		x_{w,q} & \coloneqq\begin{cases}
+			1&\text{if }\dfa\text{ is in state }q\text{ after reading }w,\\
+		    0&\text{otherwise,}
+		\end{cases} \\
+		\alpha_{w,q} & \coloneqq\begin{cases}
+			1&\text{if }\dfa\text{ is in state }q\text{ after reading }w\text{ and }q\in F,\\
+			0&\text{otherwise,}
+		\end{cases}
+	\end{align*}
+	%
+	Being deterministic the DFA $\dfa$ and thus any model constructed this way obviously fulfills Constraints~\ref{eq:single-transition} to~\ref{eq:run}.
+	Furthermore, the definition of $\alpha_{w,q}$ ensures that the set of Constraints~\ref{eq:accepting} is fulfilled and that $\sum_{w\in\sample}\sum_{q\in Q}\alpha_{w,q}=\sum_{w\in\sample}\sum_{q\in F}x_{w,q}$ corresponds to the amount of words in $\sample$ which are accepted by $\dfa$ whence by assumption both Constraints \ref{eq: bounds}  are fulfilled.
+	Hence this model is feasible for our MILP problem for size $n$.
+
+	In order to conclude the proof of Theorem~\ref{thm:correctness-two-bounds}, we now show that Algorithm~\ref{alg:two-bounds}
+	terminates and finds a DFA fulfilling the bounds, if such a DFA exists.
+	Termination itself is straight forward.
+	The algorithm iterates over increasing sizes until a feasible model is found or $n = \abs{\mathit{Pref}(\mathcal{S})} + 2$ is reached in which case it concludes that no DFA fulfilling the bounds exists.
+	Since solving the MILP problem for each $n$ is computable, the algorithm thus always terminates.
+	Furthermore, if a feasible model is found, we showed above that the algorithm returns a DFA fulfilling the bounds.
+	On the other hand, as explained in the decidability proof of Problem~\ref{problem:1},
+	the size of the prefix tree is a natural upper bound for the minimal DFA fulfilling the bounds.
+	In the prefix tree, the run on each word $w$ in the sample $\sample$ leads to a unique state $q_w$.
+	Therefore, we can check accepting each combination of words from $\sample$ by making the corresponding states a final or non-final state respectively.
+	If no such combination fulfills the bounds, we can conclude that no DFA exists which fulfills the bounds.
+	Since the prefix tree can have unspecified transitions, we may need one additional state to which we target all these unspecified transitions in order to construct a well-defined DFA.
+	Hence, there either exists a DFA of size $n = \abs{\mathit{Pref}(\mathcal{S})} + 1$ or none at all.
+	By the equivalence proven above, we thus have that not finding a feasible model until $n = \abs{\mathit{Pref}(\mathcal{S})} + 2$ shows that truly no DFA fulfilling the bounds exists.
+	This concludes the proof of termination and correctness and, thus, of Theorem~\ref{thm:correctness-two-bounds}.
+
+	We have shown that Algorithm~\ref{alg:two-bounds} terminates and finds a DFA which fulfills the bounds on the acceptance, if such a DFA exists.
+	We displayed that such a DFA of size $n$ exists if and only if our MILP problem for size $n$ has a feasible model.
+	Furthermore, we have shown how to construct this DFA given a feasible model. \qed
+\end{proof}
+
+Finally, let us investigate the number of constraints in our MILP model.
+This number depends on multiple factors:
+\begin{itemize}
+	\item The size $n$ of the automaton to be constructed
+	\item The size of the alphabet $\Sigma$ over which the words in the sample $\sample$ range
+	\item The number of unique words in $\sample$
+	\item The size of the prefix tree of $\sample$
+\end{itemize}
+Let $\abs{\Sigma}$ now denote the size of the alphabet and $p =\abs{\mathit{Pref}(\mathcal{S})}$ denote the size of the prefix tree of $\sample$.
+Note that the number of unique words in $\sample$ is a lower bound for the size of the prefix tree.
+Then, we obtain the following remark.
+
+\begin{remark}
+The number of constraints in the MILP problem is in $\mathcal{O}(n^2 \cdot \abs{\Sigma} \cdot p)$.
+\end{remark}
+
+\subsection{Single-Bound DFA Learning}
+In order to not clutter this section, we will only describe the encoding for the case where the lower bound $\ell$ is given. 
+The case in which the upper bound is given is analogous.
+We recall that the task is to construct a DFA of a fixed size $n$ that minimizes acceptance above $\ell$.
+As in the first setup, we encode the DFA and the runs on all words in the sample using the same set of variables and automata constraints $\Phi_{\dfa}^n$ as above.
+Furthermore, we use the same idea to ensure that the number of accepted words is larger than the lower bound:
+We introduce variables $\alpha_{w,q}$ and add Constraints~\ref{eq:accepting} and the corresponding inequality of Constraint~\ref{eq: bounds}.
+For the remainder of this section, let $\Phi_{\ell}$ denote the conjunction of these constraints.
+In contrast to Two-Bound Learning, we are not satisfied with finding just any DFA, but want to find one that accepts the least number of words while adhering to the lower bound.
+To achieve this, we use the following objective function:
+\begin{equation}\label{eq:optimization}
+    \mathit{obj} = \min\ \sum_{w \in S} \sum_{q \in Q} \alpha_{w,q}
+\end{equation}
+which minimizes the number of accepted words from $\sample$.
+All in all, the resulting Algorithm~\ref{alg:lower-bound} returns a DFA of size $n$ that minimizes acceptance above the lower bound $l$.
+\begin{algorithm}[b]
+	\caption{Learning with a single bound}\label{alg:lower-bound}
+	
+	\begin{algorithmic}[1]
+		\State \textbf{Input:} Sample $\sample$, Bound $\ell \in \mathbb{N}$, Size $n \in \mathbb{N}$
+		\State Construct $\Phi_{\sample, \ell}^n = \Phi_{\dfa}^n \land \Phi_{\ell}$
+		\State Set $\mathit{obj} = \min\ \sum_{w \in S} \sum_{q \in Q} \alpha_{w,q}$
+		\State Compute optimal model minimizing $\mathit{obj}$ with respect to $ \Phi_{\sample, \ell}^n$, say $m$
+		
+		\State \Return Construct DFA $\dfa$ using $m$
+	\end{algorithmic}
+\end{algorithm}
+%
+\begin{theorem}
+Given a sample $\sample$ and two natural numbers $\ell, n \in \mathbb{N}$ with $\ell \leq \abs{\sample}$, Algorithm~\ref{alg:lower-bound} terminates and outputs a DFA $\dfa_{\sample}$ of size $n$ that accepts the smallest number $k \geq l$ of words from $\sample$.
+\end{theorem}
+We omit the proof of this theorem, which is similar to the proof of Theorem~\ref{thm:correctness-two-bounds}.
+
+
+\subsection{Distance-Based DFA Learning}
+Let us recall the third setup: We are given a sample $\sample$, the size $n \in \mathbb N$ of the automata, and the Leveshtein distance betwwen samples and want to compute a DFA that minimizes Equation~\ref{eq:distance}.
+Analogously to the first two setups, we encode the DFA and the runs on all words in the sample using the same set of variables and automata constraints $\Phi_{\dfa}^n$ as above.
+To optimize the distance between pairs of words as described in Problem~\ref{problem:3}, we need to keep track of which words will be accepted by the automaton and which will be rejected.
+For this, we introduce variables $\alpha_{w,q}$ and $\beta_{w,q}$, respectively, and add Constraints~\ref{eq:accepting} to track whether a word $w$ is accepted by the DFA as well as $\beta_{w,q} = 1 - \alpha_{w,q}$ for all $w \in \sample$ and $q \in Q$, indicating whether a word $w$ is rejected by the automaton.
+We then define the objective function in the same way as in Problem~\ref{problem:3}:
+\begin{equation}
+    \mathit{obj} = \min\ \sum_{w_1, w_2 \in S} \sum_{q_1,q_2 \in Q} \alpha_{w_1,q_1} \cdot \alpha_{w_2,q_2} \cdot dist(w_1, w_2) -  \alpha_{w_1,q_1} \cdot \beta_{w_2,q_2} \cdot dist(w_1, w_2)
+\end{equation}
+Note that for every pair of words $w_1$ and $w_2$, the distance $dist(w_1, w_2)$ can be precomputed, thus allowing arbitrary complex distance functions to be used.
+As above, this MILP model can then be used to construct a DFA of a given size $n$ that minimizes the distance between pairs of accepted words while maximizing the distance between pairs of one accepted and one rejected word (see also Algorithm~\ref{alg:distance}).
+\begin{algorithm}[tbp]
+	\caption{Learning based on distance}\label{alg:distance}
+	
+	\begin{algorithmic}[1]
+		\State \textbf{Input:} Sample $\sample$, Size $n \in \mathbb{N}$
+        \State Compute the Levenshtein distance $dist(w_1, w_2)$ for each pair of words $w_1,w_2 \in \sample$
+		\State Construct $\Phi_{\dfa}^n$
+		\State Set $\mathit{obj} = \min\ \sum\limits_{\substack{w_1, w_2 \in S \\ q_1,q_2 \in Q}} \alpha_{w_1,q_1} \cdot \alpha_{w_2,q_2} \cdot dist(w_1, w_2) -  \alpha_{w_1,q_1} \cdot \beta_{w_2,q_2} \cdot dist(w_1, w_2)$
+		\State Compute optimal model minimizing $\mathit{obj}$ with respect to $\Phi_{\dfa}^n$, say $m$
+		
+		\State \Return Construct DFA $\dfa$ using $m$
+	\end{algorithmic}
+\end{algorithm}
+%
+\begin{theorem}
+Given a sample $\sample$ and two natural numbers $\ell, n \in \mathbb{N}$ with $\ell \leq \abs{\sample}$, Algorithm~\ref{alg:distance} terminates and outputs a DFA $\dfa_{\sample}$ of size $n$ which minimizes 
+%Equation~\ref{eq:distance}
+the following objective function: $\sum\limits_{w_i, w_j \in L(\dfa)} dist(w_i, w_j)  - \sum\limits_{\substack{w_i \in L(\dfa) \\ w_j \notin L(\dfa)}} dist(w_i, w_j)$
+
+\end{theorem}
+We omit the proof of this theorem which is similar to the proof of Theorem~\ref{thm:correctness-two-bounds}.

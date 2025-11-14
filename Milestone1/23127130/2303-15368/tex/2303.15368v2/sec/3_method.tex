@@ -1,0 +1,101 @@
+\section{Method}
+At the foundation of UDF-based learning approaches is the task of crafting a density function that converts unsigned distance values into volume density, ensuring that the resulting weight function is unbiased and responsive to occlusions.
+None of the existing UDF learning methods~\cite{Long2023,Liu2023NeUDF} can simultaneously meet the three critical requirements, i.e., ensuring the density function is bounded, and that the weight function remains both unbiased and occlusion aware.
+
+We tackle these challenges by decoupling the density function and weight function across two stages. In the initial stage (Section~\ref{sec:stage1}), we utilize an easy-to-train, bell-shaped density function (which is inherently bounded) to learn a coarse UDF. While the resulting weight function is not theoretically unbiased or occlusion-aware, we can make it practically usable by choosing a proper parameter. Moving into the second stage (Section~\ref{sec:stage2}), we sidestep the density function entirely, focusing instead on refining the UDF by directly adjusting the weight function within the neural volume rendering framework. Specifically, we truncate light rays after they hit the front side of the object and obtain a weight function that is both unbiased and sensitive to occlusions, without the overhang of density function boundedness concerns. Finally, Section~\ref{sec:training} presents the training details.
+
+
+\subsection{Stage 1: Coarse UDF Learning via a Simple Density Function}
+\label{sec:stage1}
+
+We consider the scenario of a single planar plane $\mathcal{M}$ and a single ray-plane intersection. Inspired by HF-NeuS~\cite{Wang2022HFNeuSIS}, we propose an easy-to-learn density function $\sigma_1$ that maps unsigned distance $f$ to density
+\begin{equation}
+\sigma_1(f(t)) = \frac{cse^{-sf(t)}}{1+e^{-sf(t)}},\;s>0,\;c>0,
+\end{equation}
+where $c>0$ is a fixed, user-specified parameter and $s>0$ is a learnable parameter controlling the width of the bell-shaped curve. 
+Straightforward calculation shows that the weight function $w_1(f(t))=e^{-\int_{0}^t\sigma_1(f(u))\mathrm{d}u}\sigma_1(f(t))$ is monotonically decreasing behind the plane $\mathcal{M}$ and the maximum value occurs at a point $t^{*}$ in front of $\mathcal{M}$ with an unsigned distance value of $f(t^*)=\frac{1}{s}\ln\frac{c}{\left\lvert\cos (\theta)\right\lvert}, (c>|\cos (\theta)|)$ or $f(t^*)=0, (0<c\leq |\cos (\theta)|)$,
+where $\theta$ is the incident angle between the light ray and the surface normal. 
+This means that the weight function $w_1$ is not unbiased.
+Furthermore, the line integral $\int_{0}^t\sigma_1(f(u))\mathrm{d}u$ does not approach infinity when a light ray passes through the front-most layer of the surface, indicating $w_1$ is only partially occlusion-aware.
+
+While the density function $\sigma_1$ is not perfect in theory, by selecting an appropriate $c$, we can practically minimize bias and enhance opacity. Clearly, a smaller $c$ value decreases $f(t^*)$, thereby reducing bias. To gauge the effect of $c$ on opacity, we now consider the most extreme scenario where the incident light ray is perpendicular to the planar surface $\mathcal{M}$, and assume that the intersection point is located at $t=1$. In such a situation, the unsigned distance function is $f(t)=1-t$ for points in front of $\mathcal{M}$. Since $\sigma_1$ is symmetrical on either side of $\mathcal{M}$, the surface transparency is the square of the transparency of the front side. The theoretic transparency is,
+\begin{equation*}
+\begin{aligned}
+     \left(e^{-\int_0^1\hat{\sigma_1}(f(t))\mathrm{d}t}\right)^2
+    &=
+    \left[\exp\left(-\int^1_0\frac{cse^{-s(1-t)}}{1+e^{-s(1-t)}}\mathrm{d} t\right)\right]^2\\
+    &=\left(\frac{1+e^{-s}}{2}\right)^{2c}.
+\end{aligned}
+\end{equation*}
+Therefore, we should choose a relatively large $c$ to reduce transparency. In our implementation, we set the constant $c=5$ based on the typical value of the learned parameter $s$ which usually ranges between $1000$ and $2000$. Calculations of bias and translucency show that this setting offers a good balance between occlusion-awareness and unbiasedness in the first stage training. Please refer to the supplementary material for a detailed analysis.
+
+\subsection{Stage 2: UDF Refinement through  Weight Adjustment}
+\label{sec:stage2}
+
+In this stage, we refine the UDF learned in Stage 1 to improve the quality of geometry and appearance. Unlike Stage 1 and all other UDF-learning methods, inspired by~\cite{Azinovic2022}, we truncate light rays based on the approximated UDF learned in Stage 1 and learn the weight function $w(t)$ directly instead of the density function $\sigma(t)$ to refine the UDF. 
+
+Ideally, for a single ray-plane intersection, we want a bell-shaped function $w(t)$ that attains its maximum at the points with zero distance values, and satisfies partition of unity. Therefore, we adopt the derivative of the sigmoid function as the weight function~\cite{Azinovic2022}, defined as 
+\begin{equation}
+    w_2(f(t)) = \frac{se^{-sf(t)}}{(1 + e^{-sf(t)})^2} \cdot |\cos(\theta)|.
+\end{equation}
+with $\theta$ being the incident angle between the light ray and the surface normal.
+
+Intuitively speaking, learning such a  weight function $w_2$ in Stage 2 of our UDF method is similar to learning an S-shaped density function in SDF-based approaches, such as~\cite{Wang2022HFNeuSIS}. As a result, the learning process in Stage 2 is as stable as those SDF approaches. Furthermore, it can totally avoid using the visibility indicator function, which is necessary in NeuralUDF~\cite{Long2023}.
+
+Calculation shows that the weight $w_2$ attains its maximum at zero distance values, therefore it is unbiased. However, if we naively predict the weight function directly, it will not be occlusion-aware, so we introduce the ray truncation. To make $w_2$ occlusion-aware, we can truncate the light rays after they pass through the frontmost layer of the surface, thereby preventing rendering the interior of the object. Note that we do not expect the truncation to be exactly on the frontmost layer of the surface. In fact, as long as it occurs between the frontmost layer and the second layer, we consider the truncation valid. This means that the approximate UDF learned in the first stage, which can capture the main topological features (such as boundaries) and provide a fairly good representation of the target object, is sufficient for us to determine where to cut off the light rays. 
+
+In our implementation, we adopt a simple strategy to determine the truncation point for each light ray. Specifically, the  truncation point of ray $\bf r$ is the first sample point along $\bf r$ such that 
+\begin{itemize}
+    \item The unsigned distance value at the point is a local maxima. To avoid distance vibration interference, it should be the maximum in a window centered at the point. And
+    \item The accumulated weight up to this point is greater than $\delta_{thres}$.
+\end{itemize}
+The accumulated weight threshold $\delta_{thres}$ is intuitively set to 0.5. This choice is based on the assumption that if the Stage 1 training is performed well enough, the accumulated weights at each sample point along the ray would be either 0 (for not reaching a surface) or 1 (for having intersected with a surface). Hence, we intuitively select 0.5 for $\delta_{thres}$ because it is the midpoint between 0 and 1.
+With the cutoff mechanism, only the first ray-surface intersection contributes to the color of the ray, effectively achieving occlusion-awareness. Given these properties, we conclude that,
+\begin{theorem}
+    The weight $w_2$ with light cutting off is unbiased and occlusion-aware.
+\end{theorem}
+
+Figure~\ref{fig:cutoff-fig} is an intuitive illustration of our Stage 2 weight learning and truncation strategy. The UDF maxima point $A$ in front of the intersection surface would not affect the cutting point selection as the accumulated weight is below $\delta_{thres}$ (0.5). The local maxima $B$ due to UDF oscillation also would not affect it since it's not the maximum in a large enough neighborhood. The light is cut at maxima point $C$, and thus the weight of point $D$ is zero without contributions to the rendering. As illustrated in Figure~\ref{fig:cutoff-fig}, the cutting process is robust against UDF oscillation, open boundaries, and local maxima in front of the intersection surface.
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=3.in]{media/cutoff_graph}
+    \caption{An intuitive illustration of our ray cutting algorithm, best viewed in color and magnified. A ray shoots from left to right, approaching the boundary of the first surface, and going through another two surfaces (gray boxes). The violet solid line represents the UDF values along the ray; the orange dashed line represents the corresponding color weight.
+    }
+    \label{fig:cutoff-fig}
+\end{figure}
+
+\subsection{Training}
+\label{sec:training}
+
+\textbf{Differentiable UDFs.} NeuS uses an MLP network to learn the signed distance function $f$, which is a differentiable function. In contrast, UDF is not differentiable at the zero level set, 
+making the network difficult to learn the values and gradients of the UDF close to the zero level set. 
+
+Another crucial requirement is to ensure non-negative values for the computed distances, which seems like a trivial task as one may simply apply absolute value or normalization such as ReLU~\cite{Fukushima1975} to the MLP output. However, applying the absolute value to the distance is not viable due to its non-differentiability at zero. Similarly, normalizing the output value using ReLU is not feasible as it is also non-differentiable at zero and its gradient vanishes for negative inputs. This can be particularly problematic for learning UDFs, since when the MLP returns a negative distance value, the ReLU gradient vanishes, hindering the update of the distance to a positive value in the subsequent iterations.
+
+
+We add a softplus~\cite{Dugas2000} function after the output layer of the MLP~\cite{Liu2023NeUDF}.
+The softplus function is a smooth and differentiable approximation of the ReLU function, which is defined as
+$\text{softplus}(x) = \frac{1}{\beta} \ln(1 + e^{\beta x}).$
+Softplus has the same shape as ReLU, but it is continuous and differentiable at every point and its gradients do not vanish anywhere. Using the softplus function allows us to ensure that the output of the MLP is non-negative and differentiable, making it suitable for learning the UDF. Similar to NeUDF~\cite{Liu2023NeUDF}, we set $\beta=100$ in our experiments.
+
+\textbf{Loss functions.} 
+Following NeuralUDF~\cite{Long2023}, we adopt an iso-surface regularizer to penalize the UDF values of the non-surface points from being zero, therefore encouraging smooth and clean UDFs. The regularization loss is defined as~\cite{Long2023}
+\begin{equation*}    \mathcal{L}_{reg}=\frac{1}{MN} \sum_{i, k}\exp{\left(-\tau \cdot f(t_{i,k})\right)},
+\end{equation*}
+where $\tau$ is a constant scalar that scales the learned UDF values, $M$ is the total number of sampled rays per training iteration, and $N$ is the number of sampled points on a single ray.
+$\tau$ is set to 5.0 in the first stage and 50.0 in the second stage.
+
+The value of $s$, which is learnable in our method, significantly affects the quality of the reconstruction. When $s$ is small, it introduces a larger bias and leads to a more blurred output. We observe that $s$ typically converges to a relatively large value between 1000 and 2000, leading to visually pleasing results. However, in rare cases when $s$ stops increasing during training, we apply a penalty to force it to increase. The penalty is defined as follows
+\begin{equation*}
+    \mathcal{L}_{s} = \frac{1}{M} \sum_{i, k} \frac{1}{s_{i, k}},
+\end{equation*}
+where $M$ is the number of rays during a training epoch. 
+This term $\mathcal{L}_{s}$ aggregates the reciprocals of all $s$ values used for the point $t_{i,k}$ on ray $r_i$. 
+Intuitively speaking, it encourages a larger $s$ during the early stage of training. In our implementation, we make this term optional since $s$ generally increases with a decreasing rate during training, and the penalty term is only necessary in rare cases when $s$ stops at a relatively low value.
+
+As in other SDF- and UDF-based methods~\cite{Wang2021,Wang2022HFNeuSIS,Long2023}, we adopt color loss and Eikonal loss in our approach. Specifically, the color loss $\mathcal{L}_{color}$ is the $L_1$ loss between the predicted color and the ground truth color of a single pixel as used in~\cite{Wang2021}. The Eikonal loss $\mathcal{L}_{eik}$ is used to regularize the learned distance field to have a unit gradient~\cite{Gropp2020}. Users may also choose to adopt object masks for supervision as introduced in other SDF- and UDF-based methods~\cite{Wang2021,Long2023}.
+Putting it all together, we define the combined loss function as a weighted sum,
+\begin{equation*}
+    \mathcal{L} = \mathcal{L}_{color} + \lambda_1 \mathcal{L}_{eik} + \lambda_2 \mathcal{L}_{reg} + \lambda_3 \mathcal{L}_{s} \left(+\lambda_m \mathcal{L}_{mask}\right),
+\end{equation*}
+where $\lambda_1$, $\lambda_2$, $\lambda_3$ and the optional $\lambda_m$ are hyperparameters that control the weight of each loss term.

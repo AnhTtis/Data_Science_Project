@@ -1,0 +1,198 @@
+\section{Additional experimental details}
+\label{app:expe}
+
+\subsection{Essential Code}
+\label{sec:code}
+
+{\bf SSL Graph}~
+\begin{lstlisting}[language=Python,escapechar=\%]
+G = torch.zeros(N * V, N * V)                                   #  X in R^{Np x D}, V views
+i = torch.arange(0, N * V).repeat_interleave(V - 1)             # row indices
+j = (i + torch.arange(1, V).repeat(N * V) * N).remainder(p * V) # column indices
+G[i,j] = 1                                                      # unweighted graph
+\end{lstlisting}
+
+\medskip
+{\bf Sup Graph}~
+\begin{lstlisting}[language=Python,escapechar=\%]
+Y = torch.nn.functional.one_hot(labels, num_classes=num_classes).float()
+G = Y @ Y.T
+\end{lstlisting}
+
+\medskip
+{\bf VICReg.}~
+\begin{lstlisting}[language=Python,escapechar=\%]
+C = torch.cov(Z.t())                                     # Z in R^{N x K}
+reg_loss = torch.nn.functional.mse_loss(C, torch.eye(K)) 
+reg_loss *= out_dim ** 2                                 # correct for mean vs sum
+i,j = G.nonzero(as_tuple=True)
+inv_loss = torch.nn.functional.mse_loss(Z[i], Z[j])      # pairwise L2 weighted by G_{i,j}
+inv_loss *= out_dim
+loss = beta * inv_loss + reg_loss
+\end{lstlisting}
+
+\medskip
+{\bf SimCLR}~
+\begin{lstlisting}[language=Python,escapechar=\%]
+Z_renorm = torch.nn.functional.normalize(Z, dim=1)          # Z \in \mathbb{R}^{N \times K}
+cosim = Z_renorm @ Z_renorm.t() / tau                       # N x N matrix, tau is the temperature 
+mask = 1 - torch.eye(N, N, device=Z.device, dtype=Z.dtype)
+loss = (G * (torch.logsumexp(cosim*mask, dim=1, keepdim=True) - cosim)).mean()
+\end{lstlisting}
+
+\medskip
+{\bf SCL}~
+\begin{lstlisting}[language=Python,escapechar=\%]
+Z = torch.nn.functional.normalize(Z, dim=1)
+loss = torch.nn.functional.mse_loss(G, Z@Z.T)
+\end{lstlisting}
+
+\subsection{Controlled experiments}
+\subsubsection{Setup}
+
+The train and test set of Figure \ref{fig:active} is shown on \cref{fig:setup_toy}.
+The similarity graphs corresponding to the different snapshots on \cref{fig:active} are shown on \cref{fig:graph_fig4}.
+In all the experiments, we consider $K = C + 1 = 5$.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics{figures/toy_train.pdf}
+    \includegraphics{figures/toy_test.pdf}
+    \caption{Setup for the controlled experiments of \cref{fig:active}.
+    The dataset is made of four concentric circles that corresponds to four different classes represented by different colors. The training dataset is made of one hundred random points, with some noise.}
+    \label{fig:setup_toy}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=.2\linewidth]{figures/G_empty.pdf}
+    \includegraphics[width=.2\linewidth]{figures/G_passive.pdf}
+    \includegraphics[width=.2\linewidth]{figures/G_active.pdf}
+    \includegraphics[width=.2\linewidth]{figures/G_full.pdf}
+    \caption{
+    Graphs $\mG$ corresponding to the different snapshot taken on \cref{fig:active}.
+    Grey indicates zeros, white indicates negative observations, and black means positive ones.
+    The main strength of the active strategy in \cref{alg:active} is that, by leveraging the underlying structure of the graph, is able to deduce much faster the full graph $\mG$ than the naive passive implementation that only asks for random query pairs.
+    Basically a positive observation is turned into many negative observations.
+    }
+    \label{fig:graph_fig4}
+\end{figure}
+
+\subsubsection{Contrastive vs. Non-Contrastive}
+
+Intuitively, it is useful to distinguish more explicitly between positive, negative and unknown relations, which we test on \cref{fig:contrastive}.
+To do so, the graph $\mG$ is modified to encode semantically similar elements as positive edges, dissimilar ones as negative edges, while unknown relationships are going to be represented by zeros.
+\begin{equation}
+    \mG_{ij} = \left\{\begin{array}{cl} 1 & \text{if } \vx_i\sim \vx_j \text{ has been observed}, \\ -1 & \text{if } \vx_i \not\sim \vx_j \text{ has been observed}, \\ 0 & \text{otherwise}. \end{array} \right.
+\end{equation}
+One might wonder if this really improves performance. 
+The comparison is the object of \cref{fig:contrastive}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics{figures/contrastive.pdf}
+    \caption{Comparison of contrastive ($\mG_{ij} \in \brace{-1, 0, 1}$) and non-contrastive ($\mG_{ij} \in \brace{0, 1}$) variation of VICReg with $N=300$.
+    The setting is the same as \cref{fig:active} with \cref{alg:active}.
+    We remark the usefulness to distinguish between negative pairs and unknown pairs, although some instability issues seem to appear when few entries are known for the contrastive method.
+    }
+    \label{fig:contrastive}
+\end{figure}
+
+\subsubsection{The Benefits of Incorporating Known Labels}
+A major motivation of this paper is to be able to add prior information on sample relationships in SSL methods, and more in particular, to have a simple way to leverage known labels.
+Let us denote by $\hat\mY \in\R^{N\times D}$ the one-hot matrix $(\vy_i)_{i\in[N]}$ where $\vy_i$ is the one-hot vector of the label $y_i$, such that if $y_i$ is unknown $\vy_i = 0$.
+The knowledge of some coefficients of the real $\mY$, leads to the knowledge of a few coefficient of $\mG^{(\sup)} = \mY\mY^\top$, those could be added to the SSL graph to add useful connection deduced from the labels, leading to
+\[
+    \mG = (1-\alpha) \cdot \mG^{(\ssl)} + \alpha \cdot \hat\mY\hat\mY^\top,
+\]
+where $\alpha \in [0, 1]$ is a mixing coefficient stating how much the supervised information should weigh in the similarity matrix.
+Naively, we could set $\alpha=1/2$, yet when only few labels are given this would destabilize the spectral decomposition of $\mG$ too much, and we observe on Figure \ref{fig:interpolation} that a small mixing coefficient is better.
+An explanation could be that the relations encoded by SSL are quite local and subtle, while the connections suggested by supervised learning are quite global and brutal on it suggested to fold the input space, hence need to be dampened when mixing the SSL and supervised graphs.
+
+\subsubsection{Robustness to noise}
+
+As mentioned in the last part of the paper, depending on the algorithm used, the effect of noise in queries answers might lead to dramatic performance loss.
+In the main text, we were careful to describe algorithms that are robust to noise.
+The effect of noise in the labels for \cref{alg:active} is studied in \cref{fig:noise}.
+Because of its structure, noise in the query for \cref{alg:active} is equivalent to noise in the label $\vy$.
+This explains the setup of the figure.
+
+\begin{figure}
+    \centering
+    \includegraphics{figures/noise.pdf}
+    \caption{Study of the effect of labeling noise.
+    The setup is the same as \cref{fig:active} yet with $N=300$ points.
+    We consider having full access to $\mY$ thus to $\mG = \mY\mY^\top$ yet we assume that a certain number of labels $y_i$ are corrupted. 
+    We see that the algorithm is somewhat robust to noise.}
+    \label{fig:noise}
+\end{figure}
+
+\subsubsection{The Importance to Recover Connected Components}
+
+An interesting experiments is provided by \cref{fig:comp}, which compares the test error and the number of connected components of the graph $\mG$ as a function of the number of missing entries of $\mG = \mG^{(\sup)}$. 
+In our synthetic experiment, $\mG^{(\sup)}$ has four connected components corresponding to the four classes in the dataset, e.g. \cref{fig:G}.
+Typically, based on transitivity of the similarity relation $\sim$, one can hope to only need $O(1/N) = O(NC / N^2)$ queries, i.e. reconstructed entries of $\mG$, to have a good sense of the global $\mG$, hence to learn $f_\theta$.
+Moreover, on \cref{fig:comp}, the test error can be relatively well-predicted by the number of connected components of the graph $\mG$.
+This suggests creative ways to design active learning strategies based on search to optimize the number of connected components of $\mG$.
+However, leveraging transitivity of the similarity relationship to fill $\mG$ efficiently might be limited when queries answers are noisy, although literature on error correcting codes might be useful \cite{Varshamov1957,Cover1991}.
+Moreover, the binary (and transitive) nature of similarity can be questioned when SSL sometimes uses DA that provides iconoclast unrealistic images, and one might prefer to assign similarity scores.
+Problems that do not occur with the transitivity agnostic \cref{alg:active}.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics{figures/missing_entries.pdf}
+    \caption{Comparison between the test error and number of connected components in the graph $\mG$ as a function of the percentage of missing entries in $\mG$.
+    The test error is reported as in \cref{fig:active}, but it is reported as a function of missing entries of the supervised learning graph $\mG^{(\sup)}$.
+    The standard deviation for the red curve is not represented here as the number of connected components is highly concentrated around its mean.
+    }
+    \label{fig:comp}
+\end{figure}
+
+\subsubsection{Mixture of Gaussian}
+
+One can question if the findings presented so far are specific to the concentric circles datasets.
+In order to assert the validity of those findings, we consider a second dataset, made of mixture of Gaussian, formally
+\[
+    \mX = \mY + \sigma\mE, \qquad\text{where}\qquad
+    \mE_{ij} \sim {\cal N}(0, 1),
+\]
+given a label $y\in[C]$, $\vx$ is generated according to ${\cal N}(\ve_y, \sigma I_C)$.
+The results are reported on \cref{fig:gaussian} with $\sigma=.3$.
+
+\begin{figure}
+    \centering
+    \includegraphics{figures/active_gauss.pdf}
+    \hspace{1em}
+    \includegraphics{figures/missing_entries_gauss.pdf}
+    
+    \vspace{1em}
+    \includegraphics{figures/contrastive_gauss.pdf}
+    \hspace{1em}
+    \includegraphics{figures/interpolation_gauss.pdf}
+    
+    \vspace{1em}
+    \includegraphics{figures/noise_gauss.pdf}
+    \caption{Same figures as before with a mixture of Gaussians dataset.
+    The mixture dataset has the particularity that the downstream task can be solved with any orthogonal basis of $\R^C$. 
+    When no queries has been made, $\mG = I_N$, and the spectral decomposition of this graph will lead to a representation that can solve the downstream task, explaining why when no queries have been made, or when all the entries of $\mG$ are removed, the downstream task can be solved.}
+    \label{fig:gaussian}
+\end{figure}
+
+\subsection{Real-world experiment}
+
+While it is hard to control all the factors that come into play when training a neural network on real data, our experiments suggested that what we have seen in controlled experiments transfer to real-world problems.
+In particular, we consider the CIFAR-10 dataset, with a resnet 18 architecture.
+A first stage was representation learning, where we used the VICReg loss to learn representation with the CIFAR-10 training set.
+In particular, we removed the classifier head of the resnet and replaced it with two fully connected layers with batch norms.
+The number of output dimensions was set to $K = 16$, and the number of hidden neurons was set to $4K$.
+After the representation was learned, we replaced the classifier head by a linear layer with $K=C$ output dimension and fit this last layer on the CIFAR-10 training set.
+The resulting network was then tested on the CIFAR-10 testing set.
+Regarding hyperparameters (network, DA, optimizer), we fixed them in accordance with tutorial online (in particular the pytorch-lightning tutorial) in order to achieve high performance results on CIFAR with SSL.
+In our first experiments, we stopped after two epochs of training for pretraining (since the output dimension is quite small, there is no need to go really far away in training), and twenty epochs downstream.
+The pretraining task consisted in all the training data of CIFAR-10 tackle, 
+We found that the representation learned with SSL was achieving 28 \% accuracy on CIFAR-10 with linear probing, while the representation learned directly with the supervised graph was achieving 63 \% accuracy.
+In the meanwhile, training a resnet with classifier head to be made of 60 hidden neurons and 10 output dimensions with the ground truth labels and the mean-square error in the exact same setting leads to a performance of 63\% too.
+In other terms, in these simple experiments, one can use the VICReg technique we derived here, or the MSE loss and get the same performance.
+Training for tens epochs for the upstream task (the minimization of the VICReg loss), and one hundred for the downstream one (the linear head fitting), we improved performance to 62\% for SSL and 66\% for the supervised learning graph.
+Furthermore, we did not perform extensive hyperparameter tuning, which suggests that the supervised learning performance could be even more competitive, since we took parameters that are known to be good for the self-supervised learning techniques.
+All the code is available to reproduce our experiments.

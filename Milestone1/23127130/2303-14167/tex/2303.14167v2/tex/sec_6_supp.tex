@@ -1,0 +1,107 @@
+
+\section{Implementation Details}
+\label{sec:implementation}
+\subsection{Object Patch Rendering} 
+We render object patches taking occlusions into consideration. First, this allows us to directly crop the object patches from the full composited image without additional computation to render the complete objects. Second, we can keep occluded object patches in the real images for training, as filtering out occluded objects is not trivial.  
+More specifically, we first obtain the alpha value of a ray corresponding to the $k$th object via volume rendering:
+\begin{gather}
+\label{eq:obj_alpha}
+    \mathrm{A}_{obj}^k =\sum_{i=1}^{N} T_i \alpha_i \mathbbm{1}[\bx_i \in \{\bR(\bs \odot \bx_{obj}^k)+ \bt\}]
+\end{gather}
+This means  $T_i \alpha_i$ is accumulated if the corresponding sampled point $\bx_i$ belongs to the $k$th object. 
+Here, we use the transmittance $T_i$ of the composited scene obtained via Eq. 7 of the main paper, meaning that the alpha value is close to $0$ if the object is occluded. 
+Let $\bA^k_{obj}\in\nR ^{H_f\times W_f}$ denote the alpha map consisting of object alpha values of all rays. Note that $\bA^k_{obj}$ is obtained via volume rendering, and thus its resolution is lower than the final output image $\hat{\bI}\in\nR^{H\times W \times 3}$. Thus, we upsample $\bA^k_{obj}$ via nearest neighbor sampling to obtain the object patches from $\hat{\bI}$:
+\begin{equation}
+\hat{\bP}_k=crop(\hat{\bI} \odot  up(\bA_{obj}^k)) 
+\end{equation}
+where $up(\cdot)$ denotes nearest neighbor upsampling and $crop(\cdot)$ denotes cropping the object based on its projected 3D bounding box.
+
+\subsection{Network Architecture}
+
+  
+
+
+
+
+\boldparagraph{Generator Architecture} For the latent codes, we use a 256-dimension $\bz_{wld}$ for the entire scene and a 256-dimension $\bz^k_{obj}$ for each object.
+Our \textit{stuff generator} consists of a semantic-conditioned feature grid generator and an MLP head. The feature grid generator $G_\theta^{vol}$ consists of 5 spatially-adaptive normalization blocks. Each block follows the structure of a ResNet~\cite{He2016CVPR} block with two convolutional layers, except that the batch normalization is replaced with spatial-adaptive normalization modulated by the semantic labels. As illustrated in Fig. 3 of the main paper, we inject the latent code  $\bz_{wld}$ at each block following~\cite{Schonfeld2021ICLR}. The MLP head  $G_\theta^{stf}$ is a 4-layer ReLU MLP with a hidden dimension of 256. The \textit{object generator} $G_\theta^{obj}$ is an 8-layer ReLU MLP but with a lower dimension of 128. We use skip connections at the fourth layer for $G_\theta^{obj}$. For the sky generator, we use a 5-layer ReLU MLP of hidden dimension 256 without a skip connection. As mentioned in the main paper, we apply positional encoding $\gamma(\cdot)$ to both $\bx^k_{obj}$ and $\bx_{wld}$:
+\begin{equation}
+\gamma(p) = (sin(2^0\pi p), cos(2^0\pi p), sin(2^1\pi p), cos(2^1\pi p),  \cdots, sin(2^{L-1}\pi p), cos(2^{L-1}\pi p) 
+\end{equation}
+where $\gamma(p)$ is applied to each element of the coordinate. 
+We use $L=10$ for both $\bx^k_{obj}$ as input to the object generator and $\bx_{wld}$ as input to the stuff generator.
+
+
+
+
+Our \textit{2D neural renderer} $\pi^{neural}_{\theta}$ consists of two blocks of StyleGAN2-modulated convolutional blocks and one upsampling layer. In practice, we render the feature maps $\bI_{\bF}\in\nR^{H_f\times W_f \times M_f}$ at half resolution and upsample it to image $\hat{\bI}\in\nR^{H\times W \times 3}$  at the target resolution, \ie, $H_f=H/2, W_f=W/2$. %
+
+\boldparagraph{Discriminator Architecture} We adopt two independent discriminators to apply adversarial losses to the  composited images and the object patches, respectively. Both discriminators follow the design choice of the StyleGAN2 discriminator, while the object discriminator takes a lower-resolution image as input and thus has fewer parameters. More specifically, all object patches are rescaled to $128 \times 128$ pixels, and the object discriminator $D_\phi^{\bP}$ has 6 convolutional blocks with 5 downsampling layers. The discriminator of the full image $D_\phi^{\bI}$ has 8 convolutional blocks with 7 downsampling layers.
+
+
+
+\subsection{Training and Inference}
+We train our model on four Nvidia GeForce RTX 3090 with a batch size of 16 for 100k iterations, taking 4 days in total. For inference, our method can render an image at the resolution of $188\times 704$ at roughly 5 FPS.
+
+\section{Baselines}
+\label{sec:baseline}
+
+\boldparagraph{GIRAFFE} We follow the original implementation\footnote{\url{https://github.com/autonomousvision/giraffe}} of GIRAFFE~\cite{Niemeyer2021CVPR}. For the KITTI-360 dataset, we sample objects following the same object layout prior as used in our method. We also sample points within the objects using the same ray-box intersection strategy for a fair comparison. We train GIRAFFE on four Nvidia GeForce RTX 3090 with a batch size of 16 for 140k iterations.
+
+\boldparagraph{GSN} We use the official  implementation\footnote{\url{https://github.com/apple/ml-gsn}} of GSN~\cite{DeVries2021ICCV}. 
+GSN generates a scene based on a 2D grid of local latent codes. Following the original implementation, the spatial resolution of the 2D grid is set to $32\times 32$. For the KITTI-360 dataset, we set the maximum sampling distance as $80m$, with each pixel in the 2D grid corresponding to a region of $2.5m \times 2.5m$ in reality. Because of the limitation of computational resources, we sample 32 points per ray instead of 64. We train GSN for 400k iterations with a batch size of 4 on two 3090 GPUs and perform gradient accumulation every two iterations. 
+
+\boldparagraph{2D Baseline} We evaluate StyleGAN2 as a state-of-the-art 2D GAN following its PyTorch implementation\footnote{\url{https://github.com/rosinality/stylegan2-pytorch}}. We train the 2D baseline on four Nvidia GeForce RTX 3090 with a batch size of 32 for 120k iterations, taking 2 days in total.
+
+\section{Dataset}
+\label{sec:dataset}
+
+\boldparagraph{KITTI-360} We adopt the KITTI-360 dataset to evaluate our method on urban scenes. For the real object (\ie, cars) patches, we filter out heavily occluded and far away objects based on the following criteria: 1) The pixel number of the object is larger than a given threshold; 2) The projected 3D bounding box has at least four visible vertices. Note that this does not filter out all occluded objects. We use instance masks provided by KITTI-360 to crop the object patches for training. These masks may be noisy as they are obtained via label transfer algorithms instead of manually labeled. Therefore, using instance masks predicted by 2D segmentation methods might be possible. In order to obtain training images containing enough objects, we keep one image only when it contains one or more than one valid object patches for training. This leads to a total of 20k training images. 
+
+We train and evaluate our method at a half resolution of KITTI-360, \ie, $188\times 704$ pixels.  The same resolution is applied to the other baselines except for GSN, which requires large memory consumption and does not scale to the target resolution. Therefore, we train and evaluate GSN at the image resolution of $94 \times 352$ pixels. 
+
+In all of our experiments, we use voxel grids at the resolution of $64 \times 64 \times 64$ voxels. Note that the sampling interval of the semantic voxel is $1 m$ horizontally and $0.25 m$ vertically. Therefore, each semantic voxel grid covers an area of $4096 m^2$ with a height of $16 m$ in the real world. 
+
+\boldparagraph{CLEVR-W} We further create a dataset CLEVR-W to facilitate comparison with GIRAFFE~\cite{Niemeyer2021CVPR} in more controlled environments. The dataset contains 10k images rendered at the resolution of $256\times 256$. In contrast to the dataset used in GIRAFFE, we add walls as stuff regions and thus increasing the difficulty of modeling the background. The walls are sampled at different locations with random colors, see \figref{fig:Clevr} for a preview.
+
+
+\begin{figure}[t]
+  \centering
+   \includegraphics[width=0.6\linewidth]{figure/ClverStuff_preview.png}
+   \caption{\textbf{Preview of CLEVR-W}. We add walls with randomly sampled colors and locations and render a set of images based on the rendering script of CLEVR~\cite{Johnson2017CVPR}.}
+   \label{fig:Clevr}
+\end{figure}
+
+\section{Additional Experimental Results}
+\label{sec:result}
+\subsection{Additional Comparison to Baselines}
+\boldparagraph{KITTI-360}
+In \figref{fig:comp_baselines_kitti360}, we show additional  comparison results to the baselines on KITTI-360, where each column shows a single scene with the camera consecutively moving forward for up to 20 meters. Note that the background regions of GIRAFFE barely change despite the large camera movement, since GIRAFFE models the background as a far-away planar structure in the challenging urban scenario. GSN can model the camera movement faithfully but has lower image fidelity, especially when synthesizing an image with a large camera moving distance. In contrast, our method is able to synthesize high-fidelity images along the large camera moving distance. %
+
+\input{gfx_supp/comp_kitti360}
+
+\boldparagraph{CLEVR-W}
+In \figref{fig:comp_baselines_clevr}, we show additional comparisons to GIRAFFE on CLEVR-W. Our method enables control over objects, stuff, and the camera pose.
+\input{gfx_supp/comp_clevr}
+
+\input{gfx_supp/failure}
+
+\subsection{Additional Results on Controllable Image Synthesis}
+
+\figref{fig:editing} shows additional scene editing results on KITTI-360, including stuff editing (including lower building in \figref{fig:building2tree}, building to tree in \figref{fig:lowerbuilding}, road to grass in \figref{fig:road2grass}) and object editing (\figref{fig:object_editing}).
+
+\input{gfx_supp/editing_kitti360}
+
+
+\subsection{Limitations}
+\figref{fig:fail} illustrates two limitations of our method. First, we observe in \figref{fig:z_fail} that changing $\bz_{wld}$ does not change the appearance of the stuff significantly. In contrast, we observe that editing the semantic layout can sometimes change the appearance of the scene. This is rational as the appearance is entangled with the semantic layout in the real world, \eg, to model shadows.  
+\figref{fig:sky_fail} shows that our sky generator sometimes generates far-away buildings and thus yields artifacts. This is due to the fact that our semantic voxel grids can only model a region of $64 \times 64$ square meters. 
+
+
+
+
+\subsection{Random Samples}
+
+We show randomly sampled, uncurated results on both KITTI-360 and CLEVR-W in \figref{fig:random}. 
+\input{gfx_supp/random}
+

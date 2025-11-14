@@ -1,0 +1,101 @@
+
+\section{Gradient Implementation}\label{backwards-pass-implementation}
+
+To the best of our knowledge, there is no existing implementation of an unfitted \ac{ls} \ac{to} method that accepts arbitrary residuals defining the PDE and computes the entire gradient $\frac{dJ}{d\mathbf{p}}$ by automatic differentiation. Making use of a backward pass, we do this efficiently by defining differentiation rules for each of the steps in the method. 
+
+\subsection{Integral Differentiation Operator}
+The backward pass is mainly composed of gradients of integrals with respect to the  \ac{DOF} of \ac{fe} functions. To make the derivative computation efficient, we exploit the fact that the \ac{DOF} only have an effect on surrounding cells and utilize the optimizations exploiting sparsity in the \ac{fe} library Gridap \cite{Verdugo2021}. Integrals in the domain can be divided into cell-wise components:
+\begin{equation}
+\mathscr{I}(\boldsymbol{u},\boldsymbol{v},\phi) = \sum_{K\in\mathcal{T}_h} \mathscr{I}^K(\mathbf{u}^K,\mathbf{v}^K,\mathbf{\phi}^K), 
+\end{equation}
+where $\mathbf{u}^K \in \mathbb{R}^{\Sigma_u},\mathbf{v}^K \in \mathbb{R}^{\Sigma_v}$ and $\phi^K\in\mathbb{R}^{\Sigma_\phi}$ are the \ac{DOF} parameterizing the restrictions of $u,v$ and $\phi$ to the cell $K$ and $\Sigma u$, $\Sigma v$ and $\Sigma \phi$ are the number of \ac{DOF} in $K$ for the respective functions. 
+Gradients can then be computed at roughly the cost of an integral evaluation for each cell $K$:
+\begin{equation}
+		\frac{\partial \mathscr{I} }{ \partial \phi }^K = \nabla^F_{\phi} \mathscr{I}^K ( \mathbf{u}^K,\mathbf{v}^K, \phi^K ),
+\end{equation}
+where the operator $\nabla^F_{\phi}$ represents taking the gradient with respect to $\phi^K$ using a vectorized forward propagation of dual numbers \cite{ForwardDiff}. 
+To make taking derivatives in this way possible for the \ac{ls}, we implement the integrals so that each $\phi^K$ is accepted as the argument to compute the contribution $\mathscr{I}^K$:
+\begin{equation}
+		\mathscr{I}^K: \phi^K \in \mathbb{R}^{\Sigma_\phi} \mapsto \mathscr{I}_K(\mathbf{u}^K,\mathbf{v}^K,\phi^K) \in \mathbb{R}.
+\end{equation}
+where
+\begin{equation}
+		\mathscr{I}^K(\mathbf{u}^K,\mathbf{v}^K,\phi^K)=\int_{K(\phi^K)} \mathcal{I}(\mathbf{u}^K,\mathbf{v}^K)dK
+\end{equation}
+
+A key point is that the integral function subroutines, including all the unfitted \ac{fe} tools, are implemented in such a way as to allow the propagation of dual numbers through the code. We also make use of a reverse mode operator $\nabla^R$ for the backwards propagation of derivatives used where appropriate, e.g., for the \ac{nn}.
+
+\subsection{Backwards Pass Routine}
+We now present the backward pass in detail. 
+To compute the sensitivity of the objective with respect to the parameters, we start with the seed $\frac{dJ}{dJ}=1$ and propagate derivatives in reverse mode using the chain rule:
+\begin{equation}
+		\frac{dJ}{d\mathbf{p}} = 	
+		\frac{dJ}{dJ} \left(
+		\frac{\partial{J}}{\partial{\phi }} +
+		\frac{\partial{J}}{\partial{\boldsymbol{u}}} 
+\frac{d\boldsymbol{u}}{d\phi } \right)
+		\frac{d\phi }{d\mathbf{\varphi}} 
+		\frac{d\mathbf{\varphi}}{d{\mathbf{p}}} 
+\end{equation}
+where an adjoint method on the problem residual $\mathscr{R}$ is used to differentiate through the PDE:
+\begin{equation}
+		\frac{\partial{J}}{\partial{\boldsymbol{u}}} \frac{d\boldsymbol{u}}{d\phi }  =  {-\lambda^T\frac{d\mathscr{R}}{d\phi }} \ (\text{ here we solved  } \frac{d\mathscr{R}}{d\boldsymbol{u}}^{T} \lambda =  \frac{dJ}{d\boldsymbol{u}}^{T}). 
+\end{equation}
+We then use the chain rule to differentiate through the \ac{ls} function processing steps:
+\begin{equation}
+		\frac{d\phi }{d\mathbf{\varphi}} = 
+		\frac{d\phi }{d{\phi_{s(3)}}}  
+		\frac{d{\phi_{s(3)}}}{d{\phi_{f(2)}}}  
+		\frac{d{\phi_{f(2)}}}{d\mathbf{\varphi} }.
+\end{equation}
+The volume constraint here involved a root-finding method. To differentiate through this step, we utilize the implicit function theorem:
+\begin{equation}
+		\frac{d\phi }{d{\phi_{s(3)}}} =  \frac{\partial \phi } { \partial {\phi_{s(3)}}}  - \frac{\partial \phi  }{ \partial b} \frac{\partial \mathscr{V}}{\partial b}^{-1} \frac{\partial\mathscr{V }}{\partial {\phi_{s(3)}}},
+\end{equation}
+and to differentiate through the signed distance map, we use the adjoint method once again for the residual $\mathscr{R}_s$ equal to the integral in (\ref{eq:Rs}). 
+Finally, we use standard backpropagation to compute the derivative with respect to the parameters of the \ac{nn}. The steps of the backward pass are presented explicitly in Algorithm \ref{al:bp}.
+
+
+
+\begin{algorithm}
+		\caption{Backwards Pass}\label{alg:cap}
+		\begin{algorithmic}
+		\State Initialize $\frac{dJ}{dJ} \gets 1$ 
+		\State Extract $\phi^K \in \mathbb{R}^{\Sigma \phi}$, $\mathbf{u}^K \in \mathbb{R}^{\Sigma u}$ from $\phi$,$\boldsymbol{u}$ $\forall{K} \in \mathcal{T}_h$.
+		\For{ $ K \in \mathcal{T}_h$ }
+		\State $\frac{\partial J }{ \partial \boldsymbol{u} }^K \gets \nabla^F_{u} J ( \mathbf{u}^K, \phi^K )$ 
+				\State $\frac{\partial J }{ \partial \phi }^K \gets \nabla^F_{\phi} J ( \mathbf{u}^K, \phi^K )$
+		\EndFor
+		\State Assemble the gradients $ \frac{\partial J }{ \partial \boldsymbol{u} } \in \mathbb{R}^{N_u}$ and $ \frac{\partial J }{ \partial \phi } \in \mathbb{R}^{N}$
+
+		\State Assemble the sparse jacobian associated with the residual $ \frac{\partial \mathscr{R} }{ \partial \boldsymbol{u} } \in \mathbb{R}^{N_u,N_u}$
+		\State Solve the adjoint equation $\frac{\partial \mathscr{R} }{ \partial \boldsymbol{u} } \lambda = \frac{\partial J }{ \partial \boldsymbol{u} }$ for $\lambda\in\mathbb{R}^{N_u}$
+		\State Extract $\lambda^K \in \mathbb{R}^{\Sigma u}$  from $\lambda$ $\forall  K \in \mathcal{T}_h$ 
+		\For{ $ K \in \mathcal{T}_h$ }	
+		\State $\frac{\partial J }{ \partial \boldsymbol{u} }\frac{\partial \boldsymbol{u}}{\partial \phi}^K \gets \nabla^F_{u} \mathscr{R} ( \mathbf{u}^K, \lambda^K, \phi^K )$ 
+		\EndFor
+		\State Assemble the gradient $ \frac{\partial J }{ \partial \boldsymbol{u} }\frac{\partial \boldsymbol{u}}{\partial \phi} \in \mathbb{R}^N $ 
+\State $\frac{dJ}{d\phi} \gets \frac{\partial J }{ \partial \phi } +  \frac{\partial J }{ \partial \boldsymbol{u} }\frac{\partial \boldsymbol{u}}{\partial \phi} $
+		\State Compute the vector-jacobian-products: 
+				\State $ \frac{\partial J }{ \partial b } \gets \frac{d J }{ d \phi } \nabla^R_b \phi  (\phi_{s(3)},b)  $ 
+				\State $ \frac{\partial J }{ \partial \phi } \gets \frac{d J }{ d \phi } \nabla^R_{\phi} \phi  (\phi_{s(3)},b) $ 
+		%\For{$ K \in \mathcal{T}_h$ }
+		\State Compute the gradients:
+				\State $\frac{\partial V }{ \partial \phi } \gets \nabla^R_{u} V ( \phi_{s(3)},b )$ 
+				\State $\frac{\partial V }{ \partial b } \gets \nabla^F_{u} V ( \phi_{s(3)},b )$ 
+		\State $\frac{dJ }{d{\phi_{s(3)}}} \gets \frac{\partial J } { \partial {\phi_{s(3)}}}  - \frac{\partial J  }{ \partial b} \frac{\partial \mathscr{V}}{\partial b}^{-1} \frac{\partial\mathscr{V }}{\partial {\phi_{s(3)}}}$
+		
+		\State Assemble the sparse jacobian associated with the residual $ \frac{\partial \mathscr{R}_s }{ \partial \phi_{s(3)} } \in \mathbb{R}^{N,N}$
+		\State Solve the adjoint equation $\frac{\partial \mathscr{R}_s }{ \partial \phi_{s(3)} } \lambda_s = \frac{\partial J }{ \partial \phi_{s(3)} }$ for $\lambda_s\in\mathbb{R}^N$
+		\For{ $ K \in \mathcal{T}_h$  }\\
+				$\frac{d \mathscr{R}_s }{ d \phi_{f (2)} }^K \gets \nabla^F_{\phi_{f (2)} } \mathscr{R}_s ( \phi_{s(3)}^K, \lambda_s^K, \phi_{ f(2)}^K )$ 
+		\EndFor
+		\State Assemble the gradient $ \frac{d J }{ d \phi_{f(2)} }  \in \mathbb{R}^N$ 
+
+		\State Compute the vector-jacobian-products: 
+		\State $ \frac{d J }{d \varphi } \gets \frac{d J }{ d \phi_{f(2)} } \nabla^R_\varphi (\phi_{f(2)}(\varphi)) $ 
+		
+		\State $ \frac{d J }{d p } \gets \frac{d J }{ d \varphi } \nabla^R_p (N(\mathbf{p})) $ 
+		\end{algorithmic}
+		\label{al:bp}
+\end{algorithm} 

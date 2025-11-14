@@ -1,0 +1,189 @@
+
+\section{Methodology}
+In this section, we first describe the \modelname~as shown in Figure \ref{fig:model}. 
+Then, we detail the adaptive grouping method for alignment prediction and explain how we adapt back-translation for the AST task. 
+
+\subsection{Overall Architecture}
+
+\begin{figure*}[t]
+    \centering
+\subfigure[The note-pooling embedding layer]{
+    \label{fig:align_enc}
+    \includegraphics[width=0.34\textwidth,clip=true]{figures/note-pooling.pdf}
+}
+\subfigure[The alignment decoder]{
+    \label{fig:align_dec}
+    \includegraphics[width=0.31\textwidth,clip=true]{figures/alignment_decoder.pdf}
+}
+\subfigure[Adaptive grouping process]{
+    \label{fig:act_gp}
+    \includegraphics[width=0.28\textwidth,clip=true]{figures/act_gp.pdf}
+}
+\caption{(a) The note-pooling embedding encodes both the note sequence and the alignment information. (b)(c) The alignment decoder computes the number of aligned notes from halting distribution.}
+\label{fig:enc_dec_act}
+\end{figure*}
+
+% We design an auto-regressive translation architecture that performs jointly lyrics translation and lyrics-melody alignment. 
+We design an auto-regressive translation architecture that jointly performs lyrics translation and lyrics-melody alignment prediction.
+As shown in Figure \ref{fig:model}, it consists of a transformer-based encoder-decoder pack for lyrics translation, two note-pooling embedding layers that embed and do pooling for notes and alignments, and an alignment decoder. 
+The transformer encoder-decoder is pre-trained with a denoising auto-encoder ~\citep{bart} and for the translation task as in \citet{gagast}. 
+During pre-training, two prefix tokens indicating the translation direction and the text domain are prepended to the source input. 
+The note-pooling embedding layers shown in Figure~\ref{fig:align_enc} is a module that processes the melody information. 
+The alignment decoder shown in Figure~\ref{fig:align_dec} is based on our adaptive notes grouping method that dynamically predicts the number of notes to align to a token during auto-regressive decoding.
+
+\subsection{Note-Pooling Embedding}
+\label{sec:note_pooling}
+
+The note-pooling embedding layer takes the notes and alignments as input, and outputs the pooled note embedding and alignment embedding. 
+The input note sequence consists of MIDI pitch and duration of each note. 
+%Each note has one of the 4 different duration: quarter note par bar, half note per bar, eighth-note per bar, or two quarter-notes per bar. 
+The MIDI pitch and duration can be represented as embedding $e_{midi}$ and $e_{dur}$ respectively. 
+We define the $i$-th note embedding:
+%
+\begin{equation}
+\label{eq:note}
+    \mathbf{e}_{note}^i = \mathbf{e}_{midi}^i + \mathbf{e}_{dur}^i + \mathbf{e}_p^i
+\end{equation}
+%
+where $\mathbf{e}_p^i$ is the positional embedding. 
+
+We apply non-overlapping mean-pooling on the note embedding sequence according to the alignment information. 
+Specifically, the embeddings of the consecutive notes that align to the same token are averaged. 
+Mathematically, the alignment information $\mathcal{A}$ is represented as a binary matrix $\mathbf{M} \in \{0,1\}^{L \times N}$, where $L$ and $N$ denote the sequence length of the tokens and notes. 
+$\mathbf{M}_{ji}=1$ if the $i$-th note is aligned to the $j$-th token. 
+We use $\mathbf{M}$ to efficiently calculate the non-overlapping mean-pooling via matrix multiplication, denoted the result as melody embedding $\mathbf{e}_{md}$. 
+%
+\begin{equation}
+\label{eq:md_embed}
+    \mathbf{e}_{md} = \text{Non-Overlap-Mean-Pool}(\mathbf{e}_{note}, \mathbf{M})
+\end{equation}
+%
+The kernel size of this operation is not fixed but varies according to the row sum of $\mathbf{M}$. 
+The detailed calculation can refer to Appendix \ref{appendix:pool_mat}. 
+
+Because lyrics-melody alignments are monotonic, we encode the alignment more succinctly by calculating the cumulative sum of the number for aligned notes:
+%
+\begin{equation}
+\label{eq:cumsum}
+    \mathbf{s} = \text{CumSum}(\text{RowSum}(\mathbf{M})) 
+\end{equation}
+%
+where $\mathbf{s}$ is a vector of length $L$. 
+$s^j / N$ then represents the alignment ratio for each aligned note. 
+We next quantize the cumulative alignment ratios by grouping them into equal-size bins over the range $(0, 1]$, and introduce a set of embedding vectors $\mathbf{E}_{ratio}$ to represent each bin. 
+Finally, the alignment embedding is calculated as follows.
+%
+\begin{align}
+\label{eq:align}
+    \mathbf{e}_{align}^j = f(\mathbf{E}_{ratio}(s^j / N))
+\end{align}
+%
+where $f(\cdot)$ is a simple non-linear layer of causal 1D convolution with ReLU activation, and the number of bins is a hyper-parameter. 
+The motivation is to implicitly constrain the translation by the number of aligned notes.
+
+The melody embedding and alignment embedding are summed and then added to the original transformer encoder or decoder input. 
+%
+\begin{equation}
+\label{eq:embed}
+    \mathbf{e}_{\text{enc(dec)}} = \mathbf{e}_{token} + \mathbf{e}_p + (\mathbf{e}_{md} + \mathbf{e}_{align})
+\end{equation}
+%
+As calculated in Eq.~(\ref{eq:md_embed}), each melody embedding corresponds to one token. 
+In addition, the causal convolution implies that the alignment embedding tensors also have the same length as the text tokens and guarantees each alignment embedding only observes previous ratio embeddings in an auto-regressive manner. 
+It means that on the decoder, this layer can fit perfectly in the teacher-forcing training. 
+
+%The alignment embeddings from source then go through a pooling layer to form a global reference representation and will be added to the target alignment embeddings in the alignment decoder.
+
+
+\subsection{Alignment Decoder}
+\label{sec:alignment_decoder}
+
+Inspired by the Adaptive Computation Time (ACT) \citep{act}, we propose the \textbf{adaptive grouping} module to model lyrics-melody alignment. 
+As shown in Figure \ref{fig:align_dec} and \ref{fig:act_gp}, this module predicts how many consecutive notes should be assigned to the current token. 
+
+For $1 \leq j \leq L_Y$, let $y_j$ be the $j$-th target token and $\mathbf{h}_j$ be the corresponding hidden state of the last transformer decoder layer. 
+Suppose previous tokens $y_{j-1:0}$ have been aligned to the first $n-1$ notes, we define the following adaptive grouping process by iterating over index $k$ (starting from 1) to derive the number of notes aligned to $y_j$.
+%
+\begin{align*}
+    \mathcal{S}_{re}^j &= N -s^{j-1}_{tgt} \\
+     \mathbf{h}_j^0 &= \mathbf{h}_j  \\
+     \mathbf{h}_j^k &= g(\mathbf{h}_j^{k-1}, \mathbf{e}_{align(X)}, \mathbf{h}_{align(y_{j-1:0})}, \mathcal{S}_{re}^j, k-1) \\
+     \alpha_j^k &= \sigma(\text{Linear}(\mathbf{h}_j^k))
+\end{align*}
+%
+where $\mathbf{e}_{align(X)}$ and $\mathbf{e}_{align(y_{j-1:0})}$ are the alignment embeddings of the full source input and the partial target input respectively, and $s^{j-1}_{tgt}$ is $j$-th element of vector $\mathbf{s}$ in Eq.~(\ref{eq:cumsum}). 
+
+We first calculate the residual number of unaligned notes at the current decoding step $j$ as $\mathcal{S}_{re}^j$. 
+$\mathbf{e}_{align(X)}$ is fed into an average pooling layer to obtain a single vector, making it always possible to be additive with $\mathbf{e}_{align(y_{j-1:0})}$ of variable length. 
+For all the inputs, we apply a multi-layer network $g(\cdot)$ shown in green in Figure \ref{fig:align_dec}. 
+Eventually, the sigmoid function $\sigma(\cdot)$ outputs the halting probability $\alpha_j^k$ of the intermediate step. 
+The summation of these probabilities represent the likelihood that the current $k$ notes are aligned to the target token $y_j$. 
+
+Given a hyper-parameter $\epsilon$ as a small float number (\emph{e.g.}, 0.01), if $\sum_k \alpha_j^k < 1-\epsilon$, the adaptive grouping process will continue and re-calculate by incrementing $k$ and decrementing $\mathcal{S}_{re}^j$.
+Otherwise, the aligning process halts, and the alignment decoder outputs the number of aligned notes $K(j)$.
+%
+\begin{equation}
+\label{eq:Kj}
+    K(j) = \underset{K}{\mathrm{argmin}} \left\{\sum_{k=1}^K \alpha_j^k \geq 1-\epsilon \right\}
+\end{equation}
+%
+A positive $\epsilon>0$ guarantees that $K(j)\geq1$, \emph{i.e.}, at least one note is aligned. 
+To define the halting probabilities of $K(j)$ aligned notes, we introduce the remainder $R(j) = 1-\sum_{k=1}^{K(j)-1} \alpha_j^k$. 
+%
+%\begin{equation}
+%    R(j) = 1-\sum_{k=1}^{K(j)-1} \alpha_j^k
+%\end{equation} 
+%
+In this way, $\alpha_j^k$ and $R(j)$ can be valid probability distributions. 
+Figure \ref{fig:act_gp} is an example of how the adaptive grouping works.
+
+In the labeled alignment data, the ground truth of the number of aligned notes for each target token is available, denoted as $\Delta_j$. 
+Instead of minimizing the ponder cost $\sum_j K(j) + R(j)$ as in ACT \citep{act}, we optimize the following adaptive grouping loss $L_G$, which could naturally upper bound the token-wise ponder cost via $\Delta_j$. 
+%
+\begin{equation*}
+\begin{array}{rl}
+    L_G = & \left| \sum_j K(j) - N \right| + \sum_j \left|K(j) - \Delta_j\right| \\
+    \approx &\left|\sum_j \left(K(j) - (1 - R(j))\right) - N \right| \\
+    & + \sum_j \left|K(j) - (1 - R(j)) - \Delta_j\right|
+\end{array}
+\end{equation*}
+%
+The variable $K(j)$ is discontinuous with respect to the halting probabilities, so we use $1-R(j)$ in the approximation to make the loss differentiable (more analysis in Appendix \ref{appendix:group_loss}). 
+Additionally, because tokens aligned to more than one notes are infrequent, we add upweighting to the alignment loss of such tokens for model calibration.
+%
+\begin{equation*}
+\begin{array}{rl}
+    L_G = & \left|\sum_j (K(j) - 1 + R(j)) - N\right| \\
+    & + \sum_j (\left|K(j) - 1 + R(j) - \Delta_j\right|\cdot w_j)
+\end{array}
+\end{equation*}
+%
+where $w_j=1$ if $\Delta_j = 1$ and $w_j>1$ is a hyper-parameter if $\Delta_j > 1$.
+
+\subsection{Back Translation with Alignments}
+\label{sec:bta}
+Although a data set of a few thousand verses with human translation and annotated with alignment information is useful, its quantity is limited.
+We therefore adopt the widely used back-translation method \cite{backtrans} to generate more training data. 
+We crawl the web for more available monolingual song data with alignments and build another pre-trained lyrics translation model with length control that is used to back translate the monolingual data into the source language. 
+The length control ensures that the number of tokens is the same as the number of notes after which a one-to-one source-side alignment can be generated. 
+This way, we obtain a comparatively larger data set with noise on the source side but still accurate information on the target side. 
+
+Because the back-translated data are much larger than the human annotated one, we in practice design our data loader by following a curriculum learning way. 
+Initially, the augmented data from back-translation will be mixed with up-sampled the real data from human annotation. 
+In each training epoch, we gradually down-sample the augmented data to raise the ratio of annotated data in the batch. 
+A visualization of the data sampling scheduler is in Figure~\ref{fig:bt_curriculum} (See Appendix \ref{appendix:bt_cl}).
+
+\subsection{Training and Inference}
+
+After the pre-training stage, we will optimize the whole model by jointly minimizing the loss from the task of lyrics translation and the task of alignment prediction. 
+% Note that the SVS model is pre-trained and will not participate the training of song translation. 
+Note that the SVS model is pre-trained and only used for evaluation. 
+The overall loss is thus:
+%
+\begin{equation*}
+    L_{joint} = \sum_{j=0}^{L_Y} \log P(y_j|y_{j-1:0},X) + \beta \cdot L_G
+\end{equation*}
+%
+where $\beta$ is a hyper-parameter to balance the importance between the two tasks.
+The inference follows the standard beam search for auto-regressive decoding, while only the last generated token and its corresponding notes should be specially taken care of. 
+Details can be found in Appendix \ref{appendix:infer}.

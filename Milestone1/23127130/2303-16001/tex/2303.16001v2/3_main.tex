@@ -1,0 +1,66 @@
+\begin{figure}[H]
+\begin{center}
+\includegraphics[width=0.95\linewidth]{figures/voronoi-example-nest.pdf}
+\end{center}
+   \caption{a) An exemplary Voronoi diagram. Each Voronoi cell is displayed in a different colour with its cluster centre as black cross; note the flexibility of the cells covering different amounts of area. b) A nested Voronoi diagram with a depth of two. Each cell is split into 4 smaller cells of the next level.}
+\label{fig:voronoi}
+\vspace{-0.3cm}
+\end{figure}
+\begin{figure}[H]
+\begin{center}
+\includegraphics[width=0.95\linewidth]{figures/composite_voronoi_scene.png}
+\end{center}
+   \caption{The samples used to optimise the Voronoi cells, visualised as point cloud with their colour values (top left);  point assignments before/after optimisation (bottom left/right), right showing cells more evenly covering the object; the optimised Voronoi diagram with cell centres (top right).}
+\label{fig:ptcloud}
+\end{figure}
+
+\begin{figure*}
+\begin{center}
+\includegraphics[width=0.95\linewidth]{figures/architecture-diagram.drawio-no-outline.pdf}
+\end{center}
+   \caption{Our proposed approach: A lightweight NeRF learns the global scene (left), then a Voronoi diagram is created to partition the scene space into cells based on weighted ray sample points gathered while training (middle-left). The cells are then optimised with regard to a uniform distribution of error per cell (middle-right). Each cell is given a new lightweight NeRF that inherits the parent parameters. In subsequent training or inference, each ray sample is processed from the according local NeRF of the Voronoi cell it is in (right). The whole pipeline can be applied in a nested fashion.}
+\label{fig:architecture}
+\end{figure*}
+
+\section{Adaptive Voronoi NeRF}
+We introduce Adaptive Voronoi NeRFs, a geometry aware approach that allows faster inference time to the training of distributed NeRFs. By exploiting the geometric information implicitly learned by the NeRF, we achieve better results in training time, inference time, and quality. While distribute the scene among multiple networks, we neither require interpolation between them nor require (possibly not ideal) human-given partitioning of the space.\\
+Pixel colour in NeRFs is the result of integrating over samples of a ray going through the volume of a scene where the samples are being evaluated in a neural network that learns to represent a radiance field of the scene. The time consuming procedure of running every ray sample through a large neural network is what our approach accelerates: Instead of learning one large network, we learn many smaller ones, as assigning a point into the according network and querying a smaller network is much faster to evaluate.\\
+To understand our idea of accelerating NeRFs with geometric tools, we first re-cap the basics about Voronoi diagrams.
+\paragraph{Voronoi Diagrams} are a flexible way to partition a space into convex cells. A Voronoi diagram  $\mathcal{V}$ partitions space by assigning every point to a cell $V_i$ with the closest cell centre $\mathbf{v_i} \in \mathcal{V}$, in our case measured in Euclidean distance. An example can be found in \cref{fig:voronoi}. Formally, for a point $\mathbf{x} \in \mathbb{R}^d$, with $d=3$ in our case, the closest cell centre $\mathbf{v}(\mathbf{x})$ is defined as:
+\begin{equation}
+\mathbf{v}(\mathbf{x}) = \underset{\mathbf{v_i} \in \mathcal{V}}{\arg \min} ||\mathbf{x}-\mathbf{v_i}||_2
+\end{equation}\label{eq:voronoi}
+Compared to approaches like octrees or BSP trees, Voronoi diagrams are both flexible in partitioning a space, \eg allowing elongated cells, while also offering cheap point assignment to a cell by simply computing the distance to all cell centres.\\
+We can nest Voronoi diagrams by subdividing the content of each cell of an existing diagram into multiple new cells. Assigning a query point into a cell can then be done hierarchically by first finding the correct cell in the first Voronoi diagram, and then finding the correct cell in the Voronoi diagram that subdivides that cell further. This nesting can be done multiple times in a recursive fashion.\\~\\
+Based on the three observations made in \cref{sec:intro}, we propose the following approach to adaptively learn a (nested) Voronoi diagram holding a scene (see Figure \ref{fig:architecture} for our visualised pipeline):
+\begin{enumerate}
+    \item A lightweight NeRF learns the global scene representation for a few iterations
+    \item A part of the sample points from regions with dense information are kept, weighted by the error of the ray that are on and the contribution to its final colour
+    \item An initially random Voronoi diagram partitions these points and is then optimise to spread the weight evenly, \ie distributing information of the scene evenly among the cells
+    \item Each Voronoi cell holds their own new neural network, inheriting the parameters of the global NeRF learned. Training continues with all nets simultaneously, but now evaluates every sample point along a ray with the respective NeRF belonging to the Voronoi cell the point lies in
+    \item[] We can apply this adaptive refinement procedure multiple times if necessary, creating new Voronoi diagrams further partitioning cells
+\end{enumerate}
+This top-down approach is agnostic to technical details of the NeRF, \eg works with considering pixels as either rays\cite{vanilla} or cones\cite{mip} through the volume of the scene, and \eg for approaches with different sampling procedures\cite{kurz2022adanerf}.
+\subsection{Estimating Scene Complexity}
+We start with training a smaller scene representation, \eg the original NeRF\cite{vanilla}, to learn a rough representation of the entire scene. We use the underlying NeRF architecture, but simply reduce the number of channels in the MLP. To get an estimate of the scene geometry to partition it, we extract a fraction of the most important ray sample points during an epoch, \ie ray samples that contribute the most to the resulting image, for every batch. When only considering one colour channel for simplicity, recall that for a ray $r$, its pixel colour $c_r$, and its \eg 128 samples $s_i, i \in \mathbb{N}_{0}^{<128}$, the resulting loss for updating the NeRF becomes:
+\begin{equation}
+    E(r) = (c_r - \sum_{i=0}^{127}(w_i \cdot c_i))^2
+\end{equation}\label{eq:ray_loss}
+Where $w_i$ is the contribution of a sample $s_i$ along the ray to the final pixel colour. As weight to find the most important, \ie heaviest, samples we use a product of the samples contribution to the pixel colour and the error of that pixel, \ie $w_i \cdot E(r)$. While this implicitly takes density of a point into consideration, this also avoids to take ray samples from inside objects, as only the point directly on the surface will contribute much to the rays colour. It also does not overly represent simple, but dense regions, \eg a flat white wall, as these tend to have a low error value. We extract $10000$ ray sample points $S$ per epoch, taking an equal amount of the heaviest points per batch. We then choose $k \in S$, \eg $k=16$, random ray samples as initial Voronoi centres for cells $V_k$.
+\subsection{Finding Ideal Voronoi Diagrams}
+When formulating a large function as a composition of $k$ smaller functions, making the smaller functions roughly equal in complexity is beneficial: For us, this means equal distribution of scene complexity in the Voronoi diagram cells leads to roughly equal amounts of information to be stored in the respective NeRFs. To optimise the Voronoi centres for this objective, we suggest a simple two step algorithm:\\
+First, we assign each sample to their respective Voronoi cell centre, then compute an update for each Voronoi cell centre, and repeat. For the update of the cell centres, we compute update directions to reduce the differences between the total weights $W_i$ of the sample points in each Voronoi cell $V_k$, meaning to even out the amount of information per cell.
+For this, we shift light cell centres, \ie cells with little or trivial geometric information in them, towards heavier neighbours, \ie cells with complex geometric information. Likewise, we shift heavy cell away from light centres. For the Voronoi cells, this takes away area from heavy cells and gives it to lighter cells.
+As an updated position $\mathbf{v'_i}$ for every cell centre $\mathbf{v_i} \in \mathbb{R}^3$ and its closest 8 Voronoi cells $\mathcal{N}(\mathbf{v_i})$, we compute:
+\begin{equation}
+    \mathbf{v'_i} = \mathbf{v_i} + \alpha \cdot \sum_{\mathbf{v_j} \in \mathcal{N}(\mathbf{v_i})} \frac{(\mathbf{v_j}-\mathbf{v_i}) \frac{W_j - W_i}{\max_{k}W_k}} {|\mathcal{N}(\mathbf{v_i})|} %||b-a||_2
+\end{equation}
+In result, this computes an update vector for each cell centre by averaging over the weighted directions towards each neighbour. Normalising the weight by dividing through the largest weight in the neighbourhood avoids pushing a cell centre arbitrarily far in a direction. We iterate this optimisation process in parallel for every Voronoi centre, using 500 steps and $\alpha = 0.05$. The assigned positions for each Voronoi cell are not changed anymore after setting them in place. An example of the resulting Voronoi cells can be seen in \cref{fig:ptcloud}.
+\subsection{Initialising Cells}
+The high quality that NeRFs achieve stems in part from an underlying prior of the network architecture: Multilayer perceptrons (MLPs) learn smooth functions better than noisy ones, and hence are prone to fall into an optimum that is a coherent scene. For multiple MLPs, each MLP in itself has a prior for smoothness, but a combined function of multiple MLPs has no such prior anymore. Hence, it is key to use some sort of prior to ensure scene coherence, as for initialising every cell in a Voronoi diagram with a new, randomly initialised NeRF, produces 'ghosting'-like artifacts as shown in \cref{fig:rnd_vs_mother_img}. In the case of distributed functions that are independent of each other, each function will try to improve the ray's colour even when the object is placed in another cell. While this helps the training objective, it creates complicated, fractured scene representations that perform poorly when evaluating an unseen camera pose (see \cref{fig:rnd_vs_mother_img}).\\
+For every new Voronoi cell, we thus initialise the respective NeRF with the parameters of the initially learned, lightweight global scene. Initialising each cell with a NeRF that learned a larger area is giving the cell a prior for shape coherence, hence the optimisation process can generally avoid bad optima. In addition, each cell will converge a bit faster with this initialisation and the boundaries of the cells are already fitting, strongly reducing visible seams even before convergence. Note that the points are always put into the respective NeRF of a cell in global coordinates, as each NeRF inherited the parameters of the NeRF trained with global coordinates.\\
+For inference, the only additional burden is the assignment of the correct cell for each sample point, \ie finding the respective NeRF, which is neglectable compared to learning a much larger NeRF. However, optimising multiple NeRFs at once instead of a single NeRF is more costly for backpropagation, but still worth the time saved on the forward pass.\\
+We also experimented with a stochastic version of interpolation, taking not always the closest cell centre as the responsible Voronoi cell, but actually sampling the from vector of distances to the cell centres. While this occasionally avoided some small visible seams early in training, it had no more effect after a few epochs of training, as the initial prior from inheriting parameters of a global network was enough.
+\subsection{Nested Voronoi Diagrams}
+Initially, a learned scene may not cover every area in much detail, hence partitioning a scene into a large number of cells right away can be both impractical and drives up the cost of assigning samples to the right cell. Hence, we propose partitioning every Voronoi cell itself, applying just the same steps as before: Gather all samples that fall into a cell while training, optimise a Voronoi diagram to partition the underlying information evenly, and then give each cell its own neural network that inherits parameters from the parent cell.\\
+To decide which cells to subdivide, we have two options: We can either choose to always subdivide the Voronoi cell that is performing worst, \ie accumulates the most error, or simply subdivide every cell at once. As we distribute the cells not only based on density, but also on error, we never experienced cases where one cell in an already partitioned scene was performing significantly worse than another cell. Hence, for simplicity, we subdivide all of the Voronoi cells in parallel.  For all our test scenes, a nesting depth of 2, \ie subdividing the scene once and then subdividing every resulting cell again, was enough. Note that we do not move any existing cell centres once we started training them, as moving them could lead to them covering an area for which they do not have the correct prior.

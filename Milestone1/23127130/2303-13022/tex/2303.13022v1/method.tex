@@ -1,0 +1,184 @@
+% \section{Methods}
+
+
+% In this section, we first describe how we build and learn a neural renderer with the approximation of a PB renderer. By utilizing this neural renderer, \model\ can learn accurate decomposition of the rendering parameter and synthesize high-quality novel views. The decomposition of the environment light also enables \model\ to relight scenes.
+% Finally, we introduce our neural blending for indirect illumination.
+
+\section{Neural Renderer: Approximating the PBR} \label{sec:renderer}
+% \ruofan{Repeat: Instead of explicitly ...}
+From the rendering equation described in \ref{sec:re}, we know PBR  is the result of the interaction between the surface material and lighting. %, and BRDF can be decomposed into diffuse and specular components.
+The neural renderer proposed in this work attempts to learn a neural approximation of the PBR, instead of \emph{explicitly} formulating a rendering equation.
+In addition to the geometry MLP $\bm{F}$ for surface geometry representation, we use three MLPs: environment light MLP $\bm{E}(\cdot)$, diffuse MLP $\bm{R}_d(\cdot)$, and specular MLP $\bm{R}_s(\cdot)$ in place of NeRF's directional MLP. 
+Similar to the decomposition of BDRF in PBR (Eqn. \ref{eq:brdf_decompose}), our diffuse MLP and specular MLP implicitly learn the rendering rules for the corresponding color components.
+The environment light MLP encodes the distant light probes of a specific environment into neural features that interact with surface geometry features (i.e., feature fusion) through diffuse/specular MLPs.
+
+\subsection{Decomposed Rendering MLPs}\label{sec:color_mlp}
+\noindent
+\textbf{Environment Light MLP.} Similar to \citea{boss2021neural, liang2022spidr, gardner2022rotation}, we represent the environment light probes as a coordinate-based MLP, conditioned on light directions. However, the output of our environment MLP is a high-dimensional neural feature vector instead of a valid HDR pixel. These neural environment features help our neural renderer capture 
+ complex surface-lighting interactions compared to RGB pixels. 
+For efficient rendering,  we use a similar approach as Neural-PIL \citea{boss2021neural} to represent pre-integrated environment light. Therefore, our environment MLP also requires roughness as the additional input. We employ the integrated directional encoding (IDE) \citea{verbin2022ref} over input direction and roughness to better learn continuous, high-frequency environment feature vectors. 
+More specifically, given a light direction $\bm{\hat{\omega}}$, and a roughness value\footnote{It should note that the roughness $\rho$ used in IDE does not have the same meaning as the perceptual roughness $\alpha$ used in analytic BRDF models.}
+$\rho$, our environment MLP $\bm{E}$ returns a neural feature vector $\mathbf{f}_{env}$:
+\begin{equation}
+    \mathbf{f}_{env} = \bm{E}(\bm{\hat{\omega}}, \rho)
+\end{equation}
+$\mathbf{f}_{env}$ is then used for synthesizing diffuse/specular colors. 
+To change the environment lighting of the rendered scene, we can swap the environment MLP to achieve this. 
+
+\noindent
+\textbf{Diffuse MLP.} The diffuse MLP learns color synthesis from the diffuse (Lambertian) BRDF. Since the irradiance of diffuse color is a cosine-weighted integration of environment light over a hemisphere centered at surface normal direction $\mathbf{\hat{n}}$, the diffuse color is independent of view direction and surface roughness. Based on this, we use the normal direction $\mathbf{\hat{n}}$ and a constant high roughness value $\rho_0$ (we empirically set $\rho_0=0.64$) as the input to our environment MLP to query the environment neural feature vector $\mathbf{f}_{env}^{d} = \bm{E}(\mathbf{\hat{n}}, \rho_0)$. Environment features $\mathbf{f}_{env}^{d}$ are then concatenated with geometry features $\mathbf{f}_{geo}$ as the input to the diffuse MLP $\bm{R}_d$:
+\begin{equation}
+\vspace{-3pt}
+    \mathbf{c}_d = \bm{R}_d(\mathbf{f}_{geo},\ \mathbf{f}_{env}^d)
+\vspace{-1pt}
+\end{equation}
+
+\noindent
+\textbf{Specular MLP.} As the counterpart of the diffuse MLP, specular MLP learns color synthesis from the specular BRDF. The commonly used analytic BRDF model \citea{cook1982reflectance, walter2007microfacet} also depends on view direction and roughness. The specular BRDF lobe\footnote{We leave the anisotropic or refraction effects to the future exploration.} is centered around the direction of specular reflection and its shape is controlled by material roughness $\rho$ and the angle between the outgoing direction $\bm{\hat{\omega}}_o$ ($\bm{\hat{\omega}}_o=-\mathbf{\hat{v}}$) and surface normal $\mathbf{\hat{n}}$.
+Similarly, the outgoing radiance at $\bm{\hat{\omega}}_o$ is also a integral over the weight distribution of incoming lights that is centered around reflected view direction $\bm{\hat{\omega}}_r$.
+Therefore, we use the reflected view direction $\bm{\hat{\omega}}_r$ and the predicted roughness $\rho$ (via geometry MLP $\bm F$) to query environment MLP $\bm E$ for the environment feature vector $\mathbf{f}_{env}^{s} = \bm{E}(\bm{\hat{\omega}}_r, \rho)$.
+Environment features, geometry features, and the dot product between  $\bm{\hat{\omega}}_o$ and $\mathbf{\hat{n}}_r$. are then combined as the input to the specular MLP $\bm{R}_s$:
+\begin{equation}
+    \mathbf{c}_s = \bm{R}_s(\mathbf{f}_{geo},\ \mathbf{f}_{env}^s, \bm{\hat{\omega}}_o\cdot \mathbf{\hat{n}})
+\end{equation}
+Finally, the synthesized diffuse and specular colors after volume rendering (Eq. \ref{eq_radiance}) are additively combined in the linear space and then converted to sRGB space with gamma tone mapping \citea{anderson1996proposal}:
+\begin{equation}
+    \mathbf{C} = \gamma(\mathbf{C}_d + \mathbf{C}_s)
+\end{equation}
+
+% \begin{figure}[t]
+%     \centering
+%     \includesvg[width=0.9\linewidth,inkscapelatex=false]{figures/sphere_demo.svg}
+%     \caption{\textbf{TODO}}
+%     \label{fig:sphere_demo}
+% \end{figure}
+
+
+\subsection{Training the Neural Renderer} \label{sec:train_render}
+% Combining the decomposed color MLPs described in \ref{sec:color_mlp}, we then make our color MLPs learn to approximate the actual PBR.
+
+We train our neural renderer using synthesized images of a sphere with various materials and environment lighting rendered by an existing PBR renderer as depicted in Figure \ref{fig:renderer}. 
+Specifically, we use Filament \citea{google2018filament}, a real-time PBR engine to synthesize these images by varying perceptual roughness $\alpha$, metallic value $m$, and base color $\mathbf{c}_b$ for the surface material, as well as different distant light probes for environment lighting.
+To render the same sphere with our neural renderer, we employ a simple MLP $\bm{F}_{sphere}$ (similar to the one introduced in \ref{sec:nerf_surface}) to represent the sphere surface with SDF and output geometry features $\mathbf{f}_{geo}$. % for diffuse and specular MLP. 
+$\bm{F}_{sphere}$ is also conditioned on the three material attributes ($\alpha, m, \mathbf{c}_b$) to account for the changes in geometry features caused by varying material properties. 
+% The structure of our rendering model is illustrated in Figure \ref{fig:renderer}. 
+
+To train our model, we construct an L1 photometric loss between images synthesized by the PBR renderer $\mathbf{C}^*$ and ones synthesized by our renderer $\mathbf{C}$. 
+Other than the photometric loss, we also use the ground truth SDF $s^*$ to supervise the SDF prediction of the sphere (MSE). The loss function is formulated as:
+\begin{equation}
+\vspace{-3pt}
+    \mathcal{L}_r = \mathcal{L}_{rgb}(\mathbf{C}, \mathbf{C}^*) + \lambda_1 \mathcal{L}_{SDF}(s, s^*) + \lambda_2 \mathcal{L}_{eik}(\nabla{s})
+\end{equation}
+Where $L_{eik}$ is Eikonal loss \citea{gropp2020implicit}, $\lambda_1$ \& $\lambda_2$ are loss weights which we set to 0.1 and 0.01 respectively. Figure \ref{fig:sphere_demo} showcases the controllable rendering results of our renderer.
+Once the neural renderer is trained, we will freeze the weights of diffuse/specular MLPs for the rest experiments.
+% \ruofan{frozen}
+% we use the existing PBR renderers to synthesize images with varied 
+% \ruofan{How to train, data}
+% \ruofan{}
+
+% For simplicity, we build a neural surface model to render a reflective sphere. In addition to the color models, we include a special SDF MLP $\bm{F}_{sphere}$ to represent a sphere with standard material \footnote{We do not consider anisotropic or transparent effects in our renderer.}. 
+% In addition to the spatial coordinate, $\bm{F}_{sphere}$ is also conditioned on material attributes including perceptual roughness $\alpha$, metallic $m$, and the base color $\mathbf{c}_b$ to generate varying neural geometry features:
+% \begin{equation}
+%     s, \rho, \mathbf{f}_{geo} = \bm{F}_{sphere}(\mathbf{x}, \alpha, m, \mathbf{c}_b)
+% \end{equation}
+% For the environment light, we use multiple environment MLPs to represent different environment maps appearing in the training images, while the rest MLP modules are always shared.
+% To render a pixel, SDF $s$ is converted to density value following Eq. \ref{eq:conversion} for volume rendering. 
+% Figure \ref{fig:renderer} gives an overview of our neural renderer and its learning process. 
+
+
+\begin{table}[]
+    \centering
+    % \small
+    \setlength\tabcolsep{0pt}
+        \begin{tabularx}{\linewidth}%
+        {*{6}{>{\centering\arraybackslash}X}} % p{0.19\linewidth}
+ \multicolumn{6}{c}{\includegraphics[width=\linewidth, trim={0 0 0 0},clip]{figures/spheres/env0.pdf}}\\
+ \multicolumn{6}{c}{\includegraphics[width=\linewidth, trim={0 0 0 0},clip]{figures/spheres/env6.pdf}}\\
+ \multicolumn{6}{c}{\includegraphics[width=\linewidth, trim={0 0 0 0},clip]{figures/spheres/env10.pdf}}\\
+           $\alpha$  & 0.0 & 0.2 & 0.4 & 0.6 & 0.8 
+        \end{tabularx}%
+    \vspace{-8pt}
+    \makeatletter\def\@captype{figure}\makeatother
+    \caption{Spheres sythesized by our neural renderer with varying metallic $m$, base color $\mathbf{c}_b$, roughness $\alpha$, and light probes. 
+    We will show an interactive web demo in the future.
+    \label{fig:sphere_demo}}
+    \vspace{-20pt}
+\end{table}
+
+\subsection{Feature Normalization} \label{sec:normalization}
+% Our learned neural renderer is not only for rendering synthetic spheres, we can combine these pre-trained color MLPs with other spatial neural field backbone models for rendering arbitrary scenes. 
+% In our neural renderer, we model the interaction between environment light and object surface as the feature fusion (concatenation) of environment features $\mathbf{f}_{env}$ and geometry features $\mathbf{f}_{geo}$. The fused features are then processed by diffuse/specular MLPs. 
+Unlike the prior work that estimates all rendering parameters with physical meanings, our high-dimensional neural features are unconstrained, since they are simply the outputs of a linear net layer. There could be multiple possible feature mappings to the RGB colors in the high-dimensional space, which could cause mismatched colors in relighting results when swapping the environment MLP learned from two different scenes.
+To constrain the neural features for more plausible relighting results with environment MLP swapping, we propose to normalize the neural features ($\mathbf{f}_{env}$ and $\mathbf{f}_{geo}$) with $l^2$-norm of each feature vector:
+\vspace{-5pt}
+\begin{equation}
+    \mathbf{f'} = \mathbf{f} / \|\mathbf{f}\|_2
+\vspace{-5pt}
+\end{equation}
+This normalization maps neural features to the unit vector on a hypersphere manifold, which improves the feature interchangeability among different represented neural scenes. 
+We will give an empirical analysis of this in Section \ref{sec:ablation_renderer}.
+% https://stats.stackexchange.com/questions/248511/purpose-of-l2-normalization-for-triplet-network
+
+
+\section{Neural Rendering for General Scenes} \label{sec:envidr}
+% In this section, we describe how we use the trained color MLPs from \ref{sec:train_render} together with neural geometry representation models to reconstruct and render general 3D scenes. We then introduce our approach to rendering indirect illumination caused by inter-reflection.
+\subsection{Neural Surface Representations}
+Following \citea{mueller2022instant, wang2022go, Yu2022MonoSDF}, our approach utilizes a hybrid neural SDF representation $\bm{F}_{g}$ with multi-resolution feature grids and hash encoding for the efficient learning and rendering of scene surfaces.
+Given an input query position $\mathbf{x}$, $\bm{F}_g$  converts coordinate input $\mathbf{x}$ into a concatenated feature vector from the multi-resolution hash encoding sampled with trilinear interpolation (the encoding used in Instant-NGP \citea{mueller2022instant}). The encoded features are then fed into a shallow MLP to predict all of SDF $s$, roughness $\rho$, and geometry feature $\mathbf{f}_{geo}$.
+% Note that compared to $\bm{F}_{sphere}$  that is used for learning the neural renderer, $\bm{F}_{g}$ for general scenes is not conditioned on any explicit material properties. 
+Note that unlike $\bm{F}_{sphere}$ used for learning the neural renderer, $\bm{F}_{g}$ for general scenes is not conditioned on any explicit material properties. Instead, $\bm{F}_{g}$ implicitly learns the material properties through the multiview training images and encodes the knowledge into its geometry feature $\mathbf{f}_{geo}$.
+\begin{equation}
+    s, \rho, \mathbf{f}_{geo} = \bm{F}_{g}(\mathbf{x})
+\vspace{-3pt}
+\end{equation}
+
+For the color rendering, we utilize pre-trained diffuse and specular MLPs ($\bm{R}_d$ \& $\bm{R}_s$) from \ref{sec:train_render} to synthesize output colors. The weights of both $\bm{R}_d$ and $\bm{R}_s$ remain \emph{frozen} throughout training. To estimate unknown environment light from training images, we randomly initialize an environment MLP $\bm{E}_g$ and optimize it alongside the geometry model $\bm{F}_{g}$. 
+By combining all these components, we introduce our neural scene representation and rendering model, which we call \emph{\model}.
+Similar to the training of other neural surface models \citea{yariv2021volume, wang2021neus}, 
+Our training is supervised by L1 photometric loss and the Eikonal constraint \citea{gropp2020implicit}:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{rgb}(\mathbf{C}, \mathbf{C}^*) + \lambda_{eik} \mathcal{L}_{eik}(\nabla{s})
+\end{equation}
+where $\lambda_{eik}$ is a weight hyperparameter which we set to 0.01.
+To ensure a smooth geometry initialization at the beginning, we add additional SDF regularizations at the early training iterations, please refer to the supplement for details.
+
+\begin{figure}[t]
+    \centering
+    % \includegraphics[width=\linewidth]{figures/indiret_ref.png}
+    \begin{subfigure}{0.49\linewidth}
+    \centering\captionsetup{width=0.96\linewidth}%
+    \includegraphics[height = 85pt, trim={10pt 0 0 0},clip]{figures/ref_physics.pdf}
+    \vspace{-10pt}
+    \caption{Tracing ray's reflection path to the camera.}
+    \label{fig:mic_normal}
+    \end{subfigure}
+    \begin{subfigure}{0.49\linewidth}
+    \centering\captionsetup{width=0.96\linewidth}%
+    \includegraphics[height = 85pt,  trim={10pt 0 0 0},clip]{figures/ref_raymarch.pdf}
+    \vspace{-10pt}
+    \caption{The raymarching process to capture pixel color.}
+    \label{fig:mic_normal}
+    \end{subfigure}
+    \caption{The illustrations of inter-reflections from the (a) physical lighting process and (b) raymarching rendering process. We assume the surface has a low roughness value. 
+    }
+    \label{fig:indir_ref}
+    \vspace{-10pt}
+\end{figure}
+
+\subsection{Ray Marching for Inter-reflections} \label{sec:indir}
+Our learned neural renderer from \ref{sec:renderer} only models the image-based lighting from distant light probes. As a result, \model\ in Section \ref{sec:envidr} cannot effectively handle the indirect illumination caused by surface inter-reflection. Inter-reflection can negatively impact the inverse rendering process for mirror-like specular surfaces as shown in Figure \ref{fig:toaster_compare}. 
+We observe that most indirect illumination effects arise from reflective surfaces with low roughness values. Although rougher surfaces can also be affected by indirect illumination, the resulting visual effects are less apparent. Thus, we focus on synthesizing inter-reflection on reflective surfaces with predicted roughness lower than a threshold $\rho_s$ (set to 0.1 in our experiments).
+
+The weight distribution of incoming lights for outgoing radiance at $\bm{\hat{\omega}}_o$
+on surfaces with low roughness is similar to a specular BRDF with rays concentrated at the reflected view direction $\bm{\hat{\omega}}_r$. Thus, to efficiently approximate the incoming radiance of the indirect illumination caused by inter-reflection on these surfaces, we can perform additional raymarching (one-bounce) along the reflected view directions (see Fig. \ref{fig:indir_ref}). This raymarching is similar to the raymarching along camera rays, but the origin and direction are set to the surface point $\mathbf{p}_{s}$ and $\bm{\hat{\omega}}_r$.
+% This process is similar to screen space reflection (SSR) \citea{sousa2011secrets}, but we perform the raymarching in the 3D object space.
+
+To render indirect illumination from approximated incoming radiance $\mathbf{e}_{r}$ from rendered reflected rays, 
+we introduce another color encoding MLP $\bm{E}_{ref}$ to convert rendered reflected ray color into neural features $\mathbf{f}_{env}^{ref}$ compatible with our specular MLP $\bm{R}_s$. The rendered indirect illumination $\mathbf{c}_{ref}$ is then output by:
+\begin{equation}
+    \mathbf{c}_{ref} = \bm{R}_s(\mathbf{f}_{geo}, \mathbf{f}_{env}^{ref}, \bm{\hat{\omega}}_o\cdot \mathbf{\hat{n}}),\; \mathbf{f}_{env}^{ref} = \bm{E}_{ref}(\mathbf{e}_{r}, \rho)
+\end{equation}
+To blend the rendered indirect illumination into our final rendering results, we let the geometry MLP $\bm{F}_{g}$ to additionally predict a blending factor $\eta \in [0,1]$ (with Sigmoid activation) to combine the original direct specular color $\mathbf{c}_s$ and indirect specular color $\mathbf{c}_{ref}$ into new specular color $\mathbf{c}_s^{\prime}$:
+\begin{equation}
+    \mathbf{c}_s^\prime = \mathbf{c}_s + \eta \mathbf{c}_{ref}
+\end{equation}

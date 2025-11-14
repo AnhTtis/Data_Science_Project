@@ -1,0 +1,346 @@
+\ifdefined\isArXiv
+\else
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage{iccv}
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+%
+\input{includes.tex}
+
+%
+%
+%
+\usepackage[pagebackref=true,breaklinks=true,letterpaper=true,colorlinks,bookmarks=false]{hyperref}
+
+%
+
+\def\iccvPaperID{1802}
+\def\httilde{\mbox{\tt\raisebox{-.5ex}{\symbol{126}}}}
+
+%
+\ificcvfinal\pagestyle{empty}\fi
+
+\begin{document}
+
+%
+\def\fulltitle{Three ways to improve feature alignment for open vocabulary detection}
+\title{\fulltitle \\ -- Supplementary material --}
+\hypersetup{pdfauthor={\iccvPaperID},pdftitle={\iccvPaperID: \fulltitle}}
+
+
+\maketitle
+%
+\ificcvfinal\thispagestyle{empty}\fi
+
+\tableofcontents
+\fi
+
+\input{floats_supp.tex}
+
+
+%
+\section*{Appendix overview}
+
+Appendix~\ref{sec:app:imp} contains full details of the detector architecture
+and training procedure,
+while
+Appendix~\ref{sec:app:init} provides more information on the
+alignment preserving architecture.
+In Appendix~\ref{sec:app:selft} we give further details on the
+implementation of self-training, reimplementation of Detic, and
+relation to other methods.
+Finally, qualitative detection examples are shown in Appendix~\ref{sec:app:qual}.
+
+
+%
+\section{Implementation details}
+\label{sec:app:imp}
+
+\paragraph{Architecture.}
+For closed vocabulary detectors, the final fully connected layer
+also trains a per-class bias, and initializing it according to the focal loss
+scheme~\cite{lin2017focal} stabilizes the beginning of training.
+For the open vocabulary case it is not possible to have this per-class bias term,
+so we use a learnt shared bias, \ie a single scalar added to the scalar product
+between the classification features and the text embeddings,
+initialized in the same way, \ie
+$\text{bias}_\text{init} = -\log\left(\left(1 - p\right) / p\right)$, where $p=0.01$.
+In initial experiments we observed this indeed aided stability.
+
+The original T-Head detector head architecture~\cite{feng2021tood} uses
+the ``task-aligned predictor'' (TAP) only on the regression and classification branches
+and not on the quality branch. For consistency we simply use TAP
+on all three branches.
+
+
+\paragraph{Input and annotation processing.}
+Training and evaluation is done with $800 \times 1024$ images for all datasets
+(\LVISminusrare, COCO, Objects365) apart from the pseudo-labelled images
+from CC12M where we found that $400 \times 512$ is sufficient.
+Training uses large scale jittering~\cite{ghiasi2021simple}
+for \LVISminusrare and small scale jittering for CC12M.
+Following~\cite{zhou2021probabilistic,minderer2022simple},
+50 pseudo-negatives are used for each training sample.
+
+\paragraph{Total loss} is the sum of three equally weighted standard losses:
+binary focal loss~\cite{lin2017focal} with default FCOS parameters ($\gamma=2$, $\alpha=0.25$),
+gIoU loss\cite{rezatofighi2019generalized},
+and the IoU prediction loss~\cite{wu2020iou}.
+
+\tabArhParams
+
+\paragraph{Optimization} is done with AdamW~\cite{loshchilov2019decoupled} and $10^{-4}$ weight decay,
+and,
+as is standard for NFNets,
+adaptive gradient clipping~\cite{brock2021highperformance}
+with the clipping threshold of 0.04 is used.
+Depending on the backbone architecture and whether self-training is performed,
+we adjust the training hardware, batch size and initial (post-warmup) learning rate
+-- Table~\ref{tab:archparams} shows the parameters for all configurations.
+All networks are trained for 32 epochs
+and the learning rate schedule consists of linear warm-up for 0.25 epochs,
+followed by 10 fold reductions at 67\% and 89\% of the training.
+The same schedule is used for self-training.
+
+\isArXiv{The implementation uses JAX~\cite{google2018jax} and the DeepMind JAX ecosystem~\cite{deepmind2020jax}.}{}
+
+
+%
+\section{Alignment preserving architecture}
+\label{sec:app:init}
+
+\figOrig
+
+\isArXiv{Figure~\ref{fig:gating}}{Figure~3 of the main paper} shows our alignment preserving architecture
+with shortcuts and trainable gates.
+For reference, Figure~\ref{fig:orig} shows the classic
+design~\cite{lin2017feature,tian2019fcos} of a single-stage detector.
+
+\paragraph{Trainable gating.}
+Recall that the gates perform the following operation:
+$o = x (1-\tan\alpha) + y \tan{\alpha}$,
+where $x$ and $y$ are the inputs and $\alpha$ is a learnt parameter initialized to $0$.
+We briefly experimented with the Flamingo~\cite{alayrac2022flamingo} formulation:
+$o = x + y \tan{\alpha}$, and found it performs similarly.
+
+\paragraph{Matching dimensionalities.}
+For clarity of presentation,
+we glanced over one detail that we elaborate on here --
+gates and shortcuts assume the dimensionalities of all input and output
+features are the same,
+while the default design of the feature pyramid network (FPN)
+and detection heads includes changes in the channel dimension.
+We do not attempt to fix this by changing the default settings for the FPN and detector head
+dimensionalities and making all channels the same size,
+as that would increase the parameter count, be less memory and computation efficient,
+and be harder to compare fairly with existing approaches.
+
+Specifically, the issue is the initial $1 \times 1$ convolution in the FPN
+applied on the final backbone features, as this reduces channels to 256
+and thus loses information.
+All following processing maintains 256-D features until the very end
+where there is an increase back to the original dimensionality
+to produce classification features compatible with text embeddings
+(786-D and 1376-D for NFNet-F0 and NFNet-F6, respectively).
+We address this pragmatically -- the dimensionality reduction convolution is initialized
+such that distances and scalar products are preserved as much as possible,
+though use of an orthogonal projection.
+Similarly, the dimensionality increase at the end of the network
+is initialized to the transpose of this projection.
+We find that the details are not crucial -- in fact the axis aligned
+orthogonal matrix (\ie a rectangular ``cropped'' identity matrix)
+is used for simplicity, and even without this initialization
+the training still works well as it only needs to learn one
+projection to bring features back into alignment.
+
+%
+
+
+%
+\section{Self-training}
+\label{sec:app:selft}
+
+\paragraph{Implementation details.}
+Self-training simultaneously processes a batch from \LVISminusrare
+with human-annotations and a batch from CC12M with pseudo-annotations.
+All the three losses (classification, bounding box regression, quality prediction)
+are used for the pseudo-labelled data as well as this performs slightly better
+than only using the classification loss.
+For Detic$^\dagger$ and \emph{Image bbox} baselines we found that,
+consistent with the paper~\cite{zhou2022detecting},
+using only the classification loss performs best, and report only these results.
+The losses for the two human- and pseudo-labelled data are simply summed up,
+different relative weighting was not found to be beneficial for any of
+the methods or baselines.
+
+
+\paragraph{Relation to other methods.}
+We elaborate on the comparison to other methods from \isArXiv{Section~\ref{sec:selft}}{Section~3.3 of the main paper}.
+Recall that~\cite{redmon2017yolo9000,sohn2020simple,zoph2020rethinking,ramanathan2020dlwl}
+are closed vocabulary detectors and and there is no need or way to use
+batch-negatives.
+GLIPv2~\cite{zhang2022glipv2} does not consider the zero-shot scenario
+and uses noun phrases instead of entire captions like we do.
+Furthermore, their deep fusion architecture restricts the use
+of batch-negatives to the pre-fusion features making its effect
+indirect, while our loss operates on the very final detector head
+classification features which are directly used for detecting the object.
+
+In contrast to our approach and GLIPv2,
+Detic~\cite{zhou2022detecting} does not make use of the image caption
+to produce the pseudo-detection, but instead
+picks the largest bounding box proposal instead. The method does use
+batch-negatives in an additional loss,
+although this is done on the global image-level rather
+than the bounding box-level.
+
+Finally, the Detic paper~\cite{zhou2022detecting} also implements
+baselines where the closed vocabulary pseudo-labelling methods mentioned above~\cite{redmon2017yolo9000,sohn2020simple,zoph2020rethinking,ramanathan2020dlwl}
+are adapted to the open vocabulary setting.
+For these baselines, the paper uses the image caption to produce pseudo-detections,
+but does not use batch-negatives.
+We showed in \isArXiv{Section~\ref{sec:selft:res}}{Section~3.3.1 of the main paper} that batch-negatives are crucial for
+good performance.
+
+
+\paragraph{Comparisons with Detic~\cite{zhou2022detecting}.}
+Detic~\cite{zhou2022detecting} focuses on the zero-shot detection task
+but the main results forgo the open vocabulary claim as
+the knowledge of the names of the \LVISminusrare test classes
+is explicitly used during training,
+\eg the captions are filtered for LVIS class names and this noisy label is
+assigned to the image.
+We focus on zero-shot open vocabulary detection and do not use test class names
+during training, so we compare only to the open vocabulary version of Detic
+(\ie according to Detic terminology, no ``image label'' supervision, only ``caption'' supervision).
+
+Furthermore, for a fair comparison as we use different backbones, detector architectures,
+pretraining and self-training datasets, \etc,
+we also reimplement the open vocabulary Detic, referred to as Detic$^\dagger$.
+Our \emph{\threerec} approach and Detic$^\dagger$ are identical everywhere
+apart from that pseudo-labelling is performed differently, where
+\emph{\threerec} uses the most confident detection produced by \emph{\tworec} given the caption,
+Detic$^\dagger$ uses the largest bounding box proposal from \emph{\tworec}.
+It should be noted that our FCOS-based detector architecture is single-stage
+and thus technically does not have bounding box proposals,
+but we found that we can simulate producing proposals by filtering out the dense boxes
+through thresholding the \emph{quality score};
+we sweep a range of thresholds and pick the best performing one (0.75).
+Our Detic$^\dagger$ reimplementation surpasses the original Detic
+(\APall improved from 30.4\% to 34.8\%, and \APrare from 17.4\% to 23.4\%),
+but our \emph{\threerec} approach beats this further (\APall of 35.7\% and \APrare of 25.6\%).
+
+
+\tabLvisAll
+
+\paragraph{Comparison with full LVIS training.}
+In all other experiments detectors are trained on \LVISminusrare,
+a version of the LVIS dataset where annotations for rare classes are removed
+in order to test zero-shot detection.
+Here we investigate the value of those annotations by training a
+\emph{\tworec} detector on the entire LVIS (\ie without removing annotations for rare classes).
+As expected,
+\emph{\tworec} trained on full LVIS beats \emph{\tworec} trained on \LVISminusrare
+when evaluated on LVIS itself, due its superior performance on the rare classes (Table~\ref{tab:lvisall}).
+However, the effects of the dataset change are marginal
+when transferring to COCO and Objects365,
+and our self-trained \emph{\threerec} detector is still decidedly the best.
+Therefore, pseudo-labelled data can be more valuable than ground truth annotations.
+Furthermore, when using the NFNet-F0 backbone, \emph{\threerec} even beats the `cheating'
+\emph{\tworec} on LVIS itself, but this result does not hold for the larger and better
+NFNet-F6 backbone.
+
+
+%
+\section{Qualitative results}
+\label{sec:app:qual}
+
+\figQualThreeVsTwo
+\figQualThreeParis
+\figQualLvis
+\figQualCoco
+\figQualObj
+
+\paragraph{Zero-shot detection.}
+Figure~\ref{fig:qual:threevstwo} compares the zero-shot performance of
+the \emph{\tworec} and \emph{\threerec} networks -- \emph{\tworec} is capable
+of detecting some classes not seen during training, but \emph{\threerec}
+is better.
+Figure~\ref{fig:qual:threeparis} further showcases
+\emph{\threerec}'s zero-shot capabilities.
+
+
+\paragraph{Random samples from benchmark datasets.}
+Figure~\ref{fig:qual:lvis} shows detections on a sample of LVIS validation
+images.
+Transfer to COCO and Objects365 is shown in Figure~\ref{fig:qual:coco}
+and~\ref{fig:qual:o365}, respectively.
+Kuo \etal~\cite{kuo2023fvlm} estimate the overlap between the training
+set classes of \LVISminusrare and the classes of
+COCO and Objects365 to be 91\% and 63\%, respectively.
+Therefore, Figure~\ref{fig:qual:o365} also illustrates
+impressive zero-shot capabilities of our method.
+
+
+\paragraph{Failure cases.}
+Instead of the typical failure cases such as
+difficulty in detecting objects that are highly occluded, small, in unusual poses,
+\etc,
+here we focus on failure cases specific to zero-shot open vocabulary detection.
+While exhibiting impressive zero-shot performance, we observe that
+the network does not detect some common objects such as
+houses, buildings, windows, bricks, trees, leaves, rocks, eyes, \etc.
+We speculate that this is because images containing these objects are often
+seen during training but never annotated with a bounding box,
+thus the network learns they are not-an-object and does not assign
+a high enough quality score.
+There is also the philosophical question of what is an object,
+for example, object parts such as eyes generally do not get detected
+by our networks.
+However, the system does detect wheels, as they are annotated in
+the \LVISminusrare training set.
+All of the above indicates that that there is room for improvement
+in the zero-shot capabilities of the objectness component of detectors
+(`quality score' here, region proposal networks in two-stage detectors),
+or that this concept should be removed completely
+as being somewhat incompatible with zero-shot open vocabulary detection.
+
+\paragraph{Image attribution.}
+Images used in \isArXiv{%
+Figure~\ref{fig:teaser},~\ref{fig:qual:threevstwo}
+}{%
+Figure~\ref{fig:qual:threevstwo}}
+and~\ref{fig:qual:threeparis}
+were downloaded from Wikimedia%
+\isArXiv{ or are personal photos of an author (Relja Arandjelović)},
+and all are free to use and modify -- we made no modifications apart
+from resolution change and the overlaying of the detections.
+The Wikimedia originals can be found at the following links:
+
+\begin{Verbatim}[fontsize=\tiny, breaklines=true, breakafter=\_, breakaftersymbolpre=none]
+https://commons.wikimedia.org/wiki/File:Parisian_gargoyle_(Unsplash).jpg
+https://commons.wikimedia.org/wiki/File:Venezia-gondola_on_canal_grande.JPG
+https://commons.wikimedia.org/wiki/File:Macaroons_at_Smiths.jpg
+https://commons.wikimedia.org/wiki/File:Round_hay_bales_and_a_hot_air_balloon_somewhere_in_Luxembourg.jpg
+https://commons.wikimedia.org/wiki/File:POOL_HALL_-_NARA_-_543975.jpg
+https://commons.wikimedia.org/wiki/File:Jumping_over_the_moon.jpg
+https://commons.wikimedia.org/wiki/File:Wolves_chasing_a_wapiti,_Yellowstone_River_(2).jpg
+https://commons.wikimedia.org/wiki/File:2020-01-11_Men's_Ice_hockey_3x3_Preliminary_round_Team_Blue_vs._Team_Orange_(2020_Winter_Youth_Olympics)_by_Sandro_Halank–057.jpg
+\end{Verbatim}
+
+
+%
+
+\isArXiv{}{
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{bib/shortstrings,bib/more,bib/vgg_other,bib/vgg_local}
+}
+
+\end{document}
+}

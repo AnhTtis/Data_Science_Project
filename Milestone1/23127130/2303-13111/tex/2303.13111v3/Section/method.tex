@@ -1,0 +1,71 @@
+\input{Figure/fig_overview}
+\input{Figure/MLPP}
+
+\section{Methodology}
+PHNet adopts an encoder-decoder paradigm, as exemplified in Figure~\ref{fig:overview}. The encoder consists of a 2.5D convolution module and an MLPP module. The 2.5D convolution is responsible for extracting local features, and the output feature maps are subsequently forwarded to MLPP to capture global features. The decoder processes the hierarchical features for prediction. In the following, we will detail each component.
+
+\subsection{2.5D Convolution} 
+\label{sec2.1}
+% ------------------------------------------
+Drawing upon previous research on bias in medical image analysis~\cite{battaglia2018bias} and the anisotropic nature of volumetric medical images, we incorporate convolutional layers in the shallow layers of the encoder to extract local features. Volumetric images, such as CT and MRI scans, are often affected by anisotropic problems due to their thick-slice scanning~\cite{wang20192d5}, resulting in high in-plane (IP) resolution and low through-plane (TP) resolution~\cite{dong2022mnet,liu2018ahnet}. This discrepancy is particularly pronounced in COVID-19-20~\cite{roth2022rapid}, where the IP resolution is 0.74mm on average, while the TP resolution plunges to a mere 5mm. To mitigate this issue, we use 2D conv-blocks to capture the IP information until the feature is reformulated in approximately uniform resolution across all three axes: axial, coronal, and sagittal. Then, we apply 3D conv-blocks to handle the volumetric information. Each encoder layer consists of two residual convolution blocks, with each block comprising two sequential Convolution-Instance Normalization-Rectified Linear Unit (Conv-IN-ReLU) operations~\cite{ulyanov2016instancenorm}. The residual addition takes place before the final ReLU activation.
+
+\subsection{Multi-Layer Permute Perceptron (MLPP)} 
+\label{sec2.2}
+Although CNNs are capable of modeling long-range dependencies through deep stacks of convolution layers, studies~\cite{valanarasu2022unext,hou2022vip,tolstikhin2021mixer} have highlighted the superior ability of MLP-based networks to learn global context. 
+Motivated by this, we design MLPP as depicted in Figure~\ref{fig:mlpp} to acquire global information in deep layers of the encoder.
+MLPP decomposes the training of IP feature and TP feature in sequential order. 
+We denote these two blocks as \textbf{IP-MLP} and \textbf{TP-MLP}, respectively.
+To facilitate communication of cross-axis tokens, we further propose an auxiliary attention branch in IP-MLP, denoted as \textbf{AA-MLP}. We provide a PyTorch-style pseudo code of MLPP in the supplementary material.
+ 
+\subsubsection{\emph{IP-MLP}.} 
+Given one slice of input feature maps $\mathbf{X}\in \mathbb{R}^{H\times W \times C}$, conventional MLP-based methods~\cite{liu2021gmlp,tolstikhin2021mixer} typically flatten $\mathbf{X}$ into a 1D vector, which loses the spatial information of the original conv-features~\cite{zhang2022morphmlp} and results in large computational complexity which escalates quadratically with the size of $\mathbf{X}$.
+To this end, as depicted in Figure~\ref{fig:mlpp}, we introduce an axial decomposition operation in triplet pathways that separately process $\mathbf{X}$ in horizontal ($W$), vertical ($H$), and channel ($C$) axis. 
+It is achieved by permuting dimensions of $\mathbf{X}$ such that voxels within the same pathway across all channels are grouped, thus enabling the preservation of precise positional information along other axes when encoding information along one axis. 
+It also reduces the computational complexity, which scales linearly with the size of $\mathbf{X}$.
+
+To strike a balance between local feature and long-distance interactions, and alleviate image resolution sensitivity problem~\cite{liu2022mlpsurvey} wherein the MLP-based model is sensitive to the input resolution\footnote{Further discussion is provided in supplementary material.}, we present a token segmentation operation that splits the feature vector into multiple tokens, which can be efficiently processed by the following fully-connected (FC) layers.
+We take the horizontal axis as an example. 
+Instead of encoding the entire dimension, we split $\mathbf{X}$ into non-overlapping segments along the horizontal direction.
+Each segment, denoted as $\mathbf{X}{i}\in \mathbb{R}^{L\times C}$, where $i \in {1,...,HW/L}$, has a segment length of $L$. 
+Similarly, we divide each $\mathbf{X}_{i}$ into multiple non-overlapping groups along channel dimension, where each group has $g = C/L$ channels. 
+This yields split segments, and each individual segment is $\mathbf{X}_{i}^{k}\in \mathbb{R}^{Lg}$, where $ k \in \{1,...,C/g\}$. 
+Next, we flatten each segment and map $\mathbb{R}^{Lg} \mapsto \mathbb{R}^{Lg}$ by an FC layer to transform each segment, producing $\mathbf{Y}_{i}^{k}$. 
+To recover the original dimension, we permute all segments back to $\mathbf{Y}_{W} \in \mathbb{R}^{H\times W \times C}$. 
+Similarly, we conduct the same operations in the vertical pathway as above to permute tokens along the vertical direction, yielding $\mathbf{Y}_{H}$. 
+To facilitate communication among groups along channel dimension, we design a parallel branch that contains an FC layer that maps $\mathbb{R}^{C} \mapsto \mathbb{R}^{C}$ to process each token individually, yielding $\mathbf{Y}_{C}$. 
+Finally, we feed the element-wise summation of horizontal, vertical, and channel features into a new FC layer to attain the output, which can be formulated as: 
+\begin{equation} \label{eqn:fusion2}
+    \mathbf{Y}_{\text{IP}} = (\mathbf{Y}_H + \mathbf{Y}_W + \mathbf{Y}_C)\mathbf{W},
+\end{equation}
+where $\mathbf{W} \in \mathbb{R}^{C\times C} $ denotes an FC weight matrix. 
+
+
+\subsubsection{\emph{AA-MLP}.} 
+The MLPP, despite its strengths, possesses two limitations that may have a negative impact on segmentation performance.
+First, the axial decomposition operation restricts direct interaction between tokens that are not in the same horizontal or vertical position.
+Second, the token segmentation operation would suffer from a smaller local reception field compared with the vanilla MLP~\cite{tolstikhin2021mixer}.
+To overcome these limitations, we design an auxiliary branch to enable intra-axis token communication, which serves as an attention mechanism via a lightweight yet effective MLP-like architecture.
+Specifically, given an input slice of feature maps $\mathbf{X}\in \mathbb{R}^{H\times W \times C}$, we partition $\mathbf{X}$ into non-overlapping windows. 
+We set window size to $L$ and thus obtain $\mathbf{X}_{i}\in \mathbb{R}^{L\times L}$, where $i \in \{1,...,HWC/L^{2}\}$. 
+Subsequently, we apply an FC matrix $\mathbf{W}\in \mathbb{R}^{L^{2}\times L^{2} }$ to transform each window and get $\mathbf{Y}_{i} \in \mathbb{R}^{L\times L}$. 
+The final attention map $\mathbf{Y}_A \in \mathbb{R}^{H\times W\times C} $ is obtained by permuting all windows back to the original dimension. 
+Finally, the feature maps $\mathbf{F}_{\text{IP}}$ of IP-MLP are obtained by performing residual attention~\cite{wang2017residual} of $\mathbf{Y}_{\text{IP}}$ and $\mathbf{Y}_A$ as follows:
+\begin{equation} \label{eqn:fusion}
+    \mathbf{F}_{\text{IP}} = (1+\mathbf{Y}_A) \odot \mathbf{Y}_{\text{IP}},
+\end{equation}
+where $\odot$ denotes element-wise multiplication.
+ 
+\subsubsection{\emph{TP-MLP}.} 
+Upon obtaining the in-plane information from the IP-MLP module, we proceed to apply the TP-MLP module to capture the long-term through-plane features.
+Similarly, given input feature maps $\mathbf{F}_{\text{IP}}\in \mathbb{R}^{H\times W\times D \times C}$, we first split $\mathbf{X}=\mathbf{F}_\text{IP}$ along the depth dimension into non-overlapping segments with a segment length of $L$. 
+We thus obtain $\mathbf{X}_{i}\in \mathbb{R}^{L\times C}$, where $ i \in \{1,...,HWD/L\}$. 
+Subsequently, we divide $\mathbf{X}$ into several non-overlapping groups along the channel dimension, with each group containing $g = C/L$ channels. 
+This results in $\mathbf{X}_{i}^{k}\in \mathbb{R}^{Lg}$, where $ k \in \{1,...,C/g\}$. 
+Subsequently, we flatten each segment and map $\mathbb{R}^{Lg} \mapsto \mathbb{R}^{Lg}$ by an FC layer, yielding $\mathbf{Y}_{i}^{k}$. 
+Finally, we permute all segments $\mathbf{Y}_{i}^{k} \in \mathbb{R}^{Lg} $ back to the original dimension, yielding the output $\mathbf{F}_{\text{TP}} \in \mathbb{R}^{H\times W\times D \times C}$.
+
+\subsection{Decoder Network}
+The decoder in our proposed method utilizes a slim CNN architecture, employing transpose convolution to progressively upsample the feature maps to match the input image resolution. 
+Within the decoder, we separate an isotropic 3D convolution with kernel size $3\times3\times3$ into a $3\times3\times1$ in-plane convolution and a $1\times1\times3$ through-plane convolution to efficiently fuse the feature~\cite{zhang2021efficient}. 
+We further include skip connections between the encoder and decoder, allowing for the preservation of low-level details. 
+

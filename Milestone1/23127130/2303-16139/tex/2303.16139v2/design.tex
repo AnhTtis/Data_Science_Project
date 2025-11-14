@@ -1,0 +1,536 @@
+\section{Design}
+\label{s:design}
+In this section, we will first present the core of our system. Then we present some analysis of the system along with some extensions to address a few practical concerns. We will present details of our cloud implementation separately in the next section.
+
+\subsection{Delivery Based Ordering}
+Our solution is composed of three parts. 
+\subsubsection{Delivery Clock\\}
+\noindent\textbf{What we do.}
+Each RB maintains a delivery clock. This delivery clock essentially tracks time relative to when market data was delivered to the participant. We use $DC(i,a)$ to represent delivery clock of participant $i$ at time when trade $(i,a)$ is submitted. Delivery clock is a lexicographical tuple.
+\begin{align}
+    DC(i,a) = \langle ld(i,a), S(i,a)-D(i, ld(i,a))\rangle.
+\end{align}
+where $ld(i,a)$ is the latest data point that was delivered to MP$_i$ by time S(i,a), i.e., $D(i,ld(i,a)) \leq S(i,a) < D(i,ld(i,a)+1)$). 
+Interval, $S(i,a)-D(i, ld(i,a))$, corresponds to the time that has elapsed since the last delivery and can be measured locally at the RB without requiring any clock synchronization (challenge 1). 
+
+\noindent
+\textit{Monotonicity:} Delivery clocks advance monotonically with submission time. As a result, DBO trivially satisfies the causality condition (Equation~\ref{eq:causality}). Further, it incentivizes the participants to submit trades as early as possible. Therefore, \emph{a participant cannot gain any advantage by delaying trades.} %\pg{should this point have a heading of its own}
+Finally, we also leverage the monotonic property to overcome challenge 3 (\S\ref{ss:enforcing_ordering}). Figure~\ref{fig:delivery_clock} shows how delivery clock advances with time.
+
+%\pg{I tried to reduce the notation here. I defined delivery clock slightly differently.}
+
+\begin{figure}[t]
+\centering
+    \includegraphics[width=0.8\columnwidth]{figures/delivery_clock.pdf}
+    \caption{\small{\bf Delivery Clock.}}% \pg{Redraw}}% \pg{Eashan see Ranveer's comment}}% \pg{Eashan can you redraw this figure in powerpoint or something.}}}
+    \label{fig:delivery_clock}
+    \vspace{-2.5mm}
+\end{figure}
+
+All incoming trades are marked with the delivery clock at the trade submission time. The ordering buffer uses this delivery clock time to order trades. Formally, the ordering in DBO is given by,  
+
+\vspace{-2mm}
+\begin{align}
+    O(i,a) = DC(i, a). 
+    \label{eq:ordering_with_dc}
+\end{align}
+
+
+\begin{figure}[t]
+\centering
+    \includegraphics[trim={0 0 0 2mm},clip,width=0.8\columnwidth]{figures/dbo_correct.pdf}
+    \vspace{-4mm}
+    \caption{\small{{\bf DBO can help correct for late delivery of data.} Delivery of market data to MP$_i$ is lagging behind MP$_j$. There are two trades $(i,a)$ and $(j,b)$ generated in response to the same market data $x$. $(j,b)$ was submitted before $(i,a)$ but
+    %, i.e., $S_j(l) < A_i(k)$. 
+    response time of $(i,a)$ is less than $(j,b)$.
+    %, i.e., $rt_i(k) < rt_j(l)$. 
+    In this example, $DC(i,a) (= \langle x, RT(i,a)\rangle) < DC(j,b) (= \langle x, RT(j,b)\rangle)$ and trade $(i,a)$ is correctly ordered ahead of $(j,b)$.}} %Ordering based on the submission time leads to incorrect ordering.}
+    %\pg{Correct figure}}
+    \label{fig:dbo_correction}
+    \vspace{-3mm}
+\end{figure}
+
+
+\noindent\textbf{Why it works.}
+When the trigger point of trade $(i,a)$ is indeed the last data point (i.e., $x = TP(i,a) = ld(i, a)$), then, DBO respects condition C2 for LRTF. Figure~\ref{fig:dbo_correction} shows an illustrative example of this.
+This is because, the delivery clock directly tracks the response time of $i,a$ in this case and $O(i,a) = DC(i, a) = \langle x, RT(i,a)\rangle$. For a competing trade $(j,b)$ with higher response time, the delivery clock at time of submission will either read $O(j,b) = DC(j, b) = \langle x, RT(j,b)\rangle$ (if S(j,b)<D(j,x+1)) or $DC(j, b) = \langle y, S(j,b)-D(j,y)\rangle$ with $y>x$. In both cases, $O(i,a) < O(j,b)$.
+
+
+At a high level, in our ordering we are correcting for latency differences in data delivery by using the delivery time of the last data point. When the last data point is not the trigger point for trade $(i,a)$, DBO satisfies the LRTF condition C2, if the following condition holds, 
+\begin{align}
+    D(i,ld(i,a))-D(i,x) = D(j,ld(i,a))-D(j,x),
+    \label{eq:cond_delivery_lrtf}
+\end{align}
+where $x = TP(i,a)$.  
+While it is impossible to ensure that inter-delivery times remain the same for all participants for all points, by pacing data at the RB it is indeed possible to ensure that the above condition is always met.% \radhika{you meant C2 or the above condition?}. \pg{the above condition only}
+The main reason why we can meet the above condition is that condition C2 limits that the trigger point $x$ cannot be any arbitrary data point in the past, and that the trigger point must have been delivered recently  $S(i,a)-D(i,x) < \delta$.
+%and we only need to ensure same inter-delivery times for. 
+In the next subsection, we will show how we can achieve this and solve challenge 2. %\pg{Is this easy to follow?}
+
+
+
+%\pg{FIX: say delivery clocks helps correct has static differences in latency. Why are delivery clocks so good on their own, give more intuition and experimentation. Potential things to include, see 6.1. Maybe make a section of.delivery clock on its own. correct the equation here in terms of response time as well.}
+%\pg{Should we include results on necessary conditions on delivery times for achieving LRTF. Maybe its a bit of an overkill.}
+
+\noindent
+\textit{Remark:} In our cloud experiments, we find that DBO achieves fairness with very high probability. This is because network latency (from CES to any given participant) exhibits temporal correlation in latency especially over  short periods of time. When temporal correlation is high, inter-delivery time at any participant is close to the inter-generation time at the CES. In such cases, condition given by Equation~\ref{eq:cond_delivery_lrtf} is satisfied with high probability.
+
+\noindent
+\textbf{Difference with traditional logical clocks:} Logical clocks are commonly used in distributed systems. The most famous ones are lamport clocks~\cite{lamportSeminalPaper} and vector clocks. These clocks can be used for achieving total causal ordering of events. While these clocks can track causality of events, they cannot be used to achieve response time fairness. In particular, these clocks don't say anything about how two competing trades generated using the same market data should be ordered as these two trades have no direct causality relation. Unlike delivery clocks, such logical clocks also have no notion of measuring time between occurrences of two events. Time difference between events is critical to achieve fairnesss for exchanges. 
+
+\noindent\textit{Note:} Several major financial exchanges already rely on heartbeats~\cite{nyse-client} for liveness when traffic is low.
+
+
+\begin{figure}[t]
+\centering
+    \includegraphics[width=0.8\columnwidth]{figures/batching_pacing.pdf}
+    \vspace{-2mm}
+    \caption{\small{\bf Batching and Pacing. Inter-delivery time for consecutive batches is equal to or more than $\delta$.}}% \pg{Redraw}}% \pg{Eashan see Ranveer's comment}}% \pg{Eashan can you redraw this figure in powerpoint or something.}}}
+    \label{fig:batching_pacing}
+    \vspace{-4.5mm}
+\end{figure}
+
+\subsubsection{Batching and Pacing\\}
+\noindent
+\textbf{What we do.}
+In DBO, the CES breaks data into batches. Each new batch contains all data points in the duration $(1+\kappa) \cdot \delta$ after the previous batch. Here $\kappa > 0$. Each release buffer delivers all data points in a batch at the same time. %Two points $x,y$ belonging to the same batch are delivered simultaneously to each participant, i.e., $D(j,y)=D(j,x), \forall j$.
+The release buffer delivers batches as quickly as possible while ensuring that the time between delivery of two consecutive batches is atleast $\delta$. Figure~\ref{fig:batching_pacing} shows an illustration of batching. Both batching and pacing increase the delivery time of data points. In the next subsection we will analyze the impact of the two on latency. Note that in the event of queue build up at the RB, since the batch generation rate ($\frac{1}{(1+\kappa) \cdot \delta}$) is slower than the batch dequeue rate($\frac{1}{\delta}$), the queue at the RB eventually gets drained(\S\ref{ss:understanding_latency}).
+
+
+\noindent
+\textbf{Why it works.} With batching and pacing, DBO achieves LRTF. In particular, 
+consider a trade $(i,a)$ with response time less than $\delta$. Because of pacing, consecutive batches are separated atleast by $\delta$. This means that the trigger point ($x=TP(i,a)$) must be within the last received batch. The point $ld(i,a)$ is also the last point in this batch and $D(i,ld(i,a)) = D(i,x)$. \emph{With batching and pacing, the delivery clock again directly tracks the response time of $(i,a)$} and $O(i,a) = DC(i,a) = <ld(i,a), RT(i,a)>$.
+With batching, for participant $j$, $x$ and $ld(i,a)$ also belong to the same batch $D(j,ld(i,a)) = D(j,x)$.
+For a competing trade $(j,b)$ with higher response time, the delivery clock at the time of submission will either read $O(j,b) = DC(j,b)) = \langle ld(i,a)), RT(j,b)\rangle$ (if $(j,b)$ was submitted before the next batch, i.e., $S(j,b) < D(j,ld(i,a)+1)$) or $DC(j, b) = \langle y, S(j,b)-D(j,y)\rangle$ with $y>ld(i,a)$. In both cases, $O(i,a) < O(j,b)$.
+
+\if 0
+\begin{figure}[t]
+\centering
+    \includegraphics[width=0.8\columnwidth, angle = -90]{images/pq_hb.jpg}
+    \vspace{-2.5mm}
+    \caption{\small{\bf Enforcing the ordering.} \pg{Redraw}}% \pg{Eashan see Ranveer's comment}}% \pg{Eashan can you redraw this figure in powerpoint or something.}}}
+    \label{fig:pq_hb}
+    \vspace{-2.5mm}
+\end{figure}
+\fi
+
+\subsubsection{Enforcing the ordering\\}
+\label{ss:enforcing_ordering}
+OB contains a priority queue where all incoming trades are sorted based on the delivery clock timestamp (Equation~\ref{eq:ordering_with_dc}). A trade $(i,a)$ at the head of the priority queue should be forwarded to the CES only when the OB has received all trades $(j,b)$ with lower ordering $DC(j,b) < DC(i,a)$. 
+
+\noindent
+\textit{OB's Heartbeat Handler:} In DBO, each RB sends a heartbeat periodically every $\tau$ seconds to the CES. The heartbeat $(i,h)$, from participant $i$ contains the delivery clock timestamp at the time the heartbeat was generated ($DC(i,h)$). Since data in delivered in order and because delivery clock advances monotonically with time, heartbeat $(i,h)$ tells the OB that it has received all trades from participant $i$ with delivery clock less than $DC(i,h)$. The ordering buffer forwards trade $(i,a)$ if it has received heartbeats from all the participants with delivery clock timestamp higher than $DC(i,a)$. 
+
+
+\subsection{Understanding DBO}
+
+\subsubsection{Latency, parameter setting and straggler mitigation\\}
+\label{ss:understanding_latency}
+
+We will first derive the optimal latency for any ordering system that achieves response time fairness. We will then discuss how DBO compares to  optimal latency. We will also present guidelines for setting parameters and how to mitigate stragglers that can impact latency.
+
+We define latency for trade $(i,a)$, $L(i,a)$, as the sum of latency in delivering data (from generation time) and latency in trade forwarding to the CES (from trade submission time). Formally,
+\begin{align}
+    L(i,a) = (D(i, x) - G(x)) + (F(i,a) - S(i,a)),\nonumber\\
+    L(i,a) = F(i,a) - G(x) - RT(i,a),
+    \label{eq:latency_def}
+\end{align}
+where $x=TP(i,a)$.
+
+\noindent
+\textbf{Optimal Latency:} Formally trade $(i,a)$ can only be forwarded to the CES's ME only when the CES has received all potential competing trades $(j,b)$ with lower response times ($RT(j,b) < RT(i,a)$). Let $R(i, x, RT)$ represent the time when the CES receives trade $(i,a)$ whose whose trigger point is x and response time is RT. Formally, 
+\begin{align}
+    F(i,a) = \max_{j}(R(j, x=TP(i,a), RT=RT(i,a))). 
+\end{align}
+A subtle point to note here is that even if participant $j$ does not produce any trades, we still need to wait for that participant till $R(j, x=TP(i,a), RT(i,a))$. Before this time, fundamentally the CES cannot be sure that it will not receive a trade from participant $j$ with a lower response time. 
+
+We use $RTT(i, x, RT)$ to represent the sum of raw network latency for point x from CES to MP $_i$ and latency of trade from MP$_i$ to the CES (whose trigger point is x and response time RT).  In the best case scenario for latency (no buffering at any point in the path) we get
+\begin{align}
+    R(i, x, RT) = G(x) + RTT(i, x, RT) + RT.
+\end{align}
+
+
+Using the above two equations, we can write the following theorem.
+\begin{theorem}
+For any ordering system that achieves response time fairness, the minimum latency for trade $(i,a)$ is given by,
+\begin{align}
+    L(i,a) = \max_{j}(RTT(j, x=TP(i,a), RT=RT(i,a))).
+\end{align}
+\vspace{-2mm}
+\label{thm:latency}
+\end{theorem}
+
+Put it simply, the above theorem states for achieving response time fairness, the minimum latency is bounded by the maximum round trip time across all participants. This means that fundamentally bad latency for a participant affects the latency of all trades. To achieve low latency consistently, we would like to ensure that latency of all the participants is well behaved majority of the times. How to better achieve this goal is left as a subject for future work.
+
+%This theorem implies that even in cloud settings exchanges should ask for  network latency  
+
+%With a very large number of participants thus pose a 
+%\pg{fundamental issue with scalability}
+
+\noindent
+\textbf{How does DBO compare with the optimal?} DBO achieves close to optimal latency.  Compared to the optimal, batching and pacing introduce additional delay in delivery of market data points.  Since heartbeats are  generated only periodically they can  introduce an additional delay of $\tau$ at the ordering buffer. We now discuss the delay due to each of these components and how do the parameters $\kappa$, $\delta$ and $\tau$ affect latency. %\pg{Include a table here for parameters?}
+
+\noindent
+\textbf{Impact of batching:} Batching can introduce an additional delay of $(1+\kappa)\cdot \delta$ in the worst case. 
+
+\noindent
+\textit{Setting $\delta$:} $\delta$ thus presents a trade-off between latency and fairness (how large of a horizon can we pick). The right trade-off really depends on the needs of the exchange. Ideally, the exchange should pick the minimum value of $\delta$ that accommodates the response time of the fastest participants in a race. Our conversations reveal that fastest participants typically respond within a few microseconds and majority of the speed races last 5-10 $\mu s$. For our cloud experiments we  use $\delta = 20 \mu s$.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[trim={0 0 0 0mm},clip,width=0.8\linewidth]{images/latency_b+p.pdf}
+    \vspace{-5mm}
+    \caption{\small{\textbf{Latency in data delivery:} x-axis shows the generation time of the market data. y-axis shows the latency from generation time to data delivery. $\kappa$  governs the average slope of the orange line immediately after latency spike (slope = $\frac{\kappa}{1+\kappa}$}).} %\pg{Include orange line and the base latency. Change labels to DBO and direct-delivery. Slope is $\kappa/(1+kappa)$}}
+    %\pg{Eashan: Include the drain rate, make the colored lines thicker and use different linestyles for the three schemes..}}% \pg{Maybe label the drain rate in the figure for S1 and S2.}}
+    \label{fig:latency_b+p}
+    \vspace{-5mm}
+\end{figure}
+
+\noindent
+\textbf{Impact of pacing.} Pacing restricts the batch dequeue rate at the RB. When network latency to a participant is not varying, the batch arrival/enqueue rate at the RB ($\frac{1}{(1+\kappa) \cdot \delta}$) is higher than the batch dequeue rate limit ($\frac{1}{\delta}$) and there is no queue build up. However, when network latency to a participant is decreasing (e.g., after a latency spike), batch arrival rate at the RB can exceed the dequeue rate limit leading to a queue build up. The overall queue - dequeue rate can be given by $\text{batch size} \cdot \text{batch rate limit} = 1+\kappa$. Figure~\ref{fig:latency_b+p} shows the impact of batching and pacing on latency in delivery of data in the event of a queue build up. The figure also shows the latency when data is delivered directly (raw network latency). The smaller sawtooths in the batching + pacing are because of batching. The deviation in direct delivery and batching + pacing is because of the rate limit imposed by pacing.
+
+\noindent
+\textit{Setting $\kappa$:} Increasing $\kappa$ increases batching delay but also increases the queue drain rate in the event of queue build up due to tail latency spikes. Increasing $\kappa$ thus presents a trade-off between reducing tail latency and increasing average latency. In our experiments we use $\kappa = 0.25$.
+ 
+\noindent\textbf{Impact of heartbeats:} Heartbeats present a trade-off. Too frequent heartbeats can overwhelm the network, the ordering buffer or the release buffer. 
+Infrequent heartbeats can increase the time OB has to wait of the participants. In particular, hearbeats can introduce an additional wait time of $\tau$. Note that the number of heartbeats, the OB needs to process increases linearly with the number of participants. In the next section we show how the heartbeat handler can be sharded for scalability.
+
+\noindent\textit{Setting $\tau$:} Ideally we want to pick as low of a value as possible for the heartbeats without overwhelming the system. This number is very much dependent on the capabilities of the network and the processing power of the RB and the OB. In our cloud implementation we use $\tau = 20 \mu s$.
+
+\noindent\textit{A note on latency:} When the network latency to participants is not varying with time, there is no queue build up at the release buffers. In such cases, DBO adds maximum of $((1+\kappa)\cdot \delta) + \tau$ additional latency over the optimal.
+
+\noindent\textbf{Straggler Mitigation and RB/MP failure} In the event a  participant or release buffer crashes, DBO can stall processing trades. Further, the overall system latency also gets impacted when a certain participant is experiencing unusually high network latency (see Theorem~\ref{thm:latency}). Here we have the option to wait for the delayed participant and take a latency hit but not let the fairness be impacted. Ideally, we want to let the system continue with low latency with only the affected participant incurring unfairness. In DBO, we use a simple strategy to mitigate this. Using the heartbeats and the generation time of data points, the OB tracks the round trip latency to each participant. If this latency goes beyond a certain threshold for a participant, then the OB does not wait for heartbeats from such straggler participant before forwarding trades. When the round trip latency goes down, OB again starts waiting for heartbeats from the straggler. In the event of crashes, OB might not hear any heartbeats. If the OB does not hear a heartbeat from a particular participant for the above threshold, then it concludes that round trip latency exceeds the threshold and the OB deems the participant a straggler. 
+ 
+\noindent\textit{OB failure:} In the event, the OB crashes all trades in the priority queue will be lost. System will incur unfairness in such cases. 
+
+%The above strategy is also helpful in controlling overall system latency when a certain participant is experiencing unusually high network latency.
+
+
+\subsubsection{Is Batching and Pacing necessary?\\}
+\textbf{Batching and pacing contribute delays; are they necessary?} The answer is yes. Similar to Lemma~\ref{lemma:inter_delivery_imp}, we can derive the necessary conditions for achieving LRTF. 
+\begin{corollary}
+When trigger points are unknown, the \textit{necessary} conditions on the delivery processes for achieving response time fairness with any ordering system is given by,
+\vspace{-1mm}
+\begin{align*}
+    \text{If }  D(i,y) - D(i,x) &< \delta, \text{ then},\nonumber\\
+    D(i, y) - D(i,x) &= D(i,y) - D(i,x), & \forall i,j.
+\end{align*}
+\label{cor:inter_delivery_lrtf}
+\vspace{-6mm}
+\end{corollary}
+
+\begin{proof}
+Please see Appendix~\ref{app:cor_inter_delivery_lrtf}.
+\end{proof}
+\vspace{-1mm}
+In contrast to Lemma~\ref{lemma:inter_delivery_imp}, the above condition states that the inter-delivery time of two points should be same across all participants only if they are separated by less than $\delta$ for some participant. Batching and pacing indeed satisfies this, for two points x and y in a batch, the inter-delivery times across all participants is indeed zero and hence equal. For point $x$ and $y$ belonging to different batches, since the inter-delivery time is greater than $\delta$ across all participants, there is no additional contraint on inter-delivery times being equal.
+ 
+\subsubsection{Impact of RB to MP latency\\}
+In scenarios where RB and the participant cannot be colocated, DBO can incur unfairness. If this latency is unbounded, then, it might be impossible to achieve fairness. If latency is bounded, however, then DBO provides the following fairness guarantees.
+
+\begin{theorem}
+    If round trip network latency from release buffer $i$ to it's corresponding participant is bounded between $B_l(i)$ and $B_h(i)$, then, DBO achieves the following guarantee for ordering trades.
+    \begin{align*}
+    C3: &\text{ if } TP(i,a)= TP(j,b) = x\\ 
+    &\land RT(i,a) < RT(j,b) - (B_h(i)-B_l(j)), \\
+    & \land RT(i,a) < \delta - B_h(i),\\
+    &\text{ then, }O(i,a) < O(j,b).
+\end{align*}
+    \label{thm:rb_to_mp_latency}
+    \vspace{-5mm}
+\end{theorem}
+
+\vspace{-1mm}
+\begin{proof}
+See Appendix~\ref{app:rb_to_mp_latency}.
+\end{proof}
+\vspace{-1mm}
+
+Compared to LRTF, the above condition reduces the bound on response time for the faster trade $(i,a)$ to $\delta - B_h(i)$.
+Additionally, the above condition states that trades are ordered fairly only when the response time of the faster trade is lower than the response time of the competing trade by atleast the variability in latency ($B_h(i)-B_l(j)$). This theorem essentially states that when RB and MP cannot be colocated, for better fairness we should ensure that latency between them is both consistent (across participants) and the upper bound is small.
+
+
+
+\subsubsection{Impact of Losses\\}
+
+Although infrequent, packet losses can occur in cloud environments. Such losses can impact fairness in DBO. However, only the fairness for trades that are lost and trades  whose trigger point is lost is impacted (see Appendix~\ref{app:impact_losses}).
+
+
+
+\if 0
+\subsubsection{Excessive queing at RB and OB\\}
+\pg{This can be cut?}
+
+Even though DBO employs straggler mitigation to limit the latency at the OB, it can build up a large queue if it receives a very large number of trades (little's law). The RB can also overflow in scenarios where the network latency is decreasing (Figure~\ref{fig:latency_b+p}) for a large period of time. 
+
+\noindent
+\textbf{RB:} In the event a release buffer's queue fills up (exceeds a certain threshold), to avoid overflow the release buffer forgoes pacing and starts releasing data as fast as possible to reduce the queue. In such cases, the delivery clock advances faster than as dictated by pacing. As a result, trades from such a participant might unfairly get ordered behind. The fairness for trades from other participants remains unaffected. When the queue goes down the RB resumes normal operation.
+
+\noindent
+\textbf{OB overflow:} In the event the order buffer's queue fills up, the OB starts releasing trades as fast as possible without waiting for heartbeats from participants. Once the queue goes down, OB resumes normal operation. In such cases, fairness of all trades are impacted. 
+\fi
+
+\subsubsection{Thwarting front-running attacks\\}
+
+%Monotonicity of delivery clocks ensures that participants are incentivized to submit trades as early as possible and delaying trades does not offer any competitive advantage.% and participants are incentivized to be honest.
+There is a front-running attack possible in our system. In particular, if a participant receives a market data point $x$ through some other way before RB delivers the data point $x$ to the participant then the participant has a competitive advantage. This scenario (though unlikely) is still possible. 
+
+A simple to avoid this is to limit that a participant cannot talk to anyone beyond the CES. 
+%\pg{External participants}
+However, we would like the participant machine to use other  ``helper'' machines in the cloud, e.g.,  to aid computation. We also want to allow the participants to be able to talk to machines outside the cloud, e.g., to get a news stream. %stream.%\footnote{Participants use external news streams update trading strategies and make trading decisions.} 
+
+In Appendix~\ref{app:front_running}, we show how we can prevent such front running attacks. In our solution, the participant and its helpers cannot communicate with any other participants or their helpers using the cloud network. 
+To prevent scenarios where a participant uses a proxy machine outside the cloud to send market data to other  participants (faster than the network), we precisely add additional latency for data being sent outside the cloud.
+While our solution introduces latency for data going out, the latency of speed trades remains unaffected.
+
+\if 0
+
+While monotonicity of delivery clocks ensure that participants are incentivized to submit trades as early as possible an delaying trades does offer any competitive advantage, there is still a potential front-running attack possible in our system. In particular, if a participant receives a market data point $x$ through some other way before RB delivers the data point $x$ to the participant then it has a competitive advantage. This scenario though unlikely is still possible.
+A simple to avoid this is to limit that participant cannot talk to anyone beyond the CES. 
+
+However, we would like the participant machine to use other  ``helper'' machines in the cloud to aid computation. We also want to allow the participants to be able to talk to machines outside the cloud. Participants do use external news streams and feeds from other exchanges to update trading strategies and make trading decisions. We will discuss fairness with respect to such streams shortly.  
+
+Allowing such communication naively can lead to attacks.
+By restricting communication, it is possible to ensure that no participant gets early access to market data %(at the cost of introducing latency in messages from the front-end to helpers outside the cloud)
+and thwart such front-running attacks. 
+
+%
+%\pg{Which of two alternatives is better?}
+%
+To this end, we impose two simple constraints on communication. \begin{enumerate*}[label=(\arabic*)]\item A participant machine and its helper machines can communicate with each other freely but they cannot communicate with any other machines in the cloud. This restriction can be imposed easily by cloud providers today using security groups. This restriction ensures that a participant machine cannot get market data from other participant machines in the cloud directly. Next, we will ensure that a participant machine cannot get an earlier market data feed from outside the cloud. 
+We will do so by restricting that a participant can only send data point x out of the cloud, when x has been delivered to all participants in the cloud. This way, market data points can only be available outside the cloud once they have been delivered to all the participants.
+\item The helper machines cannot send data outside the cloud. Any data (excluding the trade orders) from a participant being sent outside the cloud is tagged by the delivery clock at the RB and buffered at a gateway. The data sent by the participant could potentially be a market data point with id less than or equal to the last point id (first tuple) of the delivery clock time stamp. The gateway thus buffers this data until it is sure that the all data points with id less than the last data point id in the delivery clock time stamp have been delivered. For this purpose, RB's periodically communicate their delivery clock to the gateway. 
+%
+%A simple way to achieve this is for each RB to send other RBs periodic beacons communicating the status of its delivery clock. This way each RB can maintain a lower bound on the delivery clocks at other RBs. 
+\end{enumerate*}
+\pg{include this? a bit hand-wavy and not clean. There is one challenge to be solved though. If data delivery to a particular participant is straggling then the gateway buffer can get bloated. It is not necessary for the gateway to wait for such straggler if we disable the incoming data to the straggler. The gateway can identify such stragglers and then disable any data coming from outside the cloud.}
+
+Note that the above solution adds additionaly latency for data being sent outside the cloud. However, the latency of speed trades remains unaffected.
+%There are other ways to thwart front-running that impose weaker restrictions on communication or are easier to implement. We chose to present this one for its simplicity.
+
+
+\fi
+
+
+
+\subsubsection{Limtations of DBO: Fairness beyond LRTF\\}
+\label{ss:beyond_fairness}
+
+With DBO, it is not guaranteed that trades that do not directly follow the LRTF model (Theorem~\ref{thm:1} and Equation~\ref{eq:cm})are ordered fairly. However, DBO still ensures that fairness for the most latency-sensitive speed trades. While ensuring guaranteed fairness for trades that do not follow the might be impossible, we will discuss potential some solutions.
+
+
+%This will impose some system challenges. Another challenge is that different participants might be requesting different external streams. 
+%
+
+
+\noindent\textbf{Trades with response time > $\delta$:} DBO does not provide any guarantees for trades with response time greater than $\delta$. %If the inter-delivery times for batches across participants are same then DBO provides response time fairness for such trades. Again achieving the same inter-delivery times for all the batches is impossible. 
+In case we have access to synchronized clocks, we can try and ensure (to the extent possible) that batches are indeed delivered at the same time across participants. 
+When batches are delivered simultaneously, delivery clocks also get synchronized and DBO simply orders trades in the order of submission time. DBO thus ensures better fairness for such trades (when data is delivered simultaneous) while always guaranteeing LRTF. %\pg{Is this clear?}
+
+
+%Regardless of whether using clocksync or not for deliverying the data, the performance of DBO for such trades is comparable to 
+
+
+\noindent\textbf{Generalized compute model for trades:} A trade's submission time might be governed by delivery times of multiple data points. Again in such cases if we have access to synchronized clocks, we can try and ensure simultaneous delivery to the extent possible and achieve better fairness for such trades.
+
+
+\noindent\textbf{External data streams:} In theory, external data streams like news events or market data from a competing exchange can trigger speed races. While DBO does not delay delivery of such streams to the participants (Appendix~\ref{app:front_running}), as described it does not guarantee fairness with respect to such streams. Existing exchanges do not provide any simultaneous delivery guarantees with respect to such external streams. Such streams typically traverse the internet, and the variability is network latency is substantially higher (order of milliseconds) than the market data stream (order of microseconds). Potentially, the exchange can serialize such external streams with the market data stream and ensure LRTF with respect to such a super stream. Such a serialization might not be trivial. Participants are requesting different data streams. We need to think carefully about what constitutes a fair serialization.
+%\pg{Talk about how  further system challenges.}
+
+
+%\subsubsection{\pg{Miscellaneous, do if time:}}
+%\pg {Radhika advidce here would be helpful}
+
+%\pg{1. Impact of clock drift rate, 3. Is batching and pacing necessary 4. Discussion, sharding for scalability, a separate RB for each asset class}
+
+
+
+
+
+
+
+
+
+
+
+
+
+\if 0
+
+\subsubsection{Delivery Clock\\}
+Each RB maintains a delivery clock. This delivery clock essentially tracks time relative to when market data was delivered to the participant. We use $DC(i,t)$ to represent deliver clock of participant $i$ at time $t$. Delivery clock is a lexicographical tuple.
+\begin{align}
+    DC(i,t) = \langle ld(i,t), t-D(i, ld(i,t))\rangle.
+\end{align}
+where $ld(i,t)$ is the latest data point that was delivered to MP$_i$ at time t.% (i.e., $D_i(x_l(t)) \leq t < D_i(x_l(t)+1)$). 
+Interval, $t-D(i, ld(i,t))$, corresponds to the time that has elapsed since the last delivery and can be measured locally at the RB without requiring any clock synchronization (challenge 1). Delivery clock advance monotonically with time. This property will help us overcome challenge 3 and also guard us against certain attack. (\pg{forward pointers}). Figure~\ref{fig:delivery_clock} shows how delivery clock advances with time.
+
+\begin{figure}[t]
+\centering
+    \includegraphics[width=0.8\columnwidth]{images/delivery_clock.jpg}
+    \vspace{-2.5mm}
+    \caption{\small{\bf Delivery Clock.} \pg{Redraw}}% \pg{Eashan see Ranveer's comment}}% \pg{Eashan can you redraw this figure in powerpoint or something.}}}
+    \label{fig:delivery_clock}
+    \vspace{-2.5mm}
+\end{figure}
+
+All incoming trades are market with the delivery clock at the trade submission time. The ordering buffer uses this delivery clock time to order trades. Formally, the ordering in DBO is given by,  
+
+\begin{align}
+    O(i,a) = DC(i, S(i,a)). 
+    \label{eq:ordering_with_dc}
+\end{align}
+
+
+\begin{figure}[t]
+\centering
+    \includegraphics[trim={0 0 0 2mm},clip,width=0.9\columnwidth]{hotnets-images/time series visualization (3).pdf}
+    \vspace{-3mm}
+    \caption{\small{{\bf DBO can help correct for late delivery of data.} Delivery of market data to MP$_i$ is lagging behind MP$_j$. There are two trades $(i,a)$ and $(j,b)$ generated in response to the same market data $x$. $(j,l)$ was submitted before $(i,k)$ but
+    %, i.e., $S_j(l) < A_i(k)$. 
+    response time of $(i,k)$ is less than $(j,l)$.
+    %, i.e., $rt_i(k) < rt_j(l)$. 
+    With DBO, $O(i,a) (= \langle x, RT(i,a)\rangle) < O(j,b) (= \langle x, RT(j,b)\rangle)$ and trade $(i,a)$ is correctly ordered ahead of $(j,b)$.} %Ordering based on the submission time leads to incorrect ordering.}
+    \pg{Correct figure}}
+    \label{fig:dbo_correction}
+    \vspace{-4mm}
+\end{figure}
+
+
+When the trigger point of trade $(i,a)$ is indeed the last data point (i.e., $x = TP(i,a) = ld(i, S(i,a))$), then, DBO respects condition C2 for LRTF. Figure~\ref{fig:dbo_correction} shows an illustrative example of this.
+This is because $O(i,a) = DC(i, S(i,a)) = \langle x, RT(i,a)\rangle$. For, a competing trade $(j,b)$ with higher response time, the delivery clock at time of submission will either read $O(j,b) = DC(j, S(j,b)) = \langle x, RT(j,b)\rangle$ (if D(j,x+1)>S(j,b)) or $DC(j, S(j,b) = \langle y, S(j,b)-D(j,y)\rangle$ with $y>x$. In both cases, $O(i,a) < O(j,b)$.
+
+
+\noindent
+\t
+At a high level, in our ordering we are correcting for latency differences in data delivery by using the delivery time of the last data point. When the last data point is not the trigger point for trade $(i,a)$, DBO satisfies the LRTF condition C2, if the following condition holds, 
+\begin{align}
+    D(i,ld(i,t))-D(i,x) = D(j,ld(i,t))-D(j,x),
+    \label{eq:cond_delivery_lrtf}
+\end{align}
+where $x = TP(i,a)$.  
+While it is impossible to ensure that inter-delivery times remain the same for all participants for all points, by pacing data at the RB it is indeed possible to ensure that the above condition is always met. 
+The main reason why we can do so is thaat condition C2 limits that the trigger point $x$ cannot be any arbitrary data point in the past ($S(i,a)-D(i,x) < \delta$).
+%and we only need to ensure same inter-delivery times for. 
+In the next subsection, we will show how we can achieve this and solve challenge 2. \pg{Is this easy to follow?}
+
+\pg{Should we include results on necessary conditions on delivery times for achieving LRTF}
+
+\noindent
+\textit{Remark:} In our cloud experiments, we find that DBO achieves fairness with very high probability. This is because network latency (from CES to any given participant) exhibits temporal correlation in latency especially over  short periods of time. When temporal correlation is high, inter-delivery time at any participant is close to the inter-generation time at the CES. In such cases, condition given by Equation~\ref{eq:cond_delivery_lrtf} is satisfied with high probability.
+
+\begin{figure}[t]
+\centering
+    \includegraphics[width=0.8\columnwidth]{images/batching_pacing.jpg}
+    \vspace{-2.5mm}
+    \caption{\small{\bf Batching and Pacing.} \pg{Redraw}}% \pg{Eashan see Ranveer's comment}}% \pg{Eashan can you redraw this figure in powerpoint or something.}}}
+    \label{fig:batching_pacing}
+    \vspace{-2.5mm}
+\end{figure}
+
+\subsubsection{Batching and Pacing\\}
+In DBO, the CES breaks data into batches. Each new batch contains all data points in the duration $(1+\kappa) \cdot \delta$ after the previous batch. Here $\kappa > 0$. Each release buffer delivers all data points in a batch at the same time. %Two points $x,y$ belonging to the same batch are delivered simultaneously to each participant, i.e., $D(j,y)=D(j,x), \forall j$.
+The release buffer delivers batches as quickly as possible while ensuring that the time between delivery of two consecutive batches is atleast $\delta$. Figure~\ref{fig:batching_pacing} shows an illustration of batching. Both batching and pacing increase the delivery time of data points. In the next subsection we will analyze the impact of the two on latency. Note that since $\kappa > 0$ batch generation rate is slower than batch drain rate and build up queue because of pacing will eventually get drained. 
+
+
+
+With batching and pacing, DBO achieves LRTF. In particular, 
+consider a trade $(i,a)$ with response time less than $\delta$. Because of pacing, batches are separated by $\delta$. This means that the trigger point ($x=TP(i,a)$) must be within the last received batch. The point $ld(i,S(i,a))$ is also the last point in this batch and $D(i,ld(i,S(i,a)) = D(i,x)$. $O(i,a) = DC(i,S(i,a)) = <ld(i,S(i,a)), RT(i,a)>$.
+With batching, for participant $j$, $x$ and $ld(i,S(i,a))$ also belong to the same batch $D(j,ld(i,S(i,a)) = D(j,x)$.
+For, a competing trade $(j,b)$ with higher response time, the delivery clock at the time of submission will either read $O(j,b) = DC(j, S(j,b)) = \langle ld(i,S(i,a)), RT(j,b)\rangle$ (if $(j,b)$ was submitted before the next batch, i.e., $D(j,ld(i,S(i,a))+1) > S(j,b)$,) or $DC(j, S(j,b) = \langle y, S(j,b)-D(j,y)\rangle$ with $y>ld(i,S(i,a))$. In both cases, $O(i,a) < O(j,b)$.
+
+\fi
+
+\if 0
+\subsection{Compute Model of the HFT Trader and Definition of Fairness}
+
+\begin{enumerate}
+    \item $MD_R(i, x):$ Receive time of market data at the gateway/RBi
+    \item $TO_G(i, a):$ Generation time of trade order a by trader i
+    \item $TP(i,a):$ Trigger/stimuli for trade (i,a)
+    \item $RT(i,a):$ Response time of for trade (i,a) 
+\end{enumerate}
+
+
+\textbf{Compute Model:}
+Time of generation of trade= time participant received the market point that triggered the trade + response time (or time it took to generate the trade)
+\begin{equation}
+    TO_G(i,a) = MD_R(i,TP(i,a)) + RT(i,a)
+\end{equation}
+
+
+\textbf{Perceived Fairness with respect to participant i}
+If all other participants received the market data at the same time as i, then how should the trades be ordered
+\begin{align*}
+    \text{Trade (i,a) should be ordered ahead if}\\
+    TO_G(i,a) &< MD_R(i,y) + RT(j,b)\\
+    TO_G(i,a) - MD_R(i,y) &< TO_G(j,b) - MD_R(j,y)
+\end{align*}
+This definition states for two orders trades we need to measure time relative to event y
+
+alternatively what if i goes into j's time domain
+\begin{align*}
+    &\text{Trade (i,a) should be ordered ahead iff O(i,a)<O(j,b)}\\
+    MD_R(j,x) + RT(i,a) &< TO_G(j,b)\\
+    TO_G(i,a)-MD_R(i,x) &< TO_G(j,b) - MD_R(j,x)
+\end{align*}
+
+Correction, relative ordering
+
+
+
+
+\textbf{Achieving fairness}
+There are two challenges,
+\begin{outline}
+    \1 How do you decide how to order these trades when TP y is unknown. \pg{Three options 1) Delivery Clocks 2) Equal RTT 3) Directly to limited fairness} \pg{Time domain: two options a) I's domain b) zero latency time doman. Fairness for trades using different data points.}
+        \2 Don't know which x, recency \pg{equivalence between equal inter-delivery and correcting one way latency}
+        \2 Clocks are not synced
+        \2 Monotonic ordering with time
+    \1 How do you enforce the ordering process. In particular, trades may take an arbitrary amount of time to reach the OB.
+\end{outline}
+
+What is the lowest RTT possible with this system?\\
+Say you knew the trigger points x,y what then, \\
+Say you didn't know the trigger points\\
+Enforcing the ordering: key insight Enforcing an ordering at a single point is easier than controlling things at multiple RBs\\
+What about trades with response time greater than delta\\
+
+
+Question: Fairness wrt to external data stream
+
+\textbf{Practical Considerations}
+
+\begin{enumerate}
+    \item Collusion attacks: Ensure that any market data point is delivered only after all participants have received it
+    \item external participants: Have all participants submit trade via a dummy MP machine (we dont support fairness for such particpants)
+    \item External data streams:
+    \item Stragglers: 
+\end{enumerate}
+
+
+\textit{Correction by latency pitch}
+\begin{align*}
+    TO_G(i,a) - MD_R(i,y) &< TO_G(j,b) - MD_R(j,y)\\
+    TO_G(i,a) - (G(y) - MD_R(i,y))) &< TO_G(j,b) +(G(y)- MD_R(j,y))
+\end{align*}
+
+\pg{Alternatively fairness in the same or equal or zero latency time domain?}
+\begin{align*}
+    &\text{Trade (i,a) should be ordered ahead iff O(i,a)<O(j,b)}\\
+    G(x) + RT(i,a) &< G(y) + RT(j,b))\\
+    TO_G(i,a) + (G(x)-MD_R(i,x)) &< TO_G(j,b) + (G(y) - MD_R(j,y))
+\end{align*}
+
+
+\textbf{Final Pitch Attempt}
+\begin{enumerate}
+    \item Introduce generalized compute model
+    \item Talk about zero latency model for fairness. Three problems clocksync, which x to use, how to enforce ordering. \pg{Introduce C1 from strong fairness here?}
+    \item clocksync: We are interested in competing trades that are generated using the same data point \pg{is clocksync really necessary to force this}
+    \item which x to use: the last x since trades are fast. What about latency for trades with response time greater than delta
+    \item how to enforce ordering: monotonic ordering process \pg{unclear if monotonic is time property is even needed (if )} 
+    \item part of above? No fooling: C1 property of strong fairness
+    \item \pg{Limitations: Our solution doesn't work with this model for trades generated using different data points. What about approx fairness? This is kind of nice because it talks about latency/}
+\end{enumerate}
+\fi

@@ -1,0 +1,72 @@
+
+\section{Method}
+
+Stable Signature modifies the generative network so that the generated images have a given signature through a fixed watermark extractor.
+It is trained in two phases.
+First, we create the watermark extractor network $\mathcal{W}$. 
+Then, we fine-tune the Latent Diffusion Model (LDM) decoder $\mathcal{D}$, such that all generated images have a given signature through $\mathcal{W}$.
+
+\def\payload{k}
+\def\im{x}
+\def\IM{\mathcal{X}}
+
+\subsection{Pre-training the watermark extractor}\label{subsec:pre-training}
+
+We use HiDDeN~\cite{zhu2018hidden}, a classical method in the deep watermarking literature.
+It jointly optimizes the parameters of watermark encoder $\mathcal{W}_E$ and extractor network $\mathcal{W}$ to embed $\payload$-bit messages into images, robustly to transformations that are applied during training. 
+We discard $\mathcal{W}_E$ after training, since only $\mathcal{W}$ serves our purpose.
+
+Formally, $\mathcal{W}_E$ takes as inputs a cover image $\im_o \in \mathbb{R}^{W\times H\times 3}$ and a $\payload$-bit message $m\in\{0,1\}^\payload$.
+Similar to ReDMark~\cite{ahmadi2020redmark}, $\mathcal{W}_E$ outputs a residual image $\delta$ of the same size as $\im_o$, that is multiplied by a factor $\alpha$ to produce watermarked image $\im_w = \im_o + \alpha \delta$.
+At each optimization step an image transformation $T$ is sampled from a set $\mathcal{T}$ that includes common image processing operations such as cropping and JPEG compression\footnote{The transformation needs to be differentiable in pixel space. This is not the case for JPEG compression so we use the forward attack simulation layer introduced by Zhang~\etal~\cite{zhang2021asl}.}. 
+A ``soft'' message is extracted from the transformed image: $m' = \mathcal{W}(T(\im_w))$ (at inference time, the decoded message is given by the signs of the components of $m'$).
+The \emph{message loss} is the Binary Cross Entropy (BCE) between $m$ and the sigmoid $\sigma (m')$:
+\vspace{-0.3cm}
+\begin{align*}\label{eq:loss1}
+    \mathcal{L}_{m} = - \sum_{i=1}^\payload m_i \cdot \log \sigma (m'_i) + (1-m_i) \cdot \log ( 1 - \sigma (m'_i)).
+\vspace{-0.3cm}
+\end{align*}
+
+The network architectures are kept simple to ease the LDM fine-tuning in the second phase.
+They are the same as HiDDeN~\cite{zhu2018hidden} (see App.~\ref{app:archi-hidden}) with two changes. 
+
+First, since $\mathcal{W}_E$ is discarded, its perceptual quality is not as important, so the perceptual loss or the adversarial network are not needed. 
+Instead, the distortion is constrained by a $\mathrm{tanh}$ function on output of $\mathcal{W}_E$ and by the scaling factor $\alpha$.
+This improves the bit accuracy of the recovered message and makes it possible to increase its size $k$.
+
+Second, we observed that $\mathcal{W}$'s output bits for vanilla images are correlated and highly biased, which violates the assumptions of Sec.~\ref{subsec:statistical-test}. 
+Therefore we remove the bias and decorrelate the outputs of $\mathcal{W}$ by applying a PCA whitening transformation (more details in App.~\ref{app:hidden-centering}).
+
+
+\subsection{Fine-tuning the generative model}\label{subsec:finetuning}
+
+In LDM, the diffusion happens in the latent space of an auto-encoder.
+The latent vector $z$ obtained at the end of the diffusion is input to decoder $\mathcal{D}$ to produce an image.
+Here we fine-tune $\mathcal{D}$ such that the image contains a given message $m$ that can be extracted by $\mathcal{W}$.
+Stable Signature is compatible with many generative tasks, since modifying only $\mathcal{D}$ does not affect the diffusion process.
+
+First, we fix the signature $m=(m_1,\ldots, m_\payload) \in \{0,1\}^k$. 
+The fine-tuning of $\mathcal{D}$ into $\mathcal{D}_m$ is inspired by the original training of the auto-encoder in LDM~\cite{rombach2022ldm}.
+
+Training image $\im \in \mathbb{R}^{H\times W\times 3}$ is fed to the LDM encoder $\mathcal{E}$ 
+that outputs activation map $z = \mathcal{E}(\im) \in \mathbb{R}^{h\times w\times c}$, downsampled by a power-of-two factor $f = H/h = W/w $.
+The decoder reconstructs an image $\im' = \mathcal{D}_m(z)$ and the extractor recovers $m' = \mathcal{W} (\im')$.
+The \emph{message loss} is the BCE between $m'$ and the original $m$: $\mathcal{L}_m = \mathrm{BCE}(\sigma \left( m' \right), m)$.
+
+In addition, the original decoder $\mathcal{D}$ reconstructs the image without watermark: $\im'_o = \mathcal{D}(z)$. 
+The \emph{image perceptual loss} $\mathcal{L}_\mathrm{i}$ between $\im'$ and $\im'_o$, controls the distortion.
+We use the Watson-VGG perceptual loss introduced by Czolbe~\etal\cite{czolbe2020loss}, an improved version of LPIPS~\cite{zhang2018unreasonable}. %
+It is essential that the decoder learns luminance and contrast masking to add less perceivable watermarks. %
+
+The weights of $\mathcal{D}_m$ are optimized in a few backpropagation steps to minimize
+\vspace{-0.3cm}
+\begin{equation}\label{eq:loss2}
+    \mathcal{L} = \mathcal{L}_\mathrm{m} + \lambda_\mathrm{i}~ \mathcal{L}_\mathrm{i}.
+    \vspace{-0.3cm}
+\end{equation}
+
+This is done over $100$ iterations with the AdamW optimizer~\cite{loshchilov2017decoupled} and batch of size $4$, \ie the fine-tuning sees \emph{less than 500 images} and takes \emph{one minute on a single GPU}.
+The learning rate follows a cosine annealing schedule with $20$ iterations of linear warmup to $10^{-4}$ and decays to $10^{-6}$.
+The factor $\lambda_\mathrm{i}$ in~\eqref{eq:loss2} is set to $2.0$ by default.
+
+

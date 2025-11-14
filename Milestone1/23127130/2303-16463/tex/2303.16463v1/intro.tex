@@ -1,0 +1,185 @@
+\section{Introduction}
+Over the last two decades, public clouds have become de facto
+standard execution environments for deploying a broad range of modern 
+software.
+%
+The move to the cloud, however, created a unique security challenge --
+cloud tenants no longer own or control an environment in which their
+software is deployed. 
+%
+Tenants are required to trust not only the provider itself,
+but also a complex software
+stack virtualizing the physical hardware across multiple users.
+%
+In the last decade three most widely deployed virtual machine monitors (VMMs) --
+Xen, KVM, and VMware -- suffered from 428~\cite{cves:xen}, 111~\cite{cves:kvm}
+and 154~\cite{cves:vmware} vulnerabilities each.
+%
+Moreover, physical access to the system opens the door for a range of hardware
+attacks, e.g., memory extraction such as cold-boot~\cite{cold-boot-attack},
+RAMBleed~\cite{rambleed, rambleed-openssl}, etc.
+%
+
+Recent CPU architectures have introduced support for a
+hardware-protected trusted execution environments (TEEs) as a way to
+minimize the trusted computing base (TCB) of a cloud application
+~\cite{intel-sgx-explained, wp:amd-sev, spec:intel-tdx, wp:arm-cca,
+  ibm-pef}.
+By using a TEE, the cloud provider infrastructure (including the hypervisor) is
+removed from the TCB, since the application is isolated from it.
+
+One of such TEE solutions is \snp{}, a variant of AMD
+secure encrypted virtualization (SEV) technology available in the EPYC
+7003 series of processors~\cite{wp:sev-snp}.
+%
+\snp{} launches a guest virtual machine in a hardware context that is
+isolated from the rest of the system by means of memory encryption.
+%
+Hence, even an attacker who has full access to both hardware and privileged cloud
+software (i.e., platform firmware, hypervisor and operating system) cannot 
+access the encrypted state of the protected
+guest VM~(also referred as \cvm{}).
+
+Thus hardware memory encryption provides confidentiality of the
+application's code and data.
+%
+Unfortunately, confidentiality without
+integrity does not provide strong security guarantees.
+%
+A range of attacks allow a malicious entity on the host to attack the
+execution of the confidential VM by modifying the code, data, or
+configuration parameters during the boot sequence or later
+as long as attacker posesses administrative privileges (e.g., 
+enabling debug flags that could leak secrets, loading malicious 
+kernel extensions, downgrading security-critical subsystems to 
+vulnerable versions, etc.) 
+
+To ensure integrity, i.e., the guarantee that the system is
+not tampered with, modern systems rely on a combination of \emph{measured
+boot}~\cite{mboot:uefi, mboot:bootstrapping-trust} and \emph{runtime
+attestation}~\cite{ra:principles, ra:semantic}.
+%
+Measured boot consists of measuring all boot time binaries, i.e., platform
+firmware, bootloader(s), and the operating system.
+%
+%
+Runtime attestation combines measured boot with integrity measurement architecture
+(IMA) that uses the same principle -- measuring all executables loaded into
+the memory -- after the system is booted. 
+%
+Attestation works by comparing entries in the measured boot and
+IMA logs with a pre-defined set of acceptable values (called an
+\emph{attestation policy}) and exposing any measurements that do not
+conform to policy expectations.
+
+Support for attestation requires a \emph{root-of-trust device}, i.e.,
+an integrity protected location that can store measurements in a
+trustworthy manner, extend them, and authenticate the measurement logs to the user
+(remote attestation). This device is typically a trusted platform
+module (TPM) chip.
+%
+TEE technologies typically offer mechanisms to support
+\emph{pre-attestation}, i.e., measuring all the memory initialized in the \cvm{}
+before boot, but lack mechanisms that allow the
+software stack to extend and log subsequent measurements.
+%
+
+Thus, to perform continuous runtime attestation and integrity monitoring of 
+a \cvm{}, the VM needs a different root-of-trust. Given
+the existing software stack for TPMs, it is natural to think of a virtual TPM (vTPM).
+%
+Providing vTPMs with strong security guarantees in an environment in which 
+neither the guest system nor provider are trusted is challenging. 
+%
+Several design constraints are critical for the security of the system:
+
+\begin{itemize}
+  \item \textbf{Isolation}: To ensure security of an encrypted VM, the
+      \vtpm{} must be protected from the host controlled by the
+      provider (an obvious TEE requirement).
+      %
+      In addition, the \vtpm{} also needs isolation from the guest
+      operating system, since it acts as a root-of-trust device for
+      attestation.
+      %
+      Existing \vtpm{} designs trust the host OS and or the
+      hypervisor to run a \vtpm{} manager and \vtpm{}
+      instances~\cite{vtpm:gcp, vtpm:azure, vtpm:aws-nitro,
+      vtpm:alibaba}, isolating the \vtpm{} from the guest but leaving
+      it open to attack from the provider side.
+
+  \item \textbf{Secure communication}: In a typical \vtpm{}, the TPM
+    commands and responses are transmitted through the untrusted
+    hypervisor~\cite{vtpm:berger, vtpm:xen-doma, vtpm:xen-domb,
+    vtpm:gvtpm, vtpm:xen-libos}.
+    %
+    An attacker can interpose on the channel and alter the request
+    or response defeating the security guarantees offered by a
+    TPM~\cite{tpm-genie}.
+    %
+    To provide confidentiality and integrity of messages exchanged
+    between the VM and the \vtpm{} in an untrusted host
+    environment, we require a secure communication channel.
+
+
+\item \textbf{Persistent state}: 
+    A physical TPM guards its
+    internal state inside a mechanical chip wrapper and as such,
+    the TPM state cannot be easily exfiltrated.
+
+    By contrast, a \vtpm{} instance requires the injection of its
+    state every time it is created. The persistent state needs to
+    be properly secured both at rest, and while in use. At rest
+    protection can be done by using encryption mechanisms on the
+    permanent state file. In use protection is more difficult,
+    since it requires both protecting the vTPM memory from improper
+    access, and ensuring that the state cannot be exfiltrated with
+    legitimate operations coming from a malicious actor.
+\end{itemize}
+
+In this work, we propose \svtpm{}, a new \vtpm{} architecture that solves
+the above security challenges.
+%
+Our work leverages unique architectural properties of the AMD \snp{} execution
+environment; however, we will discuss how to generalize this solution at the end
+of the paper.
+%
+Specifically, we rely on the VM privilege level~(\vmpl{}) feature offered by the secure
+VM service module specification~(\svsm{}) to isolate the \vtpm{} from both the host and the guest
+system.
+%
+With \vmpl{}s, we implement a \vtpm{} running inside a privilege isolated memory region
+inside the guest VM address space. Since the \vtpm{} is still running inside the \cvm{}, it is also isolated from the host.
+%
+Additionally, being inside the \cvm{} allows us to automatically protect the request and response messages to and from the TPM by leveraging the \cvm{} memory encryption.
+%
+This allows us, by construction, to eliminate the need for establishing a secure
+communication channel between the VM and the \vtpm{}.
+
+Finally, we address the problems of persistent vTPM state by proposing a
+stateless, ephemeral \vtpm{}.
+%
+Specifically, we pair each \cvm{} with a private instance of a \vtpm{}
+that manufactures fresh state and keys every time it boots.
+%
+This means that there is no shared state managed by a TPM manager and no
+persistent vTPM state to protect.
+%
+The vTPM state lives entirely within the encrypted memory of the virtual
+machine, with no mechanism for exporting it, allowing us to address a whole
+class of attacks based on exfiltration of vTPM state.
+%
+The cost of doing this ephemeral \vtpm{} is that the TPM itself can retain no
+persistent keys or non-volatile indexes.
+While this makes our \vtpm{} implementation not compliant to the specifications, we
+note that persistent state is not required for the attestation
+and integrity monitoring procedures we describe in this paper.
+
+Our contributions are as follows:
+\begin{itemize}[leftmargin=*, nosep, labelindent=\parindent]
+\item We propose the use of an ephemeral \vtpm{} to remove attacks to the \vtpm{} state.
+\item We are the first to leverage the new features of AMD \sev{} to provide a secure implementation of a \vtpm{}.
+\item We demonstrate a full remote attestation workflow for our \svtpm{} solution, implicitly proving that remote attestation frameworks can provide
+measured boot and remote attestation with an ephemeral \vtpm{}.
+
+\end{itemize}
