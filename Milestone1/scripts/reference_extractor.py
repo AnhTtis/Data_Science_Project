@@ -3,9 +3,28 @@ import json
 import os
 import time
 import re
+import threading
 from downloader import format_yymm_id
 
-def get_paper_references(arxiv_id, delay=2):
+# Semantic Scholar API Key
+API_KEY = ""
+
+# Rate limiter: 1 request per second across all threads
+_rate_limit_lock = threading.Lock()
+_last_request_time = 0
+
+def wait_for_rate_limit():
+    """Ensure at least 1 second has passed since last API call"""
+    global _last_request_time
+    with _rate_limit_lock:
+        current_time = time.time()
+        time_since_last = current_time - _last_request_time
+        if time_since_last < 1.0:
+            sleep_time = 1.0 - time_since_last
+            time.sleep(sleep_time)
+        _last_request_time = time.time()
+
+def get_paper_references(arxiv_id, delay=1):
     """
     Fetch references for a paper from Semantic Scholar API.
     
@@ -19,17 +38,25 @@ def get_paper_references(arxiv_id, delay=2):
     """
     # Clean arxiv_id (remove version suffix if present)
     clean_id = re.sub(r'v\d+$', '', arxiv_id)
-    url = f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{clean_id}"
+    url = f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{clean_id}/references"
     params = {
-        "fields": "references,references.title,references.authors,references.year,references.venue,references.externalIds,references.publicationDate"
+        "fields": "title,authors,year,venue,externalIds,publicationDate"
+    }
+    headers = {
+        "x-api-key": API_KEY,
+        "Accept": "application/json"
     }
 
     while True:
         try:
-            response = requests.get(url, params=params, timeout=10)
+            # Wait to respect rate limit before making request
+            wait_for_rate_limit()
+            
+            response = requests.get(url, params=params, headers=headers, timeout=10)
             if response.status_code == 200:
                 data = response.json()
-                return data.get("references", [])
+                # API trả về {"data": [list of references]}
+                return data.get("data", [])
             elif response.status_code == 429:
                 print(f"  Rate limit hit. Waiting {delay}s before retry...")
                 time.sleep(delay)
@@ -60,14 +87,15 @@ def convert_to_references_dict(references):
     non_arxiv_counter = 1
     
     for ref in references:
-        # The reference data is directly in ref, not under "citedPaper"
+        # Extract citedPaper from the reference object
+        cited_paper = ref.get("citedPaper", {})
         
-        # Skip if reference is None or empty
-        if not ref:
+        # Skip if citedPaper is None or empty
+        if not cited_paper:
             continue
         
         # Extract external IDs (may be None)
-        external_ids = ref.get("externalIds", {})
+        external_ids = cited_paper.get("externalIds", {})
         if external_ids is None:
             external_ids = {}
         
@@ -86,7 +114,7 @@ def convert_to_references_dict(references):
             key = f"doi:{doi.replace('/', '_')}"
         else:
             # Generate a unique key for papers without arXiv ID or DOI
-            title = ref.get("title", "")
+            title = cited_paper.get("title", "")
             if title:
                 # Use first word of title + counter
                 first_word = re.sub(r'[^\w]', '', title.split()[0] if title.split() else "unknown")
@@ -96,12 +124,12 @@ def convert_to_references_dict(references):
             non_arxiv_counter += 1
         
         # Extract authors
-        authors_list = ref.get("authors", [])
+        authors_list = cited_paper.get("authors", [])
         authors = [author.get("name", "") for author in authors_list if author.get("name")]
         
         # Extract dates (use publicationDate if available)
-        publication_date = ref.get("publicationDate", "")
-        year = ref.get("year")
+        publication_date = cited_paper.get("publicationDate", "")
+        year = cited_paper.get("year")
         
         # If no publication date but have year, create an ISO-like format
         if not publication_date and year:
@@ -109,7 +137,7 @@ def convert_to_references_dict(references):
         
         # Build metadata dictionary with required fields
         metadata = {
-            "title": ref.get("title", ""),
+            "title": cited_paper.get("title", ""),
             "authors": authors,
             "submission_date": publication_date if publication_date else "",
             "revised_dates": []  # Semantic Scholar doesn't provide revision history
@@ -120,8 +148,8 @@ def convert_to_references_dict(references):
             metadata["doi"] = doi
         if arxiv_id:
             metadata["arxiv_id"] = arxiv_id
-        if ref.get("venue"):
-            metadata["venue"] = ref.get("venue")
+        if cited_paper.get("venue"):
+            metadata["venue"] = cited_paper.get("venue")
         if year:
             metadata["year"] = year
         
