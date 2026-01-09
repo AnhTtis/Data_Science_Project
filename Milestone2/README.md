@@ -3,8 +3,8 @@
 | Student ID      | Full Name                |
 | :-------------- | :----------------------- | 
 | **23127130**    | Nguyễn Hữu Anh Trí       |
-| **23127107**    | Nguyễn Huy Quân          | 
-| **23127051**    | Cao Tấn Hoàng Huy        |  
+| **23127051**    | Cao Tấn Hoàng Huy        | 
+| **23127107**    | Nguyễn Huy Quân          |  
 
 ---
 
