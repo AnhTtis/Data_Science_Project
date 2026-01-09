@@ -75,107 +75,85 @@ This modularized and concurrent design supports fault isolation, improved runtim
 
 ---
 
-## 📂 Project Structure
+## 🎯 Milestone 2: Hierarchical Parsing and Reference Matching
 
-The folder hierarchy follows the required format from the course guideline:
+Milestone 2 transitions from simple data collection to advanced data processing and analysis. The focus is on transforming unstructured raw data (LaTeX sources) into a structured hierarchical format and applying machine learning techniques to match citation entries extracted from the text with external metadata. This practice mimics real-world data science workflows involving unstructured text processing, standardization, feature engineering, and entity resolution/matching algorithms.
 
-```
-Data_Scince_Project/
-│
-├── README.md                                   # Main project documentation
-│
-└── Milestone1/
-    │
-    ├── data/                                   # Main data repository
-    │   ├── 232303-07857/                         # Folder named after an arXiv ID (yyyymm-id)
-    │   │   ├── 2303.07857v1/                             # Subfolder for version 1 of the paper
-    │   │   │   ├── paper_2310-12345v1.tex
-    │   │   │   └── references.bib
-    │   │   ├── v2/                             # Version 2, same structure
-    │   │   │   ├── paper_2310-12345v2.tex
-    │   │   │   ├── references.json
-    │   │   │   └── references.bib
-    │   │   ├── metadata.json
-    │   │   │── references.json
-    │   ├── 232303-07858/
-    │   │   ├── v1/
-    │   │   │   ├── paper_2310-12678v1.tex
-    │   │   │   └── references.bib
-    │   │   │── metadata.json
-    │   │   │── references.json
-    │   │
-    │   └── ...                                 # Additional arXiv paper folders
-    │
-    ├── scripts/                                # Source code and automation modules
-    │   ├── main.py                             # Entry point to run the complete pipeline
-    │   ├── arxiv_handler.py                    # Handles API queries, ID retrieval, folder creation
-    │   ├── downloader.py                       # Downloads .tar.gz sources and PDFs
-    │   ├── metadata_collector.py               # Retrieves metadata for all versions
-    │   ├── reference_extractor.py              # Collects references from Semantic Scholar
-    │
-    ├── Milestone1_Report.pdf                   # Single official report file (methodology & performance)
-    │
-    ├── Milestone1_Demo_Video.mp4               # Single 2-minute demo video
-    │
-    └──requirements.txt                        # Python dependencies
+### 🗂️ Task 1: Hierarchical Parsing and Standardization
 
-```
+Students are required to implement an automatic parser that processes the scraped LaTeX source files from Milestone 1. The processing pipeline consists of the following components:
 
----
+#### 1. Multi-file Gathering
 
-## 🧰 Environment Setup
+LaTeX content is often spread across multiple `.tex` files (e.g., using `\input` or `\include`). Students must programmatically:
+* Identify the main compilation path
+* Parse only those files that are actually included in the final PDF rendering
+* Ignore unused or redundant files found in the source directory
 
-**Requirements:**
+#### 2. Hierarchy Construction
 
-* Python ≥ 3.9
-* Internet connection (for API requests)
-* Recommended libraries:
+**Hierarchy Structure:** The goal is to convert raw LaTeX code into a hierarchical tree structure for each version of each publication.
 
-```bash
-pip install -r requirements.txt
-```
+* **Document** acts as the root
+* **Chapters or Sections** typically comprise the second level
+* **Subsections, Paragraphs**, and subsequent logical divisions form the lower levels
 
-**Run Command Example:**
+The parser must automatically identify the appropriate hierarchical level for each element based on the publication's specific formatting.
 
-```bash
-python scripts/main.py
-```
----
+**Parsing Rules:**
 
-## 📊 Evaluation Metrics
+* **Smallest Elements (Leaf Nodes):**
+  * **Sentences** (separated by dots/periods)
+  * **Block Formulas** (mathematical blocks such as contents within `equation` environments or `$$...$$`)
+  * **Figures** (note that Tables are also considered a type of Figure)
+  * Itemized points: `\begin{itemize}...\end{itemize}` blocks are considered higher components with each point being a next-level element
 
-Each scraper execution is evaluated using the following criteria (as required by the course specification):
+* **Exclusions:** References sections should not be parsed into the hierarchy
 
-| Category              | Metric                                       |
-| --------------------- | -------------------------------------------- |
-| **Data Completeness** | Number of papers scraped successfully        |
-| **Metadata Coverage** | Ratio of successfully retrieved JSON entries |
-| **Performance**       | Average runtime and memory footprint         |
-| **Data Efficiency**   | Storage reduction after removing figures     |
-| **Quality**           | Correctness of references and file structure |
+* **Inclusions:** Acknowledgements and Appendices (often unnumbered using `\section*`) must be included
+
+#### 3. Standardization and Deduplication
+
+**Cleanup and Normalization:**
+
+* **LaTeX Cleanup:** Remove unnecessary formatting commands (e.g., `\centering`, `[htpb]`, `\midrule`) that do not contribute to semantic meaning
+* **Math Normalization:** 
+  * Convert all inline mathematics to a unified format (e.g., `$...$`)
+  * Convert all block mathematics to a unified format (e.g., `\begin{equation}...\end{equation}`)
+
+**Reference Extraction:**
+
+* For citations defined using `\bibitem` within `.tex` files, convert them into standard BibTeX entries using programmatic tools (e.g., Regular Expressions)
+
+**Deduplication at Two Levels:**
+
+1. **Reference Entries:** 
+   * Handle duplicated reference entries inside each version or across different versions
+   * If different citation keys refer to the same underlying reference content, choose a single citation key
+   * Rename the `\cite{}` commands of remaining entries to this chosen key
+   * Unionize the fields of duplicate entries rather than selecting one entry while discarding all other information
+
+2. **Full-text Content:**
+   * Apply full-text content deduplication to hierarchical elements
+   * If an element's text content matches exactly across different versions (full-text match), represent it by a single identifier in the final output
+   * **Note:** Full-text matching should be performed after cleanup to remove discrepancies in minor details (such as formatting or spacing)
+
+### 🤖 Task 2: Reference Matching Pipeline
+
+This task requires performing a matching operation between:
+* The references extracted and standardized from Task 1 (BibTeX entries)
+* The scraped `references.json` data from Milestone 1
+
+**Goal:** Identify which extracted BibTeX entry corresponds to which arXiv ID (or metadata entry) in the `references.json` file.
+
+Students must perform the full data science pipeline including:
+* Data preprocessing and feature engineering
+* Model selection and training
+* Evaluation and validation
+* Entity resolution/matching algorithms
 
 ---
 
-## 🧾 Deliverables
+**© 2025 University of Science (VNU-HCMC)**  
+Developed for **Introduction to Data Science – Milestones 1 & 2** under the guidance of **Huỳnh Lâm Hải Đăng**.
 
-* **Source Code:** All `.py` files organized under `scripts/` and `src/`.
-* **Dataset:** Compressed `.zip` following the naming rule `<StudentID>.zip`.
-* **Report:** Technical report detailing implementation and performance analysis.
-* **Demo Video:** 2-minute demonstration of system execution and explanation.
-
----
-
-## 📚 References
-
-1. Waleed Ammar et al., *The Semantic Scholar Open Research Corpus*, [arXiv:1805.02234](https://arxiv.org/abs/1805.02234)
-2. [arXiv API Basics](https://info.arxiv.org/help/api/basics.html)
-3. [OAI-PMH Protocol](https://info.arxiv.org/help/oa/index.html)
-4. [Semantic Scholar Graph API](https://api.semanticscholar.org/api-docs/graph)
-5. [Cornell University ArXiv Dataset on Kaggle](https://www.kaggle.com/datasets/Cornell-University/arxiv)
-6. [arxiv-downloader GitHub Repository](https://github.com/braun-steven/arxiv-downloader)
-7. [arxiv.py Wrapper Library](https://github.com/lukasschwab/arxiv.py)
-
----
-
-**© 2025 University of Science (VNU-HCMC)**
-Developed for **Introduction to Data Science – Milestone 1** under the guidance of **Huỳnh Lâm Hải Đăng**.
