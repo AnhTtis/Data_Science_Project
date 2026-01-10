@@ -3,8 +3,8 @@
 | Student ID      | Full Name                |
 | :-------------- | :----------------------- | 
 | **23127130**    | Nguyễn Hữu Anh Trí       |
-| **23127107**    | Nguyễn Huy Quân          | 
-| **23127051**    | Cao Tấn Hoàng Huy        |  
+| **23127051**    | Cao Tấn Hoàng Huy        | 
+| **23127107**    | Nguyễn Huy Quân          |  
 
 ---
 
@@ -295,7 +295,7 @@ with open("output/2310-12345/hierarchy.json") as f:
    - Author overlap (exact match, fuzzy match)
    - Year difference
    - Text length features
-5. **Data Splitting:** 80% train, 20% test
+5. **Data Splitting:** Following the instruction.
 6. **Model Training:** Logistic Regression with hyperparameter tuning
 7. **Ranking:** Generate top-5 predictions per BibTeX entry
 8. **Evaluation:** Compute MRR, accuracy, precision, recall
@@ -327,7 +327,7 @@ CONFIDENCE_THRESHOLD = 0.1         # Minimum confidence for predictions
 - **LOGISTIC_C:** Lower values = stronger regularization (prevent overfitting)
 ---
 
-## Step 5: Outputs and Deliverables
+## Step 5: Outputs
 
 ### 5.1 Generated Files
 
@@ -342,7 +342,7 @@ output/<paper_id>/
 └── pred.json            # Top-5 predictions (Task 2)
 ```
 
-### 5.2 Verification Script
+### 5.2 Verification script
 
 ```python
 # Verify all outputs exist
@@ -365,7 +365,7 @@ for paper_dir in output_dir.iterdir():
 
 ---
 
-## Step 6: (Optional) Watch the Demo Video to Learn How to Run the Pipeline Properly
+## Step 6: (Optional) Watch the Demo Video to learn How to run the pipeline properly
 
 Alongside the source code and processed data, we also have a **YouTube demo video** (maximum **120 seconds**) that showcases how the pipeline works.
 
@@ -390,7 +390,7 @@ The video provides:
   - Feature selection for reference matching
   - Logistic Regression model for ranking
 
-### 9.3 Video Link
+### 6.3 Video Link
 
 * **Watch the demo:** [YouTube Demo Video](https://youtu.be/HM0WQzqbxXY)
 * **Availability:** Publicly viewable, online for at least 1 month after course completion
@@ -412,10 +412,6 @@ The video provides:
 - **Regular Expressions:** https://docs.python.org/3/library/re.html
 - **TF-IDF:** https://scikit-learn.org/stable/modules/feature_extraction.html#tfidf-term-weighting
 
-### Key References
-1. **BibTeX Format Specification:** http://www.bibtex.org/Format/
-2. **Mean Reciprocal Rank (MRR):** Commonly used metric for evaluating ranking systems
-3. **Logistic Regression for Ranking:** scikit-learn documentation on probabilistic classification
 
 ---
 
