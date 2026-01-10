@@ -102,10 +102,10 @@ output/
 
 ## Step 1: Extracting Files
 
-From the submission, extract the **Milestone2.zip** file containing:
+From the submission, extract the **23127130.zip** file containing:
 
 ```
-Milestone2/
+23127130/
 ├── src/                      
 │   ├── Milestone2_Hierarchy.ipynb        # Task 1: Hierarchical parsing
 │   ├── Milestone2_ReferencesMatching.ipynb  # Task 2: Reference matching
@@ -325,44 +325,6 @@ CONFIDENCE_THRESHOLD = 0.1         # Minimum confidence for predictions
 - **TFIDF_MAX_FEATURES:** Controls vocabulary size - higher values capture more terms but increase memory
 - **TEST_SIZE:** Fraction of data used for testing - keep at 0.2 for balanced evaluation
 - **LOGISTIC_C:** Lower values = stronger regularization (prevent overfitting)
-### 4.4 Model Performance
-
-Expected performance metrics on the test set:
-
-**Classification Metrics:**
-- **Accuracy:** 85-95% (binary classification: match vs. no match)
-- **Precision:** 80-90% (of predicted matches, how many are correct)
-- **Recall:** 75-85% (of actual matches, how many we found)
-- **F1 Score:** 78-88% (harmonic mean of precision and recall)
-
-**Ranking Metrics:**
-- **MRR (Mean Reciprocal Rank):** 0.6-0.8
-  - MRR = 1.0: Correct match always ranked #1 (perfect)
-  - MRR = 0.5: Correct match ranked #2 on average
-  - MRR = 0.33: Correct match ranked #3 on average
-  
-**Feature Importance (typical results):**
-1. Title TF-IDF similarity: ~40% contribution
-2. Title Levenshtein distance: ~25% contribution
-3. Author overlap: ~20% contribution
-4. Year difference: ~10% contribution
-5. Other features: ~5% contribution
-
-**Note:** Actual performance may vary depending on:
-- Quality of ground truth labels
-- Diversity of reference styles
-- Completeness of candidate metadata paper's output directory
-
-### 4.4 Model Performance
-
-Expected performance metrics:
-- **Accuracy:** 85-95% (binary classification)
-- **Precision:** 80-90%
-- **Recall:** 75-85%
-- **MRR (Mean Reciprocal Rank):** 0.6-0.8
-  - MRR = 1.0 means correct match always ranked #1
-  - MRR = 0.5 means correct match ranked #2 on average
-
 ---
 
 ## Step 5: Outputs and Deliverables
@@ -380,22 +342,7 @@ output/<paper_id>/
 └── pred.json            # Top-5 predictions (Task 2)
 ```
 
-### 5.2 pred.json Format
-
-```json
-{
-  "ref_xyz": [
-    {"arxiv_id": "2301.12345", "score": 0.95, "rank": 1},
-    {"arxiv_id": "2302.67890", "score": 0.82, "rank": 2},
-    {"arxiv_id": "2303.11111", "score": 0.71, "rank": 3},
-    {"arxiv_id": "2304.22222", "score": 0.65, "rank": 4},
-    {"arxiv_id": "2305.33333", "score": 0.58, "rank": 5}
-  ],
-  "ref_abc": [...]
-}
-```
-
-### 5.3 Verification Script
+### 5.2 Verification Script
 
 ```python
 # Verify all outputs exist
@@ -445,7 +392,7 @@ The video provides:
 
 ### 9.3 Video Link
 
-* **Watch the demo:** [YouTube Demo Video](https://youtu.be/MILESTONE2_DEMO_LINK)
+* **Watch the demo:** [YouTube Demo Video](https://youtu.be/HM0WQzqbxXY)
 * **Availability:** Publicly viewable, online for at least 1 month after course completion
 * **Link included in:** Final Report document
 
